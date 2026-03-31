@@ -67,6 +67,6 @@ Extract key frames and/or a timestamped transcript from a video or audio file.
 
 ## Error handling
 
-- If `keyframe` is not found, tell the user to install it: `pipx install git+ssh://git@github.com/charlesnpx/key-frame.git && keyframe install-skills`
+- If `keyframe` is not found, tell the user to install it: `pipx install git+ssh://git@github.com/charlesnpx/keyframe.git && keyframe install-skills`
 - If models fail to download (SSL errors), suggest: `/Applications/Python\ 3.14/Install\ Certificates.command`
 - If ffmpeg is missing (Whisper needs it), suggest: `brew install ffmpeg`

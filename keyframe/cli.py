@@ -79,28 +79,45 @@ def cmd_extract(args):
         print("=" * 60)
 
         from keyframe.frames import (
-            sample_frames, CLIPEncoder, clip_oversegment,
-            caption_candidates, merge_by_caption, save_results,
+            sample_frames, CLIPEncoder, ModelPreloader, clip_oversegment,
+            caption_candidates, ocr_candidates, _filter_ocr_tokens,
+            _build_hybrid_captions, merge_by_caption, save_results,
         )
         import torch
 
         device = "mps" if torch.backends.mps.is_available() else "cpu"
         frames_dir = out_dir / "frames"
 
+        # Start loading all models in parallel while we sample frames
+        preloader = ModelPreloader(device=device, need_florence=True, need_ocr=True)
+
         frames, timestamps, frame_indices = sample_frames(
             str(video), args.sample_interval
         )
 
-        clip = CLIPEncoder(device=device)
+        clip = CLIPEncoder(device=device, preloaded=preloader.get_clip())
         clip_emb = clip.embed_images(frames)
         print(f"  Embedded {len(frames)} frames -> {clip_emb.shape}")
 
         n_clusters = min(args.pass1_clusters, len(frames) // 2)
         candidates = clip_oversegment(clip_emb, timestamps, frame_indices, n_clusters)
 
-        captions = caption_candidates(candidates, frames, device=device)
-        final = merge_by_caption(candidates, captions, clip, args.similarity_threshold)
+        florence_captions = caption_candidates(
+            candidates, frames, device=device, preloaded=preloader.get_florence()
+        )
+        ocr_texts = ocr_candidates(
+            candidates, frames, preloaded_engine=preloader.get_ocr_engine()
+        )
+        filtered_ocr = _filter_ocr_tokens(ocr_texts)
+        florence_caps, ocr_caps, has_ocr = _build_hybrid_captions(
+            filtered_ocr, florence_captions, candidates
+        )
+        final = merge_by_caption(
+            candidates, florence_caps, ocr_caps, has_ocr,
+            clip, args.similarity_threshold,
+        )
         clip.cleanup()
+        preloader.shutdown()
 
         save_results(final, frames, str(frames_dir))
 

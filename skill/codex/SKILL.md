@@ -46,4 +46,4 @@ Extract key frames and/or a timestamped transcript from a video or audio file.
 
 ## Installation
 
-If `keyframe` is not found: `pipx install git+ssh://git@github.com/charlesnpx/key-frame.git && keyframe install-skills`
+If `keyframe` is not found: `pipx install git+ssh://git@github.com/charlesnpx/keyframe.git && keyframe install-skills`
