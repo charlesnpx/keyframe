@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "keyframe"
+version = "0.1.0"
+description = "Extract key frames and transcripts from video files using CLIP, Florence-2, and Whisper"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = [
+    "opencv-python",
+    "torch",
+    "open-clip-torch",
+    "transformers>=4.50",
+    "scikit-learn",
+    "numpy",
+    "pillow",
+    "openai-whisper",
+]
+
+[project.scripts]
+keyframe = "keyframe.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["keyframe"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"skill" = "skill"
