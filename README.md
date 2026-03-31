@@ -91,7 +91,7 @@ $keyframe ~/Downloads/meeting-recording.mp4
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-o, --output` | `<video>_extracted/` | Output directory |
+| `-o, --output` | `/tmp/<video>_extracted/` | Output directory |
 | `--frames-only` | | Skip transcript extraction |
 | `--transcript-only` | | Skip frame extraction |
 | `-i, --sample-interval` | `0.5` | Sample one frame every N seconds |

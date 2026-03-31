@@ -63,7 +63,7 @@ def cmd_extract(args):
     if args.output:
         out_dir = Path(args.output)
     else:
-        out_dir = video.parent / f"{video.stem}_extracted"
+        out_dir = Path("/tmp") / f"{video.stem}_extracted"
 
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output: {out_dir.resolve()}\n")
@@ -176,7 +176,7 @@ def main():
 def _add_extract_args(parser):
     parser.add_argument("video", nargs="?", help="Path to input video/audio file")
     parser.add_argument("--output", "-o", default=None,
-                        help="Output directory (default: <video>_extracted/)")
+                        help="Output directory (default: /tmp/<video>_extracted/)")
 
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--frames-only", action="store_true",

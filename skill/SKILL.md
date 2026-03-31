@@ -27,8 +27,9 @@ Extract key frames and/or a timestamped transcript from a video or audio file.
 
 3. **Run the command.** Execute via Bash:
    ```bash
-   keyframe "<path to file>" -o "<output directory>"
+   keyframe "<path to file>"
    ```
+   Output goes to `/tmp/<filename>_extracted/` by default. Use `-o` to override:
 
    Common flags:
    - `--frames-only` — skip transcript extraction
