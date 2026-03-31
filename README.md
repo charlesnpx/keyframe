@@ -6,10 +6,10 @@ Extract key frames and timestamped transcripts from video files using CLIP, Flor
 
 ```bash
 # via pipx (recommended)
-pipx install git+ssh://git@github.com/charlesnpx/key-frame.git
+pipx install git+ssh://git@github.com/charlesnpx/keyframe.git
 
 # or HTTPS
-pipx install git+https://github.com/charlesnpx/key-frame.git
+pipx install git+https://github.com/charlesnpx/keyframe.git
 
 # or from local checkout
 pipx install --force .
