@@ -274,16 +274,6 @@ def caption_candidates(candidates, frames, device="mps", preloaded=None):
 
 # ── Pass 2b: PaddleOCR text extraction ───────────────────────────────────
 
-_OCR_MAX_LONG_EDGE = 1920
-
-
-def _resize_for_ocr(img):
-    """Downscale to at most _OCR_MAX_LONG_EDGE on the long side."""
-    w, h = img.size
-    if max(w, h) <= _OCR_MAX_LONG_EDGE:
-        return img
-    scale = _OCR_MAX_LONG_EDGE / max(w, h)
-    return img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
 
 
 def _ocr_apple_vision(img):
@@ -326,8 +316,7 @@ def _ocr_apple_vision(img):
 
 def _ocr_paddle(img, ocr_engine):
     """Use PaddleOCR (CPU fallback for non-macOS)."""
-    img_resized = _resize_for_ocr(img)
-    img_array = np.array(img_resized)
+    img_array = np.array(img)
     result = ocr_engine.predict(img_array)
 
     lines = []
