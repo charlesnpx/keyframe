@@ -486,6 +486,33 @@ def _jaccard_similarity(tokens_a, tokens_b):
     return len(tokens_a & tokens_b) / len(tokens_a | tokens_b)
 
 
+def _jaccard_sim_matrix(token_sets, has_ocr_mask):
+    """Build a full Jaccard similarity matrix, vectorized over the OCR mask."""
+    n = len(token_sets)
+    sim = np.zeros((n, n))
+    # Only compute upper triangle for pairs where both have OCR
+    ocr_idxs = np.where(has_ocr_mask)[0]
+    for i_pos, i in enumerate(ocr_idxs):
+        ti = token_sets[i]
+        for j in ocr_idxs[i_pos:]:
+            tj = token_sets[j]
+            union = len(ti | tj)
+            val = len(ti & tj) / union if union else 1.0
+            sim[i, j] = val
+            sim[j, i] = val
+    return sim
+
+
+def _build_combined_sim(clip_sim, jaccard_sim, has_ocr_mask, ocr_weight):
+    """Build combined similarity: weighted blend where both have OCR, else CLIP only."""
+    both_ocr = np.outer(has_ocr_mask, has_ocr_mask)
+    fw = 1.0 - ocr_weight
+    combined = np.where(both_ocr,
+                        fw * clip_sim + ocr_weight * jaccard_sim,
+                        clip_sim)
+    return combined, both_ocr
+
+
 def _build_ocr_token_sets(filtered_ocr_texts):
     """Build normalized token sets from filtered OCR texts for Jaccard comparison."""
     return [
@@ -510,41 +537,26 @@ def merge_by_caption(candidates, clip_emb, ocr_token_sets, has_ocr, frames,
     print(f"\n── Merging via CLIP image + Jaccard OCR (threshold={similarity_threshold}) ──")
 
     # CLIP image similarity for candidates only
-    candidate_indices = [c["sample_idx"] for c in candidates]
+    candidate_indices = np.array([c["sample_idx"] for c in candidates])
     cand_emb = clip_emb[candidate_indices]
     clip_sim = cand_emb @ cand_emb.T
     print(f"  CLIP image similarity: {cand_emb.shape[0]} candidates")
 
-    # Jaccard OCR similarity
-    n = len(candidates)
-    jaccard_sim = np.zeros((n, n))
-    for i in range(n):
-        for j in range(n):
-            if has_ocr[i] and has_ocr[j]:
-                jaccard_sim[i][j] = _jaccard_similarity(
-                    ocr_token_sets[i], ocr_token_sets[j]
-                )
+    # Jaccard OCR similarity + combined matrix (vectorized)
+    has_ocr_mask = np.array(has_ocr, dtype=bool)
+    jaccard_sim = _jaccard_sim_matrix(ocr_token_sets, has_ocr_mask)
+    combined_sim, both_ocr = _build_combined_sim(clip_sim, jaccard_sim, has_ocr_mask, ocr_weight)
 
-    # Combined similarity: weighted blend when both have OCR, else CLIP image only
-    combined_sim = np.zeros((n, n))
-    fw = 1.0 - ocr_weight
-    for i in range(n):
-        for j in range(n):
-            if has_ocr[i] and has_ocr[j]:
-                combined_sim[i][j] = fw * clip_sim[i][j] + ocr_weight * jaccard_sim[i][j]
-            else:
-                combined_sim[i][j] = clip_sim[i][j]
-
-    for i in range(n):
-        for j in range(i + 1, n):
-            if combined_sim[i][j] > similarity_threshold:
-                detail = ""
-                if has_ocr[i] and has_ocr[j]:
-                    detail = (f" [CLIP:{clip_sim[i][j]:.3f} "
-                              f"Jaccard:{jaccard_sim[i][j]:.3f}]")
-                print(f"    {candidates[i]['timestamp']:5.1f}s ↔ "
-                      f"{candidates[j]['timestamp']:5.1f}s: "
-                      f"{combined_sim[i][j]:.3f}{detail} (will merge)")
+    # Log merge decisions
+    merge_i, merge_j = np.where(np.triu(combined_sim > similarity_threshold, k=1))
+    for i, j in zip(merge_i, merge_j):
+        detail = ""
+        if both_ocr[i, j]:
+            detail = (f" [CLIP:{clip_sim[i, j]:.3f} "
+                      f"Jaccard:{jaccard_sim[i, j]:.3f}]")
+        print(f"    {candidates[i]['timestamp']:5.1f}s ↔ "
+              f"{candidates[j]['timestamp']:5.1f}s: "
+              f"{combined_sim[i, j]:.3f}{detail} (will merge)")
 
     # Convert combined similarity to distance for clustering
     combined_dist = 1.0 - combined_sim
@@ -591,16 +603,13 @@ def merge_by_caption(candidates, clip_emb, ocr_token_sets, has_ocr, frames,
 
         # Recompute combined similarity with locally-filtered Jaccard
         gn = len(group_idxs)
-        local_combined = np.zeros((gn, gn))
-        for gi in range(gn):
-            for gj in range(gn):
-                ii, jj = group_idxs[gi], group_idxs[gj]
-                has_both = len(local_token_sets[gi]) >= 3 and len(local_token_sets[gj]) >= 3
-                if has_both:
-                    jaccard = _jaccard_similarity(local_token_sets[gi], local_token_sets[gj])
-                    local_combined[gi][gj] = fw * clip_sim[ii][jj] + ocr_weight * jaccard
-                else:
-                    local_combined[gi][gj] = clip_sim[ii][jj]
+        group_arr = np.array(group_idxs)
+        local_clip = clip_sim[np.ix_(group_arr, group_arr)]
+        local_has_ocr = np.array([len(s) >= 3 for s in local_token_sets])
+        local_jaccard = _jaccard_sim_matrix(local_token_sets, local_has_ocr)
+        local_combined, _ = _build_combined_sim(
+            local_clip, local_jaccard, local_has_ocr, ocr_weight
+        )
 
         local_dist = 1.0 - local_combined
         np.fill_diagonal(local_dist, 0)
