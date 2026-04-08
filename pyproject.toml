@@ -17,6 +17,7 @@ dependencies = [
     "numpy",
     "pillow",
     "openai-whisper",
+    "scenedetect[opencv]",
 ]
 
 [project.optional-dependencies]

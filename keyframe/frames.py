@@ -71,6 +71,58 @@ def sample_frames(video_path, interval_seconds=0.5):
     return frames, timestamps, frame_indices
 
 
+# ── Scene detection ──────────────────────────────────────────────────────
+
+def detect_scenes(video_path, timestamps, threshold=27.0):
+    """Run pySceneDetect ContentDetector and return scene boundaries as
+    (start_idx, end_idx) tuples indexed into the timestamps/frames arrays."""
+    from scenedetect import open_video, SceneManager
+    from scenedetect.detectors import ContentDetector
+    import bisect
+
+    print(f"\n── Scene detection (ContentDetector, threshold={threshold}) ──")
+    video = open_video(video_path)
+    sm = SceneManager()
+    sm.add_detector(ContentDetector(threshold=threshold))
+    sm.detect_scenes(video)
+    scene_list = sm.get_scene_list()
+
+    if not scene_list:
+        print(f"  No scene cuts detected — treating entire video as one scene")
+        return [(0, len(timestamps) - 1)]
+
+    scenes = []
+    for start_tc, end_tc in scene_list:
+        start_sec = start_tc.get_seconds()
+        end_sec = end_tc.get_seconds()
+        s_idx = bisect.bisect_left(timestamps, start_sec)
+        e_idx = bisect.bisect_right(timestamps, end_sec) - 1
+        s_idx = max(0, min(s_idx, len(timestamps) - 1))
+        e_idx = max(s_idx, min(e_idx, len(timestamps) - 1))
+        scenes.append((s_idx, e_idx))
+
+    print(f"  Detected {len(scenes)} scenes:")
+    for i, (s, e) in enumerate(scenes):
+        print(f"    Scene {i}: frames {s}-{e} "
+              f"({timestamps[s]:.1f}s - {timestamps[e]:.1f}s, "
+              f"{e - s + 1} frames)")
+    return scenes
+
+
+def _allocate_clusters(scenes, total_clusters, min_per_scene=2):
+    """Distribute cluster budget proportionally to scene length."""
+    total_frames = sum(e - s + 1 for s, e in scenes)
+    if total_frames == 0:
+        return [min_per_scene] * len(scenes)
+
+    allocs = []
+    for s, e in scenes:
+        scene_len = e - s + 1
+        share = max(min_per_scene, round(total_clusters * scene_len / total_frames))
+        allocs.append(share)
+    return allocs
+
+
 # ── Parallel model preloading ─────────────────────────────────────────────
 
 def _load_clip(device, model_name="ViT-B-32", pretrained="laion2b_s34b_b79k"):
@@ -187,7 +239,13 @@ class CLIPEncoder:
 
 # ── Pass 1: CLIP image embedding + over-segmentation ───────────────────────
 
-def clip_oversegment(embeddings, timestamps, frame_indices, n_clusters):
+def _laplacian_sharpness(pil_img):
+    """Score frame sharpness via Laplacian variance (higher = sharper)."""
+    gray = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2GRAY)
+    return cv2.Laplacian(gray, cv2.CV_64F).var()
+
+
+def clip_oversegment(embeddings, timestamps, frame_indices, n_clusters, frames):
     print(f"  Over-segmenting into {n_clusters} clusters...")
     clustering = AgglomerativeClustering(
         n_clusters=n_clusters, metric="cosine", linkage="average",
@@ -198,12 +256,9 @@ def clip_oversegment(embeddings, timestamps, frame_indices, n_clusters):
     for cid in range(n_clusters):
         mask = labels == cid
         idxs = np.where(mask)[0]
-        cluster_emb = embeddings[idxs]
 
-        centroid = cluster_emb.mean(axis=0)
-        centroid /= np.linalg.norm(centroid) + 1e-8
-        sims = cluster_emb @ centroid
-        best = idxs[np.argmax(sims)]
+        sharpness = [_laplacian_sharpness(frames[idx]) for idx in idxs]
+        best = idxs[np.argmax(sharpness)]
 
         candidates.append({
             "sample_idx": int(best),
@@ -420,73 +475,73 @@ def _build_hybrid_captions(filtered_ocr, florence_captions, candidates,
     return florence_captions, filtered_ocr, has_ocr
 
 
-# ── Merge: CLIP text embeddings of captions ────────────────────────────────
+# ── Merge: CLIP image similarity + Jaccard OCR overlap ───────────────────
 
-# Captions matching any of these prefixes are considered low-information —
-# Florence-2 produces them for almost any screen recording regardless of content.
-_GENERIC_CAPTION_PREFIXES = (
-    "The image is a screenshot of a computer screen",
-    "The image shows a screenshot of a computer screen",
-    "The image is a screenshot of a screen",
-    "A screenshot of a computer screen",
-)
-
-
-def _is_generic(caption):
-    """Return True if a caption matches a known low-information pattern."""
-    return any(caption.startswith(p) for p in _GENERIC_CAPTION_PREFIXES)
+def _jaccard_similarity(tokens_a, tokens_b):
+    """Jaccard similarity between two sets of normalized tokens."""
+    if not tokens_a and not tokens_b:
+        return 1.0
+    if not tokens_a or not tokens_b:
+        return 0.0
+    return len(tokens_a & tokens_b) / len(tokens_a | tokens_b)
 
 
-def merge_by_caption(candidates, florence_captions, ocr_captions, has_ocr,
-                     clip_encoder, similarity_threshold=0.85, ocr_weight=0.6):
+def _build_ocr_token_sets(filtered_ocr_texts):
+    """Build normalized token sets from filtered OCR texts for Jaccard comparison."""
+    return [
+        {_normalize_token(w) for w in text.split() if _normalize_token(w)}
+        for text in filtered_ocr_texts
+    ]
+
+
+def merge_by_caption(candidates, clip_emb, ocr_token_sets, has_ocr, frames,
+                     similarity_threshold=0.85, ocr_weight=0.5):
     """
-    Dual-embedding merge: embed Florence-2 captions and OCR text separately
-    with CLIP's text encoder, then combine similarity matrices to decide merges.
-
-    This avoids CLIP's 77-token truncation — each signal gets its own full
-    encoding. When OCR is available, frames need to be similar on BOTH scene
-    description AND on-screen text to merge.
+    Merge candidates using CLIP image embeddings (from Pass 1) for semantic
+    similarity and Jaccard token overlap for OCR deduplication.
 
     Args:
-        florence_captions: List of Florence-2 captions (scene descriptions).
-        ocr_captions: List of filtered OCR texts (on-screen content).
-        has_ocr: List of bools — whether each frame has substantial OCR.
-        ocr_weight: Weight for OCR similarity (0-1). Florence gets 1-ocr_weight.
+        clip_emb: Full CLIP image embedding array from Pass 1 (all sampled frames).
+        ocr_token_sets: List of normalized token sets (one per candidate).
+        has_ocr: List of bools — whether each candidate has substantial OCR.
+        frames: List of PIL images (all sampled frames) for sharpness scoring.
+        ocr_weight: Weight for Jaccard OCR similarity (0-1). CLIP image gets 1-ocr_weight.
     """
-    print(f"\n── Merging via dual CLIP text embeddings (threshold={similarity_threshold}) ──")
+    print(f"\n── Merging via CLIP image + Jaccard OCR (threshold={similarity_threshold}) ──")
 
-    # Embed Florence-2 captions
-    florence_emb = clip_encoder.embed_texts(florence_captions)
-    florence_sim = florence_emb @ florence_emb.T
-    print(f"  Florence embeddings: {florence_emb.shape}")
+    # CLIP image similarity for candidates only
+    candidate_indices = [c["sample_idx"] for c in candidates]
+    cand_emb = clip_emb[candidate_indices]
+    clip_sim = cand_emb @ cand_emb.T
+    print(f"  CLIP image similarity: {cand_emb.shape[0]} candidates")
 
-    # Embed OCR texts (use empty string for frames without OCR)
-    ocr_emb = clip_encoder.embed_texts(
-        [ocr if h else "" for ocr, h in zip(ocr_captions, has_ocr)]
-    )
-    ocr_sim = ocr_emb @ ocr_emb.T
-    print(f"  OCR embeddings: {ocr_emb.shape}")
-
-    # Build combined similarity matrix
-    # When both frames have OCR: weighted blend of florence + OCR similarity
-    # When either lacks OCR: use florence similarity only
+    # Jaccard OCR similarity
     n = len(candidates)
+    jaccard_sim = np.zeros((n, n))
+    for i in range(n):
+        for j in range(n):
+            if has_ocr[i] and has_ocr[j]:
+                jaccard_sim[i][j] = _jaccard_similarity(
+                    ocr_token_sets[i], ocr_token_sets[j]
+                )
+
+    # Combined similarity: weighted blend when both have OCR, else CLIP image only
     combined_sim = np.zeros((n, n))
     fw = 1.0 - ocr_weight
     for i in range(n):
         for j in range(n):
             if has_ocr[i] and has_ocr[j]:
-                combined_sim[i][j] = fw * florence_sim[i][j] + ocr_weight * ocr_sim[i][j]
+                combined_sim[i][j] = fw * clip_sim[i][j] + ocr_weight * jaccard_sim[i][j]
             else:
-                combined_sim[i][j] = florence_sim[i][j]
+                combined_sim[i][j] = clip_sim[i][j]
 
     for i in range(n):
         for j in range(i + 1, n):
             if combined_sim[i][j] > similarity_threshold:
                 detail = ""
                 if has_ocr[i] and has_ocr[j]:
-                    detail = (f" [F:{florence_sim[i][j]:.3f} "
-                              f"OCR:{ocr_sim[i][j]:.3f}]")
+                    detail = (f" [CLIP:{clip_sim[i][j]:.3f} "
+                              f"Jaccard:{jaccard_sim[i][j]:.3f}]")
                 print(f"    {candidates[i]['timestamp']:5.1f}s ↔ "
                       f"{candidates[j]['timestamp']:5.1f}s: "
                       f"{combined_sim[i][j]:.3f}{detail} (will merge)")
@@ -494,7 +549,7 @@ def merge_by_caption(candidates, florence_captions, ocr_captions, has_ocr,
     # Convert combined similarity to distance for clustering
     combined_dist = 1.0 - combined_sim
     np.fill_diagonal(combined_dist, 0)
-    combined_dist = np.clip(combined_dist, 0, None)  # numerical safety
+    combined_dist = np.clip(combined_dist, 0, None)
 
     clustering = AgglomerativeClustering(
         n_clusters=None,
@@ -507,9 +562,9 @@ def merge_by_caption(candidates, florence_captions, ocr_captions, has_ocr,
     print(f"  Combined clusters: {n_clusters}")
 
     # ── Intra-group OCR refinement ──
-    # For groups where members share OCR text (same app/branch), the global DF
-    # filter doesn't remove within-group common tokens. Re-filter OCR within
-    # each group to surface what actually differs, then re-cluster.
+    # For groups where members share OCR text, the global DF filter doesn't
+    # remove within-group common tokens. Re-filter OCR within each group to
+    # surface what actually differs, then re-cluster using Jaccard.
     n_refined = 0
     refined_labels = np.array(cap_labels, copy=True)
     next_label = max(cap_labels) + 1
@@ -518,37 +573,34 @@ def merge_by_caption(candidates, florence_captions, ocr_captions, has_ocr,
         group_idxs = [i for i, l in enumerate(cap_labels) if l == cid]
         if len(group_idxs) < 4:
             continue
-        # Only refine if most members have OCR
         group_has_ocr = [has_ocr[i] for i in group_idxs]
         if sum(group_has_ocr) < len(group_idxs) * 0.5:
             continue
 
-        # Intra-group DF filter: remove tokens common within this group
-        group_ocr = [ocr_captions[i] for i in group_idxs]
+        # Reconstruct text from token sets for intra-group DF filtering
+        group_ocr = [
+            " ".join(ocr_token_sets[i]) if has_ocr[i] else ""
+            for i in group_idxs
+        ]
         local_filtered = _filter_ocr_tokens(group_ocr, max_tokens=70, df_cutoff=0.5)
+        local_token_sets = _build_ocr_token_sets(local_filtered)
 
-        # Check if local filtering produced any differentiation
-        non_empty = [t for t in local_filtered if len(t.strip()) >= 30]
+        non_empty = [s for s in local_token_sets if len(s) >= 3]
         if len(non_empty) < 2:
             continue
 
-        # Re-embed locally-filtered OCR and recompute combined similarity
-        local_ocr_emb = clip_encoder.embed_texts(
-            [t if len(t.strip()) >= 30 else "" for t in local_filtered]
-        )
-        local_ocr_sim = local_ocr_emb @ local_ocr_emb.T
+        # Recompute combined similarity with locally-filtered Jaccard
         gn = len(group_idxs)
         local_combined = np.zeros((gn, gn))
         for gi in range(gn):
             for gj in range(gn):
                 ii, jj = group_idxs[gi], group_idxs[gj]
-                has_both = (len(local_filtered[gi].strip()) >= 30 and
-                            len(local_filtered[gj].strip()) >= 30)
+                has_both = len(local_token_sets[gi]) >= 3 and len(local_token_sets[gj]) >= 3
                 if has_both:
-                    local_combined[gi][gj] = (fw * florence_sim[ii][jj] +
-                                              ocr_weight * local_ocr_sim[gi][gj])
+                    jaccard = _jaccard_similarity(local_token_sets[gi], local_token_sets[gj])
+                    local_combined[gi][gj] = fw * clip_sim[ii][jj] + ocr_weight * jaccard
                 else:
-                    local_combined[gi][gj] = florence_sim[ii][jj]
+                    local_combined[gi][gj] = clip_sim[ii][jj]
 
         local_dist = 1.0 - local_combined
         np.fill_diagonal(local_dist, 0)
@@ -569,7 +621,7 @@ def merge_by_caption(candidates, florence_captions, ocr_captions, has_ocr,
                   f"(intra-group OCR filtering)")
             for gi, idx in enumerate(group_idxs):
                 refined_labels[idx] = next_label + sub_labels[gi]
-                filt_preview = local_filtered[gi][:80] if local_filtered[gi] else "(no OCR)"
+                filt_preview = " ".join(list(local_token_sets[gi])[:10]) if local_token_sets[gi] else "(no OCR)"
                 print(f"    {candidates[idx]['timestamp']:5.1f}s → sub-group "
                       f"{sub_labels[gi]}: \"{filt_preview}\"")
             next_label += n_sub
@@ -585,28 +637,27 @@ def merge_by_caption(candidates, florence_captions, ocr_captions, has_ocr,
         group_idxs = [i for i, l in enumerate(cap_labels) if l == cid]
         group_cands = [candidates[i] for i in group_idxs]
 
-        # Pick the candidate closest to the group centroid (using florence embeddings)
-        group_emb = florence_emb[group_idxs]
-        centroid = group_emb.mean(axis=0)
-        centroid /= np.linalg.norm(centroid) + 1e-8
-        sims = group_emb @ centroid
-        best_local = np.argmax(sims)
+        # Pick sharpest frame in group
+        sharpness = [_laplacian_sharpness(frames[c["sample_idx"]]) for c in group_cands]
+        best_local = np.argmax(sharpness)
 
         winner = group_cands[best_local].copy()
         winner["caption_cluster"] = int(cid)
         winner["merged_from"] = len(group_idxs)
-        winner["merged_captions"] = [florence_captions[i] for i in group_idxs]
+        winner["merged_captions"] = [candidates[i].get("caption", "") for i in group_idxs]
         winner["merged_timestamps"] = [candidates[i]["timestamp"] for i in group_idxs]
         final.append(winner)
 
         merged_tag = "" if len(group_idxs) == 1 else f" (merged {len(group_idxs)} candidates)"
         print(f"  Group {cid}: kept {winner['timestamp']:.1f}s{merged_tag}")
-        print(f"    \"{florence_captions[group_idxs[best_local]][:120]}\"")
+        caption_preview = candidates[group_idxs[best_local]].get("caption", "")
+        print(f"    \"{caption_preview[:120]}\"")
         if len(group_idxs) > 1:
             for i in group_idxs:
                 if i != group_idxs[best_local]:
+                    cap = candidates[i].get("caption", "")
                     print(f"    dropped {candidates[i]['timestamp']:.1f}s: "
-                          f"\"{florence_captions[i][:100]}\"")
+                          f"\"{cap[:100]}\"")
 
     final.sort(key=lambda c: c["timestamp"])
     return final
@@ -682,8 +733,42 @@ def main():
     clip_emb = clip.embed_images(frames)
     print(f"  Embedded {len(frames)} frames → {clip_emb.shape}")
 
+    # Scene detection → per-scene clustering
     n_clusters = min(args.pass1_clusters, len(frames) // 2)
-    candidates = clip_oversegment(clip_emb, timestamps, frame_indices, n_clusters)
+    scenes = detect_scenes(args.video, timestamps)
+    cluster_allocs = _allocate_clusters(scenes, n_clusters)
+
+    all_candidates = []
+    cluster_offset = 0
+    for (s_start, s_end), scene_clusters in zip(scenes, cluster_allocs):
+        scene_emb = clip_emb[s_start:s_end + 1]
+        scene_ts = timestamps[s_start:s_end + 1]
+        scene_fi = frame_indices[s_start:s_end + 1]
+        scene_frames = frames[s_start:s_end + 1]
+
+        if scene_clusters < 2 or len(scene_emb) < 2:
+            best = max(range(len(scene_frames)),
+                       key=lambda i: _laplacian_sharpness(scene_frames[i]))
+            all_candidates.append({
+                "sample_idx": s_start + best,
+                "frame_idx": scene_fi[best],
+                "timestamp": scene_ts[best],
+                "clip_cluster": cluster_offset,
+                "clip_cluster_size": len(scene_emb),
+            })
+            cluster_offset += 1
+            continue
+
+        scene_cands = clip_oversegment(
+            scene_emb, scene_ts, scene_fi, scene_clusters, scene_frames
+        )
+        for c in scene_cands:
+            c["sample_idx"] = s_start + c["sample_idx"]
+            c["clip_cluster"] += cluster_offset
+        cluster_offset += scene_clusters
+        all_candidates.extend(scene_cands)
+
+    candidates = sorted(all_candidates, key=lambda c: c["timestamp"])
 
     # Florence-2 captioning (batched) — model already loaded in background
     florence_captions = caption_candidates(
@@ -699,10 +784,11 @@ def main():
         filtered_ocr, florence_captions, candidates
     )
 
-    # Merge using dual CLIP text embeddings (florence + OCR separately)
+    # Merge using CLIP image similarity + Jaccard OCR overlap
+    ocr_token_sets = _build_ocr_token_sets(filtered_ocr)
     final = merge_by_caption(
-        candidates, florence_caps, ocr_caps, has_ocr,
-        clip, args.similarity_threshold,
+        candidates, clip_emb, ocr_token_sets, has_ocr, frames,
+        args.similarity_threshold,
     )
     clip.cleanup()
     preloader.shutdown()

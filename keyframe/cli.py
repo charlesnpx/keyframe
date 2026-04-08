@@ -81,7 +81,9 @@ def cmd_extract(args):
         from keyframe.frames import (
             sample_frames, CLIPEncoder, ModelPreloader, clip_oversegment,
             caption_candidates, ocr_candidates, _filter_ocr_tokens,
-            _build_hybrid_captions, merge_by_caption, save_results,
+            _build_hybrid_captions, _build_ocr_token_sets, merge_by_caption,
+            save_results, detect_scenes, _allocate_clusters,
+            _laplacian_sharpness,
         )
         import torch
 
@@ -99,8 +101,42 @@ def cmd_extract(args):
         clip_emb = clip.embed_images(frames)
         print(f"  Embedded {len(frames)} frames -> {clip_emb.shape}")
 
+        # Scene detection → per-scene clustering
         n_clusters = min(args.pass1_clusters, len(frames) // 2)
-        candidates = clip_oversegment(clip_emb, timestamps, frame_indices, n_clusters)
+        scenes = detect_scenes(str(video), timestamps)
+        cluster_allocs = _allocate_clusters(scenes, n_clusters)
+
+        all_candidates = []
+        cluster_offset = 0
+        for (s_start, s_end), scene_clusters in zip(scenes, cluster_allocs):
+            scene_emb = clip_emb[s_start:s_end + 1]
+            scene_ts = timestamps[s_start:s_end + 1]
+            scene_fi = frame_indices[s_start:s_end + 1]
+            scene_frames = frames[s_start:s_end + 1]
+
+            if scene_clusters < 2 or len(scene_emb) < 2:
+                best = max(range(len(scene_frames)),
+                           key=lambda i: _laplacian_sharpness(scene_frames[i]))
+                all_candidates.append({
+                    "sample_idx": s_start + best,
+                    "frame_idx": scene_fi[best],
+                    "timestamp": scene_ts[best],
+                    "clip_cluster": cluster_offset,
+                    "clip_cluster_size": len(scene_emb),
+                })
+                cluster_offset += 1
+                continue
+
+            scene_cands = clip_oversegment(
+                scene_emb, scene_ts, scene_fi, scene_clusters, scene_frames
+            )
+            for c in scene_cands:
+                c["sample_idx"] = s_start + c["sample_idx"]
+                c["clip_cluster"] += cluster_offset
+            cluster_offset += scene_clusters
+            all_candidates.extend(scene_cands)
+
+        candidates = sorted(all_candidates, key=lambda c: c["timestamp"])
 
         florence_captions = caption_candidates(
             candidates, frames, device=device, preloaded=preloader.get_florence()
@@ -112,9 +148,10 @@ def cmd_extract(args):
         florence_caps, ocr_caps, has_ocr = _build_hybrid_captions(
             filtered_ocr, florence_captions, candidates
         )
+        ocr_token_sets = _build_ocr_token_sets(filtered_ocr)
         final = merge_by_caption(
-            candidates, florence_caps, ocr_caps, has_ocr,
-            clip, args.similarity_threshold,
+            candidates, clip_emb, ocr_token_sets, has_ocr, frames,
+            args.similarity_threshold,
         )
         clip.cleanup()
         preloader.shutdown()
