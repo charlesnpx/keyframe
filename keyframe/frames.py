@@ -193,6 +193,9 @@ class ModelPreloader:
 
     def shutdown(self):
         self._pool.shutdown(wait=False)
+        self._clip_future = None
+        self._florence_future = None
+        self._ocr_future = None
 
 
 # ── CLIP model (shared across passes) ──────────────────────────────────────

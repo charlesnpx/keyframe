@@ -168,7 +168,14 @@ def cmd_extract(args):
               f"{len(final)} key frames")
         print(f"  Saved to: {frames_dir.resolve()}")
 
-        del frames, clip_emb, candidates, final
+        del frames, clip_emb, candidates, final, clip
+
+        preloader._clip_future = None
+        preloader._florence_future = None
+        preloader._ocr_future = None
+        del preloader
+        import gc
+        gc.collect()
         if device == "mps":
             torch.mps.empty_cache()
         elif device == "cuda":
