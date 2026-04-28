@@ -221,7 +221,7 @@ class CLIPEncoder:
             with torch.no_grad(), torch.amp.autocast(device_type=str(self.device)):
                 features = self.model.encode_image(images)
             features = features / features.norm(dim=-1, keepdim=True)
-            all_emb.append(features.cpu().numpy())
+            all_emb.append(features.float().cpu().numpy())
         return np.vstack(all_emb).astype(np.float32)
 
     def embed_texts(self, texts):
@@ -229,7 +229,7 @@ class CLIPEncoder:
         with torch.no_grad(), torch.amp.autocast(device_type=str(self.device)):
             features = self.model.encode_text(tokens)
         features = features / features.norm(dim=-1, keepdim=True)
-        return features.cpu().numpy().astype(np.float32)
+        return features.float().cpu().numpy().astype(np.float32)
 
     def cleanup(self):
         del self.model, self.tokenizer
