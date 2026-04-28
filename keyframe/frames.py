@@ -327,6 +327,8 @@ def caption_candidates(candidates, frames, device="mps", preloaded=None):
     del model, processor
     if device == "mps":
         torch.mps.empty_cache()
+    elif device == "cuda":
+        torch.cuda.empty_cache()
     return captions
 
 

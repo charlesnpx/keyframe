@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "keyframe"
-version = "0.22"
+version = "0.23"
 description = "Extract key frames and transcripts from video files using CLIP, Florence-2, and Whisper"
 requires-python = ">=3.11"
 license = "MIT"
