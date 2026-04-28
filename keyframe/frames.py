@@ -148,6 +148,7 @@ def _load_florence(device):
 
 def _load_ocr_engine():
     """Load PaddleOCR engine for non-macOS (called in background thread)."""
+    os.environ["FLAGS_use_mkldnn"] = "0"
     os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
     from paddleocr import PaddleOCR
     return PaddleOCR(
@@ -235,6 +236,8 @@ class CLIPEncoder:
         del self.model, self.tokenizer
         if self.device == "mps":
             torch.mps.empty_cache()
+        elif self.device == "cuda":
+            torch.cuda.empty_cache()
 
 
 # ── Pass 1: CLIP image embedding + over-segmentation ───────────────────────

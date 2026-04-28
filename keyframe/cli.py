@@ -87,7 +87,13 @@ def cmd_extract(args):
         )
         import torch
 
-        device = "mps" if torch.backends.mps.is_available() else "cpu"
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
+
         frames_dir = out_dir / "frames"
 
         # Start loading all models in parallel while we sample frames
@@ -165,6 +171,8 @@ def cmd_extract(args):
         del frames, clip_emb, candidates, final
         if device == "mps":
             torch.mps.empty_cache()
+        elif device == "cuda":
+            torch.cuda.empty_cache()
 
     # ── Transcript ──────────────────────────────────────────────────────
     if do_transcript:
