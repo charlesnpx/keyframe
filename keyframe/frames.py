@@ -17,12 +17,12 @@ Dependencies:
 """
 
 import cv2
+import gc
 import numpy as np
 import os
 import re
 import torch
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, Future
 from PIL import Image
 from pathlib import Path
 from transformers import Florence2ForConditionalGeneration, AutoProcessor
@@ -135,12 +135,24 @@ def _load_clip(device, model_name="ViT-B-32", pretrained="laion2b_s34b_b79k"):
     return model, preprocess, tokenizer
 
 
+def _florence_dtype(device):
+    """Pick Florence-2 dtype based on device.
+
+    fp16 on CUDA/MPS halves the model footprint vs fp32. CPU stays fp32 because
+    fp16 CPU kernels are slow and not always supported.
+    """
+    dev = str(device)
+    if dev.startswith("cuda") or dev == "mps":
+        return torch.float16
+    return torch.float32
+
+
 def _load_florence(device):
     """Load Florence-2 model + processor (called in background thread)."""
     model_name = "florence-community/Florence-2-base"
     processor = AutoProcessor.from_pretrained(model_name)
     model = Florence2ForConditionalGeneration.from_pretrained(
-        model_name, dtype=torch.float32,
+        model_name, dtype=_florence_dtype(device),
     ).to(device)
     model.eval()
     return model, processor
@@ -159,43 +171,75 @@ def _load_ocr_engine():
     )
 
 
+def _empty_device_cache(device):
+    dev = str(device)
+    if dev == "mps":
+        torch.mps.empty_cache()
+    elif dev.startswith("cuda"):
+        torch.cuda.empty_cache()
+
+
 class ModelPreloader:
-    """Starts loading all models in background threads at pipeline start."""
+    """Lazily loads each model on first access and releases it on demand.
+
+    Each `get_*` loads its model synchronously the first time and caches it.
+    Each `release_*` drops the cached model, runs a GC pass, and frees device
+    memory. This keeps peak RAM low because callers can free CLIP before
+    Florence loads, and Florence before OCR loads.
+    """
 
     def __init__(self, device="mps", need_florence=True, need_ocr=True):
-        self._pool = ThreadPoolExecutor(max_workers=3)
         self._device = device
+        self._need_florence = need_florence
+        self._need_ocr = need_ocr and not _is_macos()
 
-        print("  Preloading models in background...")
-        self._clip_future = self._pool.submit(_load_clip, device)
-
-        self._florence_future = None
-        if need_florence:
-            self._florence_future = self._pool.submit(_load_florence, device)
-
-        self._ocr_future = None
-        if need_ocr and not _is_macos():
-            self._ocr_future = self._pool.submit(_load_ocr_engine)
+        self._clip = None
+        self._florence = None
+        self._ocr = None
 
     def get_clip(self):
-        model, preprocess, tokenizer = self._clip_future.result()
-        return model, preprocess, tokenizer
+        if self._clip is None:
+            print("  Loading CLIP...")
+            self._clip = _load_clip(self._device)
+        return self._clip
 
     def get_florence(self):
-        if self._florence_future is None:
-            raise RuntimeError("Florence-2 was not preloaded")
-        return self._florence_future.result()
+        if not self._need_florence:
+            raise RuntimeError("Florence-2 was not requested")
+        if self._florence is None:
+            print("  Loading Florence-2...")
+            self._florence = _load_florence(self._device)
+        return self._florence
 
     def get_ocr_engine(self):
-        if self._ocr_future is None:
+        if not self._need_ocr:
             return None
-        return self._ocr_future.result()
+        if self._ocr is None:
+            print("  Loading PaddleOCR...")
+            self._ocr = _load_ocr_engine()
+        return self._ocr
+
+    def release_clip(self):
+        if self._clip is not None:
+            self._clip = None
+            gc.collect()
+            _empty_device_cache(self._device)
+
+    def release_florence(self):
+        if self._florence is not None:
+            self._florence = None
+            gc.collect()
+            _empty_device_cache(self._device)
+
+    def release_ocr_engine(self):
+        if self._ocr is not None:
+            self._ocr = None
+            gc.collect()
 
     def shutdown(self):
-        self._pool.shutdown(wait=False)
-        self._clip_future = None
-        self._florence_future = None
-        self._ocr_future = None
+        self.release_clip()
+        self.release_florence()
+        self.release_ocr_engine()
 
 
 # ── CLIP model (shared across passes) ──────────────────────────────────────
@@ -294,7 +338,7 @@ def caption_candidates(candidates, frames, device="mps", preloaded=None):
         model_name = "florence-community/Florence-2-base"
         processor = AutoProcessor.from_pretrained(model_name)
         model = Florence2ForConditionalGeneration.from_pretrained(
-            model_name, dtype=torch.float32,
+            model_name, dtype=_florence_dtype(device),
         ).to(device)
         model.eval()
 
@@ -307,6 +351,11 @@ def caption_candidates(candidates, frames, device="mps", preloaded=None):
         return_tensors="pt",
         padding=True,
     ).to(device)
+
+    # Cast pixel inputs to the model's compute dtype (fp16 on CUDA/MPS).
+    model_dtype = next(model.parameters()).dtype
+    if "pixel_values" in batch_inputs and batch_inputs["pixel_values"].dtype != model_dtype:
+        batch_inputs["pixel_values"] = batch_inputs["pixel_values"].to(model_dtype)
 
     with torch.no_grad():
         generated_ids = model.generate(
@@ -683,6 +732,12 @@ def merge_by_caption(candidates, clip_emb, ocr_token_sets, has_ocr, frames,
 # ── Output ──────────────────────────────────────────────────────────────────
 
 def save_results(selected, frames, output_dir):
+    """Save selected frames to disk.
+
+    `frames` may be a list (indexed by sample_idx) or a mapping
+    {sample_idx: PIL.Image} containing only the selected frames. The mapping
+    form lets callers free the full frames list before saving.
+    """
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
