@@ -33,6 +33,29 @@ import sys
 import time
 import json
 
+from keyframe.dedupe import (
+    adjacent_same_screen_dedupe,
+    clean_ocr_token_sets,
+    compute_dhash,
+    filter_low_information_candidates,
+    global_candidate_dedupe,
+    hamming,
+    near_time_dedupe,
+)
+from keyframe.manifest import write_manifest
+from keyframe.merge import (
+    build_ocr_token_sets,
+    jaccard_sim_matrix,
+    jaccard_similarity,
+    union_find_merge,
+)
+from keyframe.scoring import (
+    allocate_clusters_by_novelty,
+    candidate_budget_for_scenes,
+    coalesce_tiny_scenes,
+    score_candidate_for_rep,
+)
+
 
 # ── Video sampling ──────────────────────────────────────────────────────────
 
@@ -110,7 +133,7 @@ def detect_scenes(video_path, timestamps, threshold=27.0):
 
 
 def _allocate_clusters(scenes, total_clusters, min_per_scene=2):
-    """Distribute cluster budget proportionally to scene length."""
+    """Deprecated duration allocator retained for compatibility."""
     total_frames = sum(e - s + 1 for s, e in scenes)
     if total_frames == 0:
         return [min_per_scene] * len(scenes)
@@ -295,7 +318,15 @@ def _laplacian_sharpness(pil_img):
     return cv2.Laplacian(gray, cv2.CV_64F).var()
 
 
-def clip_oversegment(embeddings, timestamps, frame_indices, n_clusters, frames):
+def clip_oversegment(
+    embeddings,
+    timestamps,
+    frame_indices,
+    n_clusters,
+    frames,
+    transcript_density=None,
+    dhashes=None,
+):
     print(f"  Over-segmenting into {n_clusters} clusters...")
     clustering = AgglomerativeClustering(
         n_clusters=n_clusters, metric="cosine", linkage="average",
@@ -307,8 +338,24 @@ def clip_oversegment(embeddings, timestamps, frame_indices, n_clusters, frames):
         mask = labels == cid
         idxs = np.where(mask)[0]
 
-        sharpness = [_laplacian_sharpness(frames[idx]) for idx in idxs]
-        best = idxs[np.argmax(sharpness)]
+        scored = []
+        for idx in idxs:
+            sharpness = _laplacian_sharpness(frames[idx])
+            if dhashes is not None and idx < len(dhashes):
+                left = dhashes[idx - 1] if idx > 0 else dhashes[idx]
+                right = dhashes[idx + 1] if idx + 1 < len(dhashes) else dhashes[idx]
+                dwell_bonus = 1.0 if max(hamming(dhashes[idx], left), hamming(dhashes[idx], right)) <= 6 else 0.0
+            else:
+                dwell_bonus = 0.0
+            cand = {
+                "sample_idx": int(idx),
+                "timestamp": timestamps[idx],
+                "sharpness": sharpness,
+                "end_of_dwell_bonus": dwell_bonus,
+            }
+            density = 0.0 if transcript_density is None else transcript_density.get(idx, 0.0)
+            scored.append((score_candidate_for_rep(cand, frames[idx], density, dwell_bonus), idx, sharpness))
+        _, best, best_sharpness = max(scored)
 
         candidates.append({
             "sample_idx": int(best),
@@ -316,6 +363,8 @@ def clip_oversegment(embeddings, timestamps, frame_indices, n_clusters, frames):
             "timestamp": timestamps[best],
             "clip_cluster": cid,
             "clip_cluster_size": int(mask.sum()),
+            "sharpness": float(best_sharpness),
+            "candidate_score": float(max(score for score, _, _ in scored)),
         })
 
     candidates.sort(key=lambda c: c["timestamp"])
@@ -536,28 +585,12 @@ def _build_hybrid_captions(filtered_ocr, florence_captions, candidates,
 
 def _jaccard_similarity(tokens_a, tokens_b):
     """Jaccard similarity between two sets of normalized tokens."""
-    if not tokens_a and not tokens_b:
-        return 1.0
-    if not tokens_a or not tokens_b:
-        return 0.0
-    return len(tokens_a & tokens_b) / len(tokens_a | tokens_b)
+    return jaccard_similarity(tokens_a, tokens_b)
 
 
 def _jaccard_sim_matrix(token_sets, has_ocr_mask):
     """Build a full Jaccard similarity matrix, vectorized over the OCR mask."""
-    n = len(token_sets)
-    sim = np.zeros((n, n))
-    # Only compute upper triangle for pairs where both have OCR
-    ocr_idxs = np.where(has_ocr_mask)[0]
-    for i_pos, i in enumerate(ocr_idxs):
-        ti = token_sets[i]
-        for j in ocr_idxs[i_pos:]:
-            tj = token_sets[j]
-            union = len(ti | tj)
-            val = len(ti & tj) / union if union else 1.0
-            sim[i, j] = val
-            sim[j, i] = val
-    return sim
+    return jaccard_sim_matrix(token_sets, has_ocr_mask)
 
 
 def _build_combined_sim(clip_sim, jaccard_sim, has_ocr_mask, ocr_weight):
@@ -572,10 +605,7 @@ def _build_combined_sim(clip_sim, jaccard_sim, has_ocr_mask, ocr_weight):
 
 def _build_ocr_token_sets(filtered_ocr_texts):
     """Build normalized token sets from filtered OCR texts for Jaccard comparison."""
-    return [
-        {_normalize_token(w) for w in text.split() if _normalize_token(w)}
-        for text in filtered_ocr_texts
-    ]
+    return build_ocr_token_sets(filtered_ocr_texts, _normalize_token)
 
 
 def merge_by_caption(candidates, clip_emb, ocr_token_sets, has_ocr, frames,
@@ -756,10 +786,13 @@ def save_results(selected, frames, output_dir):
         "merged_from": s["merged_from"],
         "merged_captions": s.get("merged_captions", []),
         "merged_timestamps": s.get("merged_timestamps", []),
+        "merged_from_sample_idxs": s.get("merged_from_sample_idxs", [s["sample_idx"]]),
         "clip_cluster": s["clip_cluster"],
         "clip_cluster_size": s["clip_cluster_size"],
         "split_from_generic": s.get("split_from_generic", False),
         "ocr_text": s.get("ocr_text", ""),
+        "ocr_tokens": s.get("ocr_tokens", []),
+        "dhash": s.get("dhash_hex") or (f"{int(s['dhash']):016x}" if "dhash" in s else None),
         "caption_source": s.get("caption_source", "florence"),
     } for s in selected]
 
@@ -784,7 +817,7 @@ def main():
     parser.add_argument("--pass1-clusters", "-c", type=int, default=15,
                         help="Number of CLIP clusters in pass 1 (default: 15)")
     parser.add_argument("--similarity-threshold", "-t", type=float, default=0.85,
-                        help="Caption similarity threshold for merging (default: 0.85)")
+                        help="Deprecated no-op; deterministic merge vetoes are used")
 
     args = parser.parse_args()
     t0 = time.time()
@@ -808,31 +841,44 @@ def main():
     # Scene detection → per-scene clustering
     n_clusters = min(args.pass1_clusters, len(frames) // 2)
     scenes = detect_scenes(args.video, timestamps)
-    cluster_allocs = _allocate_clusters(scenes, n_clusters)
+    dhashes = [compute_dhash(frame) for frame in frames]
+    original_scene_count = len(scenes)
+    scenes = coalesce_tiny_scenes(scenes, timestamps, dhashes)
+    if len(scenes) != original_scene_count:
+        print(f"  Coalesced scenes: {original_scene_count} -> {len(scenes)}")
+    cluster_budget = candidate_budget_for_scenes(n_clusters, len(scenes))
+    cluster_allocs = allocate_clusters_by_novelty(scenes, cluster_budget, dhashes, floor=1)
+    print(f"  Cluster allocation budget: {sum(cluster_allocs)} candidates")
 
     all_candidates = []
     cluster_offset = 0
     for (s_start, s_end), scene_clusters in zip(scenes, cluster_allocs):
+        if scene_clusters <= 0:
+            continue
         scene_emb = clip_emb[s_start:s_end + 1]
         scene_ts = timestamps[s_start:s_end + 1]
         scene_fi = frame_indices[s_start:s_end + 1]
         scene_frames = frames[s_start:s_end + 1]
+        scene_clusters = min(scene_clusters, len(scene_emb))
 
         if scene_clusters < 2 or len(scene_emb) < 2:
             best = max(range(len(scene_frames)),
                        key=lambda i: _laplacian_sharpness(scene_frames[i]))
+            sharpness = _laplacian_sharpness(scene_frames[best])
             all_candidates.append({
                 "sample_idx": s_start + best,
                 "frame_idx": scene_fi[best],
                 "timestamp": scene_ts[best],
                 "clip_cluster": cluster_offset,
                 "clip_cluster_size": len(scene_emb),
+                "sharpness": float(sharpness),
             })
             cluster_offset += 1
             continue
 
         scene_cands = clip_oversegment(
-            scene_emb, scene_ts, scene_fi, scene_clusters, scene_frames
+            scene_emb, scene_ts, scene_fi, scene_clusters, scene_frames,
+            dhashes=dhashes[s_start:s_end + 1],
         )
         for c in scene_cands:
             c["sample_idx"] = s_start + c["sample_idx"]
@@ -841,6 +887,9 @@ def main():
         all_candidates.extend(scene_cands)
 
     candidates = sorted(all_candidates, key=lambda c: c["timestamp"])
+    for cand in candidates:
+        cand["dhash"] = dhashes[cand["sample_idx"]]
+        cand["dhash_hex"] = f"{dhashes[cand['sample_idx']]:016x}"
 
     # Florence-2 captioning (batched) — model already loaded in background
     florence_captions = caption_candidates(
@@ -858,15 +907,27 @@ def main():
 
     # Merge using CLIP image similarity + Jaccard OCR overlap
     ocr_token_sets = _build_ocr_token_sets(filtered_ocr)
-    final = merge_by_caption(
-        candidates, clip_emb, ocr_token_sets, has_ocr, frames,
-        args.similarity_threshold,
-    )
+    ocr_token_sets = clean_ocr_token_sets(ocr_token_sets)
+    for cand, tokens in zip(candidates, ocr_token_sets):
+        cand["ocr_tokens"] = sorted(tokens)
+    deduped = near_time_dedupe(candidates, ocr_token_sets, dhashes)
+    print(f"  Near-time dedupe: {len(candidates)} -> {len(deduped)} candidates")
+    deduped_token_sets = [set(c.get("ocr_tokens", [])) for c in deduped]
+    globally_deduped = global_candidate_dedupe(deduped, deduped_token_sets, dhashes)
+    print(f"  Global conservative dedupe: {len(deduped)} -> {len(globally_deduped)} candidates")
+    filtered = filter_low_information_candidates(globally_deduped, frames)
+    print(f"  Low-information filter: {len(globally_deduped)} -> {len(filtered)} candidates")
+    adjacent_deduped = adjacent_same_screen_dedupe(filtered)
+    print(f"  Adjacent same-screen dedupe: {len(filtered)} -> {len(adjacent_deduped)} candidates")
+    deduped_token_sets = [set(c.get("ocr_tokens", [])) for c in adjacent_deduped]
+    deduped_has_ocr = [len(tokens) >= 3 for tokens in deduped_token_sets]
+    final = union_find_merge(adjacent_deduped, deduped_token_sets, deduped_has_ocr, frames)
     clip.cleanup()
     preloader.shutdown()
 
     # Save
     log_path = save_results(final, frames, args.output_dir)
+    manifest_path = write_manifest(final, args.output_dir)
 
     elapsed = time.time() - t0
     print(f"\n{'='*60}")
@@ -875,6 +936,7 @@ def main():
     print(f"Pass 2: {len(candidates)} captioned → {len(final)} final frames")
     print(f"Saved to: {Path(args.output_dir).resolve()}")
     print(f"Caption log: {log_path}")
+    print(f"Manifest: {manifest_path}")
     print(f"\nFinal key frames:")
     for s in final:
         print(f"  {Path(s['path']).name}  \"{s['caption'][:100]}\"")
