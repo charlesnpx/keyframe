@@ -28,14 +28,16 @@ def _skill_bundle_dir() -> Path:
 
 
 def _version() -> str:
-    try:
-        return importlib_metadata.version("keyframe")
-    except importlib_metadata.PackageNotFoundError:
-        pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    if pyproject.exists():
         try:
             return tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"]
         except Exception:
-            return "0.0.0"
+            pass
+    try:
+        return importlib_metadata.version("keyframe")
+    except importlib_metadata.PackageNotFoundError:
+        return "0.0.0"
 
 
 def _sha256(path: Path) -> str:
