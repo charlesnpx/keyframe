@@ -106,6 +106,10 @@ def cmd_extract(args):
         clip = CLIPEncoder(device=device, preloaded=preloader.get_clip())
         clip_emb = clip.embed_images(frames)
         print(f"  Embedded {len(frames)} frames -> {clip_emb.shape}")
+        # CLIP image encoder is no longer needed; merge step uses clip_emb (numpy).
+        clip.cleanup()
+        del clip
+        preloader.release_clip()
 
         # Scene detection → per-scene clustering
         n_clusters = min(args.pass1_clusters, len(frames) // 2)
@@ -147,9 +151,14 @@ def cmd_extract(args):
         florence_captions = caption_candidates(
             candidates, frames, device=device, preloaded=preloader.get_florence()
         )
+        # Florence is not needed past pass 2; free it before OCR loads.
+        preloader.release_florence()
+
         ocr_texts = ocr_candidates(
             candidates, frames, preloaded_engine=preloader.get_ocr_engine()
         )
+        preloader.release_ocr_engine()
+
         filtered_ocr = _filter_ocr_tokens(ocr_texts)
         florence_caps, ocr_caps, has_ocr = _build_hybrid_captions(
             filtered_ocr, florence_captions, candidates
@@ -159,20 +168,19 @@ def cmd_extract(args):
             candidates, clip_emb, ocr_token_sets, has_ocr, frames,
             args.similarity_threshold,
         )
-        clip.cleanup()
-        preloader.shutdown()
 
-        save_results(final, frames, str(frames_dir))
+        # Keep only the PIL images we still need to write to disk, then drop
+        # the full sampled-frames list before Whisper loads.
+        selected_imgs = {c["sample_idx"]: frames[c["sample_idx"]] for c in final}
+        del frames, clip_emb, candidates
 
-        print(f"\n  {len(frames)} sampled -> {len(candidates)} candidates -> "
-              f"{len(final)} key frames")
+        save_results(final, selected_imgs, str(frames_dir))
+
+        print(f"\n  {len(final)} key frames")
         print(f"  Saved to: {frames_dir.resolve()}")
 
-        del frames, clip_emb, candidates, final, clip
-
-        preloader._clip_future = None
-        preloader._florence_future = None
-        preloader._ocr_future = None
+        del final, selected_imgs
+        preloader.shutdown()
         del preloader
         import gc
         gc.collect()
