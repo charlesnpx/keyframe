@@ -259,9 +259,9 @@ def _add_extract_args(parser):
                         help="Number of CLIP clusters in pass 1 (default: 15)")
     parser.add_argument("--similarity-threshold", "-t", type=float, default=0.85,
                         help="Caption similarity threshold for merging (default: 0.85)")
-    parser.add_argument("--whisper-model", "-w", default="large",
+    parser.add_argument("--whisper-model", "-w", default="medium",
                         choices=["tiny", "base", "small", "medium", "large"],
-                        help="Whisper model size (default: large)")
+                        help="Whisper model size (default: medium)")
     parser.add_argument("--transcript-format", default="txt",
                         choices=["txt", "srt", "vtt", "json"],
                         help="Transcript format (default: txt)")
