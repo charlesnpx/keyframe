@@ -11,10 +11,14 @@ Usage:
 """
 
 import argparse
+import hashlib
+import json
 import os
 import shutil
 import sys
 import time
+import tomllib
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 
 
@@ -23,29 +27,93 @@ def _skill_bundle_dir() -> Path:
     return Path(__file__).resolve().parent.parent / "skill"
 
 
-def install_skills() -> list[str]:
-    """Install bundled skills for Claude Code and Codex CLI."""
+def _version() -> str:
+    try:
+        return importlib_metadata.version("keyframe")
+    except importlib_metadata.PackageNotFoundError:
+        pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
+        try:
+            return tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"]
+        except Exception:
+            return "0.0.0"
+
+
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _target_specs(target: str = "all") -> dict[str, tuple[Path, Path]]:
     skill_dir = _skill_bundle_dir()
-    installed: list[str] = []
+    codex_home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+    specs = {
+        "claude": (skill_dir / "SKILL.md", Path.home() / ".claude" / "skills" / "keyframe" / "SKILL.md"),
+        "codex": (skill_dir / "codex" / "SKILL.md", codex_home / "skills" / "keyframe" / "SKILL.md"),
+    }
+    if target == "all":
+        return specs
+    return {target: specs[target]}
 
-    if shutil.which("claude"):
-        dest = Path.home() / ".claude" / "skills" / "keyframe" / "SKILL.md"
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(skill_dir / "SKILL.md", dest)
-        installed.append(f"Claude Code skill → {dest}")
 
-    if shutil.which("codex"):
-        codex_home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
-        dest = codex_home / "skills" / "keyframe" / "SKILL.md"
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(skill_dir / "codex" / "SKILL.md", dest)
-        installed.append(f"Codex skill → {dest}")
+def delegated_result(operation: str, target: str = "all", *, perform: bool = False) -> dict:
+    result = {
+        "schema": 1,
+        "name": "keyframe",
+        "version": _version(),
+        "operation": operation,
+        "kind": "delegated",
+        "targets": {},
+        "warnings": [],
+    }
+    for target_name, (src, dst) in _target_specs(target).items():
+        if operation == "install" and perform:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+        elif operation == "uninstall" and perform:
+            dst.unlink(missing_ok=True)
+        rec = {"path": str(dst.resolve())}
+        if operation == "install" and dst.exists():
+            rec["sha256"] = _sha256(dst)
+        result["targets"][target_name] = {"files": [rec]}
+    return result
 
+
+def install_skills(target: str = "all", *, json_mode: bool = False) -> list[str]:
+    """Install bundled skills for Claude Code and Codex CLI."""
+    result = delegated_result("install", target, perform=True)
+    if json_mode:
+        print(json.dumps(result, indent=2))
+        return []
+    installed = []
+    for target_name, info in result["targets"].items():
+        for f in info["files"]:
+            installed.append(f"{target_name.title()} skill → {f['path']}")
     return installed
 
 
-def cmd_install_skills(_args):
-    installed = install_skills()
+def cmd_install_skills(args):
+    target = getattr(args, "target", "all") if args is not None else "all"
+    operation = "install"
+    if getattr(args, "plan", False):
+        operation = "plan"
+    elif getattr(args, "uninstall", False):
+        operation = "uninstall"
+    json_mode = bool(getattr(args, "json", False))
+    if operation != "install" or json_mode:
+        result = delegated_result(operation, target, perform=operation != "plan")
+        if json_mode:
+            print(json.dumps(result, indent=2))
+        else:
+            for target_name, info in result["targets"].items():
+                print(f"{operation} {target_name}:")
+                for f in info["files"]:
+                    print(f"  {f['path']}")
+        return
+
+    installed = install_skills(target)
     if installed:
         for msg in installed:
             print(f"  ✓ {msg}")
@@ -227,7 +295,14 @@ def cmd_extract(args):
 def main():
     # Check for `install-skills` subcommand first
     if len(sys.argv) > 1 and sys.argv[1] == "install-skills":
-        cmd_install_skills(None)
+        parser = argparse.ArgumentParser(prog="keyframe install-skills")
+        parser.add_argument("--target", choices=["claude", "codex", "all"], default="all")
+        op = parser.add_mutually_exclusive_group()
+        op.add_argument("--plan", action="store_true", help="Print intended files without writing")
+        op.add_argument("--install", action="store_true", help="Install skill files (default)")
+        op.add_argument("--uninstall", action="store_true", help="Remove skill files")
+        parser.add_argument("--json", action="store_true", help="Emit mise-en-place delegated-installer JSON on stdout")
+        cmd_install_skills(parser.parse_args(sys.argv[2:]))
         return
 
     # Everything else is extract mode
