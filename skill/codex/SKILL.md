@@ -27,11 +27,11 @@ Extract key frames and/or a timestamped transcript from a video or audio file.
    Flags:
    - `--frames-only` — skip transcript
    - `--transcript-only` — skip frames
-   - `--whisper-model medium` — faster transcription (default: large)
+   - `--whisper-model medium` — transcription model (default: medium)
    - `--pass1-clusters 20` — more candidate frames (default: 15)
-   - `--similarity-threshold 0.80` — less aggressive merging (default: 0.85)
+   - `--similarity-threshold` — deprecated no-op; do not tune with this flag
 
-3. **Present results.** Read the transcript and key frame images, summarize what was shown and said.
+3. **Present results.** Read the transcript first; treat it as narrative authority for what was said. Use `frames/manifest.json` as the frame triage index. Describe only what is visibly shown in frame images, and distinguish “frame visibly shows X” from “speaker said X near this timestamp.”
 
 ## Output
 
@@ -40,9 +40,16 @@ Extract key frames and/or a timestamped transcript from a video or audio file.
   frames/
     frame_000064_4.00s.png
     captions.json
+    manifest.json
   transcript.txt
   transcript.json
 ```
+
+## Grounding Rules
+
+- Never claim annotations, highlights, arrows, red marks, or callouts unless directly visible.
+- If uncertain, say “no annotations visible” or “unclear.”
+- Do not describe transcript content as if it appears visually in the frame.
 
 ## Installation
 

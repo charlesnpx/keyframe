@@ -34,14 +34,15 @@ Extract key frames and/or a timestamped transcript from a video or audio file.
    Common flags:
    - `--frames-only` — skip transcript extraction
    - `--transcript-only` — skip frame extraction
-   - `--whisper-model medium` — faster transcription (default: large)
+   - `--whisper-model medium` — transcription model (default: medium)
    - `--pass1-clusters 20` — more candidate frames before merging (default: 15)
-   - `--similarity-threshold 0.80` — less aggressive merging (default: 0.85)
+   - `--similarity-threshold` — deprecated no-op; do not tune with this flag
 
 4. **Present the results.** After extraction completes:
-   - Read the transcript file and summarize what was said
-   - Read the key frame images to describe what's shown on screen
-   - Cross-reference timestamps between frames and transcript to build a narrative
+   - Read the transcript first; treat it as narrative authority for what was said
+   - Use `frames/manifest.json` as the frame triage index before opening every image
+   - Read key frame images to describe only what is visibly shown on screen
+   - Distinguish “frame visibly shows X” from “speaker said X near this timestamp”
    - If the user asked a specific question about the video, answer it using the extracted content
 
 ## Output structure
@@ -53,17 +54,25 @@ Extract key frames and/or a timestamped transcript from a video or audio file.
     frame_000296_18.48s.png
     ...
     captions.json              # Florence-2 captions + merge metadata
+    manifest.json              # Deterministic frame triage index
   transcript.txt               # Timestamped transcript
   transcript.json              # Machine-readable transcript
 ```
 
 ## Tips
 
-- For UI demo recordings with many similar screens, use `--pass1-clusters 20 --similarity-threshold 0.80` to capture more detail
+- For UI demo recordings with many similar screens, use `--pass1-clusters 20` to capture more detail
 - For long videos, the frame extraction takes ~20-30s regardless of length (it samples at 0.5s intervals)
-- Whisper large model gives best accuracy but is slower; use `--whisper-model medium` for faster results
+- Whisper defaults to `medium`; use `large` only when accuracy is worth the extra time and download
 - The transcript.json file contains structured `[{start, end, text}]` segments for programmatic use
 - Audio-only files (.m4a, .mp3) automatically skip frame extraction even without `--transcript-only`
+
+## Grounding Rules
+
+- Never claim annotations, highlights, arrows, red marks, or callouts unless they are directly visible in the frame.
+- If uncertain, say “no annotations visible” or “unclear.”
+- Do not describe transcript content as if it appears visually in the frame.
+- Use `manifest.json` OCR tokens and transcript windows for triage, then verify visual claims against the PNG.
 
 ## Error handling
 

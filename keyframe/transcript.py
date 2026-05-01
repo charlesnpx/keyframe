@@ -6,12 +6,12 @@ Extracts a timestamped transcript from a video file using OpenAI's Whisper model
 (runs locally, no API key needed).
 
 Usage:
-    python extract_transcript.py input.mp4 [--model base] [--output transcript.txt] [--format txt]
+    python extract_transcript.py input.mp4 [--model medium] [--output transcript.txt] [--format txt]
 
 Dependencies:
     pip install openai-whisper
 
-Whisper will download the model on first run (~140MB for 'base').
+Whisper will download the model on first run (~1.4GB for 'medium').
 Models in order of speed -> accuracy:
     tiny, base, small, medium, large
 """
@@ -95,7 +95,7 @@ WRITERS = {
 }
 
 
-def extract_transcript(video_path, model_name="base", output=None, fmt="txt"):
+def extract_transcript(video_path, model_name="medium", output=None, fmt="txt"):
     """
     Run Whisper on a video file and save the timestamped transcript.
 
@@ -171,9 +171,9 @@ if __name__ == "__main__":
         description="Extract a timestamped transcript from a video using Whisper."
     )
     parser.add_argument("video", help="Path to input video file")
-    parser.add_argument("--model", "-m", default="base",
+    parser.add_argument("--model", "-m", default="medium",
                         choices=["tiny", "base", "small", "medium", "large"],
-                        help="Whisper model size (default: base)")
+                        help="Whisper model size (default: medium)")
     parser.add_argument("--output", "-o", default=None,
                         help="Output file path (default: same name as video)")
     parser.add_argument("--format", "-f", default="txt",

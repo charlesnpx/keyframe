@@ -1,4 +1,12 @@
-from keyframe.dedupe import clean_ocr_token_sets, global_candidate_dedupe, near_time_dedupe
+from PIL import Image
+
+from keyframe.dedupe import (
+    adjacent_same_screen_dedupe,
+    clean_ocr_token_sets,
+    filter_low_information_candidates,
+    global_candidate_dedupe,
+    near_time_dedupe,
+)
 
 
 def test_half_second_ocr_neighbors_collapse():
@@ -126,3 +134,130 @@ def test_clean_ocr_token_sets_drops_chrome_and_keeps_status():
         {"approved", "page1"},
         {"draft", "page2"},
     ]
+
+
+def test_low_information_filter_drops_blank_avatar_only_frame():
+    candidates = [
+        {
+            "sample_idx": 0,
+            "timestamp": 35.99,
+            "caption": "black background with circular shape/photo",
+            "ocr_tokens": [],
+        }
+    ]
+    frames = [Image.new("RGB", (64, 64), "black")]
+
+    survivors = filter_low_information_candidates(candidates, frames)
+
+    assert survivors == []
+
+
+def test_low_information_filter_keeps_title_card():
+    candidates = [
+        {
+            "sample_idx": 0,
+            "timestamp": 1.0,
+            "caption": "ECHO TESTING meeting title",
+            "ocr_tokens": ["testing", "36381", "recorded"],
+        }
+    ]
+    frames = [Image.new("RGB", (64, 64), "black")]
+
+    survivors = filter_low_information_candidates(candidates, frames)
+
+    assert [c["sample_idx"] for c in survivors] == [0]
+
+
+def test_low_information_filter_keeps_document_or_app_frame():
+    candidates = [
+        {
+            "sample_idx": 0,
+            "timestamp": 12.0,
+            "caption": "document shown in a software interface",
+            "ocr_tokens": ["brucepower", "page1", "draft"],
+        }
+    ]
+    frames = [Image.new("RGB", (64, 64), "white")]
+
+    survivors = filter_low_information_candidates(candidates, frames)
+
+    assert [c["sample_idx"] for c in survivors] == [0]
+
+
+def test_low_information_filter_drops_sparse_generic_screen_transition():
+    candidates = [
+        {
+            "sample_idx": 0,
+            "timestamp": 35.99,
+            "caption": "screenshot of a computer screen with a white background",
+            "ocr_tokens": ["dll", "iit", "cechoe", "lall", "bpvpn", "townhall"],
+        }
+    ]
+    image = Image.new("RGB", (200, 100), "white")
+    for x in range(40):
+        for y in range(100):
+            image.putpixel((x, y), (0, 0, 0))
+
+    survivors = filter_low_information_candidates(candidates, [image])
+
+    assert survivors == []
+
+
+def test_adjacent_same_screen_dedupe_collapses_neighboring_echo_list_states():
+    shared = {"echo", "request", "case", "unit", "owner", "date", "list", "dashboard", "row", "team"}
+    candidates = [
+        {
+            "sample_idx": 1,
+            "timestamp": 65.5,
+            "candidate_score": 1.0,
+            "ocr_tokens": sorted(shared | {"cursor"}),
+        },
+        {
+            "sample_idx": 2,
+            "timestamp": 141.5,
+            "candidate_score": 2.0,
+            "ocr_tokens": sorted(shared | {"scroll"}),
+        },
+    ]
+
+    survivors = adjacent_same_screen_dedupe(candidates)
+
+    assert [c["sample_idx"] for c in survivors] == [2]
+    assert survivors[0]["merged_from_sample_idxs"] == [1, 2]
+    assert survivors[0]["merged_timestamps"] == [65.5, 141.5]
+
+
+def test_adjacent_same_screen_dedupe_keeps_different_page_markers():
+    shared = {"brucepower", "component", "test", "document", "review", "section", "unit", "owner", "date", "form"}
+    candidates = [
+        {"sample_idx": 1, "timestamp": 10.0, "ocr_tokens": sorted(shared | {"page1"})},
+        {"sample_idx": 2, "timestamp": 20.0, "ocr_tokens": sorted(shared | {"page2"})},
+    ]
+
+    survivors = adjacent_same_screen_dedupe(candidates)
+
+    assert [c["sample_idx"] for c in survivors] == [1, 2]
+
+
+def test_adjacent_same_screen_dedupe_keeps_different_status_tokens():
+    shared = {"approval", "request", "amount", "manager", "review", "owner", "date", "form", "unit", "case"}
+    candidates = [
+        {"sample_idx": 1, "timestamp": 10.0, "ocr_tokens": sorted(shared | {"draft"})},
+        {"sample_idx": 2, "timestamp": 20.0, "ocr_tokens": sorted(shared | {"approved"})},
+    ]
+
+    survivors = adjacent_same_screen_dedupe(candidates)
+
+    assert [c["sample_idx"] for c in survivors] == [1, 2]
+
+
+def test_adjacent_same_screen_dedupe_respects_time_window():
+    tokens = {"echo", "request", "case", "unit", "owner", "date", "list", "dashboard"}
+    candidates = [
+        {"sample_idx": 1, "timestamp": 10.0, "ocr_tokens": sorted(tokens)},
+        {"sample_idx": 2, "timestamp": 101.1, "ocr_tokens": sorted(tokens)},
+    ]
+
+    survivors = adjacent_same_screen_dedupe(candidates)
+
+    assert [c["sample_idx"] for c in survivors] == [1, 2]

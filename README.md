@@ -43,7 +43,7 @@ export SSL_CERT_FILE=/path/to/corporate-ca-bundle.crt
 These download automatically and are cached:
 - **CLIP ViT-B-32** (~350MB) — image/text embeddings
 - **Florence-2-base** (~450MB) — frame captioning
-- **Whisper large** (~2.9GB) — speech transcription (use `--whisper-model medium` for 1.4GB)
+- **Whisper medium** (~1.4GB) — speech transcription
 
 ## Usage
 
@@ -96,17 +96,17 @@ $keyframe ~/Downloads/meeting-recording.mp4
 | `--transcript-only` | | Skip frame extraction |
 | `-i, --sample-interval` | `0.5` | Sample one frame every N seconds |
 | `-c, --pass1-clusters` | `15` | CLIP over-segmentation clusters |
-| `-t, --similarity-threshold` | `0.85` | Caption merge threshold (lower = less merging) |
-| `-w, --whisper-model` | `large` | Whisper model: tiny/base/small/medium/large |
+| `-t, --similarity-threshold` | `0.85` | Deprecated no-op; deterministic merge vetoes are used |
+| `-w, --whisper-model` | `medium` | Whisper model: tiny/base/small/medium/large |
 | `--transcript-format` | `txt` | Output format: txt/srt/vtt/json |
 
 ## How it works
 
 ### Key frame extraction (two-pass)
 
-1. **Pass 1 (CLIP):** Sample frames at 0.5s intervals, embed with CLIP ViT-B-32, cluster into ~15 groups, pick one candidate per cluster.
+1. **Pass 1 (CLIP + dHash):** Sample frames at 0.5s intervals, compute dHashes, embed with CLIP ViT-B-32, allocate more clusters to visually novel scenes, and pick scored representatives.
 
-2. **Pass 2 (Florence-2 + CLIP text):** Caption the ~15 candidates with Florence-2, embed the captions with CLIP's text encoder (same vector space as images), merge candidates whose caption embeddings exceed the similarity threshold.
+2. **Pass 2 (Florence-2 + OCR):** Caption the candidates with Florence-2, extract OCR, collapse near-time duplicates, and merge with deterministic OCR/time/transcript vetoes.
 
 Scrolling a data table (visually different but semantically identical) gets collapsed, while a dropdown opening (visually similar but semantically distinct) gets preserved.
 
@@ -123,13 +123,14 @@ output_dir/
     frame_000296_18.48s.png
     ...
     captions.json           # Florence-2 captions + merge metadata
+    manifest.json           # Deterministic frame triage index
   transcript.txt            # Timestamped transcript
   transcript.json           # Machine-readable transcript
 ```
 
 ## Tips
 
-- For UI recordings with many similar screens: `--pass1-clusters 20 --similarity-threshold 0.80`
-- For faster transcription: `--whisper-model medium` (1.4GB vs 2.9GB, minimal quality loss)
+- For UI recordings with many important states: try `--pass1-clusters 20`
+- Default transcription uses `--whisper-model medium`
 - Florence-2 uses `florence-community/Florence-2-base` (native transformers support). The original `microsoft/Florence-2-base` weights are broken with transformers 4.50+.
-- CLIP model is loaded once and reused for both image embedding and caption text embedding.
+- CLIP model is used for image embedding; deterministic OCR/dHash merge logic handles final dedupe.
