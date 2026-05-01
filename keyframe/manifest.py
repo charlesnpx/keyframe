@@ -37,6 +37,7 @@ def write_manifest(
     selected: list[dict[str, Any]],
     output_dir: str | Path,
     transcript_segments: list[dict[str, Any]] | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> Path:
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -54,9 +55,23 @@ def write_manifest(
             "merged_from_sample_idxs": item.get("merged_from_sample_idxs", [item.get("sample_idx")]),
             "merged_timestamps": item.get("merged_timestamps", [timestamp]),
             "screen_type": screen_type(tokens, item.get("caption", "")),
+            "cluster_role": item.get("cluster_role"),
+            "retention_reason": item.get("retention_reason", "none"),
+            "retention_reasons_seen": item.get("retention_reasons_seen", [item.get("retention_reason", "none")]),
+            "lineage_roles": item.get("lineage_roles", [item.get("cluster_role")] if item.get("cluster_role") else []),
+            "raw_token_count": item.get("raw_token_count", 0),
+            "filtered_token_count": item.get("filtered_token_count", 0),
+            "cleaned_token_count": item.get("cleaned_token_count", len(tokens)),
+            "cleaning_attrition_ratio": item.get("cleaning_attrition_ratio", 0.0),
+            "low_information_filter_reason": item.get("low_information_filter_reason"),
+            "dedupe_stage": item.get("dedupe_stage"),
+            "merge_reason": item.get("merge_reason"),
         })
 
     path = out / "manifest.json"
+    payload = {"schema_version": 1, "frames": rows}
+    if metadata:
+        payload["metadata"] = metadata
     with open(path, "w", encoding="utf-8") as f:
-        json.dump({"schema_version": 1, "frames": rows}, f, indent=2, ensure_ascii=False)
+        json.dump(payload, f, indent=2, ensure_ascii=False)
     return path

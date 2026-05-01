@@ -7,6 +7,12 @@ from typing import Any
 
 import numpy as np
 
+from keyframe.dedupe import (
+    _merge_metadata,
+    has_differing_evidence,
+    has_evidence_asymmetry,
+    has_protective_caption_asymmetry,
+)
 from keyframe.scoring import score_candidate_for_rep
 
 
@@ -82,7 +88,18 @@ def _should_merge(
 ) -> tuple[bool, str]:
     if has_ocr_a and has_ocr_b:
         jac = jaccard_similarity(tokens_a, tokens_b)
-        if jac < 0.4:
+        if has_differing_evidence(tokens_a, tokens_b):
+            return False, "ocr-evidence"
+        protected = (
+            str(cand_a.get("retention_reason", "none") or "none") != "none"
+            or str(cand_b.get("retention_reason", "none") or "none") != "none"
+        )
+        threshold = 0.9 if protected else 0.75
+        if protected and has_evidence_asymmetry(tokens_a, tokens_b):
+            return False, "ocr-evidence-asymmetry"
+        if protected and has_protective_caption_asymmetry(cand_a, cand_b):
+            return False, "ocr-caption-asymmetry"
+        if jac < threshold:
             return False, "ocr-jaccard"
         if _density_asymmetry_veto(tokens_a, tokens_b):
             return False, "ocr-density"
@@ -98,6 +115,29 @@ def _should_merge(
         return False, "weak-signal"
 
     return True, "merge"
+
+
+def _component_evidence_compatible(
+    left: Sequence[int],
+    right: Sequence[int],
+    candidates: Sequence[Mapping[str, Any]],
+    ocr_token_sets: Sequence[set[str]],
+) -> bool:
+    for i in left:
+        for j in right:
+            tokens_i = set(ocr_token_sets[i])
+            tokens_j = set(ocr_token_sets[j])
+            if has_differing_evidence(tokens_i, tokens_j):
+                return False
+            protected = (
+                str(candidates[i].get("retention_reason", "none") or "none") != "none"
+                or str(candidates[j].get("retention_reason", "none") or "none") != "none"
+            )
+            if protected and has_evidence_asymmetry(tokens_i, tokens_j):
+                return False
+            if protected and has_protective_caption_asymmetry(candidates[i], candidates[j]):
+                return False
+    return True
 
 
 def union_find_merge(
@@ -122,6 +162,10 @@ def union_find_merge(
                 bool(has_ocr[i]), bool(has_ocr[j]),
             )
             if ok:
+                comp_i = [idx for idx in range(n) if uf.find(idx) == uf.find(i)]
+                comp_j = [idx for idx in range(n) if uf.find(idx) == uf.find(j)]
+                if not _component_evidence_compatible(comp_i, comp_j, candidates, ocr_token_sets):
+                    continue
                 print(f"    {candidates[i]['timestamp']:5.1f}s ↔ {candidates[j]['timestamp']:5.1f}s (will merge)")
                 uf.union(i, j)
 
@@ -142,20 +186,18 @@ def union_find_merge(
         best_idx = max(group_idxs, key=score_idx)
         winner = dict(candidates[best_idx])
         winner["caption_cluster"] = int(cid)
-        winner["merged_from_sample_idxs"] = sorted(
-            {
-                int(idx)
-                for group_idx in group_idxs
-                for idx in candidates[group_idx].get("merged_from_sample_idxs", [candidates[group_idx]["sample_idx"]])
-            }
-        )
-        winner["merged_timestamps"] = sorted(
-            {
-                float(ts)
-                for group_idx in group_idxs
-                for ts in candidates[group_idx].get("merged_timestamps", [candidates[group_idx]["timestamp"]])
-            }
-        )
+        winner.setdefault("merged_from_sample_idxs", [winner["sample_idx"]])
+        winner.setdefault("merged_timestamps", [winner["timestamp"]])
+        winner.setdefault("retention_reason", "none")
+        winner.setdefault("retention_reasons_seen", [winner["retention_reason"]])
+        if winner.get("cluster_role"):
+            winner.setdefault("lineage_roles", [winner["cluster_role"]])
+        for group_idx in group_idxs:
+            if group_idx == best_idx:
+                continue
+            winner["dedupe_stage"] = "union_find_merge"
+            winner["merge_reason"] = "component"
+            _merge_metadata(winner, candidates[group_idx])
         winner["merged_from"] = len(winner["merged_from_sample_idxs"])
         winner["merged_captions"] = [candidates[i].get("caption", "") for i in group_idxs]
         final.append(winner)

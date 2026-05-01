@@ -18,6 +18,8 @@ dependencies = [
     "pillow",
     "openai-whisper",
     "scenedetect[opencv]",
+    "pyobjc-framework-Vision; sys_platform == 'darwin'",
+    "pyobjc-framework-Quartz; sys_platform == 'darwin'",
 ]
 
 [project.optional-dependencies]

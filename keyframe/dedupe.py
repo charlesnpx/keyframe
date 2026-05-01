@@ -85,12 +85,6 @@ def clean_ocr_token_sets(
     if not token_sets:
         return []
 
-    doc_freq: dict[str, int] = {}
-    for tokens in token_sets:
-        for token in tokens:
-            doc_freq[token] = doc_freq.get(token, 0) + 1
-
-    n = len(token_sets)
     cleaned: list[set[str]] = []
     for tokens in token_sets:
         kept = set()
@@ -107,8 +101,6 @@ def clean_ocr_token_sets(
             if "users" in token or "downloads" in token or "http" in token or "www" in token:
                 continue
             if len(token) > 36:
-                continue
-            if doc_freq[token] / n > df_cutoff:
                 continue
             kept.add(token)
         cleaned.append(kept)
@@ -143,6 +135,14 @@ def has_differing_evidence(tokens_a: set[str], tokens_b: set[str]) -> bool:
     return False
 
 
+def has_evidence_markers(tokens: set[str]) -> bool:
+    return any(evidence_markers(tokens).values())
+
+
+def has_evidence_asymmetry(tokens_a: set[str], tokens_b: set[str]) -> bool:
+    return has_evidence_markers(tokens_a) != has_evidence_markers(tokens_b)
+
+
 def _hash_for(candidate: Mapping[str, Any], dhashes: Mapping[int, int] | Sequence[int] | None) -> int | None:
     if "dhash" in candidate:
         return int(candidate["dhash"])
@@ -171,6 +171,30 @@ def _candidate_information_score(candidate: Mapping[str, Any]) -> tuple[int, flo
     return len(tokens), float(score or 0.0), -float(candidate.get("timestamp", 0.0))
 
 
+RETENTION_REASON_ORDER = {
+    "none": 0,
+    "protective_caption_asymmetry": 1,
+    "evidence_asymmetry": 2,
+    "differing_evidence": 3,
+}
+
+
+def _strictest_retention_reason(*reasons: str | None) -> str:
+    normalized = [str(reason or "none") for reason in reasons]
+    return max(normalized, key=lambda reason: RETENTION_REASON_ORDER.get(reason, 0), default="none")
+
+
+def _as_sorted_strings(values: Any) -> list[str]:
+    if values is None:
+        return []
+    if isinstance(values, str):
+        return [values]
+    try:
+        return sorted({str(value) for value in values if value is not None})
+    except TypeError:
+        return [str(values)]
+
+
 def _merge_metadata(winner: dict[str, Any], loser: Mapping[str, Any]) -> None:
     winner.setdefault("merged_from_sample_idxs", [winner["sample_idx"]])
     winner.setdefault("merged_timestamps", [winner["timestamp"]])
@@ -183,6 +207,24 @@ def _merge_metadata(winner: dict[str, Any], loser: Mapping[str, Any]) -> None:
     winner["merged_timestamps"] = sorted(
         {float(ts) for ts in winner["merged_timestamps"] + list(loser_ts)}
     )
+
+    winner_reason = str(winner.get("retention_reason", "none") or "none")
+    loser_reason = str(loser.get("retention_reason", "none") or "none")
+    winner["retention_reason"] = _strictest_retention_reason(winner_reason, loser_reason)
+
+    reasons_seen = set(_as_sorted_strings(winner.get("retention_reasons_seen")))
+    reasons_seen.update(_as_sorted_strings(loser.get("retention_reasons_seen")))
+    reasons_seen.add(winner_reason)
+    reasons_seen.add(loser_reason)
+    winner["retention_reasons_seen"] = sorted(reason for reason in reasons_seen if reason)
+
+    roles = set(_as_sorted_strings(winner.get("lineage_roles")))
+    roles.update(_as_sorted_strings(loser.get("lineage_roles")))
+    if winner.get("cluster_role"):
+        roles.add(str(winner["cluster_role"]))
+    if loser.get("cluster_role"):
+        roles.add(str(loser["cluster_role"]))
+    winner["lineage_roles"] = sorted(role for role in roles if role)
 
 
 PROTECTIVE_CAPTION_SUBSTRINGS = {
@@ -268,14 +310,29 @@ def visual_information_score(image: Image.Image) -> dict[str, float]:
     }
 
 
-def _has_protective_caption(candidate: Mapping[str, Any]) -> bool:
+def has_protective_caption(candidate: Mapping[str, Any]) -> bool:
     caption = str(candidate.get("caption", "")).casefold()
     return any(marker in caption for marker in PROTECTIVE_CAPTION_SUBSTRINGS)
 
 
-def _has_strong_protective_caption(candidate: Mapping[str, Any]) -> bool:
+def has_strong_protective_caption(candidate: Mapping[str, Any]) -> bool:
     caption = str(candidate.get("caption", "")).casefold()
     return any(marker in caption for marker in STRONG_PROTECTIVE_CAPTION_SUBSTRINGS)
+
+
+def has_protective_caption_asymmetry(
+    candidate_a: Mapping[str, Any],
+    candidate_b: Mapping[str, Any],
+) -> bool:
+    return has_strong_protective_caption(candidate_a) != has_strong_protective_caption(candidate_b)
+
+
+def _has_protective_caption(candidate: Mapping[str, Any]) -> bool:
+    return has_protective_caption(candidate)
+
+
+def _has_strong_protective_caption(candidate: Mapping[str, Any]) -> bool:
+    return has_strong_protective_caption(candidate)
 
 
 def _is_generic_screen_transition(candidate: Mapping[str, Any]) -> bool:
@@ -290,7 +347,103 @@ def _is_generic_screen_transition(candidate: Mapping[str, Any]) -> bool:
 
 
 def _has_evidence_markers(tokens: set[str]) -> bool:
-    return any(evidence_markers(tokens).values())
+    return has_evidence_markers(tokens)
+
+
+def _is_retained_evidence_candidate(candidate: Mapping[str, Any]) -> bool:
+    return str(candidate.get("retention_reason", "none") or "none") != "none"
+
+
+def _ocr_merge_threshold(
+    candidate_a: Mapping[str, Any],
+    candidate_b: Mapping[str, Any],
+    default_threshold: float,
+) -> float:
+    if _is_retained_evidence_candidate(candidate_a) or _is_retained_evidence_candidate(candidate_b):
+        return max(default_threshold, 0.9)
+    return default_threshold
+
+
+def _ocr_policy_allows_merge(
+    candidate_a: Mapping[str, Any],
+    candidate_b: Mapping[str, Any],
+    tokens_a: set[str],
+    tokens_b: set[str],
+    default_threshold: float,
+) -> tuple[bool, str]:
+    if has_differing_evidence(tokens_a, tokens_b):
+        return False, "differing_evidence"
+    if _density_asymmetry_veto(tokens_a, tokens_b):
+        return False, "density_asymmetry"
+
+    protected = _is_retained_evidence_candidate(candidate_a) or _is_retained_evidence_candidate(candidate_b)
+    if protected:
+        if has_evidence_asymmetry(tokens_a, tokens_b):
+            return False, "evidence_asymmetry"
+        if has_protective_caption_asymmetry(candidate_a, candidate_b):
+            return False, "protective_caption_asymmetry"
+
+    threshold = _ocr_merge_threshold(candidate_a, candidate_b, default_threshold)
+    if _jaccard(tokens_a, tokens_b) < threshold:
+        return False, "ocr_jaccard"
+    return True, "ocr_jaccard"
+
+
+def retain_cluster_alternates(candidates: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Keep dual CLIP representatives only when post-OCR/caption evidence differs."""
+    rows = [dict(candidate) for candidate in candidates]
+    by_cluster: dict[Any, list[dict[str, Any]]] = {}
+    for row in rows:
+        row.setdefault("retention_reason", "none")
+        row.setdefault("retention_reasons_seen", [row["retention_reason"]])
+        if row.get("cluster_role"):
+            row.setdefault("lineage_roles", [row["cluster_role"]])
+        by_cluster.setdefault(row.get("clip_cluster", row.get("sample_idx")), []).append(row)
+
+    retained: list[dict[str, Any]] = []
+    for group in by_cluster.values():
+        group.sort(key=lambda c: (float(c.get("timestamp", 0.0)), int(c.get("sample_idx", 0))))
+        primary = next((c for c in group if c.get("cluster_role") == "primary"), None)
+        if primary is None:
+            primary = next((c for c in group if c.get("cluster_role") in {"single", None}), group[0])
+
+        primary_tokens = set(primary.get("ocr_tokens", []))
+        primary["retention_reason"] = str(primary.get("retention_reason", "none") or "none")
+        primary["retention_reasons_seen"] = sorted(set(_as_sorted_strings(primary.get("retention_reasons_seen"))) | {primary["retention_reason"]})
+        if primary.get("cluster_role"):
+            primary["lineage_roles"] = sorted(set(_as_sorted_strings(primary.get("lineage_roles"))) | {str(primary["cluster_role"])})
+
+        for row in group:
+            role = row.get("cluster_role")
+            if row is primary or role == "single" or role not in {"alt"}:
+                if row is not primary:
+                    row["retention_reason"] = str(row.get("retention_reason", "none") or "none")
+                    row["retention_reasons_seen"] = sorted(set(_as_sorted_strings(row.get("retention_reasons_seen"))) | {row["retention_reason"]})
+                    if row.get("cluster_role"):
+                        row["lineage_roles"] = sorted(set(_as_sorted_strings(row.get("lineage_roles"))) | {str(row["cluster_role"])})
+                retained.append(row)
+                continue
+
+            alt_tokens = set(row.get("ocr_tokens", []))
+            if has_differing_evidence(primary_tokens, alt_tokens):
+                reason = "differing_evidence"
+            elif has_evidence_markers(alt_tokens) and not has_evidence_markers(primary_tokens):
+                reason = "evidence_asymmetry"
+            elif has_strong_protective_caption(row) and not has_strong_protective_caption(primary):
+                reason = "protective_caption_asymmetry"
+            else:
+                row["retention_reason"] = "none"
+                row["retention_reasons_seen"] = sorted(set(_as_sorted_strings(row.get("retention_reasons_seen"))) | {"none"})
+                row["dedupe_stage"] = "retain_cluster_alternates"
+                row["merge_reason"] = "dropped_no_asymmetry"
+                continue
+
+            row["retention_reason"] = reason
+            row["retention_reasons_seen"] = sorted(set(_as_sorted_strings(row.get("retention_reasons_seen"))) | {reason})
+            row["lineage_roles"] = sorted(set(_as_sorted_strings(row.get("lineage_roles"))) | {"alt"})
+            retained.append(row)
+
+    return sorted(retained, key=lambda c: (float(c.get("timestamp", 0.0)), int(c.get("sample_idx", 0))))
 
 
 def filter_low_information_candidates(
@@ -313,6 +466,7 @@ def filter_low_information_candidates(
 
         image = _frame_for_candidate(row, frames)
         if image is None:
+            row["low_information_filter_reason"] = "no_frame"
             survivors.append(row)
             continue
 
@@ -324,6 +478,14 @@ def filter_low_information_candidates(
             and metrics["entropy"] < 2.2
             and (metrics["bright_ratio"] > 0.60 or metrics["dark_ratio"] > 0.60)
         )
+        generic_dark_viewer_transition = (
+            not has_evidence
+            and not has_strong_protective_caption
+            and "computer screen with a black background" in str(row.get("caption", "")).casefold()
+            and metrics["edge_score"] < 8.0
+            and metrics["entropy"] < 2.7
+            and metrics["dark_ratio"] > 0.20
+        )
         avatar_only = (
             len(tokens) < min_clean_tokens
             and not has_evidence
@@ -332,10 +494,22 @@ def filter_low_information_candidates(
             and metrics["edge_score"] < 2.0
             and metrics["entropy"] < 1.0
         )
-        if generic_sparse_transition or avatar_only:
+        if _is_retained_evidence_candidate(row) and (has_evidence or has_strong_protective_caption):
+            row["low_information_filter_reason"] = "protected_retained_evidence"
+            survivors.append(row)
+            continue
+        if generic_sparse_transition or generic_dark_viewer_transition or avatar_only:
+            row["low_information_filter_reason"] = (
+                "generic_sparse_transition"
+                if generic_sparse_transition
+                else "generic_dark_viewer_transition"
+                if generic_dark_viewer_transition
+                else "avatar_only"
+            )
             continue
 
         if len(tokens) >= min_clean_tokens or has_evidence or has_protective_caption:
+            row["low_information_filter_reason"] = "text_or_protective_signal"
             survivors.append(row)
             continue
 
@@ -346,7 +520,9 @@ def filter_low_information_candidates(
             or metrics["edge_score"] < 20.0
         )
         if low_variance and low_signal:
+            row["low_information_filter_reason"] = "low_variance_low_signal"
             continue
+        row["low_information_filter_reason"] = "visual_signal"
         survivors.append(row)
 
     return survivors
@@ -382,9 +558,9 @@ def adjacent_same_screen_dedupe(
             dt <= max_dt_seconds
             and bool(row_tokens)
             and bool(previous_tokens)
-            and _jaccard(row_tokens, previous_tokens) >= ocr_jaccard_threshold
-            and not has_differing_evidence(row_tokens, previous_tokens)
-            and not _density_asymmetry_veto(row_tokens, previous_tokens)
+            and _ocr_policy_allows_merge(
+                row, previous, row_tokens, previous_tokens, ocr_jaccard_threshold
+            )[0]
         )
 
         if not should_merge:
@@ -393,9 +569,13 @@ def adjacent_same_screen_dedupe(
 
         if _candidate_information_score(row) > _candidate_information_score(previous):
             replacement = row
+            replacement["dedupe_stage"] = "adjacent_same_screen_dedupe"
+            replacement["merge_reason"] = "ocr_jaccard"
             _merge_metadata(replacement, previous)
             survivors[-1] = replacement
         else:
+            previous["dedupe_stage"] = "adjacent_same_screen_dedupe"
+            previous["merge_reason"] = "ocr_jaccard"
             _merge_metadata(previous, row)
 
     return sorted(survivors, key=lambda c: float(c.get("timestamp", 0.0)))
@@ -435,7 +615,10 @@ def near_time_dedupe(
 
             survivor_tokens = set(survivor.get("ocr_tokens", []))
             if row_tokens and survivor_tokens:
-                if _jaccard(row_tokens, survivor_tokens) >= ocr_jaccard_threshold:
+                ok, _reason = _ocr_policy_allows_merge(
+                    row, survivor, row_tokens, survivor_tokens, ocr_jaccard_threshold
+                )
+                if ok:
                     duplicate_idx = i
                     break
                 continue
@@ -453,9 +636,13 @@ def near_time_dedupe(
         survivor = survivors[duplicate_idx]
         if _candidate_score(row) > _candidate_score(survivor):
             replacement = row
+            replacement["dedupe_stage"] = "near_time_dedupe"
+            replacement["merge_reason"] = "ocr_or_dhash"
             _merge_metadata(replacement, survivor)
             survivors[duplicate_idx] = replacement
         else:
+            survivor["dedupe_stage"] = "near_time_dedupe"
+            survivor["merge_reason"] = "ocr_or_dhash"
             _merge_metadata(survivor, row)
 
     return sorted(survivors, key=lambda c: float(c.get("timestamp", 0.0)))
@@ -488,11 +675,10 @@ def global_candidate_dedupe(
         for i, survivor in enumerate(survivors):
             survivor_tokens = set(survivor.get("ocr_tokens", []))
             if row_tokens and survivor_tokens:
-                if has_differing_evidence(row_tokens, survivor_tokens):
-                    continue
-                if _density_asymmetry_veto(row_tokens, survivor_tokens):
-                    continue
-                if _jaccard(row_tokens, survivor_tokens) >= ocr_jaccard_threshold:
+                ok, _reason = _ocr_policy_allows_merge(
+                    row, survivor, row_tokens, survivor_tokens, ocr_jaccard_threshold
+                )
+                if ok:
                     duplicate_idx = i
                     break
                 continue
@@ -510,9 +696,13 @@ def global_candidate_dedupe(
         survivor = survivors[duplicate_idx]
         if _candidate_score(row) > _candidate_score(survivor):
             replacement = row
+            replacement["dedupe_stage"] = "global_candidate_dedupe"
+            replacement["merge_reason"] = "ocr_or_dhash"
             _merge_metadata(replacement, survivor)
             survivors[duplicate_idx] = replacement
         else:
+            survivor["dedupe_stage"] = "global_candidate_dedupe"
+            survivor["merge_reason"] = "ocr_or_dhash"
             _merge_metadata(survivor, row)
 
     return sorted(survivors, key=lambda c: float(c.get("timestamp", 0.0)))
