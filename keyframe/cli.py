@@ -46,11 +46,16 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def _target_specs(target: str = "all") -> dict[str, tuple[Path, Path]]:
+def _home_for_install(install_root: str | None) -> Path:
+    return Path(install_root).expanduser().resolve() if install_root else Path.home()
+
+
+def _target_specs(target: str = "all", install_root: str | None = None) -> dict[str, tuple[Path, Path]]:
     skill_dir = _skill_bundle_dir()
-    codex_home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+    home = _home_for_install(install_root)
+    codex_home = home / ".codex" if install_root else Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
     specs = {
-        "claude": (skill_dir / "SKILL.md", Path.home() / ".claude" / "skills" / "keyframe" / "SKILL.md"),
+        "claude": (skill_dir / "SKILL.md", home / ".claude" / "skills" / "keyframe" / "SKILL.md"),
         "codex": (skill_dir / "codex" / "SKILL.md", codex_home / "skills" / "keyframe" / "SKILL.md"),
     }
     if target == "all":
@@ -58,7 +63,13 @@ def _target_specs(target: str = "all") -> dict[str, tuple[Path, Path]]:
     return {target: specs[target]}
 
 
-def delegated_result(operation: str, target: str = "all", *, perform: bool = False) -> dict:
+def delegated_result(
+    operation: str,
+    target: str = "all",
+    *,
+    perform: bool = False,
+    install_root: str | None = None,
+) -> dict:
     result = {
         "schema": 1,
         "name": "keyframe",
@@ -68,7 +79,7 @@ def delegated_result(operation: str, target: str = "all", *, perform: bool = Fal
         "targets": {},
         "warnings": [],
     }
-    for target_name, (src, dst) in _target_specs(target).items():
+    for target_name, (src, dst) in _target_specs(target, install_root).items():
         if operation == "install" and perform:
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
@@ -81,9 +92,9 @@ def delegated_result(operation: str, target: str = "all", *, perform: bool = Fal
     return result
 
 
-def install_skills(target: str = "all", *, json_mode: bool = False) -> list[str]:
+def install_skills(target: str = "all", *, json_mode: bool = False, install_root: str | None = None) -> list[str]:
     """Install bundled skills for Claude Code and Codex CLI."""
-    result = delegated_result("install", target, perform=True)
+    result = delegated_result("install", target, perform=True, install_root=install_root)
     if json_mode:
         print(json.dumps(result, indent=2))
         return []
@@ -103,7 +114,12 @@ def cmd_install_skills(args):
         operation = "uninstall"
     json_mode = bool(getattr(args, "json", False))
     if operation != "install" or json_mode:
-        result = delegated_result(operation, target, perform=operation != "plan")
+        result = delegated_result(
+            operation,
+            target,
+            perform=operation != "plan",
+            install_root=getattr(args, "install_root", None),
+        )
         if json_mode:
             print(json.dumps(result, indent=2))
         else:
@@ -113,7 +129,7 @@ def cmd_install_skills(args):
                     print(f"  {f['path']}")
         return
 
-    installed = install_skills(target)
+    installed = install_skills(target, install_root=getattr(args, "install_root", None))
     if installed:
         for msg in installed:
             print(f"  ✓ {msg}")
@@ -361,6 +377,7 @@ def main():
         op.add_argument("--install", action="store_true", help="Install skill files (default)")
         op.add_argument("--uninstall", action="store_true", help="Remove skill files")
         parser.add_argument("--json", action="store_true", help="Emit mise-en-place delegated-installer JSON on stdout")
+        parser.add_argument("--install-root", help="Stage install under this absolute directory as if it were HOME")
         cmd_install_skills(parser.parse_args(sys.argv[2:]))
         return
 

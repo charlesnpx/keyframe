@@ -16,7 +16,12 @@ pipx install --force .
 
 # install Claude Code / Codex skills
 keyframe install-skills
+keyframe install-skills --install --target all --json --install-root /tmp/keyframe-skill-stage
 ```
+
+`--install-root` is intended for delegated installers such as `mise-en-place`.
+It stages files under the supplied directory as if it were `$HOME` and reports
+the staged absolute paths in JSON.
 
 ### Prerequisites
 
