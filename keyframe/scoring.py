@@ -14,12 +14,15 @@ def coalesce_tiny_scenes(
     dhashes: Sequence[int] | Mapping[int, int],
     max_scene_seconds: float = 3.0,
     boundary_hamming_threshold: int = 18,
-) -> list[tuple[int, int]]:
+    return_trace: bool = False,
+) -> list[tuple[int, int]] | tuple[list[tuple[int, int]], dict[str, Any]]:
     """Merge tiny scene-detection fragments unless the visual boundary is large."""
     if not scenes:
-        return []
+        trace = {"original_scene_count": 0, "coalesced_scene_count": 0, "coalescences": []}
+        return ([], trace) if return_trace else []
 
     merged: list[tuple[int, int]] = []
+    coalescences: list[dict[str, Any]] = []
     for start, end in scenes:
         duration = float(timestamps[end]) - float(timestamps[start]) if end < len(timestamps) else 0.0
         if not merged or duration >= max_scene_seconds:
@@ -36,7 +39,19 @@ def coalesce_tiny_scenes(
             merged.append((start, end))
         else:
             merged[-1] = (prev_start, end)
+            coalescences.append({
+                "from_scene": [int(start), int(end)],
+                "into_scene": [int(prev_start), int(prev_end)],
+                "result_scene": [int(prev_start), int(end)],
+                "boundary_hash_jump": int(boundary_jump),
+            })
 
+    if return_trace:
+        return merged, {
+            "original_scene_count": len(scenes),
+            "coalesced_scene_count": len(merged),
+            "coalescences": coalescences,
+        }
     return merged
 
 
@@ -105,7 +120,7 @@ def score_candidate_for_rep(
         sharpness = _laplacian_sharpness(image)
 
     sharpness = float(sharpness or 0.0)
-    normalized_sharpness = min(sharpness / 1000.0, 3.0)
+    normalized_sharpness = min(sharpness / 1000.0, 1.5)
     transcript_bonus = min(max(float(transcript_density or 0.0), 0.0), 1.0) * 0.75
 
     if end_of_dwell_bonus is None:

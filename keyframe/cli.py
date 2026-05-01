@@ -159,6 +159,7 @@ def cmd_extract(args):
     do_transcript = not args.frames_only
     manifest_frames = None
     manifest_dir = None
+    manifest_run_metadata = None
 
     # ── Key frames ──────────────────────────────────────────────────────
     if do_frames:
@@ -170,7 +171,7 @@ def cmd_extract(args):
             sample_frames, CLIPEncoder, ModelPreloader, clip_oversegment,
             caption_candidates, ocr_candidates, _filter_ocr_tokens,
             _build_hybrid_captions, _build_ocr_token_sets,
-            save_results, detect_scenes, _laplacian_sharpness,
+            attach_ocr_token_attribution, save_results, detect_scenes, _laplacian_sharpness,
         )
         from keyframe.dedupe import (
             adjacent_same_screen_dedupe,
@@ -179,6 +180,7 @@ def cmd_extract(args):
             filter_low_information_candidates,
             global_candidate_dedupe,
             near_time_dedupe,
+            retain_cluster_alternates,
         )
         from keyframe.manifest import write_manifest
         from keyframe.merge import union_find_merge
@@ -224,10 +226,14 @@ def cmd_extract(args):
         # Scene detection → per-scene clustering
         n_clusters = min(args.pass1_clusters, len(frames) // 2)
         scenes = detect_scenes(str(video), timestamps)
-        original_scene_count = len(scenes)
-        scenes = coalesce_tiny_scenes(scenes, timestamps, dhashes)
-        if len(scenes) != original_scene_count:
-            print(f"  Coalesced scenes: {original_scene_count} -> {len(scenes)}")
+        scenes, scene_coalescence = coalesce_tiny_scenes(
+            scenes, timestamps, dhashes, return_trace=True
+        )
+        if scene_coalescence["coalesced_scene_count"] != scene_coalescence["original_scene_count"]:
+            print(
+                "  Coalesced scenes: "
+                f"{scene_coalescence['original_scene_count']} -> {scene_coalescence['coalesced_scene_count']}"
+            )
         cluster_budget = candidate_budget_for_scenes(n_clusters, len(scenes))
         cluster_allocs = allocate_clusters_by_novelty(scenes, cluster_budget, dhashes, floor=1)
         print(f"  Cluster allocation budget: {sum(cluster_allocs)} candidates")
@@ -254,6 +260,7 @@ def cmd_extract(args):
                     "clip_cluster": cluster_offset,
                     "clip_cluster_size": len(scene_emb),
                     "sharpness": float(sharpness),
+                    "cluster_role": "single",
                 })
                 cluster_offset += 1
                 continue
@@ -261,6 +268,7 @@ def cmd_extract(args):
             scene_cands = clip_oversegment(
                 scene_emb, scene_ts, scene_fi, scene_clusters, scene_frames,
                 dhashes=dhashes[s_start:s_end + 1],
+                max_reps_per_cluster=2,
             )
             for c in scene_cands:
                 c["sample_idx"] = s_start + c["sample_idx"]
@@ -290,11 +298,13 @@ def cmd_extract(args):
         )
         ocr_token_sets = _build_ocr_token_sets(filtered_ocr)
         ocr_token_sets = clean_ocr_token_sets(ocr_token_sets)
-        for cand, tokens in zip(candidates, ocr_token_sets):
-            cand["ocr_tokens"] = sorted(tokens)
+        attach_ocr_token_attribution(candidates, ocr_texts, filtered_ocr, ocr_token_sets)
 
-        deduped = near_time_dedupe(candidates, ocr_token_sets, dhashes)
-        print(f"  Near-time dedupe: {len(candidates)} -> {len(deduped)} candidates")
+        retained = retain_cluster_alternates(candidates)
+        print(f"  Cluster alternate retention: {len(candidates)} -> {len(retained)} candidates")
+
+        deduped = near_time_dedupe(retained, [set(c.get("ocr_tokens", [])) for c in retained], dhashes)
+        print(f"  Near-time dedupe: {len(retained)} -> {len(deduped)} candidates")
         deduped_token_sets = [set(c.get("ocr_tokens", [])) for c in deduped]
         globally_deduped = global_candidate_dedupe(deduped, deduped_token_sets, dhashes)
         print(f"  Global conservative dedupe: {len(deduped)} -> {len(globally_deduped)} candidates")
@@ -309,12 +319,14 @@ def cmd_extract(args):
         # Keep only the PIL images we still need to write to disk, then drop
         # the full sampled-frames list before Whisper loads.
         selected_imgs = {c["sample_idx"]: frames[c["sample_idx"]] for c in final}
-        del frames, clip_emb, candidates, deduped, globally_deduped, filtered, adjacent_deduped
+        del frames, clip_emb, candidates, retained, deduped, globally_deduped, filtered, adjacent_deduped
 
         save_results(final, selected_imgs, str(frames_dir))
-        write_manifest(final, frames_dir)
+        manifest_metadata = {"scene_coalescence": scene_coalescence}
+        write_manifest(final, frames_dir, metadata=manifest_metadata)
         manifest_frames = final
         manifest_dir = frames_dir
+        manifest_run_metadata = manifest_metadata
 
         print(f"\n  {len(final)} key frames")
         print(f"  Saved to: {frames_dir.resolve()}")
@@ -352,7 +364,7 @@ def cmd_extract(args):
         if manifest_frames is not None and manifest_dir is not None:
             from keyframe.manifest import write_manifest
 
-            write_manifest(manifest_frames, manifest_dir, segments)
+            write_manifest(manifest_frames, manifest_dir, segments, metadata=manifest_run_metadata)
 
     # ── Summary ─────────────────────────────────────────────────────────
     elapsed = time.time() - t0

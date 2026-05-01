@@ -41,6 +41,7 @@ from keyframe.dedupe import (
     global_candidate_dedupe,
     hamming,
     near_time_dedupe,
+    retain_cluster_alternates,
 )
 from keyframe.manifest import write_manifest
 from keyframe.merge import (
@@ -326,6 +327,10 @@ def clip_oversegment(
     frames,
     transcript_density=None,
     dhashes=None,
+    max_reps_per_cluster=1,
+    alt_dhash_threshold=12,
+    alt_clip_distance_threshold=0.08,
+    alt_sharpness_ratio_floor=0.5,
 ):
     print(f"  Over-segmenting into {n_clusters} clusters...")
     clustering = AgglomerativeClustering(
@@ -355,17 +360,66 @@ def clip_oversegment(
             }
             density = 0.0 if transcript_density is None else transcript_density.get(idx, 0.0)
             scored.append((score_candidate_for_rep(cand, frames[idx], density, dwell_bonus), idx, sharpness))
-        _, best, best_sharpness = max(scored)
+        best_score, best, best_sharpness = max(scored)
 
-        candidates.append({
+        selected = [{
             "sample_idx": int(best),
             "frame_idx": frame_indices[best],
             "timestamp": timestamps[best],
             "clip_cluster": cid,
             "clip_cluster_size": int(mask.sum()),
             "sharpness": float(best_sharpness),
-            "candidate_score": float(max(score for score, _, _ in scored)),
-        })
+            "candidate_score": float(best_score),
+        }]
+
+        if max_reps_per_cluster >= 2 and len(scored) > 1:
+            alt_choices = []
+            best_embedding = embeddings[best]
+            best_hash = dhashes[best] if dhashes is not None and best < len(dhashes) else None
+            for score, idx, sharpness in scored:
+                if idx == best:
+                    continue
+                sharpness_ratio = float(sharpness) / max(float(best_sharpness), 1e-9)
+                if sharpness_ratio < alt_sharpness_ratio_floor:
+                    continue
+                clip_distance = float(1.0 - np.dot(best_embedding, embeddings[idx]))
+                dhash_distance = None
+                if best_hash is not None and dhashes is not None and idx < len(dhashes):
+                    dhash_distance = hamming(best_hash, dhashes[idx])
+                diverse_by_hash = dhash_distance is not None and dhash_distance >= alt_dhash_threshold
+                diverse_by_clip = clip_distance > alt_clip_distance_threshold
+                if not (diverse_by_hash or diverse_by_clip):
+                    continue
+                if diverse_by_hash:
+                    reason = "dhash"
+                    diversity_distance = float(dhash_distance)
+                else:
+                    reason = "clip"
+                    diversity_distance = clip_distance
+                alt_choices.append((score, idx, sharpness, reason, diversity_distance, sharpness_ratio))
+
+            if alt_choices:
+                alt_score, alt, alt_sharpness, reason, distance, ratio = max(alt_choices)
+                selected[0]["cluster_role"] = "primary"
+                selected.append({
+                    "sample_idx": int(alt),
+                    "frame_idx": frame_indices[alt],
+                    "timestamp": timestamps[alt],
+                    "clip_cluster": cid,
+                    "clip_cluster_size": int(mask.sum()),
+                    "sharpness": float(alt_sharpness),
+                    "candidate_score": float(alt_score),
+                    "cluster_role": "alt",
+                    "cluster_alt_reason": reason,
+                    "cluster_diversity_distance": float(distance),
+                    "cluster_sharpness_ratio": float(ratio),
+                })
+            else:
+                selected[0]["cluster_role"] = "single"
+        else:
+            selected[0]["cluster_role"] = "single"
+
+        candidates.extend(selected)
 
     candidates.sort(key=lambda c: c["timestamp"])
     print(f"  → {len(candidates)} candidates")
@@ -608,6 +662,28 @@ def _build_ocr_token_sets(filtered_ocr_texts):
     return build_ocr_token_sets(filtered_ocr_texts, _normalize_token)
 
 
+def attach_ocr_token_attribution(candidates, raw_ocr_texts, filtered_ocr_texts, cleaned_token_sets):
+    raw_token_sets = _build_ocr_token_sets(raw_ocr_texts)
+    filtered_token_sets = _build_ocr_token_sets(filtered_ocr_texts)
+    for cand, raw_tokens, filtered_tokens, cleaned_tokens in zip(
+        candidates, raw_token_sets, filtered_token_sets, cleaned_token_sets
+    ):
+        raw_count = len(raw_tokens)
+        filtered_count = len(filtered_tokens)
+        cleaned_count = len(cleaned_tokens)
+        cand["ocr_tokens"] = sorted(cleaned_tokens)
+        cand["raw_token_count"] = raw_count
+        cand["filtered_token_count"] = filtered_count
+        cand["cleaned_token_count"] = cleaned_count
+        cand["cleaning_attrition_ratio"] = (
+            0.0 if raw_count == 0 else round((raw_count - cleaned_count) / raw_count, 4)
+        )
+        cand.setdefault("retention_reason", "none")
+        cand.setdefault("retention_reasons_seen", [cand["retention_reason"]])
+        if cand.get("cluster_role"):
+            cand.setdefault("lineage_roles", [cand["cluster_role"]])
+
+
 def merge_by_caption(candidates, clip_emb, ocr_token_sets, has_ocr, frames,
                      similarity_threshold=0.85, ocr_weight=0.5):
     """
@@ -794,6 +870,17 @@ def save_results(selected, frames, output_dir):
         "ocr_tokens": s.get("ocr_tokens", []),
         "dhash": s.get("dhash_hex") or (f"{int(s['dhash']):016x}" if "dhash" in s else None),
         "caption_source": s.get("caption_source", "florence"),
+        "cluster_role": s.get("cluster_role"),
+        "retention_reason": s.get("retention_reason", "none"),
+        "retention_reasons_seen": s.get("retention_reasons_seen", [s.get("retention_reason", "none")]),
+        "lineage_roles": s.get("lineage_roles", [s.get("cluster_role")] if s.get("cluster_role") else []),
+        "raw_token_count": s.get("raw_token_count", 0),
+        "filtered_token_count": s.get("filtered_token_count", 0),
+        "cleaned_token_count": s.get("cleaned_token_count", len(s.get("ocr_tokens", []))),
+        "cleaning_attrition_ratio": s.get("cleaning_attrition_ratio", 0.0),
+        "low_information_filter_reason": s.get("low_information_filter_reason"),
+        "dedupe_stage": s.get("dedupe_stage"),
+        "merge_reason": s.get("merge_reason"),
     } for s in selected]
 
     log_path = out / "captions.json"
@@ -842,10 +929,14 @@ def main():
     n_clusters = min(args.pass1_clusters, len(frames) // 2)
     scenes = detect_scenes(args.video, timestamps)
     dhashes = [compute_dhash(frame) for frame in frames]
-    original_scene_count = len(scenes)
-    scenes = coalesce_tiny_scenes(scenes, timestamps, dhashes)
-    if len(scenes) != original_scene_count:
-        print(f"  Coalesced scenes: {original_scene_count} -> {len(scenes)}")
+    scenes, scene_coalescence = coalesce_tiny_scenes(
+        scenes, timestamps, dhashes, return_trace=True
+    )
+    if scene_coalescence["coalesced_scene_count"] != scene_coalescence["original_scene_count"]:
+        print(
+            "  Coalesced scenes: "
+            f"{scene_coalescence['original_scene_count']} -> {scene_coalescence['coalesced_scene_count']}"
+        )
     cluster_budget = candidate_budget_for_scenes(n_clusters, len(scenes))
     cluster_allocs = allocate_clusters_by_novelty(scenes, cluster_budget, dhashes, floor=1)
     print(f"  Cluster allocation budget: {sum(cluster_allocs)} candidates")
@@ -872,6 +963,7 @@ def main():
                 "clip_cluster": cluster_offset,
                 "clip_cluster_size": len(scene_emb),
                 "sharpness": float(sharpness),
+                "cluster_role": "single",
             })
             cluster_offset += 1
             continue
@@ -879,6 +971,7 @@ def main():
         scene_cands = clip_oversegment(
             scene_emb, scene_ts, scene_fi, scene_clusters, scene_frames,
             dhashes=dhashes[s_start:s_end + 1],
+            max_reps_per_cluster=2,
         )
         for c in scene_cands:
             c["sample_idx"] = s_start + c["sample_idx"]
@@ -908,10 +1001,11 @@ def main():
     # Merge using CLIP image similarity + Jaccard OCR overlap
     ocr_token_sets = _build_ocr_token_sets(filtered_ocr)
     ocr_token_sets = clean_ocr_token_sets(ocr_token_sets)
-    for cand, tokens in zip(candidates, ocr_token_sets):
-        cand["ocr_tokens"] = sorted(tokens)
-    deduped = near_time_dedupe(candidates, ocr_token_sets, dhashes)
-    print(f"  Near-time dedupe: {len(candidates)} -> {len(deduped)} candidates")
+    attach_ocr_token_attribution(candidates, ocr_texts, filtered_ocr, ocr_token_sets)
+    retained = retain_cluster_alternates(candidates)
+    print(f"  Cluster alternate retention: {len(candidates)} -> {len(retained)} candidates")
+    deduped = near_time_dedupe(retained, [set(c.get("ocr_tokens", [])) for c in retained], dhashes)
+    print(f"  Near-time dedupe: {len(retained)} -> {len(deduped)} candidates")
     deduped_token_sets = [set(c.get("ocr_tokens", [])) for c in deduped]
     globally_deduped = global_candidate_dedupe(deduped, deduped_token_sets, dhashes)
     print(f"  Global conservative dedupe: {len(deduped)} -> {len(globally_deduped)} candidates")
@@ -927,7 +1021,7 @@ def main():
 
     # Save
     log_path = save_results(final, frames, args.output_dir)
-    manifest_path = write_manifest(final, args.output_dir)
+    manifest_path = write_manifest(final, args.output_dir, metadata={"scene_coalescence": scene_coalescence})
 
     elapsed = time.time() - t0
     print(f"\n{'='*60}")

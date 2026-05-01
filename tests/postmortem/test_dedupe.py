@@ -1,11 +1,13 @@
 from PIL import Image
 
 from keyframe.dedupe import (
+    _merge_metadata,
     adjacent_same_screen_dedupe,
     clean_ocr_token_sets,
     filter_low_information_candidates,
     global_candidate_dedupe,
     near_time_dedupe,
+    retain_cluster_alternates,
 )
 
 
@@ -30,6 +32,30 @@ def test_distinct_near_time_ocr_survives():
     tokens = [{"approval", "page"}, {"shipping", "address"}]
 
     survivors = near_time_dedupe(candidates, tokens)
+
+    assert [c["sample_idx"] for c in survivors] == [1, 2]
+
+
+def test_near_time_dedupe_keeps_different_page_markers():
+    shared = {"brucepower", "component", "test", "document", "review", "unit", "owner", "date", "form"}
+    candidates = [
+        {"sample_idx": 1, "timestamp": 10.0, "candidate_score": 1.0},
+        {"sample_idx": 2, "timestamp": 10.5, "candidate_score": 2.0},
+    ]
+
+    survivors = near_time_dedupe(candidates, [shared | {"page1"}, shared | {"page2"}])
+
+    assert [c["sample_idx"] for c in survivors] == [1, 2]
+
+
+def test_near_time_dedupe_keeps_different_status_tokens():
+    shared = {"approval", "request", "amount", "manager", "review", "owner", "date", "form", "unit"}
+    candidates = [
+        {"sample_idx": 1, "timestamp": 10.0, "candidate_score": 1.0},
+        {"sample_idx": 2, "timestamp": 10.5, "candidate_score": 2.0},
+    ]
+
+    survivors = near_time_dedupe(candidates, [shared | {"draft"}, shared | {"approved"}])
 
     assert [c["sample_idx"] for c in survivors] == [1, 2]
 
@@ -131,9 +157,23 @@ def test_clean_ocr_token_sets_drops_chrome_and_keeps_status():
     ])
 
     assert cleaned == [
-        {"approved", "page1"},
-        {"draft", "page2"},
+        {"approved", "page1", "component"},
+        {"draft", "page2", "component"},
     ]
+
+
+def test_clean_ocr_token_sets_keeps_common_content_tokens():
+    cleaned = clean_ocr_token_sets(
+        [
+            {"approved", "page1", "component", "shared"},
+            {"draft", "page2", "component", "shared"},
+            {"pending", "page3", "component", "shared"},
+        ],
+        df_cutoff=0.1,
+    )
+
+    assert all("component" in tokens for tokens in cleaned)
+    assert all("shared" in tokens for tokens in cleaned)
 
 
 def test_low_information_filter_drops_blank_avatar_only_frame():
@@ -184,6 +224,24 @@ def test_low_information_filter_keeps_document_or_app_frame():
     assert [c["sample_idx"] for c in survivors] == [0]
 
 
+def test_low_information_filter_keeps_protected_retained_evidence_frame():
+    candidates = [
+        {
+            "sample_idx": 0,
+            "timestamp": 12.0,
+            "caption": "document shown in a software interface",
+            "ocr_tokens": ["page1"],
+            "retention_reason": "evidence_asymmetry",
+        }
+    ]
+    frames = [Image.new("RGB", (64, 64), "white")]
+
+    survivors = filter_low_information_candidates(candidates, frames, min_clean_tokens=3)
+
+    assert [c["sample_idx"] for c in survivors] == [0]
+    assert survivors[0]["low_information_filter_reason"] == "protected_retained_evidence"
+
+
 def test_low_information_filter_drops_sparse_generic_screen_transition():
     candidates = [
         {
@@ -197,6 +255,25 @@ def test_low_information_filter_drops_sparse_generic_screen_transition():
     for x in range(40):
         for y in range(100):
             image.putpixel((x, y), (0, 0, 0))
+
+    survivors = filter_low_information_candidates(candidates, [image])
+
+    assert survivors == []
+
+
+def test_low_information_filter_drops_dark_viewer_transition_with_chrome_text():
+    candidates = [
+        {
+            "sample_idx": 0,
+            "timestamp": 63.0,
+            "caption": "screenshot of a computer screen with a black background and browser chrome",
+            "ocr_tokens": ["townhall", "gather", "component", "counts", "file"],
+        }
+    ]
+    image = Image.new("RGB", (200, 100), "black")
+    for x in range(0, 200, 20):
+        for y in range(2):
+            image.putpixel((x, y), (255, 255, 255))
 
     survivors = filter_low_information_candidates(candidates, [image])
 
@@ -261,3 +338,80 @@ def test_adjacent_same_screen_dedupe_respects_time_window():
     survivors = adjacent_same_screen_dedupe(candidates)
 
     assert [c["sample_idx"] for c in survivors] == [1, 2]
+
+
+def test_retain_cluster_alternates_keeps_differing_evidence():
+    candidates = [
+        {"sample_idx": 1, "timestamp": 10.0, "clip_cluster": 7, "cluster_role": "primary", "ocr_tokens": ["page1"]},
+        {"sample_idx": 2, "timestamp": 11.0, "clip_cluster": 7, "cluster_role": "alt", "ocr_tokens": ["page2"]},
+    ]
+
+    retained = retain_cluster_alternates(candidates)
+
+    assert [c["sample_idx"] for c in retained] == [1, 2]
+    assert retained[1]["retention_reason"] == "differing_evidence"
+
+
+def test_retain_cluster_alternates_keeps_evidence_asymmetry():
+    candidates = [
+        {"sample_idx": 1, "timestamp": 10.0, "clip_cluster": 7, "cluster_role": "primary", "ocr_tokens": ["form"]},
+        {"sample_idx": 2, "timestamp": 11.0, "clip_cluster": 7, "cluster_role": "alt", "ocr_tokens": ["form", "page1"]},
+    ]
+
+    retained = retain_cluster_alternates(candidates)
+
+    assert [c["sample_idx"] for c in retained] == [1, 2]
+    assert retained[1]["retention_reason"] == "evidence_asymmetry"
+
+
+def test_retain_cluster_alternates_keeps_protective_caption_asymmetry():
+    candidates = [
+        {"sample_idx": 1, "timestamp": 10.0, "clip_cluster": 7, "cluster_role": "primary", "ocr_tokens": []},
+        {
+            "sample_idx": 2,
+            "timestamp": 11.0,
+            "clip_cluster": 7,
+            "cluster_role": "alt",
+            "ocr_tokens": [],
+            "caption": "PDF document page in a viewer",
+        },
+    ]
+
+    retained = retain_cluster_alternates(candidates)
+
+    assert [c["sample_idx"] for c in retained] == [1, 2]
+    assert retained[1]["retention_reason"] == "protective_caption_asymmetry"
+
+
+def test_retain_cluster_alternates_drops_alt_without_asymmetry():
+    candidates = [
+        {"sample_idx": 1, "timestamp": 10.0, "clip_cluster": 7, "cluster_role": "primary", "ocr_tokens": ["form"]},
+        {"sample_idx": 2, "timestamp": 11.0, "clip_cluster": 7, "cluster_role": "alt", "ocr_tokens": ["form"]},
+    ]
+
+    retained = retain_cluster_alternates(candidates)
+
+    assert [c["sample_idx"] for c in retained] == [1]
+
+
+def test_merge_metadata_preserves_policy_and_lineage_fields():
+    winner = {
+        "sample_idx": 1,
+        "timestamp": 10.0,
+        "retention_reason": "protective_caption_asymmetry",
+        "cluster_role": "primary",
+    }
+    loser = {
+        "sample_idx": 2,
+        "timestamp": 11.0,
+        "retention_reason": "evidence_asymmetry",
+        "cluster_role": "alt",
+        "retention_reasons_seen": ["evidence_asymmetry"],
+        "lineage_roles": ["alt"],
+    }
+
+    _merge_metadata(winner, loser)
+
+    assert winner["retention_reason"] == "evidence_asymmetry"
+    assert winner["retention_reasons_seen"] == ["evidence_asymmetry", "protective_caption_asymmetry"]
+    assert winner["lineage_roles"] == ["alt", "primary"]
