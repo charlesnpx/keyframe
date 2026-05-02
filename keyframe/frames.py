@@ -839,7 +839,15 @@ def rescue_from_sampled_frames(
         for cand in candidates
     )
 
-    shortlist, proxy_rows, rescue_budget = build_rescue_shortlist(
+    (
+        shortlist,
+        proxy_rows,
+        rescue_budget,
+        rescue_ocr_cap,
+        _temporal_window_count,
+        _scene_count,
+        _legacy_proxy_dropped_count,
+    ) = build_rescue_shortlist(
         frames,
         timestamps,
         frame_indices,
@@ -867,7 +875,7 @@ def rescue_from_sampled_frames(
         for row in shortlist
     )
 
-    print(f"  Rescue shortlist: {len(shortlist)} frames, budget {rescue_budget}")
+    print(f"  Rescue shortlist: {len(shortlist)} frames, budget {rescue_budget}, OCR cap {rescue_ocr_cap}")
     comparison_idxs = _comparison_primary_sample_idxs(candidates, shortlist)
     candidate_by_idx = {int(cand.sample_idx): cand for cand in candidates}
     comparison_primaries = [

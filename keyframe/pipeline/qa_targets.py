@@ -121,6 +121,9 @@ def _stage_summaries(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]
                 "scene_count",
                 "rescue_shortlist_count",
                 "rescue_budget",
+                "rescue_ocr_cap",
+                "temporal_window_count",
+                "legacy_proxy_dropped_count",
             )
             if key in payload
         }

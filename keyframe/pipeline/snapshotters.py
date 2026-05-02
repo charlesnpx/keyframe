@@ -92,6 +92,7 @@ def _candidate_row(stage: str, cand: Mapping[str, Any] | CandidateRecord, index:
         "retention_candidate_reason": cand.get("retention_candidate_reason"),
         "retention_rejected_reason": cand.get("retention_rejected_reason"),
         "proxy_content_score": _safe_float(cand.get("proxy_content_score")),
+        "proposal_lane": cand.get("proposal_lane"),
         "rescue_priority": _safe_int(cand.get("rescue_priority")),
         "merged_timestamps": [
             ts for ts in (_safe_float(v) for v in cand.get("merged_timestamps", []))
@@ -136,7 +137,7 @@ def snapshot_candidate_batch(stage: str, batch: CandidateBatch | list[dict[str, 
     rows = [_candidate_row(stage, cand, index) for index, cand in enumerate(candidates)]
     sample_idxs = [row["sample_idx"] for row in rows]
     timestamps = [row["timestamp"] for row in rows]
-    return {
+    snapshot = {
         "stage": stage,
         "candidate_count": len(rows),
         "duplicate_sample_idx_count": _count_duplicates(sample_idxs),
@@ -144,6 +145,9 @@ def snapshot_candidate_batch(stage: str, batch: CandidateBatch | list[dict[str, 
         "candidates": rows,
         "integrity_violations": _candidate_violations(rows),
     }
+    if isinstance(batch, CandidateBatch) and batch.metadata:
+        snapshot.update(_jsonish(batch.metadata))
+    return snapshot
 
 
 class SnapshotterRegistry:
@@ -157,6 +161,10 @@ class SnapshotterRegistry:
                 "rescue_shortlist_count": len(value.rescue_shortlist),
                 "proxy_row_count": len(value.proxy_rows),
                 "rescue_budget": int(value.rescue_budget),
+                "rescue_ocr_cap": int(value.rescue_ocr_cap),
+                "temporal_window_count": int(value.temporal_window_count),
+                "scene_count": int(value.scene_count),
+                "legacy_proxy_dropped_count": int(value.legacy_proxy_dropped_count),
             }
         if isinstance(value, SamplingOutput):
             return self.snapshot(stage, value.samples)

@@ -22,8 +22,21 @@ def promote_rescue_candidates(*args, **kwargs):
 
 
 def build_rescue_shortlist(*args, **kwargs):
-    shortlist, proxy_rows, budget = _build_rescue_shortlist(*args, **kwargs)
+    shortlist, proxy_rows, budget, *_metadata = _build_rescue_shortlist(*args, **kwargs)
     return _project(shortlist), proxy_rows, budget
+
+
+def build_rescue_shortlist_with_metadata(*args, **kwargs):
+    (
+        shortlist,
+        proxy_rows,
+        budget,
+        ocr_cap,
+        window_count,
+        scene_count,
+        legacy_proxy_dropped_count,
+    ) = _build_rescue_shortlist(*args, **kwargs)
+    return _project(shortlist), proxy_rows, budget, ocr_cap, window_count, scene_count, legacy_proxy_dropped_count
 
 
 def ocr_candidates(*args, **kwargs):
@@ -165,6 +178,178 @@ def test_rescue_budget_duration_floor_is_bounded(monkeypatch):
     assert budget == 8
 
 
+def test_rescue_ocr_cap_scales_with_temporal_windows_not_only_output_budget(monkeypatch):
+    monkeypatch.setattr(
+        "keyframe.scoring.proxy_content_scores",
+        lambda frames: [
+            {
+                "proxy_content_score": 0.5,
+                "textline_score": 0.5,
+                "edge_score": 0.5,
+                "entropy": 0.5,
+                "dark_ratio": 0.0,
+                "bright_ratio": 0.0,
+            }
+            for _ in frames
+        ],
+    )
+    frames = [Image.new("RGB", (8, 8), "white") for _ in range(50)]
+
+    _shortlist, _proxy_rows, budget, ocr_cap, window_count, scene_count, _dropped = build_rescue_shortlist_with_metadata(
+        frames,
+        [float(i) for i in range(50)],
+        list(range(50)),
+        [{"sample_idx": 0, "timestamp": 0.0, "scene_id": 0}],
+        pass1_clusters=3,
+        sample_scenes={i: 0 for i in range(50)},
+    )
+
+    assert budget == 3
+    assert window_count == 3
+    assert scene_count == 1
+    assert ocr_cap == 40
+
+
+def test_coverage_shortlist_is_monotonic_with_legacy_proxy_shortlist(monkeypatch):
+    scores = [0.99] * 20 + [0.10] * 20 + [0.01] * 5
+    monkeypatch.setattr(
+        "keyframe.scoring.proxy_content_scores",
+        lambda frames: [
+            {
+                "proxy_content_score": score,
+                "textline_score": score,
+                "edge_score": score,
+                "entropy": score,
+                "dark_ratio": 0.0,
+                "bright_ratio": 0.0,
+            }
+            for score in scores
+        ],
+    )
+    frames = [Image.new("RGB", (8, 8), "white") for _ in scores]
+
+    shortlist, _proxy_rows, budget, ocr_cap, window_count, _scene_count, dropped = build_rescue_shortlist_with_metadata(
+        frames,
+        [float(i) for i in range(len(scores))],
+        list(range(len(scores))),
+        [{"sample_idx": 0, "timestamp": 0.0, "scene_id": 0}],
+        pass1_clusters=3,
+        sample_scenes={i: 0 for i in range(len(scores))},
+    )
+
+    assert budget == 3
+    assert ocr_cap == 40
+    assert window_count == 3
+    sample_idxs = {row["sample_idx"] for row in shortlist}
+    assert set(range(1, 13)) <= sample_idxs
+    assert {20, 40} <= sample_idxs
+    assert dropped == 0
+    lane_by_idx = {row["sample_idx"]: row["proposal_lane"] for row in shortlist}
+    assert {lane_by_idx[idx] for idx in (1, 2, 3)} == {"legacy_proxy"}
+
+
+def test_global_high_proxy_frames_do_not_starve_later_windows(monkeypatch):
+    scores = [0.99] * 60 + [0.01] * 20
+    monkeypatch.setattr(
+        "keyframe.scoring.proxy_content_scores",
+        lambda frames: [
+            {
+                "proxy_content_score": score,
+                "textline_score": score,
+                "edge_score": score,
+                "entropy": score,
+                "dark_ratio": 0.0,
+                "bright_ratio": 0.0,
+            }
+            for score in scores
+        ],
+    )
+    frames = [Image.new("RGB", (8, 8), "white") for _ in scores]
+
+    shortlist, _proxy_rows, _budget, ocr_cap, window_count, _scene_count, dropped = build_rescue_shortlist_with_metadata(
+        frames,
+        [float(i) for i in range(len(scores))],
+        list(range(len(scores))),
+        [{"sample_idx": 0, "timestamp": 0.0, "scene_id": 0}],
+        pass1_clusters=3,
+        sample_scenes={i: 0 for i in range(len(scores))},
+    )
+
+    assert ocr_cap == 40
+    assert window_count == 4
+    assert 60 in {row["sample_idx"] for row in shortlist}
+    assert dropped == 0
+
+
+def test_rescue_candidate_records_proposal_lane_metadata(monkeypatch):
+    monkeypatch.setattr(
+        "keyframe.scoring.proxy_content_scores",
+        lambda frames: [
+            {
+                "proxy_content_score": 0.5,
+                "textline_score": 0.5,
+                "edge_score": 0.5,
+                "entropy": 0.5,
+                "dark_ratio": 0.0,
+                "bright_ratio": 0.0,
+            }
+            for _ in frames
+        ],
+    )
+    frames = [Image.new("RGB", (8, 8), "white") for _ in range(30)]
+
+    shortlist, *_ = build_rescue_shortlist_with_metadata(
+        frames,
+        [float(i) for i in range(30)],
+        list(range(30)),
+        [{"sample_idx": 0, "timestamp": 0.0, "scene_id": 0}],
+        pass1_clusters=3,
+        sample_scenes={i: 0 for i in range(30)},
+    )
+
+    assert all(row.get("proposal_lane") for row in shortlist)
+
+
+def test_rescue_shortlist_order_is_deterministic_when_scores_tie(monkeypatch):
+    monkeypatch.setattr(
+        "keyframe.scoring.proxy_content_scores",
+        lambda frames: [
+            {
+                "proxy_content_score": 0.5,
+                "textline_score": 0.5,
+                "edge_score": 0.5,
+                "entropy": 0.5,
+                "dark_ratio": 0.0,
+                "bright_ratio": 0.0,
+            }
+            for _ in frames
+        ],
+    )
+    frames = [Image.new("RGB", (8, 8), "white") for _ in range(45)]
+    kwargs = {
+        "sample_scenes": {i: 0 for i in range(45)},
+    }
+
+    first, *_ = build_rescue_shortlist_with_metadata(
+        frames,
+        [float(i) for i in range(45)],
+        list(range(45)),
+        [{"sample_idx": 0, "timestamp": 0.0, "scene_id": 0}],
+        pass1_clusters=3,
+        **kwargs,
+    )
+    second, *_ = build_rescue_shortlist_with_metadata(
+        frames,
+        [float(i) for i in range(45)],
+        list(range(45)),
+        [{"sample_idx": 0, "timestamp": 0.0, "scene_id": 0}],
+        pass1_clusters=3,
+        **kwargs,
+    )
+
+    assert [row["sample_idx"] for row in first] == [row["sample_idx"] for row in second]
+
+
 def test_comparison_primary_sample_idxs_include_cluster_and_scene_primaries():
     candidates = [
         {"sample_idx": 0, "timestamp": 0.0, "clip_cluster": 1, "scene_id": 0},
@@ -179,7 +364,7 @@ def test_comparison_primary_sample_idxs_include_cluster_and_scene_primaries():
     assert _comparison_primary_sample_idxs(candidates, shortlist) == {5, 20}
 
 
-def test_rescue_same_cluster_swap_precedes_additive_and_respects_budget():
+def test_additive_evidence_promotes_before_non_subsuming_swap():
     candidates = [
         {
             "sample_idx": 0,
@@ -225,9 +410,40 @@ def test_rescue_same_cluster_swap_precedes_additive_and_respects_budget():
 
     promoted = promote_rescue_candidates(candidates, shortlist, [0, 1, 2, 3], rescue_budget=1)
 
-    assert [row["sample_idx"] for row in promoted] == [1, 2]
-    assert promoted[0]["rescue_origin"] == "same_cluster_swap"
-    assert promoted[0]["rescue_priority"] == 1
+    assert [row["sample_idx"] for row in promoted] == [0, 2, 3]
+    assert promoted[2]["rescue_origin"] == "additive_rescue"
+    assert promoted[2]["rescue_priority"] == 1
+
+
+def test_non_subsuming_same_cluster_candidate_does_not_swap_or_add():
+    candidates = [
+        {
+            "sample_idx": 0,
+            "timestamp": 0.0,
+            "clip_cluster": 3,
+            "scene_id": 0,
+            "cluster_role": "primary",
+            "proxy_content_score": 0.1,
+            "ocr_tokens": ["page1", "status"],
+            "rescue_tokens": ["page1", "status"],
+        },
+    ]
+    non_subsuming = [
+        {
+            "sample_idx": 1,
+            "frame_idx": 1,
+            "timestamp": 1.0,
+            "clip_cluster": 3,
+            "scene_id": 0,
+            "proxy_content_score": 0.8,
+            "ocr_tokens": ["page1"],
+            "rescue_tokens": ["page1"],
+        },
+    ]
+
+    not_swapped = promote_rescue_candidates(candidates, non_subsuming, [0, 1, 2], rescue_budget=1)
+
+    assert [row["sample_idx"] for row in not_swapped] == [0]
 
 
 def test_same_window_marker_equivalent_does_not_reject_outside_tolerance():

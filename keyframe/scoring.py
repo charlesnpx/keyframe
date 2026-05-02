@@ -308,7 +308,7 @@ def build_rescue_shortlist(
     *,
     sample_clusters: Mapping[int, int] | None = None,
     sample_scenes: Mapping[int, int] | None = None,
-) -> tuple[tuple[CandidateRecord, ...], list[dict[str, float]], int]:
+) -> tuple[tuple[CandidateRecord, ...], list[dict[str, float]], int, int, int, int, int]:
     """Rank non-selected sampled frames for bounded OCR rescue."""
     candidates = _records(candidates)
     proxy_rows = proxy_content_scores(frames)
@@ -318,7 +318,7 @@ def build_rescue_shortlist(
     rescue_budget = max(3, round(pass1_clusters * 0.35), duration_floor)
     scores = [row["proxy_content_score"] for row in proxy_rows]
     tau_proxy = float(np.percentile(scores, 75)) if scores else 0.0
-    cap = min(60, rescue_budget * 4)
+    legacy_cap = min(60, rescue_budget * 4)
 
     window_seconds = rescue_window_seconds(timestamps)
     temporal_window_ids = assign_temporal_window_ids(
@@ -349,79 +349,158 @@ def build_rescue_shortlist(
         key=lambda row: (
             float(row["proxy_content_score"]),
             -float(row["timestamp"]),
+            -int(row["sample_idx"]),
         ),
         reverse=True,
     )
 
-    shortlist: list[dict[str, Any]] = []
-    selected: set[int] = set()
-
-    def add(row: Mapping[str, Any]) -> None:
-        if len(shortlist) >= cap:
-            return
-        sample_idx = int(row["sample_idx"])
-        if sample_idx in selected:
-            return
-        shortlist.append(dict(row))
-        selected.add(sample_idx)
-
-    global_quota = min(cap, max(rescue_budget, cap // 4))
-    for row in ranked:
-        if float(row["proxy_content_score"]) >= tau_proxy:
-            add(row)
-        if len(shortlist) >= global_quota:
-            break
-
     by_time_window: dict[tuple[Any, int], list[dict[str, Any]]] = defaultdict(list)
+    by_scene: dict[Any, list[dict[str, Any]]] = defaultdict(list)
     for row in ranked:
         scene_id = row.get("scene_id")
         window_id = int(row.get("temporal_window_id") or 0)
         by_time_window[(scene_id, window_id)].append(row)
-
-    for key in sorted(
-        by_time_window,
-        key=lambda item: (
-            -max(float(row["proxy_content_score"]) for row in by_time_window[item]),
-            -len(by_time_window[item]),
-        ),
-    ):
-        if len(shortlist) >= cap:
-            break
-        added_in_window: list[float] = []
-        for row in by_time_window[key]:
-            ts = float(row["timestamp"])
-            if any(abs(ts - existing_ts) < 2.25 for existing_ts in added_in_window):
-                continue
-            before = len(shortlist)
-            add(row)
-            if len(shortlist) > before:
-                added_in_window.append(ts)
-            if len(added_in_window) >= 3 or len(shortlist) >= cap:
-                break
-
-    all_scenes = set(sample_scenes.values()) if sample_scenes else {
-        row.get("scene_id") for row in ranked if row.get("scene_id") is not None
-    }
-    by_scene: dict[Any, list[dict[str, Any]]] = defaultdict(list)
-    for row in ranked:
-        scene_id = row.get("scene_id")
-        if scene_id in all_scenes:
+        if scene_id is not None:
             by_scene[scene_id].append(row)
 
-    for scene_id in sorted(by_scene, key=lambda value: -1 if value is None else int(value)):
-        if len(shortlist) >= cap:
+    temporal_window_count = len(by_time_window)
+    scene_count = len(by_scene)
+    rescue_ocr_cap = min(
+        96,
+        max(
+            rescue_budget * 4,
+            2 * temporal_window_count + scene_count,
+            40,
+        ),
+    )
+
+    def add_to_lane(
+        lane: list[dict[str, Any]],
+        selected: set[int],
+        row: Mapping[str, Any],
+        proposal_lane: str,
+        cap: int | None = None,
+    ) -> bool:
+        if cap is not None and len(lane) >= cap:
+            return False
+        sample_idx = int(row["sample_idx"])
+        if sample_idx in selected:
+            return False
+        lane.append({**dict(row), "proposal_lane": proposal_lane})
+        selected.add(sample_idx)
+        return True
+
+    def build_legacy_proxy_lane() -> list[dict[str, Any]]:
+        lane: list[dict[str, Any]] = []
+        selected: set[int] = set()
+        global_quota = min(legacy_cap, max(rescue_budget, legacy_cap // 4))
+        for row in ranked:
+            if float(row["proxy_content_score"]) >= tau_proxy:
+                add_to_lane(lane, selected, row, "legacy_proxy", legacy_cap)
+            if len(lane) >= global_quota:
+                break
+
+        for key in sorted(
+            by_time_window,
+            key=lambda item: (
+                -max(float(row["proxy_content_score"]) for row in by_time_window[item]),
+                -len(by_time_window[item]),
+            ),
+        ):
+            if len(lane) >= legacy_cap:
+                break
+            added_in_window: list[float] = []
+            for row in by_time_window[key]:
+                ts = float(row["timestamp"])
+                if any(abs(ts - existing_ts) < 2.25 for existing_ts in added_in_window):
+                    continue
+                if add_to_lane(lane, selected, row, "legacy_proxy", legacy_cap):
+                    added_in_window.append(ts)
+                if len(added_in_window) >= 3 or len(lane) >= legacy_cap:
+                    break
+
+        for scene_id in sorted(by_scene, key=lambda value: int(value)):
+            if len(lane) >= legacy_cap:
+                break
+            add_to_lane(lane, selected, by_scene[scene_id][0], "legacy_proxy", legacy_cap)
+
+        for row in ranked:
+            if len(lane) >= legacy_cap:
+                break
+            add_to_lane(lane, selected, row, "legacy_proxy", legacy_cap)
+        return lane
+
+    def window_sort_key(key: tuple[Any, int]) -> tuple[int, int, float]:
+        scene_id, window_id = key
+        first_ts = min(float(row["timestamp"]) for row in by_time_window[key])
+        scene_sort = int(scene_id) if scene_id is not None else -1
+        return scene_sort, int(window_id), first_ts
+
+    window_keys = sorted(by_time_window, key=window_sort_key)
+    coverage_lane: list[dict[str, Any]] = []
+    coverage_selected: set[int] = set()
+    selected_ts_by_window: dict[tuple[Any, int], list[float]] = defaultdict(list)
+
+    for key in window_keys:
+        row = by_time_window[key][0]
+        if add_to_lane(coverage_lane, coverage_selected, row, "temporal_coverage"):
+            selected_ts_by_window[key].append(float(row["timestamp"]))
+
+    for key in window_keys:
+        for row in by_time_window[key]:
+            sample_idx = int(row["sample_idx"])
+            if sample_idx in coverage_selected:
+                continue
+            ts = float(row["timestamp"])
+            if any(abs(ts - existing_ts) < 2.25 for existing_ts in selected_ts_by_window[key]):
+                continue
+            if add_to_lane(coverage_lane, coverage_selected, row, "temporal_coverage"):
+                selected_ts_by_window[key].append(ts)
             break
-        add(by_scene[scene_id][0])
+
+    scene_window_counts: dict[Any, int] = defaultdict(int)
+    for scene_id, _window_id in by_time_window:
+        if scene_id is not None:
+            scene_window_counts[scene_id] += 1
+
+    for scene_id in sorted(by_scene, key=lambda value: int(value)):
+        if scene_window_counts.get(scene_id, 0) <= 1:
+            continue
+        for row in by_scene[scene_id]:
+            if add_to_lane(coverage_lane, coverage_selected, row, "scene_coverage"):
+                break
+
+    legacy_lane = build_legacy_proxy_lane()
+    final_rows: list[dict[str, Any]] = []
+    final_selected: set[int] = set()
+
+    def add_final(row: Mapping[str, Any]) -> bool:
+        return add_to_lane(
+            final_rows,
+            final_selected,
+            row,
+            str(row.get("proposal_lane") or "global_backfill"),
+            rescue_ocr_cap,
+        )
+
+    for lane_rows in (legacy_lane, coverage_lane):
+        for row in lane_rows:
+            add_final(row)
 
     for row in ranked:
-        if len(shortlist) >= cap:
+        if len(final_rows) >= rescue_ocr_cap:
             break
-        add(row)
+        add_final({**dict(row), "proposal_lane": "global_backfill"})
+
+    final_sample_idxs = {int(row["sample_idx"]) for row in final_rows}
+    legacy_proxy_dropped_count = sum(
+        1 for row in legacy_lane if int(row["sample_idx"]) not in final_sample_idxs
+    )
 
     return tuple(
         as_candidate_record(row, origin="rescue_shortlist")
-        for row in shortlist[:cap]
-    ), proxy_rows, rescue_budget
+        for row in final_rows[:rescue_ocr_cap]
+    ), proxy_rows, rescue_budget, rescue_ocr_cap, temporal_window_count, scene_count, legacy_proxy_dropped_count
 
 
 def _marker_signature(tokens: set[str]) -> tuple[tuple[str, tuple[str, ...]], ...]:
@@ -510,6 +589,21 @@ def _clip_token_redundant(
         _clip_cosine(clip_embeddings, rescue_idx, candidate_idx) >= 0.93
         and _jaccard(rescue_tokens, candidate_tokens) >= 0.7
     )
+
+
+def _strictly_subsumes_tokens(rescue_tokens: set[str], primary_tokens: set[str]) -> bool:
+    if not primary_tokens:
+        return bool(rescue_tokens)
+    if _has_form_state_delta(primary_tokens, rescue_tokens):
+        return False
+    primary_markers = canonical_markers(primary_tokens)
+    rescue_markers = canonical_markers(rescue_tokens)
+    marker_subsumed = all(
+        primary_markers[key] <= rescue_markers[key]
+        for key in ("page", "option", "section", "status")
+    )
+    token_subsumed = primary_tokens <= rescue_tokens
+    return marker_subsumed and token_subsumed and rescue_tokens != primary_tokens
 
 
 def _same_marker_covered(
@@ -640,9 +734,9 @@ def _additive_priority_key(
 ) -> tuple[float, ...]:
     components = _additive_priority_components(rescue, primary, reason, candidates)
     return (
+        float(components["form_state_delta"]),
         float(components["reason_priority"]),
         float(components["marker_gain"]),
-        float(components["form_state_delta"]),
         float(components["token_gain"]),
         float(components["temporal_gap"]),
         float(components["proxy_content_score"]),
@@ -1023,6 +1117,8 @@ def promote_rescue_candidates(
         primary_tokens = _record_tokens(primary, rescue=True)
         if _has_form_state_delta(rescue_tokens, primary_tokens):
             return False
+        if not _strictly_subsumes_tokens(rescue_tokens, primary_tokens):
+            return False
         if (
             _temporally_local(rescue, primary, dwell_ids)
             and _clip_token_redundant(
@@ -1057,22 +1153,6 @@ def promote_rescue_candidates(
                 consumed += 1
                 return True
         return False
-
-    for rescue in rescue_shortlist:
-        if consumed >= rescue_budget:
-            break
-        if int(rescue.sample_idx) in used_idxs:
-            continue
-        if maybe_swap(rescue, same_cluster=True, origin="same_cluster_swap"):
-            continue
-
-    for rescue in rescue_shortlist:
-        if consumed >= rescue_budget:
-            break
-        if int(rescue.sample_idx) in used_idxs:
-            continue
-        if maybe_swap(rescue, same_cluster=False, origin="same_scene_generic_primary_swap"):
-            continue
 
     additive_candidates: list[tuple[tuple[float, ...], CandidateRecord, CandidateRecord | None, str]] = []
     for rescue in rescue_shortlist:
@@ -1142,5 +1222,21 @@ def promote_rescue_candidates(
         promoted.append(row)
         used_idxs.add(rescue_idx)
         consumed += 1
+
+    for rescue in rescue_shortlist:
+        if consumed >= rescue_budget:
+            break
+        if int(rescue.sample_idx) in used_idxs:
+            continue
+        if maybe_swap(rescue, same_cluster=True, origin="same_cluster_swap"):
+            continue
+
+    for rescue in rescue_shortlist:
+        if consumed >= rescue_budget:
+            break
+        if int(rescue.sample_idx) in used_idxs:
+            continue
+        if maybe_swap(rescue, same_cluster=False, origin="same_scene_generic_primary_swap"):
+            continue
 
     return tuple(sorted(promoted, key=lambda c: (float(c.timestamp), int(c.sample_idx))))

@@ -169,13 +169,12 @@ EXPECTED_BASELINE = {
             "amot_spacing_midpage_consequence_dependencies_comments",
             "amot_spacing_page_boundary_current_state_description_to_page2",
             "source_form_text_fields_for_spacing_comparison",
-            "priority_form_spacing_sections",
         },
         "buckets": {
             "amot_spacing_midpage_consequence_dependencies_comments": "sampled_but_no_proposal_near_target",
-            "amot_spacing_page_boundary_current_state_description_to_page2": "sampled_but_no_proposal_near_target",
+            "amot_spacing_page_boundary_current_state_description_to_page2": "rescue_ocrd_but_not_promoted",
             "source_form_text_fields_for_spacing_comparison": "sampled_but_no_proposal_near_target",
-            "priority_form_spacing_sections": "sampled_but_no_proposal_near_target",
+            "priority_form_spacing_sections": "hit_direct",
         },
     },
     "36380": {
@@ -185,7 +184,7 @@ EXPECTED_BASELINE = {
             "priority_form_header_fields_in_body",
         },
         "buckets": {
-            "regular_amot_pdf_header_body_fields_wrong_location": "sampled_but_no_proposal_near_target",
+            "regular_amot_pdf_header_body_fields_wrong_location": "rescue_ocrd_but_not_promoted",
             "cover_page_unapproved_signed_by_should_be_blank": "rescue_ocrd_but_not_promoted",
             "priority_form_header_fields_in_body": "sampled_but_no_proposal_near_target",
         },
@@ -385,6 +384,7 @@ def test_full_video_qa_fixture_recall(tmp_path, name, annotation):
     rescue_metadata = manifest.get("metadata", {}).get("rescue", {})
     pre_rescue_count = int(rescue_metadata.get("pre_rescue_candidate_count", len(captions)))
     rescue_budget = int(rescue_metadata.get("rescue_budget", 0))
+    rescue_ocr_cap = int(rescue_metadata.get("rescue_ocr_cap", 0))
     rescues = [
         {
             "timestamp": frame["timestamp"],
@@ -399,6 +399,7 @@ def test_full_video_qa_fixture_recall(tmp_path, name, annotation):
         f"{name}: recall={recall:.3f}, misses={misses}, "
         f"structural_redundancy_score={redundancy:.3f}, output_count={len(captions)}, "
         f"pre_rescue_candidate_count={pre_rescue_count}, rescue_budget={rescue_budget}, "
+        f"rescue_ocr_cap={rescue_ocr_cap}, "
         f"fixture_tolerance={FIXTURE_RECALL_TOLERANCE_SECONDS}s"
     )
     print(f"{name}: selected_timestamps={[round(float(f['timestamp']), 3) for f in manifest['frames']]}")

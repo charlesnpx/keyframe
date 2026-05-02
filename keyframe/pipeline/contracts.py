@@ -121,6 +121,7 @@ class CandidateSelectionMetadata:
     candidate_score: float | None = None
     score: float | None = None
     proxy_content_score: float | None = None
+    proposal_lane: str | None = None
     end_of_dwell_bonus: float | None = None
     rescue_origin: str | None = None
     rescue_reason: str | None = None
@@ -309,6 +310,7 @@ def candidate_to_caption_log_row(candidate: CandidateRecord, *, path: Path) -> d
 class CandidateBatch:
     stage: str
     candidates: tuple[CandidateRecord, ...]
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -317,6 +319,10 @@ class ProposalOutput:
     rescue_shortlist: tuple[CandidateRecord, ...]
     proxy_rows: list[dict[str, Any]]
     rescue_budget: int
+    rescue_ocr_cap: int
+    temporal_window_count: int
+    scene_count: int
+    legacy_proxy_dropped_count: int = 0
 
 
 @dataclass

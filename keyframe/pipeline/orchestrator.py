@@ -45,8 +45,8 @@ def _empty_cache(device: str) -> None:
         torch.cuda.empty_cache()
 
 
-def _candidate_batch(stage: str, candidates) -> CandidateBatch:
-    return CandidateBatch(stage=stage, candidates=candidate_records(candidates))
+def _candidate_batch(stage: str, candidates, metadata: dict[str, Any] | None = None) -> CandidateBatch:
+    return CandidateBatch(stage=stage, candidates=candidate_records(candidates), metadata=metadata or {})
 
 
 def _select_pass1_candidates(
@@ -287,7 +287,15 @@ class ProposalStage:
         ctx.trace.exit("proposal.pass1_primary", _candidate_batch("proposal.pass1_primary", pass1_primary))
         ctx.trace.exit("proposal.cluster_alt", _candidate_batch("proposal.cluster_alt", cluster_alt))
 
-        shortlist, proxy_rows, rescue_budget = build_rescue_shortlist(
+        (
+            shortlist,
+            proxy_rows,
+            rescue_budget,
+            rescue_ocr_cap,
+            temporal_window_count,
+            scene_count,
+            legacy_proxy_dropped_count,
+        ) = build_rescue_shortlist(
             frames,
             timestamps,
             frame_indices,
@@ -309,12 +317,26 @@ class ProposalStage:
             )
             for row in shortlist
         )
-        ctx.trace.exit("proposal.rescue_shortlist", _candidate_batch("proposal.rescue_shortlist", shortlist))
+        rescue_metadata = {
+            "rescue_budget": int(rescue_budget),
+            "rescue_ocr_cap": int(rescue_ocr_cap),
+            "temporal_window_count": int(temporal_window_count),
+            "scene_count": int(scene_count),
+            "legacy_proxy_dropped_count": int(legacy_proxy_dropped_count),
+        }
+        ctx.trace.exit(
+            "proposal.rescue_shortlist",
+            _candidate_batch("proposal.rescue_shortlist", shortlist, rescue_metadata),
+        )
         return ProposalOutput(
             candidates=candidates,
             rescue_shortlist=shortlist,
             proxy_rows=proxy_rows,
             rescue_budget=rescue_budget,
+            rescue_ocr_cap=rescue_ocr_cap,
+            temporal_window_count=temporal_window_count,
+            scene_count=scene_count,
+            legacy_proxy_dropped_count=legacy_proxy_dropped_count,
         )
 
 
@@ -342,7 +364,10 @@ class RescueEvidenceStage:
             for row in shortlist
         )
         proposal.rescue_shortlist = shortlist
-        print(f"  Rescue shortlist: {len(shortlist)} frames, budget {proposal.rescue_budget}")
+        print(
+            f"  Rescue shortlist: {len(shortlist)} frames, "
+            f"budget {proposal.rescue_budget}, OCR cap {proposal.rescue_ocr_cap}"
+        )
         comparison_idxs = _comparison_primary_sample_idxs(proposal.candidates, shortlist)
         candidate_by_idx = {int(cand.sample_idx): cand for cand in proposal.candidates}
         comparison_primaries = [
@@ -528,6 +553,10 @@ class OutputStage:
         temporal: TemporalOutput,
         output_dir: Path,
         rescue_budget: int,
+        rescue_ocr_cap: int,
+        temporal_window_count: int,
+        scene_count: int,
+        legacy_proxy_dropped_count: int,
         pre_rescue_candidate_count: int,
         ctx: RunContext,
     ) -> OutputArtifacts:
@@ -542,6 +571,10 @@ class OutputStage:
             "rescue": {
                 "pre_rescue_candidate_count": pre_rescue_candidate_count,
                 "rescue_budget": rescue_budget,
+                "rescue_ocr_cap": rescue_ocr_cap,
+                "temporal_window_count": temporal_window_count,
+                "scene_count": scene_count,
+                "legacy_proxy_dropped_count": legacy_proxy_dropped_count,
             },
         }
         manifest_rows = [
@@ -642,6 +675,10 @@ def extract_keyframes(
             temporal,
             output_dir,
             proposal.rescue_budget,
+            proposal.rescue_ocr_cap,
+            proposal.temporal_window_count,
+            proposal.scene_count,
+            proposal.legacy_proxy_dropped_count,
             pre_rescue_candidate_count,
             ctx,
         )

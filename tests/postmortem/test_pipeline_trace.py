@@ -45,6 +45,29 @@ def test_candidate_snapshot_is_json_safe_and_reports_duplicates_and_violations()
     assert {"candidate_id": "test:1", "reason": "rescue_origin_without_reason"} in payload["integrity_violations"]
 
 
+def test_candidate_snapshot_includes_rescue_shortlist_metadata():
+    sink = SnapshotTraceSink()
+    batch = CandidateBatch(
+        stage="proposal.rescue_shortlist",
+        candidates=[{"sample_idx": 1, "timestamp": 10.0}],
+        metadata={
+            "rescue_budget": 3,
+            "rescue_ocr_cap": 40,
+            "temporal_window_count": 4,
+            "scene_count": 2,
+        },
+    )
+
+    sink.exit("proposal.rescue_shortlist", batch)
+    payload = sink.records[0]["payload"]
+
+    assert payload["candidate_count"] == 1
+    assert payload["rescue_budget"] == 3
+    assert payload["rescue_ocr_cap"] == 40
+    assert payload["temporal_window_count"] == 4
+    assert payload["scene_count"] == 2
+
+
 def test_debug_qa_trace_reports_direct_and_lineage_only_hits():
     records = [
         {
