@@ -61,6 +61,7 @@ from keyframe.scoring import (
     rescue_window_seconds,
     score_candidate_for_rep,
 )
+from keyframe.pipeline.contracts import as_candidate_record, candidate_records
 
 
 # ── Video sampling ──────────────────────────────────────────────────────────
@@ -477,6 +478,7 @@ def caption_candidates(candidates, frames, device="mps", preloaded=None):
 
     captions = []
     generated_texts = processor.batch_decode(generated_ids, skip_special_tokens=False)
+    updated_candidates = []
     for i, (cand, text) in enumerate(zip(candidates, generated_texts)):
         img = candidate_images[i]
         parsed = processor.post_process_generation(
@@ -484,7 +486,7 @@ def caption_candidates(candidates, frames, device="mps", preloaded=None):
         )
         caption = parsed.get(prompt, text)
         captions.append(caption)
-        cand["caption"] = caption
+        updated_candidates.append(cand.with_updates(caption=caption) if hasattr(cand, "with_updates") else {**cand, "caption": caption})
         print(f"  [{i+1}/{len(candidates)}] {cand['timestamp']:5.1f}s → \"{caption[:120]}\"")
 
     del model, processor
@@ -492,7 +494,7 @@ def caption_candidates(candidates, frames, device="mps", preloaded=None):
         torch.mps.empty_cache()
     elif device == "cuda":
         torch.cuda.empty_cache()
-    return captions
+    return captions, tuple(updated_candidates)
 
 
 # ── Pass 2b: PaddleOCR text extraction ───────────────────────────────────
@@ -579,10 +581,12 @@ def ocr_candidates(candidates, frames, preloaded_engine=None):
             )
 
     ocr_texts = []
+    updated_candidates = []
     for i, cand in enumerate(candidates):
         if "ocr_text" in cand and cand["ocr_text"] is not None:
             raw_text = str(cand["ocr_text"])
             ocr_texts.append(raw_text)
+            updated_candidates.append(cand)
             preview = raw_text[:120] if raw_text else "(no text)"
             print(f"  [{i+1}/{len(candidates)}] {cand['timestamp']:5.1f}s → "
                   f"cached, {len(raw_text)} chars: \"{preview}\"")
@@ -593,12 +597,12 @@ def ocr_candidates(candidates, frames, preloaded_engine=None):
 
         raw_text = " ".join(lines)
         ocr_texts.append(raw_text)
-        cand["ocr_text"] = raw_text
+        updated_candidates.append(cand.with_updates(ocr_text=raw_text) if hasattr(cand, "with_updates") else {**cand, "ocr_text": raw_text})
         preview = raw_text[:120] if raw_text else "(no text)"
         print(f"  [{i+1}/{len(candidates)}] {cand['timestamp']:5.1f}s → "
               f"{len(lines)} lines, {len(raw_text)} chars: \"{preview}\"")
 
-    return ocr_texts
+    return ocr_texts, tuple(updated_candidates)
 
 
 def _normalize_token(word):
@@ -639,17 +643,19 @@ def _build_hybrid_captions(filtered_ocr, florence_captions, candidates,
     """
     print(f"\n── Hybrid caption analysis ──")
     has_ocr = []
+    updated_candidates = []
     for i, (ocr, flor) in enumerate(zip(filtered_ocr, florence_captions)):
         has = len(ocr) >= min_ocr_chars
         has_ocr.append(has)
         tag = "both" if has else "florence"
-        candidates[i]["caption_source"] = tag
+        cand = candidates[i]
+        updated_candidates.append(cand.with_updates(caption_source=tag) if hasattr(cand, "with_updates") else {**cand, "caption_source": tag})
         display = f"{flor[:60]} + OCR({len(ocr)}ch)" if has else flor[:100]
         print(f"  [{i+1}/{len(filtered_ocr)}] {candidates[i]['timestamp']:5.1f}s → "
               f"[{tag}] \"{display}\"")
     n_both = sum(has_ocr)
     print(f"  → {n_both} with OCR signal, {len(has_ocr) - n_both} Florence-2 only")
-    return florence_captions, filtered_ocr, has_ocr
+    return florence_captions, filtered_ocr, has_ocr, tuple(updated_candidates)
 
 
 # ── Merge: CLIP image similarity + Jaccard OCR overlap ───────────────────
@@ -707,25 +713,30 @@ def attach_ocr_token_attribution(candidates, raw_ocr_texts, filtered_ocr_texts, 
     raw_token_sets = _build_ocr_token_sets(raw_ocr_texts)
     filtered_token_sets = _build_ocr_token_sets(filtered_ocr_texts)
     rescue_token_sets = _build_rescue_token_sets(raw_ocr_texts)
+    updated_candidates = []
     for cand, raw_tokens, filtered_tokens, cleaned_tokens, rescue_tokens in zip(
         candidates, raw_token_sets, filtered_token_sets, cleaned_token_sets, rescue_token_sets
     ):
         raw_count = len(raw_tokens)
         filtered_count = len(filtered_tokens)
         cleaned_count = len(cleaned_tokens)
-        cand["ocr_tokens"] = sorted(cleaned_tokens)
-        cand["dedupe_tokens"] = sorted(cleaned_tokens)
-        cand["rescue_tokens"] = sorted(rescue_tokens)
-        cand["raw_token_count"] = raw_count
-        cand["filtered_token_count"] = filtered_count
-        cand["cleaned_token_count"] = cleaned_count
-        cand["cleaning_attrition_ratio"] = (
+        updates = {
+            "ocr_tokens": sorted(cleaned_tokens),
+            "dedupe_tokens": sorted(cleaned_tokens),
+            "rescue_tokens": sorted(rescue_tokens),
+            "raw_token_count": raw_count,
+            "filtered_token_count": filtered_count,
+            "cleaned_token_count": cleaned_count,
+            "cleaning_attrition_ratio": (
             0.0 if raw_count == 0 else round((raw_count - cleaned_count) / raw_count, 4)
-        )
-        cand.setdefault("retention_reason", "none")
-        cand.setdefault("retention_reasons_seen", [cand["retention_reason"]])
+            ),
+            "retention_reason": cand.get("retention_reason", "none"),
+            "retention_reasons_seen": cand.get("retention_reasons_seen", [cand.get("retention_reason", "none")]),
+        }
         if cand.get("cluster_role"):
-            cand.setdefault("lineage_roles", [cand["cluster_role"]])
+            updates["lineage_roles"] = cand.get("lineage_roles", [cand["cluster_role"]])
+        updated_candidates.append(cand.with_updates(**updates) if hasattr(cand, "with_updates") else {**cand, **updates})
+    return tuple(updated_candidates)
 
 
 def attach_rescue_ocr_metadata(candidates, raw_ocr_texts):
@@ -733,19 +744,24 @@ def attach_rescue_ocr_metadata(candidates, raw_ocr_texts):
     filtered_ocr = _filter_ocr_tokens(raw_ocr_texts)
     dedupe_token_sets = clean_ocr_token_sets(_build_ocr_token_sets(filtered_ocr))
     rescue_token_sets = _build_rescue_token_sets(raw_ocr_texts)
+    updated_candidates = []
     for cand, raw_text, filtered_text, dedupe_tokens, rescue_tokens in zip(
         candidates, raw_ocr_texts, filtered_ocr, dedupe_token_sets, rescue_token_sets
     ):
         raw_tokens = _build_ocr_token_sets([raw_text])[0]
         filtered_tokens = _build_ocr_token_sets([filtered_text])[0]
-        cand["ocr_text"] = raw_text
-        cand.setdefault("ocr_cache_source", "rescue")
-        cand["ocr_tokens"] = sorted(dedupe_tokens)
-        cand["dedupe_tokens"] = sorted(dedupe_tokens)
-        cand["rescue_tokens"] = sorted(rescue_tokens)
-        cand["raw_token_count"] = len(raw_tokens)
-        cand["filtered_token_count"] = len(filtered_tokens)
-        cand["cleaned_token_count"] = len(dedupe_tokens)
+        updates = {
+            "ocr_text": raw_text,
+            "ocr_cache_source": cand.get("ocr_cache_source", "rescue"),
+            "ocr_tokens": sorted(dedupe_tokens),
+            "dedupe_tokens": sorted(dedupe_tokens),
+            "rescue_tokens": sorted(rescue_tokens),
+            "raw_token_count": len(raw_tokens),
+            "filtered_token_count": len(filtered_tokens),
+            "cleaned_token_count": len(dedupe_tokens),
+        }
+        updated_candidates.append(cand.with_updates(**updates) if hasattr(cand, "with_updates") else {**cand, **updates})
+    return tuple(updated_candidates)
 
 
 def _comparison_primary_sample_idxs(candidates, shortlist):
@@ -793,14 +809,21 @@ def rescue_from_sampled_frames(
         sample_scenes,
         window_seconds=window_seconds,
     )
-    for cand in candidates:
-        sample_idx = int(cand["sample_idx"])
-        cand["proxy_content_score"] = float(cand.get("proxy_content_score", 0.0) or 0.0)
-        if sample_scenes:
-            cand["scene_id"] = sample_scenes.get(sample_idx)
-        if sample_idx < len(temporal_window_ids):
-            cand["temporal_window_id"] = temporal_window_ids[sample_idx]
-            cand["temporal_window_seconds"] = window_seconds
+    candidates = tuple(
+        as_candidate_record(cand).with_updates(
+            proxy_content_score=float(cand.get("proxy_content_score", 0.0) or 0.0),
+            **({"scene_id": sample_scenes.get(int(cand["sample_idx"]))} if sample_scenes else {}),
+            **(
+                {
+                    "temporal_window_id": temporal_window_ids[int(cand["sample_idx"])],
+                    "temporal_window_seconds": window_seconds,
+                }
+                if int(cand["sample_idx"]) < len(temporal_window_ids)
+                else {}
+            ),
+        )
+        for cand in candidates
+    )
 
     shortlist, proxy_rows, rescue_budget = build_rescue_shortlist(
         frames,
@@ -811,19 +834,24 @@ def rescue_from_sampled_frames(
         sample_clusters=sample_clusters,
         sample_scenes=sample_scenes,
     )
-    for cand in candidates:
-        sample_idx = int(cand["sample_idx"])
-        if 0 <= sample_idx < len(proxy_rows):
-            cand["proxy_content_score"] = float(proxy_rows[sample_idx]["proxy_content_score"])
+    candidates = tuple(
+        cand.with_updates(proxy_content_score=float(proxy_rows[int(cand["sample_idx"])]["proxy_content_score"]))
+        if 0 <= int(cand["sample_idx"]) < len(proxy_rows)
+        else cand
+        for cand in candidates
+    )
     if not shortlist:
         print("  Rescue shortlist: 0 frames")
         return sorted(candidates, key=lambda c: c["timestamp"])
 
-    for row in shortlist:
-        sample_idx = int(row["sample_idx"])
-        row["dhash"] = dhashes[sample_idx]
-        row["dhash_hex"] = f"{dhashes[sample_idx]:016x}"
-        row["sharpness"] = float(_laplacian_sharpness(frames[sample_idx]))
+    shortlist = tuple(
+        as_candidate_record(row, origin="rescue_shortlist").with_updates(
+            dhash=dhashes[int(row["sample_idx"])],
+            dhash_hex=f"{dhashes[int(row['sample_idx'])]:016x}",
+            sharpness=float(_laplacian_sharpness(frames[int(row["sample_idx"])])),
+        )
+        for row in shortlist
+    )
 
     print(f"  Rescue shortlist: {len(shortlist)} frames, budget {rescue_budget}")
     comparison_idxs = _comparison_primary_sample_idxs(candidates, shortlist)
@@ -833,22 +861,19 @@ def rescue_from_sampled_frames(
         for sample_idx in sorted(comparison_idxs)
         if sample_idx in candidate_by_idx
     ]
-    ocr_batch = shortlist + comparison_primaries
-    rescue_ocr_texts = ocr_candidates(ocr_batch, frames, preloaded_engine=preloaded_engine)
-    attach_rescue_ocr_metadata(ocr_batch, rescue_ocr_texts)
+    ocr_batch = shortlist + tuple(comparison_primaries)
+    rescue_ocr_texts, ocr_batch = ocr_candidates(ocr_batch, frames, preloaded_engine=preloaded_engine)
+    ocr_batch = attach_rescue_ocr_metadata(ocr_batch, rescue_ocr_texts)
+    updated_by_idx = {int(cand["sample_idx"]): cand for cand in ocr_batch}
+    candidates = tuple(updated_by_idx.get(int(cand["sample_idx"]), cand) for cand in candidates)
+    shortlist = tuple(updated_by_idx.get(int(row["sample_idx"]), row) for row in shortlist)
     print(
         "  Rescue OCR comparison primaries: "
         f"{len(comparison_primaries)} cached selected candidates"
     )
     dwell_ids = assign_dwell_ids(dhashes)
-    for cand in candidates:
-        sample_idx = int(cand["sample_idx"])
-        if 0 <= sample_idx < len(dwell_ids):
-            cand["dwell_id"] = dwell_ids[sample_idx]
-    for row in shortlist:
-        sample_idx = int(row["sample_idx"])
-        if 0 <= sample_idx < len(dwell_ids):
-            row["dwell_id"] = dwell_ids[sample_idx]
+    candidates = tuple(cand.with_updates(dwell_id=dwell_ids[int(cand["sample_idx"])]) for cand in candidates)
+    shortlist = tuple(row.with_updates(dwell_id=dwell_ids[int(row["sample_idx"])]) for row in shortlist)
     promoted = promote_rescue_candidates(
         candidates,
         shortlist,
@@ -1095,175 +1120,20 @@ def main():
                         help="Deprecated no-op; deterministic merge vetoes are used")
 
     args = parser.parse_args()
-    t0 = time.time()
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    from keyframe.pipeline import KeyframeExtractionConfig, extract_keyframes
 
-    # Start loading all models in parallel while we sample frames
-    preloader = ModelPreloader(device=device, need_florence=True, need_ocr=True)
-
-    # Sample
-    frames, timestamps, frame_indices = sample_frames(args.video, args.sample_interval)
-    if len(frames) < 4:
-        print("Too few frames.", file=sys.stderr)
-        sys.exit(1)
-
-    # CLIP is ready (or we wait for it here)
-    print("\n── Pass 1: CLIP visual embedding ──")
-    clip = CLIPEncoder(device=device, preloaded=preloader.get_clip())
-    clip_emb = clip.embed_images(frames)
-    print(f"  Embedded {len(frames)} frames → {clip_emb.shape}")
-
-    # Scene detection → per-scene clustering
-    n_clusters = min(args.pass1_clusters, len(frames) // 2)
-    scenes = detect_scenes(args.video, timestamps)
-    dhashes = [compute_dhash(frame) for frame in frames]
-    scenes, scene_coalescence = coalesce_tiny_scenes(
-        scenes, timestamps, dhashes, return_trace=True
-    )
-    if scene_coalescence["coalesced_scene_count"] != scene_coalescence["original_scene_count"]:
-        print(
-            "  Coalesced scenes: "
-            f"{scene_coalescence['original_scene_count']} -> {scene_coalescence['coalesced_scene_count']}"
-        )
-    cluster_budget = candidate_budget_for_scenes(n_clusters, len(scenes))
-    cluster_allocs = allocate_clusters_by_novelty(scenes, cluster_budget, dhashes, floor=1)
-    print(f"  Cluster allocation budget: {sum(cluster_allocs)} candidates")
-
-    all_candidates = []
-    sample_clusters = {}
-    sample_scenes = {}
-    cluster_offset = 0
-    for scene_id, ((s_start, s_end), scene_clusters) in enumerate(zip(scenes, cluster_allocs)):
-        for sample_idx in range(s_start, s_end + 1):
-            sample_scenes[sample_idx] = scene_id
-        if scene_clusters <= 0:
-            continue
-        scene_emb = clip_emb[s_start:s_end + 1]
-        scene_ts = timestamps[s_start:s_end + 1]
-        scene_fi = frame_indices[s_start:s_end + 1]
-        scene_frames = frames[s_start:s_end + 1]
-        scene_clusters = min(scene_clusters, len(scene_emb))
-
-        if scene_clusters < 2 or len(scene_emb) < 2:
-            best = max(range(len(scene_frames)),
-                       key=lambda i: _laplacian_sharpness(scene_frames[i]))
-            sharpness = _laplacian_sharpness(scene_frames[best])
-            all_candidates.append({
-                "sample_idx": s_start + best,
-                "frame_idx": scene_fi[best],
-                "timestamp": scene_ts[best],
-                "clip_cluster": cluster_offset,
-                "clip_cluster_size": len(scene_emb),
-                "sharpness": float(sharpness),
-                "cluster_role": "single",
-                "scene_id": scene_id,
-            })
-            for sample_idx in range(s_start, s_end + 1):
-                sample_clusters[sample_idx] = cluster_offset
-            cluster_offset += 1
-            continue
-
-        scene_cands, scene_labels = clip_oversegment(
-            scene_emb, scene_ts, scene_fi, scene_clusters, scene_frames,
-            dhashes=dhashes[s_start:s_end + 1],
-            max_reps_per_cluster=2,
-            return_labels=True,
-        )
-        for local_idx, label in enumerate(scene_labels):
-            sample_clusters[s_start + local_idx] = cluster_offset + int(label)
-        for c in scene_cands:
-            c["sample_idx"] = s_start + c["sample_idx"]
-            c["clip_cluster"] += cluster_offset
-            c["scene_id"] = scene_id
-        cluster_offset += scene_clusters
-        all_candidates.extend(scene_cands)
-
-    candidates = sorted(all_candidates, key=lambda c: c["timestamp"])
-    for cand in candidates:
-        cand["dhash"] = dhashes[cand["sample_idx"]]
-        cand["dhash_hex"] = f"{dhashes[cand['sample_idx']]:016x}"
-
-    pre_rescue_candidate_count = len(candidates)
-    rescue_budget = max(3, round(n_clusters * 0.35))
-    clip.cleanup()
-
-    candidates = rescue_from_sampled_frames(
-        candidates,
-        frames,
-        timestamps,
-        frame_indices,
-        dhashes,
-        clip_emb,
-        n_clusters,
-        sample_clusters=sample_clusters,
-        sample_scenes=sample_scenes,
-        preloaded_engine=preloader.get_ocr_engine(),
-    )
-    for cand in candidates:
-        if "dhash" not in cand:
-            cand["dhash"] = dhashes[cand["sample_idx"]]
-            cand["dhash_hex"] = f"{dhashes[cand['sample_idx']]:016x}"
-        if "sharpness" not in cand:
-            cand["sharpness"] = float(_laplacian_sharpness(frames[cand["sample_idx"]]))
-
-    # Florence-2 captioning (batched) — model already loaded in background
-    florence_captions = caption_candidates(
-        candidates, frames, device=device, preloaded=preloader.get_florence()
-    )
-
-    # OCR text extraction + hybrid caption combination
-    ocr_texts = ocr_candidates(
-        candidates, frames, preloaded_engine=preloader.get_ocr_engine()
-    )
-    filtered_ocr = _filter_ocr_tokens(ocr_texts)
-    florence_caps, ocr_caps, has_ocr = _build_hybrid_captions(
-        filtered_ocr, florence_captions, candidates
-    )
-
-    # Merge using CLIP image similarity + Jaccard OCR overlap
-    ocr_token_sets = _build_ocr_token_sets(filtered_ocr)
-    ocr_token_sets = clean_ocr_token_sets(ocr_token_sets)
-    attach_ocr_token_attribution(candidates, ocr_texts, filtered_ocr, ocr_token_sets)
-    retained = retain_cluster_alternates(candidates)
-    print(f"  Cluster alternate retention: {len(candidates)} -> {len(retained)} candidates")
-    deduped = near_time_dedupe(retained, [set(c.get("ocr_tokens", [])) for c in retained], dhashes)
-    print(f"  Near-time dedupe: {len(retained)} -> {len(deduped)} candidates")
-    deduped_token_sets = [set(c.get("ocr_tokens", [])) for c in deduped]
-    globally_deduped = global_candidate_dedupe(deduped, deduped_token_sets, dhashes)
-    print(f"  Global conservative dedupe: {len(deduped)} -> {len(globally_deduped)} candidates")
-    filtered = filter_low_information_candidates(globally_deduped, frames)
-    print(f"  Low-information filter: {len(globally_deduped)} -> {len(filtered)} candidates")
-    adjacent_deduped = adjacent_same_screen_dedupe(filtered)
-    print(f"  Adjacent same-screen dedupe: {len(filtered)} -> {len(adjacent_deduped)} candidates")
-    deduped_token_sets = [set(c.get("ocr_tokens", [])) for c in adjacent_deduped]
-    deduped_has_ocr = [len(tokens) >= 3 for tokens in deduped_token_sets]
-    final = union_find_merge(adjacent_deduped, deduped_token_sets, deduped_has_ocr, frames)
-    preloader.shutdown()
-
-    # Save
-    log_path = save_results(final, frames, args.output_dir)
-    manifest_path = write_manifest(
-        final,
+    result = extract_keyframes(
+        args.video,
         args.output_dir,
-        metadata={
-            "scene_coalescence": scene_coalescence,
-            "rescue": {
-                "pre_rescue_candidate_count": pre_rescue_candidate_count,
-                "rescue_budget": rescue_budget,
-            },
-        },
+        KeyframeExtractionConfig(
+            sample_interval=args.sample_interval,
+            pass1_clusters=args.pass1_clusters,
+            similarity_threshold=args.similarity_threshold,
+        ),
     )
 
-    elapsed = time.time() - t0
-    print(f"\n{'='*60}")
-    print(f"Done in {elapsed:.1f}s")
-    print(f"Pass 1: {len(frames)} sampled → {len(candidates)} CLIP candidates")
-    print(f"Pass 2: {len(candidates)} captioned → {len(final)} final frames")
-    print(f"Saved to: {Path(args.output_dir).resolve()}")
-    print(f"Caption log: {log_path}")
-    print(f"Manifest: {manifest_path}")
     print(f"\nFinal key frames:")
-    for s in final:
+    for s in result.final:
         print(f"  {Path(s['path']).name}  \"{s['caption'][:100]}\"")
 
 

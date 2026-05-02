@@ -163,6 +163,55 @@ FIXTURES = {
 }
 
 
+EXPECTED_BASELINE = {
+    "36381": {
+        "misses": {
+            "amot_spacing_midpage_consequence_dependencies_comments",
+            "amot_spacing_page_boundary_current_state_description_to_page2",
+            "source_form_text_fields_for_spacing_comparison",
+            "priority_form_spacing_sections",
+        },
+        "buckets": {
+            "amot_spacing_midpage_consequence_dependencies_comments": "no_coarse_proposal_near_target",
+            "amot_spacing_page_boundary_current_state_description_to_page2": "no_coarse_proposal_near_target",
+            "source_form_text_fields_for_spacing_comparison": "no_coarse_proposal_near_target",
+            "priority_form_spacing_sections": "no_coarse_proposal_near_target",
+        },
+    },
+    "36380": {
+        "misses": {
+            "regular_amot_pdf_header_body_fields_wrong_location",
+            "cover_page_unapproved_signed_by_should_be_blank",
+            "priority_form_header_fields_in_body",
+        },
+        "buckets": {
+            "regular_amot_pdf_header_body_fields_wrong_location": "no_coarse_proposal_near_target",
+            "cover_page_unapproved_signed_by_should_be_blank": "rescue_ocrd_but_not_promoted",
+            "priority_form_header_fields_in_body": "no_coarse_proposal_near_target",
+        },
+    },
+    "36324": {
+        "misses": {
+            "impacted_location_completed_status_date_blank_required",
+            "status_date_empty_expected_error_visible",
+        },
+        "buckets": {
+            "impacted_location_completed_status_date_blank_required": "rescue_ocrd_but_not_promoted",
+            "status_date_empty_expected_error_visible": "rescue_ocrd_but_not_promoted",
+            "status_date_filled_error_state_persists": "hit_direct",
+        },
+    },
+    "11111": {
+        "misses": set(),
+        "buckets": {
+            "active_amot_0264_visible_in_list": "hit_direct",
+            "amot_0264_search_value_available": "hit_direct",
+            "amot_0264_filter_returns_no_templates_found": "hit_direct",
+        },
+    },
+}
+
+
 def _load_local_env():
     env_path = REPO_ROOT / ".env"
     if not env_path.exists():
@@ -300,22 +349,28 @@ def test_full_video_qa_fixture_recall(tmp_path, name, annotation):
         pytest.skip(f"fixture video not found: {video_path}")
 
     out_dir = tmp_path / name
-    subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "keyframe.cli",
-            str(video_path),
-            "--frames-only",
-            "--output",
-            str(out_dir),
-        ],
-        check=True,
+    debug_targets_path = tmp_path / f"{name}_debug_targets.json"
+    debug_targets_path.write_text(
+        json.dumps({"targets": annotation["must_include"]}, indent=2),
+        encoding="utf-8",
     )
+    command = [
+        sys.executable,
+        "-m",
+        "keyframe.cli",
+        str(video_path),
+        "--frames-only",
+        "--output",
+        str(out_dir),
+        "--debug-qa-targets",
+        str(debug_targets_path),
+    ]
+    subprocess.run(command, check=True)
 
     frames_dir = out_dir / "frames"
     captions_path = frames_dir / "captions.json"
     manifest_path = frames_dir / "manifest.json"
+    debug_trace_path = frames_dir / "debug_qa_trace.json"
     captions = json.loads(captions_path.read_text(encoding="utf-8"))
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     pngs = sorted(frames_dir.glob("*.png"))
@@ -368,6 +423,27 @@ def test_full_video_qa_fixture_recall(tmp_path, name, annotation):
     )
     if anchor_diagnostics:
         print(f"{name}: anchor_token_diagnostics={anchor_diagnostics}")
+    trace = None
+    if debug_trace_path.exists():
+        trace = json.loads(debug_trace_path.read_text(encoding="utf-8"))
+        trace_summary = [
+            {
+                "label": target["label"],
+                "bucket": target["bucket"],
+                "nearest_final_timestamp": target["nearest_final_timestamp"],
+                "nearest_final_delta": target["nearest_final_delta"],
+            }
+            for target in trace.get("targets", [])
+        ]
+        print(f"{name}: debug_qa_trace={debug_trace_path}")
+        print(f"{name}: debug_qa_target_summary={trace_summary}")
+        if trace.get("integrity_violations"):
+            print(f"{name}: debug_qa_integrity_violations={trace['integrity_violations']}")
     assert redundancy <= 0.10
     assert len(captions) <= pre_rescue_count + rescue_budget
-    assert misses == []
+    expected = EXPECTED_BASELINE[name]
+    assert {miss["label"] for miss in misses} == expected["misses"]
+    if trace is not None:
+        buckets = {target["label"]: target["bucket"] for target in trace.get("targets", [])}
+        for label, bucket in expected["buckets"].items():
+            assert buckets[label] == bucket

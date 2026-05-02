@@ -9,6 +9,8 @@ from typing import Any
 
 from PIL import Image, ImageStat
 
+from keyframe.pipeline.contracts import candidate_records
+
 
 def compute_dhash(image: Image.Image, hash_size: int = 8) -> int:
     """Compute a 64-bit difference hash from a center crop of an image."""
@@ -569,7 +571,7 @@ def retain_cluster_alternates(candidates: Sequence[Mapping[str, Any]]) -> list[d
             row["lineage_roles"] = sorted(set(_as_sorted_strings(row.get("lineage_roles"))) | {"alt"})
             retained.append(row)
 
-    return sorted(retained, key=lambda c: (float(c.get("timestamp", 0.0)), int(c.get("sample_idx", 0))))
+    return candidate_records(sorted(retained, key=lambda c: (float(c.get("timestamp", 0.0)), int(c.get("sample_idx", 0)))))
 
 
 def filter_low_information_candidates(
@@ -651,7 +653,7 @@ def filter_low_information_candidates(
         row["low_information_filter_reason"] = "visual_signal"
         survivors.append(row)
 
-    return survivors
+    return candidate_records(survivors)
 
 
 def adjacent_same_screen_dedupe(
@@ -704,7 +706,7 @@ def adjacent_same_screen_dedupe(
             previous["merge_reason"] = "ocr_jaccard"
             _merge_metadata(previous, row)
 
-    return sorted(survivors, key=lambda c: float(c.get("timestamp", 0.0)))
+    return candidate_records(sorted(survivors, key=lambda c: float(c.get("timestamp", 0.0))))
 
 
 def near_time_dedupe(
@@ -771,7 +773,7 @@ def near_time_dedupe(
             survivor["merge_reason"] = "ocr_or_dhash"
             _merge_metadata(survivor, row)
 
-    return sorted(survivors, key=lambda c: float(c.get("timestamp", 0.0)))
+    return candidate_records(sorted(survivors, key=lambda c: float(c.get("timestamp", 0.0))))
 
 
 def global_candidate_dedupe(
@@ -831,7 +833,7 @@ def global_candidate_dedupe(
             survivor["merge_reason"] = "ocr_or_dhash"
             _merge_metadata(survivor, row)
 
-    return sorted(survivors, key=lambda c: float(c.get("timestamp", 0.0)))
+    return candidate_records(sorted(survivors, key=lambda c: float(c.get("timestamp", 0.0))))
 
 
 def _density_asymmetry_veto(tokens_a: set[str], tokens_b: set[str]) -> bool:

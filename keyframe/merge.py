@@ -15,6 +15,7 @@ from keyframe.dedupe import (
     is_protected_candidate,
 )
 from keyframe.scoring import score_candidate_for_rep
+from keyframe.pipeline.contracts import candidate_records
 
 
 def jaccard_similarity(tokens_a: set[str], tokens_b: set[str]) -> float:
@@ -141,7 +142,7 @@ def union_find_merge(
     has_ocr: Sequence[bool],
     frames: Sequence[Any] | Mapping[int, Any],
     transcript_token_sets: Sequence[set[str]] | None = None,
-) -> list[dict[str, Any]]:
+) -> tuple[Any, ...]:
     """Merge candidate pairs with explicit vetoes and union-find components."""
     print("\n── Merging via deterministic union-find veto graph ──")
     n = len(candidates)
@@ -200,4 +201,4 @@ def union_find_merge(
         tag = "" if len(group_idxs) == 1 else f" (merged {len(group_idxs)} candidates)"
         print(f"  Group {cid}: kept {winner['timestamp']:.1f}s{tag}")
 
-    return sorted(final, key=lambda c: float(c.get("timestamp", 0.0)))
+    return candidate_records(sorted(final, key=lambda c: float(c.get("timestamp", 0.0))))

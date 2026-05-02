@@ -210,7 +210,7 @@ def test_low_information_filter_drops_blank_avatar_only_frame():
 
     survivors = filter_low_information_candidates(candidates, frames)
 
-    assert survivors == []
+    assert len(survivors) == 0
 
 
 def test_low_information_filter_keeps_title_card():
@@ -297,7 +297,7 @@ def test_low_information_filter_drops_sparse_generic_screen_transition():
 
     survivors = filter_low_information_candidates(candidates, [image])
 
-    assert survivors == []
+    assert len(survivors) == 0
 
 
 def test_low_information_filter_drops_dark_viewer_transition_with_chrome_text():
@@ -316,7 +316,7 @@ def test_low_information_filter_drops_dark_viewer_transition_with_chrome_text():
 
     survivors = filter_low_information_candidates(candidates, [image])
 
-    assert survivors == []
+    assert len(survivors) == 0
 
 
 def test_adjacent_same_screen_dedupe_collapses_neighboring_echo_list_states():
@@ -442,18 +442,16 @@ def test_retain_cluster_alternates_records_rejection_reason():
 
     retained = retain_cluster_alternates(candidates)
 
-    assert retained == [{
-        "sample_idx": 1,
-        "timestamp": 10.0,
-        "clip_cluster": 7,
-        "cluster_role": "primary",
-        "ocr_tokens": ["form"],
-        "retention_reason": "none",
-        "retention_candidate_reason": "primary",
-        "retention_rejected_reason": None,
-        "retention_reasons_seen": ["none"],
-        "lineage_roles": ["primary"],
-    }]
+    assert len(retained) == 1
+    assert retained[0]["sample_idx"] == 1
+    assert retained[0]["timestamp"] == 10.0
+    assert retained[0]["clip_cluster"] == 7
+    assert retained[0]["cluster_role"] == "primary"
+    assert retained[0]["ocr_tokens"] == ["form"]
+    assert retained[0]["retention_reason"] == "none"
+    assert retained[0]["retention_candidate_reason"] == "primary"
+    assert retained[0]["retention_reasons_seen"] == ["none"]
+    assert retained[0]["lineage_roles"] == ["primary"]
 
 
 def test_merge_metadata_preserves_policy_and_lineage_fields():

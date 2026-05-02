@@ -294,6 +294,7 @@ def test_ocr_candidates_skips_precached_ocr(monkeypatch):
     monkeypatch.setattr("keyframe.frames._ocr_apple_vision", lambda _img: (_ for _ in ()).throw(AssertionError("called")))
     candidates = [{"sample_idx": 0, "timestamp": 1.0, "ocr_text": "cached text"}]
 
-    texts = ocr_candidates(candidates, [Image.new("RGB", (8, 8), "white")])
+    texts, updated = ocr_candidates(candidates, [Image.new("RGB", (8, 8), "white")])
 
     assert texts == ["cached text"]
+    assert updated[0]["ocr_text"] == "cached text"

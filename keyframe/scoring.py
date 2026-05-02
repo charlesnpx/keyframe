@@ -16,6 +16,7 @@ from keyframe.dedupe import (
     has_meaningful_evidence_for_retention,
     hamming,
 )
+from keyframe.pipeline.contracts import as_candidate_record, candidate_records
 
 
 def coalesce_tiny_scenes(
@@ -588,7 +589,7 @@ def _as_promoted_rescue(
     reason: str,
     priority: int,
     next_cluster: int,
-) -> dict[str, Any]:
+) -> Any:
     row = dict(rescue)
     if primary is not None:
         row["clip_cluster"] = primary.get("clip_cluster", row.get("clip_cluster", next_cluster))
@@ -604,7 +605,7 @@ def _as_promoted_rescue(
     roles = set(row.get("lineage_roles", []))
     roles.add("rescue")
     row["lineage_roles"] = sorted(roles)
-    return row
+    return as_candidate_record(row)
 
 
 def promote_rescue_candidates(
@@ -614,11 +615,11 @@ def promote_rescue_candidates(
     *,
     rescue_budget: int,
     clip_embeddings: Any | None = None,
-) -> list[dict[str, Any]]:
+) -> tuple[Any, ...]:
     """Promote OCR-bearing rescue frames by bounded swap/additive rules."""
-    promoted = [dict(c) for c in candidates]
+    promoted = [as_candidate_record(c) for c in candidates]
     if rescue_budget <= 0 or not rescue_shortlist:
-        return sorted(promoted, key=lambda c: (float(c.get("timestamp", 0.0)), int(c.get("sample_idx", 0))))
+        return tuple(sorted(promoted, key=lambda c: (float(c.get("timestamp", 0.0)), int(c.get("sample_idx", 0)))))
 
     next_cluster = max((int(c.get("clip_cluster", -1)) for c in promoted if c.get("clip_cluster") is not None), default=-1) + 1
     used_idxs = {int(c["sample_idx"]) for c in promoted}
@@ -762,4 +763,4 @@ def promote_rescue_candidates(
         used_idxs.add(rescue_idx)
         consumed += 1
 
-    return sorted(promoted, key=lambda c: (float(c.get("timestamp", 0.0)), int(c.get("sample_idx", 0))))
+    return tuple(sorted(promoted, key=lambda c: (float(c.get("timestamp", 0.0)), int(c.get("sample_idx", 0)))))
