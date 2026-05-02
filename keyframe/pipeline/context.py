@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import time
 
 from keyframe.pipeline.config import KeyframeExtractionConfig
@@ -13,6 +13,7 @@ class RunContext:
     trace: TraceSink
     run_id: str
     started_at: float
+    metadata: dict[str, object] = field(default_factory=dict)
 
 
 def make_context(config: KeyframeExtractionConfig, trace: TraceSink) -> RunContext:

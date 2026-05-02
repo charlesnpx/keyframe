@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from PIL import Image
 
 from keyframe.dedupe import (
@@ -5,6 +7,7 @@ from keyframe.dedupe import (
     adjacent_same_screen_dedupe as _adjacent_same_screen_dedupe,
     clean_ocr_token_sets,
     canonical_markers,
+    content_area_duplicate_veto as _content_area_duplicate_veto,
     filter_low_information_candidates as _filter_low_information_candidates,
     global_candidate_dedupe as _global_candidate_dedupe,
     has_meaningful_evidence_for_retention,
@@ -13,7 +16,9 @@ from keyframe.dedupe import (
     near_time_dedupe as _near_time_dedupe,
     retain_cluster_alternates as _retain_cluster_alternates,
 )
+from keyframe.evidence import field_section_signatures, normalized_ocr_line_signatures
 from keyframe.pipeline.contracts import as_candidate_record
+from keyframe.visual import build_frame_metric_table
 
 
 def _project(records):
@@ -38,6 +43,11 @@ def adjacent_same_screen_dedupe(*args, **kwargs):
 
 def retain_cluster_alternates(*args, **kwargs):
     return _project(_retain_cluster_alternates(*args, **kwargs))
+
+
+def content_area_duplicate_veto(*args, **kwargs):
+    survivors, dropped = _content_area_duplicate_veto(*args, **kwargs)
+    return _project(survivors), dropped
 
 
 def test_half_second_ocr_neighbors_collapse():
@@ -181,8 +191,8 @@ def test_global_dedupe_blocks_density_asymmetry():
 
 def test_clean_ocr_token_sets_drops_chrome_and_keeps_status():
     cleaned = clean_ocr_token_sets([
-        {"echo", "figma", "approved", "page1", "component"},
-        {"echo", "figma", "draft", "page2", "component"},
+        {"browser", "figma", "approved", "page1", "component"},
+        {"chrome", "figma", "draft", "page2", "component"},
     ])
 
     assert cleaned == [
@@ -238,13 +248,29 @@ def test_low_information_filter_drops_blank_avatar_only_frame():
     assert len(survivors) == 0
 
 
-def test_low_information_filter_keeps_title_card():
+def test_low_information_filter_uses_cached_frame_metrics_without_frame_lookup():
+    candidates = [
+        {
+            "sample_idx": 0,
+            "timestamp": 35.99,
+            "caption": "black background with circular shape/photo",
+            "ocr_tokens": [],
+        }
+    ]
+    table = build_frame_metric_table([Image.new("RGB", (64, 64), "black")], [35.99], [0])
+
+    survivors = filter_low_information_candidates(candidates, [], frame_metrics=table)
+
+    assert len(survivors) == 0
+
+
+def test_low_information_filter_keeps_meeting_title_card():
     candidates = [
         {
             "sample_idx": 0,
             "timestamp": 1.0,
-            "caption": "ECHO TESTING meeting title",
-            "ocr_tokens": ["testing", "36381", "recorded"],
+            "caption": "recorded meeting title",
+            "ocr_tokens": ["testing", "session", "recorded"],
         }
     ]
     frames = [Image.new("RGB", (64, 64), "black")]
@@ -344,8 +370,8 @@ def test_low_information_filter_drops_dark_viewer_transition_with_chrome_text():
     assert len(survivors) == 0
 
 
-def test_adjacent_same_screen_dedupe_collapses_neighboring_echo_list_states():
-    shared = {"echo", "request", "case", "unit", "owner", "date", "list", "dashboard", "row", "team"}
+def test_adjacent_same_screen_dedupe_collapses_neighboring_list_states():
+    shared = {"request", "case", "unit", "owner", "date", "list", "dashboard", "row", "team", "queue"}
     candidates = [
         {
             "sample_idx": 1,
@@ -393,7 +419,7 @@ def test_adjacent_same_screen_dedupe_keeps_different_status_tokens():
 
 
 def test_adjacent_same_screen_dedupe_respects_time_window():
-    tokens = {"echo", "request", "case", "unit", "owner", "date", "list", "dashboard"}
+    tokens = {"request", "case", "unit", "owner", "date", "list", "dashboard"}
     candidates = [
         {"sample_idx": 1, "timestamp": 10.0, "ocr_tokens": sorted(tokens)},
         {"sample_idx": 2, "timestamp": 101.1, "ocr_tokens": sorted(tokens)},
@@ -402,6 +428,206 @@ def test_adjacent_same_screen_dedupe_respects_time_window():
     survivors = adjacent_same_screen_dedupe(candidates)
 
     assert [c["sample_idx"] for c in survivors] == [1, 2]
+
+
+def test_content_area_duplicate_veto_drops_cursor_jitter():
+    base = Image.new("RGB", (120, 80), "white")
+    jitter = base.copy()
+    jitter.putpixel((4, 4), (0, 0, 0))
+    candidates = [
+        {"sample_idx": 0, "timestamp": 10.0, "scene_id": 1, "dwell_id": 1, "ocr_tokens": ["page1", "form"]},
+        {"sample_idx": 1, "timestamp": 11.0, "scene_id": 1, "dwell_id": 1, "ocr_tokens": ["page1", "form"]},
+    ]
+
+    survivors, dropped = content_area_duplicate_veto(candidates, [base, jitter])
+
+    assert [row["sample_idx"] for row in survivors] == [0]
+    assert dropped[0]["reason"] == "near_identical_content_area"
+
+
+def test_content_area_duplicate_veto_uses_cached_content_metrics_without_frame_lookup():
+    image = Image.new("RGB", (120, 80), "white")
+    table = build_frame_metric_table([image, image.copy()], [10.0, 11.0], [0, 1])
+    candidates = [
+        {"sample_idx": 0, "timestamp": 10.0, "scene_id": 1, "dwell_id": 1, "ocr_tokens": ["page1", "form"]},
+        {"sample_idx": 1, "timestamp": 11.0, "scene_id": 1, "dwell_id": 1, "ocr_tokens": ["page1", "form"]},
+    ]
+
+    survivors, dropped = content_area_duplicate_veto(candidates, [], frame_metrics=table)
+
+    assert [row["sample_idx"] for row in survivors] == [0]
+    assert dropped[0]["mean_abs_content_delta"] == 0.0
+
+
+def test_content_area_duplicate_veto_preserves_form_state_delta():
+    image = Image.new("RGB", (120, 80), "white")
+    candidates = [
+        {"sample_idx": 0, "timestamp": 70.0, "scene_id": 1, "dwell_id": 1, "ocr_tokens": ["completed", "status", "date", "please", "selection"]},
+        {"sample_idx": 1, "timestamp": 80.0, "scene_id": 1, "dwell_id": 1, "ocr_tokens": ["completed", "status", "date", "24apr2026"]},
+    ]
+
+    survivors, dropped = content_area_duplicate_veto(candidates, [image, image.copy()])
+
+    assert [row["sample_idx"] for row in survivors] == [0, 1]
+    assert dropped == []
+
+
+def test_content_area_duplicate_veto_preserves_generic_status_signature_delta():
+    image = Image.new("RGB", (120, 80), "white")
+    candidates = [
+        {
+            "sample_idx": 0,
+            "timestamp": 70.0,
+            "scene_id": 1,
+            "dwell_id": 1,
+            "ocr_tokens": ["review", "record", "status"],
+            "field_signature": field_section_signatures("Status Draft"),
+        },
+        {
+            "sample_idx": 1,
+            "timestamp": 80.0,
+            "scene_id": 1,
+            "dwell_id": 1,
+            "ocr_tokens": ["review", "record", "status"],
+            "field_signature": field_section_signatures("Status Approved"),
+        },
+    ]
+
+    survivors, dropped = content_area_duplicate_veto(candidates, [image, image.copy()])
+
+    assert [row["sample_idx"] for row in survivors] == [0, 1]
+    assert dropped == []
+
+
+def test_content_area_duplicate_veto_preserves_generic_label_value_signature_delta():
+    image = Image.new("RGB", (120, 80), "white")
+    candidates = [
+        {
+            "sample_idx": 0,
+            "timestamp": 70.0,
+            "scene_id": 1,
+            "dwell_id": 1,
+            "ocr_tokens": ["control", "id", "record"],
+            "field_signature": field_section_signatures("Control ID: 12345"),
+        },
+        {
+            "sample_idx": 1,
+            "timestamp": 80.0,
+            "scene_id": 1,
+            "dwell_id": 1,
+            "ocr_tokens": ["control", "id", "record"],
+            "field_signature": field_section_signatures("Control ID: 67890"),
+        },
+    ]
+
+    survivors, dropped = content_area_duplicate_veto(candidates, [image, image.copy()])
+
+    assert [row["sample_idx"] for row in survivors] == [0, 1]
+    assert dropped == []
+
+
+def test_ocr_signatures_capture_page_marker_changes():
+    left_text = "Page 1"
+    right_text = "Page 2"
+
+    left_lines = normalized_ocr_line_signatures(left_text)
+    right_lines = normalized_ocr_line_signatures(right_text)
+    left_fields = field_section_signatures(left_text)
+    right_fields = field_section_signatures(right_text)
+
+    assert "page 1" in left_lines
+    assert "page:1" in left_fields
+    assert "page 2" in right_lines
+    assert "page:2" in right_fields
+
+
+def test_ocr_signatures_capture_date_value_appearing():
+    left_fields = field_section_signatures("Review Date")
+    right_fields = field_section_signatures("Review Date: 24APR2026")
+
+    assert "date:24apr2026" not in left_fields
+    assert "date:24apr2026" in right_fields
+    assert left_fields != right_fields
+
+
+def test_ocr_signatures_capture_status_marker_changes():
+    left_fields = field_section_signatures("Status Draft")
+    right_fields = field_section_signatures("Status Approved")
+
+    assert "status:draft" in left_fields
+    assert "status:approved" in right_fields
+    assert left_fields != right_fields
+
+
+def test_ocr_signatures_capture_generic_label_value_pair_changes():
+    left_fields = field_section_signatures("Control ID: 12345")
+    right_fields = field_section_signatures("Control ID: 67890")
+    left_labels = {sig for sig in left_fields if sig.startswith("label:")}
+    right_labels = {sig for sig in right_fields if sig.startswith("label:")}
+    left_values = {sig for sig in left_fields if sig.startswith("label-value:")}
+    right_values = {sig for sig in right_fields if sig.startswith("label-value:")}
+
+    assert left_labels
+    assert left_labels == right_labels
+    assert left_values
+    assert right_values
+    assert left_values != right_values
+
+
+def test_ocr_signatures_capture_heading_and_line_novelty_without_domain_terms():
+    left_text = "Release Checklist"
+    right_text = "Deployment Checklist"
+    left_lines = normalized_ocr_line_signatures(left_text)
+    right_lines = normalized_ocr_line_signatures(right_text)
+    left_fields = field_section_signatures(left_text)
+    right_fields = field_section_signatures(right_text)
+
+    assert left_lines == ("release checklist",)
+    assert right_lines == ("deployment checklist",)
+    assert any(sig.startswith("heading:") for sig in left_fields)
+    assert any(sig.startswith("heading:") for sig in right_fields)
+    assert left_fields != right_fields
+
+
+def test_ocr_signatures_capture_generic_reference_artifact_words():
+    fields = field_section_signatures("Source design reference")
+
+    assert {"reference:source", "reference:design", "reference:reference"} <= set(fields)
+
+
+def test_ocr_field_signatures_do_not_emit_fixture_domain_concepts():
+    fields = field_section_signatures(
+        "AMOT # Revision\nPriority Form\nRisk Justification\nOverride Justification\nSigned on Behalf"
+    )
+
+    joined = "\n".join(fields).casefold()
+    for banned in ("amot", "priority", "risk", "override", "signed", "behalf"):
+        assert banned not in joined
+
+
+def test_production_code_does_not_contain_fixture_domain_terms():
+    repo_root = Path(__file__).resolve().parents[2]
+    banned_terms = (
+        "amot",
+        "echo",
+        "echoteam",
+        "override justification",
+        "override_justification",
+        "priority form",
+        "priority_form",
+        "risk justification",
+        "risk_justification",
+        "signed on behalf",
+        "signed_on_behalf",
+    )
+    leaks = []
+    for path in sorted((repo_root / "keyframe").rglob("*.py")):
+        text = path.read_text(encoding="utf-8").casefold()
+        for term in banned_terms:
+            if term in text:
+                leaks.append(f"{path.relative_to(repo_root)}: {term}")
+
+    assert leaks == []
 
 
 def test_retain_cluster_alternates_keeps_differing_evidence():

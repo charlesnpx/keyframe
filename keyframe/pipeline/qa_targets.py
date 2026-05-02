@@ -19,6 +19,7 @@ DEFAULT_STAGE_ORDER = [
     "survival.after_global_dedupe",
     "survival.after_low_info_filter",
     "survival.after_adjacent_dedupe",
+    "survival.after_content_area_veto",
     "survival.final_pre_cap",
     "survival.final_post_cap",
 ]
@@ -34,6 +35,7 @@ FAMILY_STAGE_ORDER = {
         "survival.after_global_dedupe",
         "survival.after_low_info_filter",
         "survival.after_adjacent_dedupe",
+        "survival.after_content_area_veto",
         "survival.final_pre_cap",
         "survival.final_post_cap",
     ],
@@ -46,6 +48,7 @@ FAMILY_STAGE_ORDER = {
         "survival.after_global_dedupe",
         "survival.after_low_info_filter",
         "survival.after_adjacent_dedupe",
+        "survival.after_content_area_veto",
         "survival.final_pre_cap",
         "survival.final_post_cap",
     ],
@@ -60,6 +63,7 @@ FAMILY_STAGE_ORDER = {
         "survival.after_global_dedupe",
         "survival.after_low_info_filter",
         "survival.after_adjacent_dedupe",
+        "survival.after_content_area_veto",
         "survival.final_pre_cap",
         "survival.final_post_cap",
     ],
@@ -355,6 +359,7 @@ def _bucket(stage_membership: Mapping[str, Mapping[str, Any]]) -> str:
             "survival.after_global_dedupe",
             "survival.after_low_info_filter",
             "survival.after_adjacent_dedupe",
+            "survival.after_content_area_veto",
         )
     ):
         return "present_after_selection_but_removed_by_survival_policy"

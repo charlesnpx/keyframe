@@ -3,7 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from keyframe.visual import FrameMetricTable
 
 
 @dataclass
@@ -99,6 +102,8 @@ class CandidateEvidenceMetadata:
     ocr_tokens: tuple[str, ...] = ()
     dedupe_tokens: tuple[str, ...] = ()
     rescue_tokens: tuple[str, ...] = ()
+    ocr_line_signature: tuple[str, ...] = ()
+    field_signature: tuple[str, ...] = ()
     raw_token_count: int | None = None
     filtered_token_count: int | None = None
     cleaned_token_count: int | None = None
@@ -110,6 +115,9 @@ class CandidateSelectionMetadata:
     candidate_score: float | None = None
     score: float | None = None
     proxy_content_score: float | None = None
+    content_area_delta_score: float | None = None
+    content_area_previous_delta: float | None = None
+    content_area_next_delta: float | None = None
     proposal_lane: str | None = None
     end_of_dwell_bonus: float | None = None
     rescue_origin: str | None = None
@@ -307,6 +315,7 @@ class ProposalOutput:
     candidates: tuple[CandidateRecord, ...]
     rescue_shortlist: tuple[CandidateRecord, ...]
     proxy_rows: list[dict[str, Any]]
+    frame_metrics: FrameMetricTable | None
     rescue_budget: int
     rescue_ocr_cap: int
     temporal_window_count: int
