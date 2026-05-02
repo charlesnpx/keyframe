@@ -3,7 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from keyframe.visual import FrameMetricTable
 
 
 @dataclass
@@ -312,6 +315,7 @@ class ProposalOutput:
     candidates: tuple[CandidateRecord, ...]
     rescue_shortlist: tuple[CandidateRecord, ...]
     proxy_rows: list[dict[str, Any]]
+    frame_metrics: FrameMetricTable | None
     rescue_budget: int
     rescue_ocr_cap: int
     temporal_window_count: int

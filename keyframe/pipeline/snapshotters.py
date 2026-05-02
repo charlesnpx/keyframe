@@ -155,11 +155,13 @@ class SnapshotterRegistry:
         if isinstance(value, CandidateBatch):
             return snapshot_candidate_batch(stage, value)
         if isinstance(value, ProposalOutput):
+            frame_metrics = value.frame_metrics.summary() if value.frame_metrics is not None else None
             return {
                 "stage": stage,
                 "candidate_count": len(value.candidates),
                 "rescue_shortlist_count": len(value.rescue_shortlist),
                 "proxy_row_count": len(value.proxy_rows),
+                "frame_metrics": frame_metrics,
                 "rescue_budget": int(value.rescue_budget),
                 "rescue_ocr_cap": int(value.rescue_ocr_cap),
                 "temporal_window_count": int(value.temporal_window_count),

@@ -58,6 +58,7 @@ def _select_pass1_candidates(
     scenes,
     cluster_allocs,
     dhashes,
+    frame_metrics=None,
 ) -> tuple[tuple[CandidateRecord, ...], dict[int, int], dict[int, int]]:
     from keyframe.frames import clip_oversegment
     from keyframe.visual import laplacian_sharpness
@@ -80,8 +81,15 @@ def _select_pass1_candidates(
         scene_clusters = min(scene_clusters, len(scene_emb))
 
         if scene_clusters < 2 or len(scene_emb) < 2:
-            best = max(range(len(scene_frames)), key=lambda i: laplacian_sharpness(scene_frames[i]))
-            sharpness = laplacian_sharpness(scene_frames[best])
+            if frame_metrics is not None:
+                best = max(
+                    range(len(scene_frames)),
+                    key=lambda i: float(frame_metrics.sharpness[s_start + i]),
+                )
+                sharpness = float(frame_metrics.sharpness[s_start + best])
+            else:
+                best = max(range(len(scene_frames)), key=lambda i: laplacian_sharpness(scene_frames[i]))
+                sharpness = laplacian_sharpness(scene_frames[best])
             all_candidates.append({
                 "sample_idx": s_start + best,
                 "frame_idx": scene_fi[best],
@@ -235,11 +243,13 @@ class ProposalStage:
             build_rescue_shortlist,
             rescue_window_seconds,
         )
+        from keyframe.visual import build_frame_metric_table
 
         frames = sampling.frame_store.frames
         timestamps = sampling.samples.timestamps
         frame_indices = sampling.samples.frame_indices
         n_clusters = min(ctx.config.pass1_clusters, len(frames) // 2)
+        frame_metrics = build_frame_metric_table(frames, timestamps, frame_indices)
 
         candidates, sample_clusters, sample_scenes = _select_pass1_candidates(
             clip_emb=features.clip_embeddings,
@@ -249,6 +259,7 @@ class ProposalStage:
             scenes=temporal.scenes,
             cluster_allocs=temporal.cluster_allocs,
             dhashes=features.dhashes,
+            frame_metrics=frame_metrics,
         )
         temporal.sample_clusters = sample_clusters
         temporal.sample_scenes = sample_scenes
@@ -304,6 +315,7 @@ class ProposalStage:
             n_clusters,
             sample_clusters=sample_clusters,
             sample_scenes=sample_scenes,
+            frame_metrics=frame_metrics,
         )
         candidates = tuple(
             cand.with_selection(proxy_content_score=float(proxy_rows[int(cand.sample_idx)]["proxy_content_score"]))
@@ -338,6 +350,7 @@ class ProposalStage:
             temporal_window_count=temporal_window_count,
             scene_count=scene_count,
             legacy_proxy_dropped_count=legacy_proxy_dropped_count,
+            frame_metrics=frame_metrics,
         )
 
 
@@ -353,15 +366,19 @@ class RescueEvidenceStage:
             attach_rescue_ocr_metadata,
             ocr_candidates,
         )
-        from keyframe.visual import laplacian_sharpness
-
         shortlist = proposal.rescue_shortlist
         frames = sampling.frame_store.frames
         if not shortlist:
             print("  Rescue shortlist: 0 frames")
             return
         shortlist = tuple(
-            row.with_visual(sharpness=float(laplacian_sharpness(frames[int(row.sample_idx)])))
+            row.with_visual(
+                sharpness=(
+                    proposal.frame_metrics.sharpness_for(row.sample_idx)
+                    if proposal.frame_metrics is not None
+                    else row.visual.sharpness
+                )
+            )
             for row in shortlist
         )
         proposal.rescue_shortlist = shortlist
@@ -508,6 +525,7 @@ class SurvivalStage:
         sampling: SamplingOutput,
         features: FeatureOutput,
         ctx: RunContext,
+        frame_metrics=None,
     ) -> tuple[CandidateRecord, ...]:
         from keyframe.dedupe import (
             adjacent_same_screen_dedupe,
@@ -529,7 +547,7 @@ class SurvivalStage:
         print(f"  Global conservative dedupe: {len(deduped)} -> {len(globally_deduped)} candidates")
         ctx.trace.exit("survival.after_global_dedupe", _candidate_batch("survival.after_global_dedupe", globally_deduped))
 
-        filtered = filter_low_information_candidates(globally_deduped, frames)
+        filtered = filter_low_information_candidates(globally_deduped, frames, frame_metrics=frame_metrics)
         print(f"  Low-information filter: {len(globally_deduped)} -> {len(filtered)} candidates")
         ctx.trace.exit("survival.after_low_info_filter", _candidate_batch("survival.after_low_info_filter", filtered))
 
@@ -540,7 +558,7 @@ class SurvivalStage:
         deduped_token_sets = [set(c.evidence.ocr_tokens) for c in adjacent_deduped]
         deduped_has_ocr = [len(tokens) >= 3 for tokens in deduped_token_sets]
         final = union_find_merge(adjacent_deduped, deduped_token_sets, deduped_has_ocr, frames)
-        post_veto, dropped_duplicates = content_area_duplicate_veto(final, frames)
+        post_veto, dropped_duplicates = content_area_duplicate_veto(final, frames, frame_metrics=frame_metrics)
         print(f"  Content-area duplicate veto: {len(final)} -> {len(post_veto)} candidates")
         ctx.trace.exit(
             "survival.after_content_area_veto",
@@ -689,7 +707,6 @@ def extract_keyframes(
 ) -> KeyframeExtractionResult:
     """Run the shared key-frame extraction pipeline and write frame artifacts."""
     from keyframe.frames import ModelPreloader
-    from keyframe.visual import laplacian_sharpness
 
     cfg = config or KeyframeExtractionConfig()
     video_path = Path(video_path)
@@ -735,7 +752,11 @@ def extract_keyframes(
                 sharpness=(
                     cand.visual.sharpness
                     if cand.visual.sharpness is not None
-                    else float(laplacian_sharpness(sampling.frame_store.frames[cand.sample_idx]))
+                    else (
+                        proposal.frame_metrics.sharpness_for(cand.sample_idx)
+                        if proposal.frame_metrics is not None
+                        else None
+                    )
                 ),
             )
             for cand in candidates
@@ -743,7 +764,7 @@ def extract_keyframes(
 
         candidates = FinalEvidenceStage(preloader, device).run(candidates, sampling, ctx)
         retained = SelectionStage().run(candidates, ctx)
-        final = SurvivalStage().run(retained, sampling, features, ctx)
+        final = SurvivalStage().run(retained, sampling, features, ctx, frame_metrics=proposal.frame_metrics)
 
         artifacts = OutputStage().run(
             final,

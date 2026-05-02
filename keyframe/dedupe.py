@@ -10,7 +10,7 @@ from PIL import Image
 
 from keyframe.evidence import has_signature_delta
 from keyframe.pipeline.contracts import CandidateRecord, candidate_records
-from keyframe.visual import frame_for_index, mean_abs_content_delta, visual_information_score
+from keyframe.visual import FrameMetricTable, frame_for_index, mean_abs_content_delta, visual_information_score
 
 
 def compute_dhash(image: Image.Image, hash_size: int = 8) -> int:
@@ -66,8 +66,6 @@ CHROME_TOKENS = {
     "browser",
     "chrome",
     "dashboard",
-    "echo",
-    "echoteam",
     "figm",
     "figma",
     "file",
@@ -390,7 +388,6 @@ PROTECTIVE_CAPTION_SUBSTRINGS = {
     "dashboard",
     "dialog",
     "document",
-    "echo testing",
     "form",
     "modal",
     "page",
@@ -579,6 +576,7 @@ def filter_low_information_candidates(
     candidates: Sequence[Mapping[str, Any] | CandidateRecord],
     frames: Sequence[Any] | Mapping[int, Any],
     min_clean_tokens: int = 3,
+    frame_metrics: FrameMetricTable | None = None,
 ) -> tuple[CandidateRecord, ...]:
     """Drop blank/avatar-like selected frames only when text and pixels are weak."""
     survivors: list[CandidateRecord] = []
@@ -593,12 +591,13 @@ def filter_low_information_candidates(
         has_protective_caption = _has_protective_caption(row)
         has_strong_protective_caption = _has_strong_protective_caption(row)
 
-        image = _frame_for_candidate(row, frames)
-        if image is None:
-            survivors.append(row.with_selection(low_information_filter_reason="no_frame"))
-            continue
-
-        metrics = visual_information_score(image)
+        metrics = frame_metrics.visual_information_for(row.sample_idx) if frame_metrics is not None else None
+        if metrics is None:
+            image = _frame_for_candidate(row, frames)
+            if image is None:
+                survivors.append(row.with_selection(low_information_filter_reason="no_frame"))
+                continue
+            metrics = visual_information_score(image)
         generic_sparse_transition = (
             not has_evidence
             and _is_generic_screen_transition(row)
@@ -717,6 +716,7 @@ def content_area_duplicate_veto(
     *,
     max_mean_abs_delta: float = 2.5,
     ocr_jaccard_threshold: float = 0.90,
+    frame_metrics: FrameMetricTable | None = None,
 ) -> tuple[tuple[CandidateRecord, ...], list[dict[str, Any]]]:
     """Drop late neighboring visual duplicates when content evidence is unchanged."""
     rows = list(sorted(_records(candidates), key=lambda c: (float(c.timestamp), int(c.sample_idx))))
@@ -734,13 +734,14 @@ def content_area_duplicate_veto(
             survivors.append(row)
             continue
 
-        left_image = _frame_for_candidate(previous, frames)
-        right_image = _frame_for_candidate(row, frames)
-        if left_image is None or right_image is None:
-            survivors.append(row)
-            continue
-
-        delta = mean_abs_content_delta(left_image, right_image)
+        delta = frame_metrics.content_delta_between(previous.sample_idx, row.sample_idx) if frame_metrics is not None else None
+        if delta is None:
+            left_image = _frame_for_candidate(previous, frames)
+            right_image = _frame_for_candidate(row, frames)
+            if left_image is None or right_image is None:
+                survivors.append(row)
+                continue
+            delta = mean_abs_content_delta(left_image, right_image)
         if delta > max_mean_abs_delta:
             survivors.append(row)
             continue

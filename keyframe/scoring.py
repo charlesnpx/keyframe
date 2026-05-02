@@ -18,7 +18,7 @@ from keyframe.dedupe import (
     hamming,
 )
 from keyframe.pipeline.contracts import CandidateRecord, as_candidate_record, candidate_records
-from keyframe.visual import mean_abs_content_delta, proxy_frame_components
+from keyframe.visual import FrameMetricTable, build_frame_metric_table, mean_abs_content_delta
 
 
 def coalesce_tiny_scenes(
@@ -166,26 +166,9 @@ def _normalize(values: Sequence[float]) -> list[float]:
 
 def proxy_content_scores(frames: Sequence[Image.Image]) -> list[dict[str, float]]:
     """Compute normalized proxy content scores for every sampled frame."""
-    components = [proxy_frame_components(frame) for frame in frames]
-    norm_textline = _normalize([c["textline_score"] for c in components])
-    norm_edge = _normalize([c["edge_score"] for c in components])
-    norm_entropy = _normalize([c["entropy"] for c in components])
-
-    scored: list[dict[str, float]] = []
-    for comp, textline, edge, entropy in zip(components, norm_textline, norm_edge, norm_entropy):
-        blank_penalty = (
-            0.5 * max(0.0, comp["dark_ratio"] - 0.7)
-            + 0.5 * max(0.0, comp["bright_ratio"] - 0.7)
-        )
-        score = 0.45 * textline + 0.30 * edge + 0.25 * entropy - blank_penalty
-        row = dict(comp)
-        row["proxy_content_score"] = min(max(float(score), 0.0), 1.0)
-        row["normalized_textline_score"] = float(textline)
-        row["normalized_edge_score"] = float(edge)
-        row["normalized_entropy"] = float(entropy)
-        row["blank_penalty"] = float(blank_penalty)
-        scored.append(row)
-    return scored
+    sample_idxs = list(range(len(frames)))
+    table = build_frame_metric_table(frames, [float(idx) for idx in sample_idxs], sample_idxs)
+    return table.to_proxy_rows()
 
 
 def assign_dwell_ids(dhashes: Sequence[int] | Mapping[int, int], hamming_threshold: int = 6) -> list[int]:
@@ -255,11 +238,16 @@ def build_rescue_shortlist(
     *,
     sample_clusters: Mapping[int, int] | None = None,
     sample_scenes: Mapping[int, int] | None = None,
+    frame_metrics: FrameMetricTable | None = None,
 ) -> tuple[tuple[CandidateRecord, ...], list[dict[str, float]], int, int, int, int, int]:
     """Rank non-selected sampled frames for bounded OCR rescue."""
     candidates = _records(candidates)
-    proxy_rows = proxy_content_scores(frames)
+    proxy_rows = frame_metrics.to_proxy_rows() if frame_metrics is not None else proxy_content_scores(frames)
     candidate_idxs = {int(c.sample_idx) for c in candidates}
+    eligible_mask = np.ones((len(frames),), dtype=bool)
+    for idx in candidate_idxs:
+        if 0 <= idx < len(eligible_mask):
+            eligible_mask[idx] = False
     duration_seconds = max(timestamps) - min(timestamps) if timestamps else 0.0
     duration_floor = min(8, math.ceil(float(duration_seconds) / 90.0))
     rescue_budget = max(3, round(pass1_clusters * 0.35), duration_floor)
@@ -274,9 +262,12 @@ def build_rescue_shortlist(
         window_seconds=window_seconds,
     )
 
-    content_deltas = [0.0 for _ in frames]
-    for idx in range(1, len(frames)):
-        content_deltas[idx] = mean_abs_content_delta(frames[idx - 1], frames[idx])
+    if frame_metrics is not None:
+        content_deltas = [float(value) for value in frame_metrics.content_prev_delta]
+    else:
+        content_deltas = [0.0 for _ in frames]
+        for idx in range(1, len(frames)):
+            content_deltas[idx] = mean_abs_content_delta(frames[idx - 1], frames[idx])
 
     ranked: list[dict[str, Any]] = []
     for sample_idx, metrics in enumerate(proxy_rows):
@@ -285,9 +276,9 @@ def build_rescue_shortlist(
         metrics["content_area_delta_score"] = float(max(previous_delta, next_delta) / 255.0)
         metrics["content_area_previous_delta"] = float(previous_delta)
         metrics["content_area_next_delta"] = float(next_delta)
-        if sample_idx in candidate_idxs:
+        if not eligible_mask[sample_idx]:
             continue
-        ranked.append({
+        row = {
             "sample_idx": int(sample_idx),
             "frame_idx": int(frame_indices[sample_idx]),
             "timestamp": float(timestamps[sample_idx]),
@@ -300,7 +291,10 @@ def build_rescue_shortlist(
             "proxy_content_score": float(metrics["proxy_content_score"]),
             "content_area_delta_score": float(metrics["content_area_delta_score"]),
             "rescue_priority": 0,
-        })
+        }
+        if frame_metrics is not None and frame_metrics.has_sample(sample_idx):
+            row["sharpness"] = float(frame_metrics.sharpness[sample_idx])
+        ranked.append(row)
 
     ranked.sort(
         key=lambda row: (
@@ -359,7 +353,7 @@ def build_rescue_shortlist(
         rows_by_idx = {int(row["sample_idx"]): row for row in ranked}
         scored: list[tuple[float, dict[str, Any]]] = []
         for idx in range(1, len(frames) - 1):
-            if idx in candidate_idxs or idx not in rows_by_idx:
+            if not eligible_mask[idx] or idx not in rows_by_idx:
                 continue
             prev_delta = float(content_deltas[idx])
             next_delta = float(content_deltas[idx + 1])

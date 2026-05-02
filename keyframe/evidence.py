@@ -4,37 +4,39 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
+from hashlib import blake2b
 
 
 TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9._/-]*", re.IGNORECASE)
-DATE_VALUE_RE = re.compile(r"\b\d{1,2}[a-z]{3}\d{4}\b", re.IGNORECASE)
+DATE_VALUE_RE = re.compile(
+    r"\b(?:\d{1,2}[a-z]{3}\d{4}|\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4})\b",
+    re.IGNORECASE,
+)
 PAGE_LINE_RE = re.compile(r"\bpage\s*(\d+[a-z]?)\b", re.IGNORECASE)
+LABEL_VALUE_RE = re.compile(r"\s*[:=]\s*")
 
 STATUS_WORDS = {"approved", "approve", "complete", "completed", "draft", "pending", "rejected", "submitted"}
-SECTION_WORDS = {
-    "consequence",
-    "dependencies",
-    "comments",
-    "description",
-    "priority",
-    "justification",
-    "considerations",
-    "summary",
-    "changes",
+VALUE_WORDS = {"false", "na", "n/a", "no", "none", "true", "yes"} | STATUS_WORDS
+REFERENCE_WORDS = {
+    "attachment",
+    "artifact",
+    "design",
+    "doc",
+    "document",
+    "file",
+    "form",
+    "image",
+    "link",
+    "mockup",
+    "pdf",
+    "record",
+    "reference",
+    "report",
+    "screenshot",
+    "source",
+    "spreadsheet",
+    "url",
 }
-FIELD_PHRASES = {
-    "amot revision": ("field:amot_revision", ("amot", "revision")),
-    "amot revision date": ("field:amot_revision_date", ("amot", "revision", "date")),
-    "approved date": ("field:approved_date", ("approved", "date")),
-    "cover page revision": ("field:cover_page_revision", ("cover", "page", "revision")),
-    "override justification": ("section:override_justification", ("override", "justification")),
-    "priority form": ("section:priority_form", ("priority", "form")),
-    "risk justification": ("section:risk_justification", ("risk", "justification")),
-    "signed on behalf": ("field:signed_on_behalf", ("signed", "behalf")),
-    "source": ("reference:source", ("source",)),
-    "status date": ("field:status_date", ("status", "date")),
-}
-REFERENCE_WORDS = {"design", "figma", "mockup", "pdf", "reference", "source"}
 
 
 def normalize_ocr_tokens(text: str) -> tuple[str, ...]:
@@ -58,6 +60,58 @@ def normalized_ocr_line_signatures(text: str, *, max_lines: int = 80) -> tuple[s
     return tuple(dict.fromkeys(signatures))
 
 
+def _stable_signature(prefix: str, tokens: Iterable[str]) -> str:
+    digest_input = " ".join(tokens).encode("utf-8", errors="ignore")
+    digest = blake2b(digest_input, digest_size=5).hexdigest()
+    return f"{prefix}:{digest}"
+
+
+def _looks_like_value_token(token: str) -> bool:
+    return (
+        token in VALUE_WORDS
+        or any(ch.isdigit() for ch in token)
+        or DATE_VALUE_RE.fullmatch(token) is not None
+    )
+
+
+def _value_signature(token: str) -> str:
+    if token in STATUS_WORDS:
+        return f"status:{token}"
+    if DATE_VALUE_RE.fullmatch(token):
+        return f"date:{token}"
+    if token.startswith("page") and len(token) > 4:
+        return f"page:{token[4:]}"
+    return _stable_signature("value", (token,))
+
+
+def _add_label_value_signatures(signatures: set[str], label_tokens: tuple[str, ...], value_tokens: tuple[str, ...]) -> None:
+    if not label_tokens or not value_tokens:
+        return
+    label_signature = _stable_signature("label", label_tokens[:8])
+    value_signatures = tuple(_value_signature(token) for token in value_tokens if _looks_like_value_token(token))
+    if not value_signatures:
+        return
+    signatures.add(label_signature)
+    for value in value_signatures[:4]:
+        signatures.add(f"label-value:{label_signature.removeprefix('label:')}:{value}")
+
+
+def _is_heading_like_line(raw_line: str, tokens: tuple[str, ...]) -> bool:
+    if not 1 <= len(tokens) <= 8:
+        return False
+    if any(_looks_like_value_token(token) for token in tokens):
+        return False
+    stripped = raw_line.strip()
+    if len(stripped) > 80 or LABEL_VALUE_RE.search(stripped):
+        return False
+    letters = [ch for ch in stripped if ch.isalpha()]
+    if not letters:
+        return False
+    uppercase_ratio = sum(1 for ch in letters if ch.isupper()) / len(letters)
+    title_tokens = sum(1 for part in stripped.split() if part[:1].isupper())
+    return uppercase_ratio >= 0.6 or title_tokens >= max(1, len(tokens) - 1)
+
+
 def field_section_signatures(text: str, tokens: Iterable[str] = ()) -> tuple[str, ...]:
     haystack = " ".join([str(text or "").casefold(), " ".join(str(t).casefold() for t in tokens)])
     token_set = set(normalize_ocr_tokens(haystack))
@@ -74,13 +128,31 @@ def field_section_signatures(text: str, tokens: Iterable[str] = ()) -> tuple[str
             signatures.add(f"page:{token[4:]}")
         if token.startswith("section") and len(token) > 7:
             signatures.add(f"section:{token[7:]}")
-    for name, (_label, phrase_tokens) in FIELD_PHRASES.items():
-        if all(part in token_set for part in phrase_tokens):
-            signatures.add(FIELD_PHRASES[name][0])
-    for word in sorted(token_set & SECTION_WORDS):
-        signatures.add(f"section-token:{word}")
     for word in sorted(token_set & REFERENCE_WORDS):
         signatures.add(f"reference:{word}")
+
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        line_tokens = normalize_ocr_tokens(line)
+        if not line_tokens:
+            continue
+
+        parts = LABEL_VALUE_RE.split(line, maxsplit=1)
+        if len(parts) == 2:
+            _add_label_value_signatures(
+                signatures,
+                normalize_ocr_tokens(parts[0]),
+                normalize_ocr_tokens(parts[1]),
+            )
+            continue
+
+        if len(line_tokens) >= 2 and _looks_like_value_token(line_tokens[-1]):
+            _add_label_value_signatures(signatures, line_tokens[:-1], line_tokens[-1:])
+            continue
+
+        if _is_heading_like_line(line, line_tokens):
+            signatures.add(_stable_signature("heading", line_tokens[:8]))
+
     return tuple(sorted(signatures))
 
 

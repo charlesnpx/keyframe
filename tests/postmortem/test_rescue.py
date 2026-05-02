@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 from PIL import Image
 import json
 
@@ -11,6 +12,7 @@ from keyframe.scoring import (
     proxy_content_scores,
     rescue_promotion_preflight_report,
 )
+from keyframe.visual import FrameMetricTable, build_frame_metric_table
 
 
 def _project(records):
@@ -69,6 +71,48 @@ def _preflight(base, shortlist, current, dwell_ids, budget, embeddings=None):
     )
 
 
+def _metric_table(scores, *, timestamps=None, prev_deltas=None, textline_scores=None):
+    n = len(scores)
+    scores = np.asarray(scores, dtype=np.float32)
+    timestamps = np.asarray(timestamps if timestamps is not None else [float(i) for i in range(n)], dtype=np.float64)
+    prev = np.asarray(prev_deltas if prev_deltas is not None else [0.0] * n, dtype=np.float32)
+    next_delta = np.zeros((n,), dtype=np.float32)
+    if n > 1:
+        next_delta[:-1] = prev[1:]
+    textline = np.asarray(textline_scores if textline_scores is not None else scores, dtype=np.float32)
+    zeros = np.zeros((n,), dtype=np.float32)
+    content_stack = np.zeros((n, 90, 160), dtype=np.float32)
+    for idx, value in enumerate(np.cumsum(prev)):
+        content_stack[idx, :, :] = float(value % 255.0)
+    return FrameMetricTable(
+        sample_idx=np.arange(n, dtype=np.int64),
+        frame_idx=np.arange(n, dtype=np.int64),
+        timestamp=timestamps,
+        textline_score=textline,
+        edge_score=scores,
+        entropy=scores,
+        dark_ratio=zeros.copy(),
+        bright_ratio=zeros.copy(),
+        normalized_textline_score=textline,
+        normalized_edge_score=scores,
+        normalized_entropy=scores,
+        blank_penalty=zeros.copy(),
+        proxy_content_score=scores,
+        content_prev_delta=prev,
+        content_next_delta=next_delta,
+        content_area_delta_score=np.maximum(prev, next_delta) / 255.0,
+        visual_stddev=np.full((n,), 32.0, dtype=np.float32),
+        visual_edge_score=np.full((n,), 32.0, dtype=np.float32),
+        visual_dark_ratio=zeros.copy(),
+        visual_bright_ratio=zeros.copy(),
+        visual_entropy=np.full((n,), 3.0, dtype=np.float32),
+        visual_unique_buckets=np.full((n,), 8.0, dtype=np.float32),
+        sharpness=np.linspace(10.0, 10.0 + n, n, dtype=np.float32),
+        full_gray_stack=np.zeros((n, 90, 160), dtype=np.float32),
+        content_gray_stack=content_stack,
+    )
+
+
 def test_proxy_content_scores_clamp_and_no_variance_normalizes_to_zero():
     frames = [Image.new("RGB", (32, 32), "white"), Image.new("RGB", (32, 32), "white")]
 
@@ -78,27 +122,51 @@ def test_proxy_content_scores_clamp_and_no_variance_normalizes_to_zero():
     assert all(0.0 <= row["proxy_content_score"] <= 1.0 for row in scores)
 
 
+def test_frame_metric_table_flat_frames_normalize_without_divide_by_zero():
+    frames = [Image.new("RGB", (32, 32), "white"), Image.new("RGB", (32, 32), "black")]
+
+    table = build_frame_metric_table(frames, [0.0, 1.0], [0, 1])
+
+    assert table.sample_count == 2
+    assert np.isfinite(table.proxy_content_score).all()
+    assert np.isfinite(table.normalized_textline_score).all()
+    assert all(0.0 <= float(score) <= 1.0 for score in table.proxy_content_score)
+
+
+def test_frame_metric_table_proxy_rows_match_adapter():
+    frames = [
+        Image.new("RGB", (64, 64), "white"),
+        Image.new("RGB", (64, 64), "black"),
+        Image.effect_noise((64, 64), 40).convert("RGB"),
+    ]
+
+    table_rows = build_frame_metric_table(frames, [0.0, 1.0, 2.0], [0, 1, 2]).to_proxy_rows()
+    adapter_rows = proxy_content_scores(frames)
+
+    for table_row, adapter_row in zip(table_rows, adapter_rows):
+        assert table_row["proxy_content_score"] == pytest.approx(adapter_row["proxy_content_score"], abs=1e-6)
+        assert table_row["edge_score"] == pytest.approx(adapter_row["edge_score"], abs=1e-6)
+
+
+def test_frame_metric_table_adjacent_deltas_and_cached_metrics_by_sample_idx():
+    frames = [Image.new("RGB", (40, 40), "white"), Image.new("RGB", (40, 40), "black")]
+
+    table = build_frame_metric_table(frames, [0.0, 1.0], [10, 20])
+
+    assert table.content_prev_delta[1] > 200.0
+    assert table.content_next_delta[0] > 200.0
+    assert table.visual_information_for(1)["dark_ratio"] > 0.95
+    assert table.sharpness_for(0) is not None
+
+
 def test_assign_dwell_ids_groups_adjacent_similar_hashes():
     assert assign_dwell_ids([0b0000, 0b0001, 0b1111], hamming_threshold=1) == [0, 0, 1]
 
 
-def test_rescue_shortlist_backfills_when_proxy_scores_are_flat(monkeypatch):
-    monkeypatch.setattr(
-        "keyframe.scoring.proxy_content_scores",
-        lambda frames: [
-            {
-                "proxy_content_score": 0.0,
-                "textline_score": 0.0,
-                "edge_score": 0.0,
-                "entropy": 0.0,
-                "dark_ratio": 0.0,
-                "bright_ratio": 1.0,
-            }
-            for _ in frames
-        ],
-    )
+def test_rescue_shortlist_backfills_when_proxy_scores_are_flat():
     frames = [Image.new("RGB", (8, 8), "white") for _ in range(8)]
     candidates = [{"sample_idx": 0, "timestamp": 0.0, "scene_id": 0}]
+    frame_metrics = _metric_table([0.0] * 8)
 
     shortlist, _proxy_rows, budget = build_rescue_shortlist(
         frames,
@@ -107,6 +175,7 @@ def test_rescue_shortlist_backfills_when_proxy_scores_are_flat(monkeypatch):
         candidates,
         pass1_clusters=3,
         sample_scenes={i: 0 for i in range(8)},
+        frame_metrics=frame_metrics,
     )
 
     assert budget == 3
@@ -114,27 +183,14 @@ def test_rescue_shortlist_backfills_when_proxy_scores_are_flat(monkeypatch):
     assert 0 not in {row["sample_idx"] for row in shortlist}
 
 
-def test_rescue_shortlist_includes_per_scene_coverage(monkeypatch):
+def test_rescue_shortlist_includes_per_scene_coverage():
     scores = [0.99, 0.98, 0.97, 0.96, 0.10, 0.09]
-    monkeypatch.setattr(
-        "keyframe.scoring.proxy_content_scores",
-        lambda frames: [
-            {
-                "proxy_content_score": score,
-                "textline_score": score,
-                "edge_score": score,
-                "entropy": score,
-                "dark_ratio": 0.0,
-                "bright_ratio": 0.0,
-            }
-            for score in scores
-        ],
-    )
     frames = [Image.new("RGB", (8, 8), "white") for _ in scores]
     candidates = [
         {"sample_idx": 0, "timestamp": 0.0, "scene_id": 0},
         {"sample_idx": 5, "timestamp": 5.0, "scene_id": 1},
     ]
+    frame_metrics = _metric_table(scores)
 
     shortlist, _proxy_rows, _budget = build_rescue_shortlist(
         frames,
@@ -143,28 +199,16 @@ def test_rescue_shortlist_includes_per_scene_coverage(monkeypatch):
         candidates,
         pass1_clusters=3,
         sample_scenes={0: 0, 1: 0, 2: 0, 3: 0, 4: 1, 5: 1},
+        frame_metrics=frame_metrics,
     )
 
     assert 4 in {row["sample_idx"] for row in shortlist}
 
 
-def test_rescue_budget_duration_floor_is_bounded(monkeypatch):
-    monkeypatch.setattr(
-        "keyframe.scoring.proxy_content_scores",
-        lambda frames: [
-            {
-                "proxy_content_score": 0.5,
-                "textline_score": 0.5,
-                "edge_score": 0.5,
-                "entropy": 0.5,
-                "dark_ratio": 0.0,
-                "bright_ratio": 0.0,
-            }
-            for _ in frames
-        ],
-    )
+def test_rescue_budget_duration_floor_is_bounded():
     frames = [Image.new("RGB", (8, 8), "white") for _ in range(12)]
     timestamps = [float(i * 90) for i in range(12)]
+    frame_metrics = _metric_table([0.5] * 12, timestamps=timestamps)
 
     _shortlist, _proxy_rows, budget = build_rescue_shortlist(
         frames,
@@ -173,27 +217,15 @@ def test_rescue_budget_duration_floor_is_bounded(monkeypatch):
         [{"sample_idx": 0, "timestamp": 0.0, "scene_id": 0}],
         pass1_clusters=3,
         sample_scenes={i: i // 3 for i in range(12)},
+        frame_metrics=frame_metrics,
     )
 
     assert budget == 8
 
 
-def test_rescue_ocr_cap_scales_with_temporal_windows_not_only_output_budget(monkeypatch):
-    monkeypatch.setattr(
-        "keyframe.scoring.proxy_content_scores",
-        lambda frames: [
-            {
-                "proxy_content_score": 0.5,
-                "textline_score": 0.5,
-                "edge_score": 0.5,
-                "entropy": 0.5,
-                "dark_ratio": 0.0,
-                "bright_ratio": 0.0,
-            }
-            for _ in frames
-        ],
-    )
+def test_rescue_ocr_cap_scales_with_temporal_windows_not_only_output_budget():
     frames = [Image.new("RGB", (8, 8), "white") for _ in range(50)]
+    frame_metrics = _metric_table([0.5] * 50)
 
     _shortlist, _proxy_rows, budget, ocr_cap, window_count, scene_count, _dropped = build_rescue_shortlist_with_metadata(
         frames,
@@ -202,6 +234,7 @@ def test_rescue_ocr_cap_scales_with_temporal_windows_not_only_output_budget(monk
         [{"sample_idx": 0, "timestamp": 0.0, "scene_id": 0}],
         pass1_clusters=3,
         sample_scenes={i: 0 for i in range(50)},
+        frame_metrics=frame_metrics,
     )
 
     assert budget == 3
@@ -210,23 +243,10 @@ def test_rescue_ocr_cap_scales_with_temporal_windows_not_only_output_budget(monk
     assert ocr_cap == 40
 
 
-def test_coverage_shortlist_is_monotonic_with_legacy_proxy_shortlist(monkeypatch):
+def test_coverage_shortlist_is_monotonic_with_legacy_proxy_shortlist():
     scores = [0.99] * 20 + [0.10] * 20 + [0.01] * 5
-    monkeypatch.setattr(
-        "keyframe.scoring.proxy_content_scores",
-        lambda frames: [
-            {
-                "proxy_content_score": score,
-                "textline_score": score,
-                "edge_score": score,
-                "entropy": score,
-                "dark_ratio": 0.0,
-                "bright_ratio": 0.0,
-            }
-            for score in scores
-        ],
-    )
     frames = [Image.new("RGB", (8, 8), "white") for _ in scores]
+    frame_metrics = _metric_table(scores)
 
     shortlist, _proxy_rows, budget, ocr_cap, window_count, _scene_count, dropped = build_rescue_shortlist_with_metadata(
         frames,
@@ -235,6 +255,7 @@ def test_coverage_shortlist_is_monotonic_with_legacy_proxy_shortlist(monkeypatch
         [{"sample_idx": 0, "timestamp": 0.0, "scene_id": 0}],
         pass1_clusters=3,
         sample_scenes={i: 0 for i in range(len(scores))},
+        frame_metrics=frame_metrics,
     )
 
     assert budget == 3
@@ -248,23 +269,10 @@ def test_coverage_shortlist_is_monotonic_with_legacy_proxy_shortlist(monkeypatch
     assert {lane_by_idx[idx] for idx in (1, 2, 3)} == {"legacy_proxy"}
 
 
-def test_global_high_proxy_frames_do_not_starve_later_windows(monkeypatch):
+def test_global_high_proxy_frames_do_not_starve_later_windows():
     scores = [0.99] * 60 + [0.01] * 20
-    monkeypatch.setattr(
-        "keyframe.scoring.proxy_content_scores",
-        lambda frames: [
-            {
-                "proxy_content_score": score,
-                "textline_score": score,
-                "edge_score": score,
-                "entropy": score,
-                "dark_ratio": 0.0,
-                "bright_ratio": 0.0,
-            }
-            for score in scores
-        ],
-    )
     frames = [Image.new("RGB", (8, 8), "white") for _ in scores]
+    frame_metrics = _metric_table(scores)
 
     shortlist, _proxy_rows, _budget, ocr_cap, window_count, _scene_count, dropped = build_rescue_shortlist_with_metadata(
         frames,
@@ -273,6 +281,7 @@ def test_global_high_proxy_frames_do_not_starve_later_windows(monkeypatch):
         [{"sample_idx": 0, "timestamp": 0.0, "scene_id": 0}],
         pass1_clusters=3,
         sample_scenes={i: 0 for i in range(len(scores))},
+        frame_metrics=frame_metrics,
     )
 
     assert ocr_cap == 40
@@ -281,22 +290,9 @@ def test_global_high_proxy_frames_do_not_starve_later_windows(monkeypatch):
     assert dropped == 0
 
 
-def test_rescue_candidate_records_proposal_lane_metadata(monkeypatch):
-    monkeypatch.setattr(
-        "keyframe.scoring.proxy_content_scores",
-        lambda frames: [
-            {
-                "proxy_content_score": 0.5,
-                "textline_score": 0.5,
-                "edge_score": 0.5,
-                "entropy": 0.5,
-                "dark_ratio": 0.0,
-                "bright_ratio": 0.0,
-            }
-            for _ in frames
-        ],
-    )
+def test_rescue_candidate_records_proposal_lane_metadata():
     frames = [Image.new("RGB", (8, 8), "white") for _ in range(30)]
+    frame_metrics = _metric_table([0.5] * 30)
 
     shortlist, *_ = build_rescue_shortlist_with_metadata(
         frames,
@@ -305,29 +301,17 @@ def test_rescue_candidate_records_proposal_lane_metadata(monkeypatch):
         [{"sample_idx": 0, "timestamp": 0.0, "scene_id": 0}],
         pass1_clusters=3,
         sample_scenes={i: 0 for i in range(30)},
+        frame_metrics=frame_metrics,
     )
 
     assert all(row.get("proposal_lane") for row in shortlist)
 
 
-def test_content_area_delta_lane_proposes_settled_transition_frame(monkeypatch):
-    monkeypatch.setattr(
-        "keyframe.scoring.proxy_content_scores",
-        lambda frames: [
-            {
-                "proxy_content_score": 0.1,
-                "textline_score": 0.1,
-                "edge_score": 0.1,
-                "entropy": 0.1,
-                "dark_ratio": 0.0,
-                "bright_ratio": 0.0,
-            }
-            for _ in frames
-        ],
-    )
+def test_content_area_delta_lane_proposes_settled_transition_frame():
     frames = [Image.new("RGB", (40, 40), "white") for _ in range(8)]
     for idx in range(3, 8):
         frames[idx] = Image.new("RGB", (40, 40), "black")
+    frame_metrics = _metric_table([0.1] * 8, prev_deltas=[0.0, 0.0, 0.0, 255.0, 0.0, 0.0, 0.0, 0.0])
 
     shortlist, *_ = build_rescue_shortlist_with_metadata(
         frames,
@@ -336,30 +320,19 @@ def test_content_area_delta_lane_proposes_settled_transition_frame(monkeypatch):
         [{"sample_idx": 0, "timestamp": 0.0, "scene_id": 0}],
         pass1_clusters=3,
         sample_scenes={i: 0 for i in range(len(frames))},
+        frame_metrics=frame_metrics,
     )
 
     lane_by_idx = {row["sample_idx"]: row["proposal_lane"] for row in shortlist}
     assert lane_by_idx[3] == "content_area_delta"
 
 
-def test_rescue_shortlist_order_is_deterministic_when_scores_tie(monkeypatch):
-    monkeypatch.setattr(
-        "keyframe.scoring.proxy_content_scores",
-        lambda frames: [
-            {
-                "proxy_content_score": 0.5,
-                "textline_score": 0.5,
-                "edge_score": 0.5,
-                "entropy": 0.5,
-                "dark_ratio": 0.0,
-                "bright_ratio": 0.0,
-            }
-            for _ in frames
-        ],
-    )
+def test_rescue_shortlist_order_is_deterministic_when_scores_tie():
     frames = [Image.new("RGB", (8, 8), "white") for _ in range(45)]
+    frame_metrics = _metric_table([0.5] * 45)
     kwargs = {
         "sample_scenes": {i: 0 for i in range(45)},
+        "frame_metrics": frame_metrics,
     }
 
     first, *_ = build_rescue_shortlist_with_metadata(
