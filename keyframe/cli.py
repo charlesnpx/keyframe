@@ -167,179 +167,30 @@ def cmd_extract(args):
         print("KEY FRAME EXTRACTION")
         print("=" * 60)
 
-        from keyframe.frames import (
-            sample_frames, CLIPEncoder, ModelPreloader, clip_oversegment,
-            caption_candidates, ocr_candidates, _filter_ocr_tokens,
-            _build_hybrid_captions, _build_ocr_token_sets,
-            attach_ocr_token_attribution, save_results, detect_scenes, _laplacian_sharpness,
-        )
-        from keyframe.dedupe import (
-            adjacent_same_screen_dedupe,
-            clean_ocr_token_sets,
-            compute_dhash,
-            filter_low_information_candidates,
-            global_candidate_dedupe,
-            near_time_dedupe,
-            retain_cluster_alternates,
-        )
-        from keyframe.manifest import write_manifest
-        from keyframe.merge import union_find_merge
-        from keyframe.scoring import (
-            allocate_clusters_by_novelty,
-            candidate_budget_for_scenes,
-            coalesce_tiny_scenes,
-        )
-        import torch
-
-        if args.similarity_threshold != 0.85:
-            print(
-                "Warning: --similarity-threshold is deprecated and currently ignored; "
-                "deterministic merge vetoes are used instead.",
-                file=sys.stderr,
-            )
-
-        if torch.cuda.is_available():
-            device = "cuda"
-        elif torch.backends.mps.is_available():
-            device = "mps"
-        else:
-            device = "cpu"
-
         frames_dir = out_dir / "frames"
+        from keyframe.pipeline import KeyframeExtractionConfig, extract_keyframes
 
-        # Start loading all models in parallel while we sample frames
-        preloader = ModelPreloader(device=device, need_florence=True, need_ocr=True)
-
-        frames, timestamps, frame_indices = sample_frames(
-            str(video), args.sample_interval
+        result = extract_keyframes(
+            video,
+            frames_dir,
+            KeyframeExtractionConfig(
+                sample_interval=args.sample_interval,
+                pass1_clusters=args.pass1_clusters,
+                similarity_threshold=args.similarity_threshold,
+                verbose_trace=bool(getattr(args, "verbose_trace", False)),
+                debug_qa_targets_path=(
+                    Path(args.debug_qa_targets)
+                    if getattr(args, "debug_qa_targets", None)
+                    else None
+                ),
+            ),
         )
-        dhashes = [compute_dhash(frame) for frame in frames]
-
-        clip = CLIPEncoder(device=device, preloaded=preloader.get_clip())
-        clip_emb = clip.embed_images(frames)
-        print(f"  Embedded {len(frames)} frames -> {clip_emb.shape}")
-        # CLIP image encoder is no longer needed after over-segmentation.
-        clip.cleanup()
-        del clip
-        preloader.release_clip()
-
-        # Scene detection → per-scene clustering
-        n_clusters = min(args.pass1_clusters, len(frames) // 2)
-        scenes = detect_scenes(str(video), timestamps)
-        scenes, scene_coalescence = coalesce_tiny_scenes(
-            scenes, timestamps, dhashes, return_trace=True
-        )
-        if scene_coalescence["coalesced_scene_count"] != scene_coalescence["original_scene_count"]:
-            print(
-                "  Coalesced scenes: "
-                f"{scene_coalescence['original_scene_count']} -> {scene_coalescence['coalesced_scene_count']}"
-            )
-        cluster_budget = candidate_budget_for_scenes(n_clusters, len(scenes))
-        cluster_allocs = allocate_clusters_by_novelty(scenes, cluster_budget, dhashes, floor=1)
-        print(f"  Cluster allocation budget: {sum(cluster_allocs)} candidates")
-
-        all_candidates = []
-        cluster_offset = 0
-        for (s_start, s_end), scene_clusters in zip(scenes, cluster_allocs):
-            if scene_clusters <= 0:
-                continue
-            scene_emb = clip_emb[s_start:s_end + 1]
-            scene_ts = timestamps[s_start:s_end + 1]
-            scene_fi = frame_indices[s_start:s_end + 1]
-            scene_frames = frames[s_start:s_end + 1]
-            scene_clusters = min(scene_clusters, len(scene_emb))
-
-            if scene_clusters < 2 or len(scene_emb) < 2:
-                best = max(range(len(scene_frames)),
-                           key=lambda i: _laplacian_sharpness(scene_frames[i]))
-                sharpness = _laplacian_sharpness(scene_frames[best])
-                all_candidates.append({
-                    "sample_idx": s_start + best,
-                    "frame_idx": scene_fi[best],
-                    "timestamp": scene_ts[best],
-                    "clip_cluster": cluster_offset,
-                    "clip_cluster_size": len(scene_emb),
-                    "sharpness": float(sharpness),
-                    "cluster_role": "single",
-                })
-                cluster_offset += 1
-                continue
-
-            scene_cands = clip_oversegment(
-                scene_emb, scene_ts, scene_fi, scene_clusters, scene_frames,
-                dhashes=dhashes[s_start:s_end + 1],
-                max_reps_per_cluster=2,
-            )
-            for c in scene_cands:
-                c["sample_idx"] = s_start + c["sample_idx"]
-                c["clip_cluster"] += cluster_offset
-            cluster_offset += scene_clusters
-            all_candidates.extend(scene_cands)
-
-        candidates = sorted(all_candidates, key=lambda c: c["timestamp"])
-        for cand in candidates:
-            cand["dhash"] = dhashes[cand["sample_idx"]]
-            cand["dhash_hex"] = f"{dhashes[cand['sample_idx']]:016x}"
-
-        florence_captions = caption_candidates(
-            candidates, frames, device=device, preloaded=preloader.get_florence()
-        )
-        # Florence is not needed past pass 2; free it before OCR loads.
-        preloader.release_florence()
-
-        ocr_texts = ocr_candidates(
-            candidates, frames, preloaded_engine=preloader.get_ocr_engine()
-        )
-        preloader.release_ocr_engine()
-
-        filtered_ocr = _filter_ocr_tokens(ocr_texts)
-        florence_caps, ocr_caps, has_ocr = _build_hybrid_captions(
-            filtered_ocr, florence_captions, candidates
-        )
-        ocr_token_sets = _build_ocr_token_sets(filtered_ocr)
-        ocr_token_sets = clean_ocr_token_sets(ocr_token_sets)
-        attach_ocr_token_attribution(candidates, ocr_texts, filtered_ocr, ocr_token_sets)
-
-        retained = retain_cluster_alternates(candidates)
-        print(f"  Cluster alternate retention: {len(candidates)} -> {len(retained)} candidates")
-
-        deduped = near_time_dedupe(retained, [set(c.get("ocr_tokens", [])) for c in retained], dhashes)
-        print(f"  Near-time dedupe: {len(retained)} -> {len(deduped)} candidates")
-        deduped_token_sets = [set(c.get("ocr_tokens", [])) for c in deduped]
-        globally_deduped = global_candidate_dedupe(deduped, deduped_token_sets, dhashes)
-        print(f"  Global conservative dedupe: {len(deduped)} -> {len(globally_deduped)} candidates")
-        filtered = filter_low_information_candidates(globally_deduped, frames)
-        print(f"  Low-information filter: {len(globally_deduped)} -> {len(filtered)} candidates")
-        adjacent_deduped = adjacent_same_screen_dedupe(filtered)
-        print(f"  Adjacent same-screen dedupe: {len(filtered)} -> {len(adjacent_deduped)} candidates")
-        deduped_token_sets = [set(c.get("ocr_tokens", [])) for c in adjacent_deduped]
-        deduped_has_ocr = [len(tokens) >= 3 for tokens in deduped_token_sets]
-        final = union_find_merge(adjacent_deduped, deduped_token_sets, deduped_has_ocr, frames)
-
-        # Keep only the PIL images we still need to write to disk, then drop
-        # the full sampled-frames list before Whisper loads.
-        selected_imgs = {c["sample_idx"]: frames[c["sample_idx"]] for c in final}
-        del frames, clip_emb, candidates, retained, deduped, globally_deduped, filtered, adjacent_deduped
-
-        save_results(final, selected_imgs, str(frames_dir))
-        manifest_metadata = {"scene_coalescence": scene_coalescence}
-        write_manifest(final, frames_dir, metadata=manifest_metadata)
-        manifest_frames = final
+        manifest_frames = result.final
         manifest_dir = frames_dir
-        manifest_run_metadata = manifest_metadata
+        manifest_run_metadata = result.manifest_metadata
 
-        print(f"\n  {len(final)} key frames")
+        print(f"\n  {result.final_frame_count} key frames")
         print(f"  Saved to: {frames_dir.resolve()}")
-
-        del selected_imgs
-        preloader.shutdown()
-        del preloader
-        import gc
-        gc.collect()
-        if device == "mps":
-            torch.mps.empty_cache()
-        elif device == "cuda":
-            torch.cuda.empty_cache()
 
     # ── Transcript ──────────────────────────────────────────────────────
     if do_transcript:
@@ -432,6 +283,10 @@ def _add_extract_args(parser):
                         help="Number of CLIP clusters in pass 1 (default: 15)")
     parser.add_argument("--similarity-threshold", "-t", type=float, default=0.85,
                         help="Deprecated no-op; deterministic merge vetoes are used")
+    parser.add_argument("--verbose-trace", action="store_true",
+                        help="Write structured pipeline trace snapshots for debugging")
+    parser.add_argument("--debug-qa-targets", default=None,
+                        help="Internal QA debug: JSON target windows to trace through extraction stages")
     parser.add_argument("--whisper-model", "-w", default="medium",
                         choices=["tiny", "base", "small", "medium", "large"],
                         help="Whisper model size (default: medium)")

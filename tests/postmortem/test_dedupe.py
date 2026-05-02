@@ -1,14 +1,43 @@
 from PIL import Image
 
 from keyframe.dedupe import (
-    _merge_metadata,
-    adjacent_same_screen_dedupe,
+    _is_retained_evidence_candidate,
+    adjacent_same_screen_dedupe as _adjacent_same_screen_dedupe,
     clean_ocr_token_sets,
-    filter_low_information_candidates,
-    global_candidate_dedupe,
-    near_time_dedupe,
-    retain_cluster_alternates,
+    canonical_markers,
+    filter_low_information_candidates as _filter_low_information_candidates,
+    global_candidate_dedupe as _global_candidate_dedupe,
+    has_meaningful_evidence_for_retention,
+    is_protected_candidate,
+    merge_candidate_lineage,
+    near_time_dedupe as _near_time_dedupe,
+    retain_cluster_alternates as _retain_cluster_alternates,
 )
+from keyframe.pipeline.contracts import as_candidate_record
+
+
+def _project(records):
+    return [record.to_dict() for record in records]
+
+
+def near_time_dedupe(*args, **kwargs):
+    return _project(_near_time_dedupe(*args, **kwargs))
+
+
+def global_candidate_dedupe(*args, **kwargs):
+    return _project(_global_candidate_dedupe(*args, **kwargs))
+
+
+def filter_low_information_candidates(*args, **kwargs):
+    return _project(_filter_low_information_candidates(*args, **kwargs))
+
+
+def adjacent_same_screen_dedupe(*args, **kwargs):
+    return _project(_adjacent_same_screen_dedupe(*args, **kwargs))
+
+
+def retain_cluster_alternates(*args, **kwargs):
+    return _project(_retain_cluster_alternates(*args, **kwargs))
 
 
 def test_half_second_ocr_neighbors_collapse():
@@ -176,6 +205,23 @@ def test_clean_ocr_token_sets_keeps_common_content_tokens():
     assert all("shared" in tokens for tokens in cleaned)
 
 
+def test_canonical_markers_page_word_and_joined_page_match():
+    assert canonical_markers({"page", "2"})["page"] == {"page2"}
+    assert canonical_markers({"page2"})["page"] == {"page2"}
+
+
+def test_canonical_markers_bare_numeric_is_not_page_without_page_word():
+    assert canonical_markers({"2", "invoice"})["page"] == set()
+
+
+def test_meaningful_evidence_retention_rules():
+    assert has_meaningful_evidence_for_retention({"draft"}, {"approved"})
+    assert has_meaningful_evidence_for_retention(set(), {"page1"})
+    assert has_meaningful_evidence_for_retention({"page1", "option1"}, {"page2", "option2"})
+    assert not has_meaningful_evidence_for_retention({"page1", "form"}, {"page2", "form"})
+    assert has_meaningful_evidence_for_retention({"page1", "form"}, {"page2", "form"}, visual_delta=0.2)
+
+
 def test_low_information_filter_drops_blank_avatar_only_frame():
     candidates = [
         {
@@ -189,7 +235,7 @@ def test_low_information_filter_drops_blank_avatar_only_frame():
 
     survivors = filter_low_information_candidates(candidates, frames)
 
-    assert survivors == []
+    assert len(survivors) == 0
 
 
 def test_low_information_filter_keeps_title_card():
@@ -242,6 +288,24 @@ def test_low_information_filter_keeps_protected_retained_evidence_frame():
     assert survivors[0]["low_information_filter_reason"] == "protected_retained_evidence"
 
 
+def test_low_information_filter_keeps_rescue_origin_as_protected():
+    candidates = [
+        {
+            "sample_idx": 0,
+            "timestamp": 12.0,
+            "caption": "document shown in a software interface",
+            "ocr_tokens": ["page1"],
+            "rescue_origin": "additive_rescue",
+        }
+    ]
+    frames = [Image.new("RGB", (64, 64), "white")]
+
+    survivors = filter_low_information_candidates(candidates, frames, min_clean_tokens=3)
+
+    assert [c["sample_idx"] for c in survivors] == [0]
+    assert _is_retained_evidence_candidate(survivors[0])
+
+
 def test_low_information_filter_drops_sparse_generic_screen_transition():
     candidates = [
         {
@@ -258,7 +322,7 @@ def test_low_information_filter_drops_sparse_generic_screen_transition():
 
     survivors = filter_low_information_candidates(candidates, [image])
 
-    assert survivors == []
+    assert len(survivors) == 0
 
 
 def test_low_information_filter_drops_dark_viewer_transition_with_chrome_text():
@@ -277,7 +341,7 @@ def test_low_information_filter_drops_dark_viewer_transition_with_chrome_text():
 
     survivors = filter_low_information_candidates(candidates, [image])
 
-    assert survivors == []
+    assert len(survivors) == 0
 
 
 def test_adjacent_same_screen_dedupe_collapses_neighboring_echo_list_states():
@@ -362,6 +426,7 @@ def test_retain_cluster_alternates_keeps_evidence_asymmetry():
 
     assert [c["sample_idx"] for c in retained] == [1, 2]
     assert retained[1]["retention_reason"] == "evidence_asymmetry"
+    assert retained[1]["retention_candidate_reason"] in {"meaningful_evidence_delta", "raw_evidence_asymmetry"}
 
 
 def test_retain_cluster_alternates_keeps_protective_caption_asymmetry():
@@ -394,6 +459,26 @@ def test_retain_cluster_alternates_drops_alt_without_asymmetry():
     assert [c["sample_idx"] for c in retained] == [1]
 
 
+def test_retain_cluster_alternates_records_rejection_reason():
+    candidates = [
+        {"sample_idx": 1, "timestamp": 10.0, "clip_cluster": 7, "cluster_role": "primary", "ocr_tokens": ["form"]},
+        {"sample_idx": 2, "timestamp": 11.0, "clip_cluster": 7, "cluster_role": "alt", "ocr_tokens": ["form"]},
+    ]
+
+    retained = retain_cluster_alternates(candidates)
+
+    assert len(retained) == 1
+    assert retained[0]["sample_idx"] == 1
+    assert retained[0]["timestamp"] == 10.0
+    assert retained[0]["clip_cluster"] == 7
+    assert retained[0]["cluster_role"] == "primary"
+    assert retained[0]["ocr_tokens"] == ["form"]
+    assert retained[0]["retention_reason"] == "none"
+    assert retained[0]["retention_candidate_reason"] == "primary"
+    assert retained[0]["retention_reasons_seen"] == ["none"]
+    assert retained[0]["lineage_roles"] == ["primary"]
+
+
 def test_merge_metadata_preserves_policy_and_lineage_fields():
     winner = {
         "sample_idx": 1,
@@ -410,8 +495,40 @@ def test_merge_metadata_preserves_policy_and_lineage_fields():
         "lineage_roles": ["alt"],
     }
 
-    _merge_metadata(winner, loser)
+    winner = merge_candidate_lineage(
+        as_candidate_record(winner),
+        as_candidate_record(loser),
+        stage="test",
+        reason="component",
+    ).to_dict()
 
     assert winner["retention_reason"] == "evidence_asymmetry"
     assert winner["retention_reasons_seen"] == ["evidence_asymmetry", "protective_caption_asymmetry"]
     assert winner["lineage_roles"] == ["alt", "primary"]
+
+
+def test_merge_metadata_preserves_rescue_policy_fields():
+    winner = {"sample_idx": 1, "timestamp": 10.0, "cluster_role": "primary"}
+    loser = {
+        "sample_idx": 2,
+        "timestamp": 11.0,
+        "cluster_role": "rescue",
+        "rescue_origin": "additive_rescue",
+        "rescue_reason": "evidence_marker",
+        "rescue_priority": 2,
+        "lineage_roles": ["rescue"],
+    }
+
+    winner = merge_candidate_lineage(
+        as_candidate_record(winner),
+        as_candidate_record(loser),
+        stage="test",
+        reason="component",
+    ).to_dict()
+
+    assert is_protected_candidate(winner)
+    assert winner["rescue_origin"] == "additive_rescue"
+    assert winner["rescue_reason"] == "evidence_marker"
+    assert winner["rescue_origins_seen"] == ["additive_rescue"]
+    assert winner["rescue_priorities_seen"] == [2]
+    assert winner["lineage_roles"] == ["primary", "rescue"]

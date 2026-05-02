@@ -1,6 +1,10 @@
 from PIL import Image
 
-from keyframe.merge import union_find_merge
+from keyframe.merge import union_find_merge as _union_find_merge
+
+
+def union_find_merge(*args, **kwargs):
+    return [record.to_dict() for record in _union_find_merge(*args, **kwargs)]
 
 
 def _candidate(sample_idx, timestamp, score=1.0):
