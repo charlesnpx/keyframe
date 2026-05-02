@@ -12,6 +12,7 @@ from keyframe.dedupe import (
     has_differing_evidence,
     has_evidence_asymmetry,
     has_protective_caption_asymmetry,
+    is_protected_candidate,
 )
 from keyframe.scoring import score_candidate_for_rep
 
@@ -90,10 +91,7 @@ def _should_merge(
         jac = jaccard_similarity(tokens_a, tokens_b)
         if has_differing_evidence(tokens_a, tokens_b):
             return False, "ocr-evidence"
-        protected = (
-            str(cand_a.get("retention_reason", "none") or "none") != "none"
-            or str(cand_b.get("retention_reason", "none") or "none") != "none"
-        )
+        protected = is_protected_candidate(cand_a) or is_protected_candidate(cand_b)
         threshold = 0.9 if protected else 0.75
         if protected and has_evidence_asymmetry(tokens_a, tokens_b):
             return False, "ocr-evidence-asymmetry"
@@ -129,10 +127,7 @@ def _component_evidence_compatible(
             tokens_j = set(ocr_token_sets[j])
             if has_differing_evidence(tokens_i, tokens_j):
                 return False
-            protected = (
-                str(candidates[i].get("retention_reason", "none") or "none") != "none"
-                or str(candidates[j].get("retention_reason", "none") or "none") != "none"
-            )
+            protected = is_protected_candidate(candidates[i]) or is_protected_candidate(candidates[j])
             if protected and has_evidence_asymmetry(tokens_i, tokens_j):
                 return False
             if protected and has_protective_caption_asymmetry(candidates[i], candidates[j]):

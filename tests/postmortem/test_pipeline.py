@@ -70,6 +70,11 @@ def test_outputs_include_additive_attribution_fields(tmp_path):
         "cluster_role": "alt",
         "retention_reason": "evidence_asymmetry",
         "retention_reasons_seen": ["evidence_asymmetry"],
+        "retention_candidate_reason": "meaningful_evidence_delta",
+        "retention_rejected_reason": None,
+        "rescue_origin": "additive_rescue",
+        "proxy_content_score": 0.72,
+        "rescue_priority": 1,
         "lineage_roles": ["primary", "alt"],
         "ocr_text": "Page 1 Approved",
         "ocr_tokens": ["page1", "approved"],
@@ -96,6 +101,11 @@ def test_outputs_include_additive_attribution_fields(tmp_path):
         assert payload["cluster_role"] == "alt"
         assert payload["retention_reason"] == "evidence_asymmetry"
         assert payload["retention_reasons_seen"] == ["evidence_asymmetry"]
+        assert payload["retention_candidate_reason"] == "meaningful_evidence_delta"
+        assert payload["retention_rejected_reason"] is None
+        assert payload["rescue_origin"] == "additive_rescue"
+        assert payload["proxy_content_score"] == 0.72
+        assert payload["rescue_priority"] == 1
         assert payload["lineage_roles"] == ["primary", "alt"]
         assert payload["raw_token_count"] == 3
         assert payload["filtered_token_count"] == 3

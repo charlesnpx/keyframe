@@ -74,6 +74,9 @@ STATUS_TOKENS = {
     "submitted",
 }
 MARKER_RE = re.compile(r"^(page|option|section|step|status|revision)?\d+[a-z]?$")
+PAGE_RE = re.compile(r"^page(\d+[a-z]?)?$")
+OPTION_RE = re.compile(r"^option(\d+[a-z]?)?$")
+SECTION_RE = re.compile(r"^section(\d+[a-z]?)?$")
 UUIDISH_RE = re.compile(r"^[0-9a-f]{6,}([0-9a-f-]{4,})?$")
 
 
@@ -124,6 +127,33 @@ def evidence_markers(tokens: set[str]) -> dict[str, set[str]]:
     }
 
 
+def canonical_markers(tokens: set[str]) -> dict[str, set[str]]:
+    """Return normalized evidence markers for retention/rescue ranking only."""
+    page: set[str] = set()
+    option: set[str] = set()
+    section: set[str] = set()
+    status = set(tokens) & STATUS_TOKENS
+
+    has_page_word = "page" in tokens
+    for token in tokens:
+        if token != "page" and PAGE_RE.match(token):
+            page.add(token)
+        elif has_page_word and token.isdigit():
+            page.add(f"page{token}")
+
+        if token != "option" and OPTION_RE.match(token):
+            option.add(token)
+        if token != "section" and SECTION_RE.match(token):
+            section.add(token)
+
+    return {
+        "page": page,
+        "option": option,
+        "section": section,
+        "status": status,
+    }
+
+
 def has_differing_evidence(tokens_a: set[str], tokens_b: set[str]) -> bool:
     markers_a = evidence_markers(tokens_a)
     markers_b = evidence_markers(tokens_b)
@@ -141,6 +171,59 @@ def has_evidence_markers(tokens: set[str]) -> bool:
 
 def has_evidence_asymmetry(tokens_a: set[str], tokens_b: set[str]) -> bool:
     return has_evidence_markers(tokens_a) != has_evidence_markers(tokens_b)
+
+
+def _canonical_marker_category_delta(markers_a: dict[str, set[str]], markers_b: dict[str, set[str]], key: str) -> bool:
+    return markers_a[key] != markers_b[key]
+
+
+def has_meaningful_evidence_for_retention(
+    tokens_a: set[str],
+    tokens_b: set[str],
+    *,
+    visual_delta: float | None = None,
+    text_density_delta: float | None = None,
+) -> bool:
+    """Precision-oriented evidence comparison for retention/rescue ranking.
+
+    This intentionally does not replace ``has_differing_evidence``. Merge vetoes
+    stay raw and conservative; this helper only decides whether extra frames are
+    worth retaining or rescuing.
+    """
+    markers_a = canonical_markers(tokens_a)
+    markers_b = canonical_markers(tokens_b)
+
+    if _canonical_marker_category_delta(markers_a, markers_b, "status"):
+        return True
+
+    category_presence_flips = [
+        key
+        for key in ("page", "option", "section", "status")
+        if bool(markers_a[key]) != bool(markers_b[key])
+    ]
+    if category_presence_flips:
+        return True
+
+    changed_categories = [
+        key
+        for key in ("page", "option", "section", "status")
+        if markers_a[key] and markers_b[key] and markers_a[key] != markers_b[key]
+    ]
+    if len(changed_categories) >= 2:
+        return True
+
+    visual_delta = 0.0 if visual_delta is None else abs(float(visual_delta))
+    text_density_delta = 0.0 if text_density_delta is None else abs(float(text_density_delta))
+    has_supplied_delta = visual_delta >= 0.15 or text_density_delta >= 0.25
+
+    for key in ("page", "option", "section"):
+        if key not in changed_categories:
+            continue
+        token_delta = len(set(tokens_a) ^ set(tokens_b))
+        if token_delta >= 3 or has_supplied_delta:
+            return True
+
+    return False
 
 
 def _hash_for(candidate: Mapping[str, Any], dhashes: Mapping[int, int] | Sequence[int] | None) -> int | None:
@@ -195,6 +278,14 @@ def _as_sorted_strings(values: Any) -> list[str]:
         return [str(values)]
 
 
+def is_protected_candidate(candidate: Mapping[str, Any]) -> bool:
+    """Return whether dedupe/merge stages should handle a candidate conservatively."""
+    return (
+        str(candidate.get("retention_reason", "none") or "none") != "none"
+        or bool(candidate.get("rescue_origin"))
+    )
+
+
 def _merge_metadata(winner: dict[str, Any], loser: Mapping[str, Any]) -> None:
     winner.setdefault("merged_from_sample_idxs", [winner["sample_idx"]])
     winner.setdefault("merged_timestamps", [winner["timestamp"]])
@@ -211,6 +302,27 @@ def _merge_metadata(winner: dict[str, Any], loser: Mapping[str, Any]) -> None:
     winner_reason = str(winner.get("retention_reason", "none") or "none")
     loser_reason = str(loser.get("retention_reason", "none") or "none")
     winner["retention_reason"] = _strictest_retention_reason(winner_reason, loser_reason)
+
+    rescue_origins_seen = set(_as_sorted_strings(winner.get("rescue_origins_seen")))
+    rescue_origins_seen.update(_as_sorted_strings(loser.get("rescue_origins_seen")))
+    if winner.get("rescue_origin"):
+        rescue_origins_seen.add(str(winner["rescue_origin"]))
+    if loser.get("rescue_origin"):
+        rescue_origins_seen.add(str(loser["rescue_origin"]))
+    if not winner.get("rescue_origin") and loser.get("rescue_origin"):
+        winner["rescue_origin"] = loser.get("rescue_origin")
+        winner["rescue_reason"] = loser.get("rescue_reason")
+    if rescue_origins_seen:
+        winner["rescue_origins_seen"] = sorted(rescue_origins_seen)
+
+    rescue_priorities_seen = set(_as_sorted_strings(winner.get("rescue_priorities_seen")))
+    rescue_priorities_seen.update(_as_sorted_strings(loser.get("rescue_priorities_seen")))
+    if winner.get("rescue_priority") is not None:
+        rescue_priorities_seen.add(str(winner["rescue_priority"]))
+    if loser.get("rescue_priority") is not None:
+        rescue_priorities_seen.add(str(loser["rescue_priority"]))
+    if rescue_priorities_seen:
+        winner["rescue_priorities_seen"] = sorted(rescue_priorities_seen)
 
     reasons_seen = set(_as_sorted_strings(winner.get("retention_reasons_seen")))
     reasons_seen.update(_as_sorted_strings(loser.get("retention_reasons_seen")))
@@ -351,7 +463,7 @@ def _has_evidence_markers(tokens: set[str]) -> bool:
 
 
 def _is_retained_evidence_candidate(candidate: Mapping[str, Any]) -> bool:
-    return str(candidate.get("retention_reason", "none") or "none") != "none"
+    return is_protected_candidate(candidate)
 
 
 def _ocr_merge_threshold(
@@ -409,6 +521,8 @@ def retain_cluster_alternates(candidates: Sequence[Mapping[str, Any]]) -> list[d
 
         primary_tokens = set(primary.get("ocr_tokens", []))
         primary["retention_reason"] = str(primary.get("retention_reason", "none") or "none")
+        primary.setdefault("retention_candidate_reason", "primary")
+        primary.setdefault("retention_rejected_reason", None)
         primary["retention_reasons_seen"] = sorted(set(_as_sorted_strings(primary.get("retention_reasons_seen"))) | {primary["retention_reason"]})
         if primary.get("cluster_role"):
             primary["lineage_roles"] = sorted(set(_as_sorted_strings(primary.get("lineage_roles"))) | {str(primary["cluster_role"])})
@@ -418,6 +532,8 @@ def retain_cluster_alternates(candidates: Sequence[Mapping[str, Any]]) -> list[d
             if row is primary or role == "single" or role not in {"alt"}:
                 if row is not primary:
                     row["retention_reason"] = str(row.get("retention_reason", "none") or "none")
+                    row.setdefault("retention_candidate_reason", "single_or_non_alt")
+                    row.setdefault("retention_rejected_reason", None)
                     row["retention_reasons_seen"] = sorted(set(_as_sorted_strings(row.get("retention_reasons_seen"))) | {row["retention_reason"]})
                     if row.get("cluster_role"):
                         row["lineage_roles"] = sorted(set(_as_sorted_strings(row.get("lineage_roles"))) | {str(row["cluster_role"])})
@@ -427,18 +543,28 @@ def retain_cluster_alternates(candidates: Sequence[Mapping[str, Any]]) -> list[d
             alt_tokens = set(row.get("ocr_tokens", []))
             if has_differing_evidence(primary_tokens, alt_tokens):
                 reason = "differing_evidence"
+                candidate_reason = "raw_differing_evidence"
+            elif has_meaningful_evidence_for_retention(primary_tokens, alt_tokens):
+                reason = "evidence_asymmetry"
+                candidate_reason = "meaningful_evidence_delta"
             elif has_evidence_markers(alt_tokens) and not has_evidence_markers(primary_tokens):
                 reason = "evidence_asymmetry"
+                candidate_reason = "raw_evidence_asymmetry"
             elif has_strong_protective_caption(row) and not has_strong_protective_caption(primary):
                 reason = "protective_caption_asymmetry"
+                candidate_reason = "protective_caption_asymmetry"
             else:
                 row["retention_reason"] = "none"
+                row["retention_candidate_reason"] = "no_meaningful_evidence_delta"
+                row["retention_rejected_reason"] = "dropped_no_asymmetry"
                 row["retention_reasons_seen"] = sorted(set(_as_sorted_strings(row.get("retention_reasons_seen"))) | {"none"})
                 row["dedupe_stage"] = "retain_cluster_alternates"
                 row["merge_reason"] = "dropped_no_asymmetry"
                 continue
 
             row["retention_reason"] = reason
+            row["retention_candidate_reason"] = candidate_reason
+            row["retention_rejected_reason"] = None
             row["retention_reasons_seen"] = sorted(set(_as_sorted_strings(row.get("retention_reasons_seen"))) | {reason})
             row["lineage_roles"] = sorted(set(_as_sorted_strings(row.get("lineage_roles"))) | {"alt"})
             retained.append(row)

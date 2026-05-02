@@ -171,7 +171,8 @@ def cmd_extract(args):
             sample_frames, CLIPEncoder, ModelPreloader, clip_oversegment,
             caption_candidates, ocr_candidates, _filter_ocr_tokens,
             _build_hybrid_captions, _build_ocr_token_sets,
-            attach_ocr_token_attribution, save_results, detect_scenes, _laplacian_sharpness,
+            attach_ocr_token_attribution, rescue_from_sampled_frames,
+            save_results, detect_scenes, _laplacian_sharpness,
         )
         from keyframe.dedupe import (
             adjacent_same_screen_dedupe,
@@ -239,8 +240,12 @@ def cmd_extract(args):
         print(f"  Cluster allocation budget: {sum(cluster_allocs)} candidates")
 
         all_candidates = []
+        sample_clusters = {}
+        sample_scenes = {}
         cluster_offset = 0
-        for (s_start, s_end), scene_clusters in zip(scenes, cluster_allocs):
+        for scene_id, ((s_start, s_end), scene_clusters) in enumerate(zip(scenes, cluster_allocs)):
+            for sample_idx in range(s_start, s_end + 1):
+                sample_scenes[sample_idx] = scene_id
             if scene_clusters <= 0:
                 continue
             scene_emb = clip_emb[s_start:s_end + 1]
@@ -261,18 +266,25 @@ def cmd_extract(args):
                     "clip_cluster_size": len(scene_emb),
                     "sharpness": float(sharpness),
                     "cluster_role": "single",
+                    "scene_id": scene_id,
                 })
+                for sample_idx in range(s_start, s_end + 1):
+                    sample_clusters[sample_idx] = cluster_offset
                 cluster_offset += 1
                 continue
 
-            scene_cands = clip_oversegment(
+            scene_cands, scene_labels = clip_oversegment(
                 scene_emb, scene_ts, scene_fi, scene_clusters, scene_frames,
                 dhashes=dhashes[s_start:s_end + 1],
                 max_reps_per_cluster=2,
+                return_labels=True,
             )
+            for local_idx, label in enumerate(scene_labels):
+                sample_clusters[s_start + local_idx] = cluster_offset + int(label)
             for c in scene_cands:
                 c["sample_idx"] = s_start + c["sample_idx"]
                 c["clip_cluster"] += cluster_offset
+                c["scene_id"] = scene_id
             cluster_offset += scene_clusters
             all_candidates.extend(scene_cands)
 
@@ -280,6 +292,27 @@ def cmd_extract(args):
         for cand in candidates:
             cand["dhash"] = dhashes[cand["sample_idx"]]
             cand["dhash_hex"] = f"{dhashes[cand['sample_idx']]:016x}"
+
+        pre_rescue_candidate_count = len(candidates)
+        rescue_budget = max(3, round(n_clusters * 0.35))
+        candidates = rescue_from_sampled_frames(
+            candidates,
+            frames,
+            timestamps,
+            frame_indices,
+            dhashes,
+            clip_emb,
+            n_clusters,
+            sample_clusters=sample_clusters,
+            sample_scenes=sample_scenes,
+            preloaded_engine=preloader.get_ocr_engine(),
+        )
+        for cand in candidates:
+            if "dhash" not in cand:
+                cand["dhash"] = dhashes[cand["sample_idx"]]
+                cand["dhash_hex"] = f"{dhashes[cand['sample_idx']]:016x}"
+            if "sharpness" not in cand:
+                cand["sharpness"] = float(_laplacian_sharpness(frames[cand["sample_idx"]]))
 
         florence_captions = caption_candidates(
             candidates, frames, device=device, preloaded=preloader.get_florence()
@@ -322,7 +355,13 @@ def cmd_extract(args):
         del frames, clip_emb, candidates, retained, deduped, globally_deduped, filtered, adjacent_deduped
 
         save_results(final, selected_imgs, str(frames_dir))
-        manifest_metadata = {"scene_coalescence": scene_coalescence}
+        manifest_metadata = {
+            "scene_coalescence": scene_coalescence,
+            "rescue": {
+                "pre_rescue_candidate_count": pre_rescue_candidate_count,
+                "rescue_budget": rescue_budget,
+            },
+        }
         write_manifest(final, frames_dir, metadata=manifest_metadata)
         manifest_frames = final
         manifest_dir = frames_dir
