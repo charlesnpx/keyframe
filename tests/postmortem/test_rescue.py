@@ -135,6 +135,36 @@ def test_rescue_shortlist_includes_per_scene_coverage(monkeypatch):
     assert 4 in {row["sample_idx"] for row in shortlist}
 
 
+def test_rescue_budget_duration_floor_is_bounded(monkeypatch):
+    monkeypatch.setattr(
+        "keyframe.scoring.proxy_content_scores",
+        lambda frames: [
+            {
+                "proxy_content_score": 0.5,
+                "textline_score": 0.5,
+                "edge_score": 0.5,
+                "entropy": 0.5,
+                "dark_ratio": 0.0,
+                "bright_ratio": 0.0,
+            }
+            for _ in frames
+        ],
+    )
+    frames = [Image.new("RGB", (8, 8), "white") for _ in range(12)]
+    timestamps = [float(i * 90) for i in range(12)]
+
+    _shortlist, _proxy_rows, budget = build_rescue_shortlist(
+        frames,
+        timestamps,
+        list(range(12)),
+        [{"sample_idx": 0, "timestamp": 0.0, "scene_id": 0}],
+        pass1_clusters=3,
+        sample_scenes={i: i // 3 for i in range(12)},
+    )
+
+    assert budget == 8
+
+
 def test_comparison_primary_sample_idxs_include_cluster_and_scene_primaries():
     candidates = [
         {"sample_idx": 0, "timestamp": 0.0, "clip_cluster": 1, "scene_id": 0},
@@ -200,7 +230,7 @@ def test_rescue_same_cluster_swap_precedes_additive_and_respects_budget():
     assert promoted[0]["rescue_priority"] == 1
 
 
-def test_additive_evidence_rescue_skips_equivalent_scene_marker_coverage():
+def test_same_window_marker_equivalent_does_not_reject_outside_tolerance():
     candidates = [
         {
             "sample_idx": 0,
@@ -229,7 +259,83 @@ def test_additive_evidence_rescue_skips_equivalent_scene_marker_coverage():
 
     promoted = promote_rescue_candidates(candidates, shortlist, [0, 1], rescue_budget=3)
 
-    assert [row["sample_idx"] for row in promoted] == [0]
+    assert [row["sample_idx"] for row in promoted] == [0, 1]
+    assert promoted[1]["rescue_reason"] == "temporal_coverage"
+
+
+def test_same_dwell_marker_equivalent_does_not_reject_outside_tolerance():
+    candidates = [
+        {
+            "sample_idx": 0,
+            "timestamp": 0.0,
+            "clip_cluster": 1,
+            "scene_id": 0,
+            "proxy_content_score": 0.1,
+            "ocr_tokens": ["page1"],
+            "rescue_tokens": ["page1"],
+            "temporal_window_id": 0,
+        }
+    ]
+    shortlist = [
+        {
+            "sample_idx": 1,
+            "frame_idx": 1,
+            "timestamp": 10.0,
+            "clip_cluster": 2,
+            "scene_id": 0,
+            "proxy_content_score": 0.8,
+            "ocr_tokens": ["page1"],
+            "rescue_tokens": ["page1"],
+            "temporal_window_id": 1,
+        }
+    ]
+
+    promoted = promote_rescue_candidates(candidates, shortlist, [0, 0], rescue_budget=3)
+
+    assert [row["sample_idx"] for row in promoted] == [0, 1]
+    assert promoted[1]["rescue_reason"] == "temporal_coverage"
+
+
+def test_form_state_token_gain_overrides_marker_equivalence():
+    candidates = [
+        _cand(130, 65.0, tokens=["page1", "completed", "status"], proxy=0.1),
+    ]
+    shortlist = [
+        _cand(
+            142,
+            66.0,
+            tokens=["page1", "completed", "status", "date", "please", "selection", "required"],
+            proxy=0.9,
+        ),
+    ]
+
+    promoted = promote_rescue_candidates(candidates, shortlist, [0] * 143, rescue_budget=3)
+
+    assert [row["sample_idx"] for row in promoted] == [130, 142]
+    assert promoted[1]["rescue_origin"] == "additive_rescue"
+
+
+def test_status_date_error_and_filled_date_are_distinct_states():
+    candidates = [
+        _cand(
+            142,
+            70.0,
+            tokens=["page1", "completed", "status", "date", "please", "selection"],
+            proxy=0.4,
+        ),
+    ]
+    shortlist = [
+        _cand(
+            164,
+            71.0,
+            tokens=["page1", "completed", "status", "date", "24apr2026"],
+            proxy=0.9,
+        ),
+    ]
+
+    promoted = promote_rescue_candidates(candidates, shortlist, [0] * 165, rescue_budget=3)
+
+    assert [row["sample_idx"] for row in promoted] == [142, 164]
 
 
 def test_additive_evidence_rescue_keeps_equivalent_marker_in_different_window():
@@ -282,7 +388,7 @@ def test_additive_content_reference_rescue_skips_clip_and_token_redundancy():
         {
             "sample_idx": 1,
             "frame_idx": 1,
-            "timestamp": 10.0,
+            "timestamp": 1.0,
             "clip_cluster": 2,
             "scene_id": 0,
             "proxy_content_score": 0.8,
@@ -334,6 +440,36 @@ def test_temporal_coverage_rescue_adds_distinct_dense_evidence_without_swapping(
     assert [row["sample_idx"] for row in promoted] == [0, 10]
     assert promoted[1]["rescue_origin"] == "additive_rescue"
     assert promoted[1]["rescue_reason"] == "temporal_coverage"
+
+
+def test_eligible_evidence_candidates_are_ranked_before_generic_candidates():
+    candidates = [_cand(0, 0.0, scene=0, cluster=1, tokens=["intro"], proxy=0.1)]
+    shortlist = [
+        _cand(10, 10.0, scene=1, cluster=2, tokens=[f"generic{i}" for i in range(20)], proxy=0.99),
+        _cand(20, 20.0, scene=2, cluster=3, tokens=["page1", "signed", "approved", "date", "cover", "pdf"], proxy=0.5),
+    ]
+
+    promoted = promote_rescue_candidates(candidates, shortlist, [0] * 21, rescue_budget=1)
+
+    assert [row["sample_idx"] for row in promoted] == [0, 20]
+    assert promoted[1]["rescue_reason"] == "evidence_marker"
+
+
+def test_preflight_uses_same_additive_priority_as_promotion():
+    base = [_cand(0, 0.0, scene=0, cluster=1, tokens=["intro"], proxy=0.1)]
+    shortlist = [
+        _cand(10, 10.0, scene=1, cluster=2, tokens=[f"generic{i}" for i in range(20)], proxy=0.99),
+        _cand(20, 20.0, scene=2, cluster=3, tokens=["page1", "signed", "approved", "date", "cover", "pdf"], proxy=0.5),
+    ]
+
+    report = _preflight(base, shortlist, base, [0] * 21, 1)
+    rows = {row["sample_idx"]: row for row in report["candidate_rows"]}
+
+    assert rows[20]["phase_a_rank"] == 1
+    assert rows[20]["outcome"] == "eligible_above_headroom"
+    assert rows[10]["phase_a_rank"] == 2
+    assert rows[10]["outcome"] == "eligible_below_headroom"
+    assert rows[20]["reason_priority"] > rows[10]["reason_priority"]
 
 
 def test_promotion_preflight_classifies_eligible_candidate_above_headroom():

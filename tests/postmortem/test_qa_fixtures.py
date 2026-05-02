@@ -172,10 +172,10 @@ EXPECTED_BASELINE = {
             "priority_form_spacing_sections",
         },
         "buckets": {
-            "amot_spacing_midpage_consequence_dependencies_comments": "no_coarse_proposal_near_target",
-            "amot_spacing_page_boundary_current_state_description_to_page2": "no_coarse_proposal_near_target",
-            "source_form_text_fields_for_spacing_comparison": "no_coarse_proposal_near_target",
-            "priority_form_spacing_sections": "no_coarse_proposal_near_target",
+            "amot_spacing_midpage_consequence_dependencies_comments": "sampled_but_no_proposal_near_target",
+            "amot_spacing_page_boundary_current_state_description_to_page2": "sampled_but_no_proposal_near_target",
+            "source_form_text_fields_for_spacing_comparison": "sampled_but_no_proposal_near_target",
+            "priority_form_spacing_sections": "sampled_but_no_proposal_near_target",
         },
     },
     "36380": {
@@ -185,19 +185,16 @@ EXPECTED_BASELINE = {
             "priority_form_header_fields_in_body",
         },
         "buckets": {
-            "regular_amot_pdf_header_body_fields_wrong_location": "no_coarse_proposal_near_target",
+            "regular_amot_pdf_header_body_fields_wrong_location": "sampled_but_no_proposal_near_target",
             "cover_page_unapproved_signed_by_should_be_blank": "rescue_ocrd_but_not_promoted",
-            "priority_form_header_fields_in_body": "no_coarse_proposal_near_target",
+            "priority_form_header_fields_in_body": "sampled_but_no_proposal_near_target",
         },
     },
     "36324": {
-        "misses": {
-            "impacted_location_completed_status_date_blank_required",
-            "status_date_empty_expected_error_visible",
-        },
+        "misses": set(),
         "buckets": {
-            "impacted_location_completed_status_date_blank_required": "rescue_ocrd_but_not_promoted",
-            "status_date_empty_expected_error_visible": "rescue_ocrd_but_not_promoted",
+            "impacted_location_completed_status_date_blank_required": "hit_direct",
+            "status_date_empty_expected_error_visible": "hit_direct",
             "status_date_filled_error_state_persists": "hit_direct",
         },
     },
@@ -430,13 +427,20 @@ def test_full_video_qa_fixture_recall(tmp_path, name, annotation):
             {
                 "label": target["label"],
                 "bucket": target["bucket"],
+                "nearest_sample_timestamp": target.get("nearest_sample_timestamp"),
+                "nearest_sample_delta": target.get("nearest_sample_delta"),
+                "best_stage": target.get("best_stage"),
                 "nearest_final_timestamp": target["nearest_final_timestamp"],
                 "nearest_final_delta": target["nearest_final_delta"],
+                "promotion_preflight_outcome": target.get("promotion_preflight", {}).get("outcome"),
+                "promotion_preflight_rejection_reason": target.get("promotion_preflight", {}).get("rejection_reason"),
             }
             for target in trace.get("targets", [])
         ]
         print(f"{name}: debug_qa_trace={debug_trace_path}")
         print(f"{name}: debug_qa_target_summary={trace_summary}")
+        if trace.get("promotion_preflight_summary"):
+            print(f"{name}: promotion_preflight_summary={trace['promotion_preflight_summary']}")
         if trace.get("integrity_violations"):
             print(f"{name}: debug_qa_integrity_violations={trace['integrity_violations']}")
     assert redundancy <= 0.10

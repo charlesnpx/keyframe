@@ -77,12 +77,43 @@ def test_debug_qa_trace_reports_direct_and_lineage_only_hits():
     buckets = {row["label"]: row["bucket"] for row in payload["targets"]}
     assert buckets["direct"] == "hit_direct"
     assert buckets["lineage"] == "hit_lineage_only"
-    assert buckets["miss"] == "no_coarse_proposal_near_target"
+    assert buckets["miss"] == "no_sample_near_target"
     assert payload["fixture_summary"] == {
         "direct_hit_count": 1,
         "lineage_only_hit_count": 1,
         "miss_count": 1,
     }
+
+
+def test_debug_qa_trace_prefers_direct_hit_over_closer_lineage_hit():
+    records = [
+        {
+            "event": "exit",
+            "stage": "survival.final_post_cap",
+            "payload": {
+                "candidates": [
+                    {"sample_idx": 1, "timestamp": 18.5, "merged_timestamps": []},
+                    {
+                        "sample_idx": 2,
+                        "timestamp": 23.5,
+                        "merged_timestamps": [20.0],
+                        "merged_from_sample_idxs": [2, 3],
+                    },
+                ]
+            },
+        }
+    ]
+
+    payload = build_debug_qa_trace(
+        trace_records=records,
+        targets=[{"time": 20.0, "label": "direct", "tolerance": 2.25}],
+        video="video.mp4",
+    )
+
+    target = payload["targets"][0]
+    assert target["bucket"] == "hit_direct"
+    assert target["stage_membership"]["survival.final_post_cap"]["matched_via"] == "timestamp"
+    assert target["nearest_final_timestamp"] == 18.5
 
 
 def test_debug_qa_trace_uses_sampling_snapshot_rows():
@@ -113,6 +144,35 @@ def test_debug_qa_trace_uses_sampling_snapshot_rows():
     membership = payload["targets"][0]["stage_membership"]["sampling"]
     assert membership["hit"] is True
     assert membership["sample_idx"] == 4
+    assert payload["targets"][0]["nearest_sample_timestamp"] == 20.0
+
+
+def test_debug_qa_trace_reports_sampled_but_no_proposal_bucket():
+    records = [
+        {
+            "event": "exit",
+            "stage": "sampling",
+            "payload": {
+                "samples": [
+                    {
+                        "sample_idx": 4,
+                        "frame_idx": 40,
+                        "timestamp": 20.0,
+                        "origin": "sampled_frame",
+                        "merged_timestamps": [],
+                    }
+                ]
+            },
+        }
+    ]
+
+    payload = build_debug_qa_trace(
+        trace_records=records,
+        targets=[{"time": 20.0, "label": "sampled", "tolerance": 2.25}],
+        video="video.mp4",
+    )
+
+    assert payload["targets"][0]["bucket"] == "sampled_but_no_proposal_near_target"
 
 
 def test_debug_qa_trace_distinguishes_rescue_ocr_and_promotion():
@@ -202,6 +262,13 @@ def test_debug_qa_trace_reads_materialized_promotion_preflight_decision():
         "selection.rescue_promotion_preflight",
         "promotion_preflight",
         {
+            "rescue_budget": 5,
+            "base_candidate_count": 10,
+            "current_post_rescue_count": 15,
+            "max_post_rescue_count": 15,
+            "additive_output_headroom": 0,
+            "current_rescue_count": 5,
+            "eligible_below_headroom_count": 1,
             "candidate_rows": [
                 {
                     "sample_idx": 7,
@@ -232,6 +299,15 @@ def test_debug_qa_trace_reads_materialized_promotion_preflight_decision():
     assert preflight["above_additive_headroom_cut"] is False
     assert preflight["rejection_branch"] == "redundant_with_selected"
     assert preflight["rejection_reason"] == "near_duplicate"
+    assert payload["promotion_preflight_summary"] == {
+        "rescue_budget": 5,
+        "base_candidate_count": 10,
+        "current_post_rescue_count": 15,
+        "max_post_rescue_count": 15,
+        "additive_output_headroom": 0,
+        "current_rescue_count": 5,
+        "eligible_below_headroom_count": 1,
+    }
 
 
 def test_debug_qa_trace_reports_promotion_preflight_miss_when_no_row_near_target():

@@ -129,7 +129,7 @@ def _stage_summaries(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]
     return summaries
 
 
-def _promotion_preflight_rows(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _promotion_preflight_payload(records: list[dict[str, Any]]) -> dict[str, Any]:
     for record in records:
         if record.get("event") != "decision":
             continue
@@ -141,10 +141,31 @@ def _promotion_preflight_rows(records: list[dict[str, Any]]) -> list[dict[str, A
         if payload.get("name") != "promotion_preflight":
             continue
         report = payload.get("payload") or {}
+        return dict(report) if isinstance(report, Mapping) else {}
+    return {}
+
+
+def _promotion_preflight_rows(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    report = _promotion_preflight_payload(records)
+    if report:
         rows = report.get("candidate_rows")
         if isinstance(rows, list):
             return [dict(row) for row in rows if isinstance(row, Mapping)]
     return []
+
+
+def _promotion_preflight_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
+    report = _promotion_preflight_payload(records)
+    keys = (
+        "rescue_budget",
+        "base_candidate_count",
+        "current_post_rescue_count",
+        "max_post_rescue_count",
+        "additive_output_headroom",
+        "current_rescue_count",
+        "eligible_below_headroom_count",
+    )
+    return {key: report.get(key) for key in keys if key in report}
 
 
 def _nearest_in_stage(
@@ -152,7 +173,9 @@ def _nearest_in_stage(
     tolerance: float,
     candidates: list[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    best: tuple[float, Mapping[str, Any], str, float] | None = None
+    best_any: tuple[float, Mapping[str, Any], str, float] | None = None
+    best_direct_hit: tuple[float, Mapping[str, Any], str, float] | None = None
+    best_lineage_hit: tuple[float, Mapping[str, Any], str, float] | None = None
     for candidate in candidates:
         direct_ts = candidate.get("timestamp")
         candidate_ts = float(direct_ts) if direct_ts is not None else None
@@ -166,8 +189,16 @@ def _nearest_in_stage(
                 continue
         for matched_via, ts in values:
             delta = abs(ts - target_time)
-            if best is None or delta < best[0]:
-                best = (delta, candidate, matched_via, ts)
+            item = (delta, candidate, matched_via, ts)
+            if best_any is None or delta < best_any[0]:
+                best_any = item
+            if delta <= tolerance and matched_via == "timestamp":
+                if best_direct_hit is None or delta < best_direct_hit[0]:
+                    best_direct_hit = item
+            elif delta <= tolerance and matched_via == "merged_timestamps":
+                if best_lineage_hit is None or delta < best_lineage_hit[0]:
+                    best_lineage_hit = item
+    best = best_direct_hit or best_lineage_hit or best_any
     if best is None:
         return {"hit": False, "nearest_ts": None, "delta": None, "matched_via": "none"}
     delta, candidate, matched_via, nearest_ts = best
@@ -217,6 +248,11 @@ def _nearest_promotion_preflight(
         "rejection_branch": row.get("rejection_branch"),
         "rejection_reason": row.get("rejection_reason"),
         "nearest_competing_candidate_timestamp": row.get("nearest_competing_candidate_timestamp"),
+        "reason_priority": row.get("reason_priority"),
+        "marker_gain": row.get("marker_gain"),
+        "form_state_delta": row.get("form_state_delta"),
+        "token_gain": row.get("token_gain"),
+        "temporal_gap": row.get("temporal_gap"),
     }
 
 
@@ -332,8 +368,8 @@ def _bucket(stage_membership: Mapping[str, Mapping[str, Any]]) -> str:
     if _hit(stage_membership, "proposal.pass1_primary") or _hit(stage_membership, "proposal.cluster_alt"):
         return "coarse_proposal_exists_but_not_selected"
     if _hit(stage_membership, "sampling"):
-        return "no_coarse_proposal_near_target"
-    return "no_coarse_proposal_near_target"
+        return "sampled_but_no_proposal_near_target"
+    return "no_sample_near_target"
 
 
 def build_debug_qa_trace(
@@ -346,6 +382,7 @@ def build_debug_qa_trace(
     stage_order = stage_order or DEFAULT_STAGE_ORDER
     stage_records = _stage_candidate_records(trace_records)
     promotion_preflight_rows = _promotion_preflight_rows(trace_records)
+    promotion_preflight_summary = _promotion_preflight_summary(trace_records)
     target_rows = []
     direct_hit_count = 0
     lineage_hit_count = 0
@@ -367,6 +404,7 @@ def build_debug_qa_trace(
         else:
             miss_count += 1
         final = membership.get("survival.final_post_cap", {})
+        sampled = membership.get("sampling", {})
         target_rows.append({
             "label": _target_label(target),
             "time": time,
@@ -376,6 +414,8 @@ def build_debug_qa_trace(
             "best_family": best["best_family"],
             "best_stage": best["best_stage"],
             "best_matched_via": best["best_matched_via"],
+            "nearest_sample_timestamp": sampled.get("nearest_ts"),
+            "nearest_sample_delta": sampled.get("delta"),
             "nearest_final_timestamp": final.get("nearest_ts"),
             "nearest_final_delta": final.get("delta"),
             "promotion_preflight": _nearest_promotion_preflight(
@@ -395,6 +435,7 @@ def build_debug_qa_trace(
         "target_count": len(targets),
         "stages": stage_order,
         "targets": target_rows,
+        "promotion_preflight_summary": promotion_preflight_summary,
         "fixture_summary": {
             "direct_hit_count": direct_hit_count,
             "lineage_only_hit_count": lineage_hit_count,

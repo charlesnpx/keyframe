@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from collections import defaultdict
 import math
+import re
 from typing import Any
 
 import numpy as np
@@ -312,7 +313,9 @@ def build_rescue_shortlist(
     candidates = _records(candidates)
     proxy_rows = proxy_content_scores(frames)
     candidate_idxs = {int(c.sample_idx) for c in candidates}
-    rescue_budget = max(3, round(pass1_clusters * 0.35))
+    duration_seconds = max(timestamps) - min(timestamps) if timestamps else 0.0
+    duration_floor = min(8, math.ceil(float(duration_seconds) / 90.0))
+    rescue_budget = max(3, round(pass1_clusters * 0.35), duration_floor)
     scores = [row["proxy_content_score"] for row in proxy_rows]
     tau_proxy = float(np.percentile(scores, 75)) if scores else 0.0
     cap = min(60, rescue_budget * 4)
@@ -456,6 +459,59 @@ def _content_reference_tokens(tokens: set[str]) -> set[str]:
     }
 
 
+FORM_STATE_TOKENS = {
+    "approved",
+    "approval",
+    "approve",
+    "completed",
+    "complete",
+    "date",
+    "draft",
+    "error",
+    "field",
+    "mandatory",
+    "please",
+    "required",
+    "selection",
+    "signed",
+    "status",
+    "validation",
+    "workflow",
+}
+DATE_VALUE_RE = re.compile(r"^\d{1,2}[a-z]{3}\d{4}$", re.IGNORECASE)
+
+
+def _has_form_state_delta(rescue_tokens: set[str], candidate_tokens: set[str]) -> bool:
+    gained = rescue_tokens - candidate_tokens
+    if {"please", "selection"} <= rescue_tokens and not {"please", "selection"} <= candidate_tokens:
+        return True
+    if any(DATE_VALUE_RE.match(token) for token in gained):
+        return True
+    return len(gained & FORM_STATE_TOKENS) >= 2
+
+
+def _marker_redundant(rescue_tokens: set[str], candidate_tokens: set[str]) -> bool:
+    return _marker_equivalent(candidate_tokens, rescue_tokens) and not _has_form_state_delta(
+        rescue_tokens,
+        candidate_tokens,
+    )
+
+
+def _clip_token_redundant(
+    rescue_tokens: set[str],
+    candidate_tokens: set[str],
+    clip_embeddings: Any | None,
+    rescue_idx: int,
+    candidate_idx: int,
+) -> bool:
+    if _has_form_state_delta(rescue_tokens, candidate_tokens):
+        return False
+    return (
+        _clip_cosine(clip_embeddings, rescue_idx, candidate_idx) >= 0.93
+        and _jaccard(rescue_tokens, candidate_tokens) >= 0.7
+    )
+
+
 def _same_marker_covered(
     rescue: CandidateRecord,
     candidates: Sequence[CandidateRecord],
@@ -512,25 +568,87 @@ def has_local_equivalent_coverage(
     records = _records(candidates)
     rescue_scene = rescue.temporal.scene_id
     rescue_tokens = _record_tokens(rescue, rescue=True)
-    rescue_dwell = _candidate_dwell_id(rescue, dwell_ids)
-    rescue_window = rescue.temporal.temporal_window_id
     for candidate in records:
         if candidate.temporal.scene_id != rescue_scene:
             continue
         candidate_tokens = _record_tokens(candidate, rescue=True)
-        if not _marker_equivalent(candidate_tokens, rescue_tokens):
+        if not _marker_redundant(rescue_tokens, candidate_tokens):
             continue
-        candidate_dwell = _candidate_dwell_id(candidate, dwell_ids)
-        same_dwell = rescue_dwell is not None and candidate_dwell == rescue_dwell
         near_time = abs(float(candidate.timestamp) - float(rescue.timestamp)) <= tolerance
-        same_window = (
-            rescue_window is not None
-            and candidate.temporal.temporal_window_id is not None
-            and int(candidate.temporal.temporal_window_id) == int(rescue_window)
-        )
-        if same_dwell or near_time or same_window:
+        if near_time:
             return True
     return False
+
+
+def _nearest_same_scene_delta(rescue: CandidateRecord, candidates: Sequence[CandidateRecord]) -> float:
+    rescue_scene = rescue.temporal.scene_id
+    deltas = [
+        abs(float(candidate.timestamp) - float(rescue.timestamp))
+        for candidate in candidates
+        if rescue_scene is not None and candidate.temporal.scene_id == rescue_scene
+    ]
+    return min(deltas, default=float("inf"))
+
+
+def _nearest_candidate_delta(rescue: CandidateRecord, candidates: Sequence[CandidateRecord]) -> float:
+    deltas = [abs(float(candidate.timestamp) - float(rescue.timestamp)) for candidate in candidates]
+    return min(deltas, default=float("inf"))
+
+
+def _additive_priority_components(
+    rescue: CandidateRecord,
+    primary: CandidateRecord | None,
+    reason: str,
+    candidates: Sequence[CandidateRecord],
+) -> dict[str, Any]:
+    rescue_tokens = _record_tokens(rescue, rescue=True)
+    primary_tokens = _record_tokens(primary, rescue=True) if primary is not None else set()
+    rescue_markers = canonical_markers(rescue_tokens)
+    primary_markers = canonical_markers(primary_tokens)
+    marker_gain = sum(
+        len(rescue_markers[key] - primary_markers[key])
+        for key in ("page", "option", "section", "status")
+    )
+    token_gain = len(rescue_tokens - primary_tokens)
+    form_state_delta = _has_form_state_delta(rescue_tokens, primary_tokens)
+    reason_priority = {
+        "evidence_marker": 4,
+        "temporal_coverage": 3,
+        "content_reference": 2,
+        "token_gain": 1,
+    }.get(reason, 0)
+    temporal_gap = _nearest_same_scene_delta(rescue, candidates)
+    if math.isinf(temporal_gap):
+        temporal_gap = _nearest_candidate_delta(rescue, candidates)
+    if math.isinf(temporal_gap):
+        temporal_gap = 0.0
+    return {
+        "reason_priority": int(reason_priority),
+        "marker_gain": int(marker_gain),
+        "form_state_delta": bool(form_state_delta),
+        "token_gain": int(token_gain),
+        "temporal_gap": float(temporal_gap),
+        "proxy_content_score": float(rescue.selection.proxy_content_score or 0.0),
+    }
+
+
+def _additive_priority_key(
+    rescue: CandidateRecord,
+    primary: CandidateRecord | None,
+    reason: str,
+    candidates: Sequence[CandidateRecord],
+) -> tuple[float, ...]:
+    components = _additive_priority_components(rescue, primary, reason, candidates)
+    return (
+        float(components["reason_priority"]),
+        float(components["marker_gain"]),
+        float(components["form_state_delta"]),
+        float(components["token_gain"]),
+        float(components["temporal_gap"]),
+        float(components["proxy_content_score"]),
+        -float(rescue.timestamp),
+        -float(rescue.sample_idx),
+    )
 
 
 def _primary_for_rescue(
@@ -560,18 +678,18 @@ def _rescue_reason(
     primary_tokens = _record_tokens(primary, rescue=True)
     rescue_score = float(rescue.selection.proxy_content_score or 0.0)
     primary_score = float(primary.selection.proxy_content_score or 0.0)
-    rescue_scene = rescue.temporal.scene_id
-    same_scene_deltas = [
-        abs(float(candidate.timestamp) - float(rescue.timestamp))
-        for candidate in candidates
-        if rescue_scene is not None and candidate.temporal.scene_id == rescue_scene
-    ]
-    nearest_same_scene_dt = min(same_scene_deltas, default=float("inf"))
+    nearest_same_scene_dt = _nearest_same_scene_delta(rescue, candidates)
 
     evidence_rescue = (
         _has_marker_signature(rescue_tokens)
-        and not has_evidence_markers(primary_tokens)
-        and has_meaningful_evidence_for_retention(primary_tokens, rescue_tokens)
+        and (
+            not has_evidence_markers(primary_tokens)
+            or _has_form_state_delta(rescue_tokens, primary_tokens)
+        )
+        and (
+            has_meaningful_evidence_for_retention(primary_tokens, rescue_tokens)
+            or _has_form_state_delta(rescue_tokens, primary_tokens)
+        )
         and not has_local_equivalent_coverage(rescue, candidates, dwell_ids)
     )
     if evidence_rescue:
@@ -637,21 +755,12 @@ def _temporally_local(
     rescue: CandidateRecord,
     candidate: CandidateRecord,
     dwell_ids: Sequence[int],
+    *,
+    tolerance: float = 2.25,
 ) -> bool:
     return (
         candidate.temporal.scene_id == rescue.temporal.scene_id
-        and (
-            abs(float(candidate.timestamp) - float(rescue.timestamp)) <= 2.25
-            or (
-                rescue.temporal.temporal_window_id is not None
-                and candidate.temporal.temporal_window_id is not None
-                and int(candidate.temporal.temporal_window_id) == int(rescue.temporal.temporal_window_id)
-            )
-            or (
-                _candidate_dwell_id(candidate, dwell_ids) is not None
-                and _candidate_dwell_id(candidate, dwell_ids) == _candidate_dwell_id(rescue, dwell_ids)
-            )
-        )
+        and abs(float(candidate.timestamp) - float(rescue.timestamp)) <= tolerance
     )
 
 
@@ -688,7 +797,7 @@ def _preflight_rejection_detail(
         if not _temporally_local(rescue, candidate, dwell_ids):
             continue
         candidate_tokens = _record_tokens(candidate, rescue=True)
-        if _marker_equivalent(candidate_tokens, rescue_tokens):
+        if _marker_redundant(rescue_tokens, candidate_tokens):
             return {
                 "eligible": False,
                 "reason": None,
@@ -697,9 +806,12 @@ def _preflight_rejection_detail(
                 "competing_candidate": candidate,
                 "local_equivalent_coverage": local_equivalent_coverage,
             }
-        if (
-            _clip_cosine(clip_embeddings, rescue_idx, int(candidate.sample_idx)) >= 0.93
-            and _jaccard(rescue_tokens, candidate_tokens) >= 0.7
+        if _clip_token_redundant(
+            rescue_tokens,
+            candidate_tokens,
+            clip_embeddings,
+            rescue_idx,
+            int(candidate.sample_idx),
         ):
             return {
                 "eligible": False,
@@ -769,7 +881,7 @@ def rescue_promotion_preflight_report(
     current_rescue_count = sum(1 for candidate in current_promoted if candidate.selection.rescue_origin)
 
     rows: list[dict[str, Any]] = []
-    eligible_pending: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
+    eligible_pending: list[tuple[tuple[float, ...], dict[str, Any], dict[str, Any]]] = []
 
     for rescue in rescue_shortlist:
         rescue_idx = int(rescue.sample_idx)
@@ -841,11 +953,20 @@ def rescue_promotion_preflight_report(
             "local_equivalent_coverage": bool(detail.get("local_equivalent_coverage", False)),
         }
         if row["phase_a_eligible"]:
-            eligible_pending.append((len(eligible_pending) + 1, row, detail))
+            reason = str(detail.get("reason") or "")
+            primary = detail.get("competing_candidate")
+            priority_components = _additive_priority_components(rescue, primary, reason, current_promoted)
+            row.update(priority_components)
+            eligible_pending.append((
+                _additive_priority_key(rescue, primary, reason, current_promoted),
+                row,
+                detail,
+            ))
         rows.append(row)
 
     predicted_ordered_eligible: list[dict[str, Any]] = []
-    for rank, row, detail in eligible_pending:
+    eligible_pending.sort(key=lambda item: item[0], reverse=True)
+    for rank, (_priority_key, row, detail) in enumerate(eligible_pending, start=1):
         above_headroom = rank <= additive_output_headroom
         row["phase_a_rank"] = rank
         row["above_additive_headroom_cut"] = above_headroom
@@ -860,11 +981,15 @@ def rescue_promotion_preflight_report(
         })
 
     return {
+        "rescue_budget": int(rescue_budget),
         "base_candidate_count": base_candidate_count,
         "current_post_rescue_count": current_post_rescue_count,
         "max_post_rescue_count": max_post_rescue_count,
         "additive_output_headroom": additive_output_headroom,
         "current_rescue_count": current_rescue_count,
+        "eligible_below_headroom_count": sum(
+            1 for row in rows if row.get("outcome") == "eligible_below_headroom"
+        ),
         "predicted_ordered_eligible": predicted_ordered_eligible,
         "candidate_rows": rows,
     }
@@ -896,25 +1021,17 @@ def promote_rescue_candidates(
             return False
         rescue_tokens = _record_tokens(rescue, rescue=True)
         primary_tokens = _record_tokens(primary, rescue=True)
-        temporally_local = (
-            primary.temporal.scene_id == rescue.temporal.scene_id
-            and (
-                abs(float(primary.timestamp) - float(rescue.timestamp)) <= 2.25
-                or (
-                    rescue.temporal.temporal_window_id is not None
-                    and primary.temporal.temporal_window_id is not None
-                    and int(primary.temporal.temporal_window_id) == int(rescue.temporal.temporal_window_id)
-                )
-                or (
-                    _candidate_dwell_id(primary, dwell_ids) is not None
-                    and _candidate_dwell_id(primary, dwell_ids) == _candidate_dwell_id(rescue, dwell_ids)
-                )
-            )
-        )
+        if _has_form_state_delta(rescue_tokens, primary_tokens):
+            return False
         if (
-            temporally_local
-            and _clip_cosine(clip_embeddings, int(rescue.sample_idx), int(primary.sample_idx)) >= 0.93
-            and _jaccard(rescue_tokens, primary_tokens) >= 0.7
+            _temporally_local(rescue, primary, dwell_ids)
+            and _clip_token_redundant(
+                rescue_tokens,
+                primary_tokens,
+                clip_embeddings,
+                int(rescue.sample_idx),
+                int(primary.sample_idx),
+            )
         ):
             return False
         reason = _rescue_reason(rescue, primary, dwell_ids, promoted)
@@ -957,6 +1074,7 @@ def promote_rescue_candidates(
         if maybe_swap(rescue, same_cluster=False, origin="same_scene_generic_primary_swap"):
             continue
 
+    additive_candidates: list[tuple[tuple[float, ...], CandidateRecord, CandidateRecord | None, str]] = []
     for rescue in rescue_shortlist:
         if consumed >= rescue_budget:
             break
@@ -966,32 +1084,17 @@ def promote_rescue_candidates(
         rescue_tokens = _record_tokens(rescue, rescue=True)
         redundant = False
         for candidate in promoted:
-            temporally_local = (
-                candidate.temporal.scene_id == rescue.temporal.scene_id
-                and (
-                    abs(float(candidate.timestamp) - float(rescue.timestamp)) <= 2.25
-                    or (
-                        rescue.temporal.temporal_window_id is not None
-                        and candidate.temporal.temporal_window_id is not None
-                        and int(candidate.temporal.temporal_window_id) == int(rescue.temporal.temporal_window_id)
-                    )
-                    or (
-                        _candidate_dwell_id(candidate, dwell_ids) is not None
-                        and _candidate_dwell_id(candidate, dwell_ids) == _candidate_dwell_id(rescue, dwell_ids)
-                    )
-                )
-            )
-            if temporally_local and _marker_equivalent(
-                _record_tokens(candidate, rescue=True),
-                rescue_tokens,
-            ):
+            temporally_local = _temporally_local(rescue, candidate, dwell_ids)
+            candidate_tokens = _record_tokens(candidate, rescue=True)
+            if temporally_local and _marker_redundant(rescue_tokens, candidate_tokens):
                 redundant = True
                 break
-            candidate_tokens = _record_tokens(candidate, rescue=True)
-            if (
-                temporally_local
-                and _clip_cosine(clip_embeddings, rescue_idx, int(candidate.sample_idx)) >= 0.93
-                and _jaccard(rescue_tokens, candidate_tokens) >= 0.7
+            if temporally_local and _clip_token_redundant(
+                rescue_tokens,
+                candidate_tokens,
+                clip_embeddings,
+                rescue_idx,
+                int(candidate.sample_idx),
             ):
                 redundant = True
                 break
@@ -1011,10 +1114,24 @@ def promote_rescue_candidates(
                 continue
         else:
             reason = "content_reference" if _content_reference_tokens(rescue_tokens) else "evidence_marker"
+        additive_candidates.append((
+            _additive_priority_key(rescue, primary if primary else None, reason, promoted),
+            rescue,
+            primary if primary else None,
+            reason,
+        ))
+
+    additive_candidates.sort(key=lambda item: item[0], reverse=True)
+    for _priority_key, rescue, primary, reason in additive_candidates:
+        if consumed >= rescue_budget:
+            break
+        rescue_idx = int(rescue.sample_idx)
+        if rescue_idx in used_idxs:
+            continue
         priority += 1
         row = _as_promoted_rescue(
             rescue,
-            primary if primary else None,
+            primary,
             origin="additive_rescue",
             reason=reason,
             priority=priority,
