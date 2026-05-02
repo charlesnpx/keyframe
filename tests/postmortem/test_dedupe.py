@@ -1,18 +1,43 @@
 from PIL import Image
 
 from keyframe.dedupe import (
-    _merge_metadata,
     _is_retained_evidence_candidate,
-    adjacent_same_screen_dedupe,
+    adjacent_same_screen_dedupe as _adjacent_same_screen_dedupe,
     clean_ocr_token_sets,
     canonical_markers,
-    filter_low_information_candidates,
-    global_candidate_dedupe,
+    filter_low_information_candidates as _filter_low_information_candidates,
+    global_candidate_dedupe as _global_candidate_dedupe,
     has_meaningful_evidence_for_retention,
     is_protected_candidate,
-    near_time_dedupe,
-    retain_cluster_alternates,
+    merge_candidate_lineage,
+    near_time_dedupe as _near_time_dedupe,
+    retain_cluster_alternates as _retain_cluster_alternates,
 )
+from keyframe.pipeline.contracts import as_candidate_record
+
+
+def _project(records):
+    return [record.to_dict() for record in records]
+
+
+def near_time_dedupe(*args, **kwargs):
+    return _project(_near_time_dedupe(*args, **kwargs))
+
+
+def global_candidate_dedupe(*args, **kwargs):
+    return _project(_global_candidate_dedupe(*args, **kwargs))
+
+
+def filter_low_information_candidates(*args, **kwargs):
+    return _project(_filter_low_information_candidates(*args, **kwargs))
+
+
+def adjacent_same_screen_dedupe(*args, **kwargs):
+    return _project(_adjacent_same_screen_dedupe(*args, **kwargs))
+
+
+def retain_cluster_alternates(*args, **kwargs):
+    return _project(_retain_cluster_alternates(*args, **kwargs))
 
 
 def test_half_second_ocr_neighbors_collapse():
@@ -470,7 +495,12 @@ def test_merge_metadata_preserves_policy_and_lineage_fields():
         "lineage_roles": ["alt"],
     }
 
-    _merge_metadata(winner, loser)
+    winner = merge_candidate_lineage(
+        as_candidate_record(winner),
+        as_candidate_record(loser),
+        stage="test",
+        reason="component",
+    ).to_dict()
 
     assert winner["retention_reason"] == "evidence_asymmetry"
     assert winner["retention_reasons_seen"] == ["evidence_asymmetry", "protective_caption_asymmetry"]
@@ -489,11 +519,16 @@ def test_merge_metadata_preserves_rescue_policy_fields():
         "lineage_roles": ["rescue"],
     }
 
-    _merge_metadata(winner, loser)
+    winner = merge_candidate_lineage(
+        as_candidate_record(winner),
+        as_candidate_record(loser),
+        stage="test",
+        reason="component",
+    ).to_dict()
 
     assert is_protected_candidate(winner)
     assert winner["rescue_origin"] == "additive_rescue"
     assert winner["rescue_reason"] == "evidence_marker"
     assert winner["rescue_origins_seen"] == ["additive_rescue"]
-    assert winner["rescue_priorities_seen"] == ["2"]
+    assert winner["rescue_priorities_seen"] == [2]
     assert winner["lineage_roles"] == ["primary", "rescue"]

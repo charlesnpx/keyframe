@@ -1,13 +1,31 @@
 import numpy as np
 from PIL import Image
 
-from keyframe.frames import _comparison_primary_sample_idxs, ocr_candidates
+from keyframe.frames import _comparison_primary_sample_idxs, ocr_candidates as _ocr_candidates
 from keyframe.scoring import (
     assign_dwell_ids,
-    build_rescue_shortlist,
-    promote_rescue_candidates,
+    build_rescue_shortlist as _build_rescue_shortlist,
+    promote_rescue_candidates as _promote_rescue_candidates,
     proxy_content_scores,
 )
+
+
+def _project(records):
+    return [record.to_dict() for record in records]
+
+
+def promote_rescue_candidates(*args, **kwargs):
+    return _project(_promote_rescue_candidates(*args, **kwargs))
+
+
+def build_rescue_shortlist(*args, **kwargs):
+    shortlist, proxy_rows, budget = _build_rescue_shortlist(*args, **kwargs)
+    return _project(shortlist), proxy_rows, budget
+
+
+def ocr_candidates(*args, **kwargs):
+    texts, records = _ocr_candidates(*args, **kwargs)
+    return texts, _project(records)
 
 
 def test_proxy_content_scores_clamp_and_no_variance_normalizes_to_zero():

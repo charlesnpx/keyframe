@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from types import MappingProxyType
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol, TypeVar
 
@@ -71,18 +70,6 @@ _HEAVY_METADATA_KEYS = {
 }
 
 
-def _freeze_value(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return MappingProxyType({str(k): _freeze_value(v) for k, v in value.items()})
-    if isinstance(value, list):
-        return tuple(_freeze_value(v) for v in value)
-    if isinstance(value, tuple):
-        return tuple(_freeze_value(v) for v in value)
-    if isinstance(value, set):
-        return frozenset(_freeze_value(v) for v in value)
-    return value
-
-
 def _thaw_value(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {str(k): _thaw_value(v) for k, v in value.items()}
@@ -99,6 +86,8 @@ class CandidateVisualMetadata:
     clip_cluster_size: int | None = None
     cluster_role: str | None = None
     cluster_alt_reason: str | None = None
+    cluster_diversity_distance: float | None = None
+    cluster_sharpness_ratio: float | None = None
     sharpness: float | None = None
     dhash: int | None = None
     dhash_hex: str | None = None
@@ -130,7 +119,9 @@ class CandidateEvidenceMetadata:
 @dataclass(frozen=True)
 class CandidateSelectionMetadata:
     candidate_score: float | None = None
+    score: float | None = None
     proxy_content_score: float | None = None
+    end_of_dwell_bonus: float | None = None
     rescue_origin: str | None = None
     rescue_reason: str | None = None
     rescue_priority: int | None = None
@@ -138,6 +129,7 @@ class CandidateSelectionMetadata:
     retention_candidate_reason: str | None = None
     retention_rejected_reason: str | None = None
     low_information_filter_reason: str | None = None
+    split_from_generic: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -165,7 +157,7 @@ _GROUP_FIELDS = {
 
 
 @dataclass(frozen=True)
-class CandidateRecord(Mapping[str, Any]):
+class CandidateRecord:
     sample_idx: int
     frame_idx: int
     timestamp: float
@@ -175,16 +167,11 @@ class CandidateRecord(Mapping[str, Any]):
     evidence: CandidateEvidenceMetadata = field(default_factory=CandidateEvidenceMetadata)
     selection: CandidateSelectionMetadata = field(default_factory=CandidateSelectionMetadata)
     lineage: CandidateLineageMetadata = field(default_factory=CandidateLineageMetadata)
-    metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        bad = _HEAVY_METADATA_KEYS & set(self.metadata)
-        if bad:
-            raise ValueError(f"CandidateRecord metadata cannot contain heavy artifacts: {sorted(bad)}")
         object.__setattr__(self, "sample_idx", int(self.sample_idx))
         object.__setattr__(self, "frame_idx", int(self.frame_idx))
         object.__setattr__(self, "timestamp", float(self.timestamp))
-        object.__setattr__(self, "metadata", _freeze_value(dict(self.metadata)))
         if not self.lineage.merged_from_sample_idxs or not self.lineage.merged_timestamps:
             object.__setattr__(
                 self,
@@ -196,83 +183,126 @@ class CandidateRecord(Mapping[str, Any]):
                 ),
             )
 
-    def __iter__(self) -> Iterator[str]:
-        return iter(self.to_dict())
-
-    def __len__(self) -> int:
-        return len(self.to_dict())
-
-    def __getitem__(self, key: str) -> Any:
-        data = self.to_dict()
-        if key not in data:
-            raise KeyError(key)
-        return data[key]
-
-    def get(self, key: str, default: Any = None) -> Any:
-        return self.to_dict().get(key, default)
-
     def to_dict(self) -> dict[str, Any]:
-        row = {
-            "sample_idx": self.sample_idx,
-            "frame_idx": self.frame_idx,
-            "timestamp": self.timestamp,
-            "origin": self.origin,
-        }
-        for group in (self.visual, self.temporal, self.evidence, self.selection, self.lineage):
-            for key, value in group.__dict__.items():
-                if value is not None and value != ():
-                    row[key] = _thaw_value(value)
-        row.update(_thaw_value(self.metadata))
-        return row
+        return candidate_to_trace_row(self)
 
-    def with_updates(self, **updates: Any) -> "CandidateRecord":
-        core = {
-            "sample_idx": self.sample_idx,
-            "frame_idx": self.frame_idx,
-            "timestamp": self.timestamp,
-            "origin": self.origin,
-        }
-        groups = {
-            "visual": self.visual,
-            "temporal": self.temporal,
-            "evidence": self.evidence,
-            "selection": self.selection,
-            "lineage": self.lineage,
-        }
-        metadata = dict(self.metadata)
-        grouped_updates: dict[str, dict[str, Any]] = {key: {} for key in groups}
-        for key, value in updates.items():
-            if key in _HEAVY_METADATA_KEYS:
-                raise ValueError(f"CandidateRecord cannot store heavy artifact field {key!r}")
-            if key in core:
-                core[key] = value
-            elif key in _GROUP_FIELDS:
-                group_name, field_name = _GROUP_FIELDS[key]
-                if isinstance(value, list):
-                    value = tuple(value)
-                grouped_updates[group_name][field_name] = value
-            else:
-                metadata[key] = value
-        for group_name, group_updates in grouped_updates.items():
-            if group_updates:
-                groups[group_name] = replace(groups[group_name], **group_updates)
-        return CandidateRecord(**core, **groups, metadata=metadata)
+    def with_core(
+        self,
+        *,
+        sample_idx: int | None = None,
+        frame_idx: int | None = None,
+        timestamp: float | None = None,
+        origin: str | None = None,
+    ) -> "CandidateRecord":
+        return replace(
+            self,
+            sample_idx=self.sample_idx if sample_idx is None else int(sample_idx),
+            frame_idx=self.frame_idx if frame_idx is None else int(frame_idx),
+            timestamp=self.timestamp if timestamp is None else float(timestamp),
+            origin=self.origin if origin is None else str(origin),
+        )
+
+    def with_visual(self, **updates: Any) -> "CandidateRecord":
+        return replace(self, visual=_replace_group(self.visual, updates))
+
+    def with_temporal(self, **updates: Any) -> "CandidateRecord":
+        return replace(self, temporal=_replace_group(self.temporal, updates))
+
+    def with_evidence(self, **updates: Any) -> "CandidateRecord":
+        return replace(self, evidence=_replace_group(self.evidence, updates))
+
+    def with_selection(self, **updates: Any) -> "CandidateRecord":
+        return replace(self, selection=_replace_group(self.selection, updates))
+
+    def with_lineage(self, **updates: Any) -> "CandidateRecord":
+        return replace(self, lineage=_replace_group(self.lineage, updates))
+
+
+def _normalize_update_value(value: Any) -> Any:
+    if isinstance(value, list):
+        return tuple(value)
+    if isinstance(value, set):
+        return tuple(sorted(value))
+    return value
+
+
+def _replace_group(group: Any, updates: Mapping[str, Any]) -> Any:
+    bad = _HEAVY_METADATA_KEYS & set(updates)
+    if bad:
+        raise ValueError(f"CandidateRecord cannot store heavy artifact field(s): {sorted(bad)}")
+    unknown = sorted(set(updates) - set(group.__dataclass_fields__))
+    if unknown:
+        raise TypeError(f"Unknown {type(group).__name__} field(s): {unknown}")
+    return replace(group, **{key: _normalize_update_value(value) for key, value in updates.items()})
+
+
+def _apply_flat_update(candidate: CandidateRecord, key: str, value: Any) -> CandidateRecord:
+    if key in _HEAVY_METADATA_KEYS:
+        raise ValueError(f"CandidateRecord cannot store heavy artifact field {key!r}")
+    if key == "sample_idx":
+        return candidate.with_core(sample_idx=value)
+    if key == "frame_idx":
+        return candidate.with_core(frame_idx=value)
+    if key == "timestamp":
+        return candidate.with_core(timestamp=value)
+    if key == "origin":
+        return candidate.with_core(origin=value)
+    if key not in _GROUP_FIELDS:
+        raise TypeError(f"Unknown CandidateRecord field {key!r}")
+    group_name, field_name = _GROUP_FIELDS[key]
+    helper = getattr(candidate, f"with_{group_name}")
+    return helper(**{field_name: value})
 
 
 def as_candidate_record(candidate: Mapping[str, Any] | CandidateRecord, *, origin: str | None = None) -> CandidateRecord:
     if isinstance(candidate, CandidateRecord):
-        return candidate if origin is None else candidate.with_updates(origin=origin)
+        return candidate if origin is None else candidate.with_core(origin=origin)
     row = dict(candidate)
-    return CandidateRecord(
-        sample_idx=int(row.pop("sample_idx")),
-        frame_idx=int(row.pop("frame_idx", row.get("sample_idx", 0))),
+    sample_idx = int(row.pop("sample_idx"))
+    record = CandidateRecord(
+        sample_idx=sample_idx,
+        frame_idx=int(row.pop("frame_idx", sample_idx)),
         timestamp=float(row.pop("timestamp")),
         origin=str(row.pop("origin", origin or "proposal")),
-    ).with_updates(**row)
+    )
+    for key, value in row.items():
+        record = _apply_flat_update(record, key, value)
+    return record
 
 
 def candidate_records(candidates: Sequence[Mapping[str, Any] | CandidateRecord]) -> tuple[CandidateRecord, ...]:
     return tuple(as_candidate_record(candidate) for candidate in candidates)
+
+
+def _candidate_projection(candidate: CandidateRecord) -> dict[str, Any]:
+    row = {
+        "sample_idx": candidate.sample_idx,
+        "frame_idx": candidate.frame_idx,
+        "timestamp": candidate.timestamp,
+        "origin": candidate.origin,
+    }
+    for group in (candidate.visual, candidate.temporal, candidate.evidence, candidate.selection, candidate.lineage):
+        for key, value in group.__dict__.items():
+            if value is not None and value != ():
+                row[key] = _thaw_value(value)
+    return row
+
+
+def candidate_to_trace_row(candidate: CandidateRecord) -> dict[str, Any]:
+    return _candidate_projection(candidate)
+
+
+def candidate_to_manifest_row(candidate: CandidateRecord, *, filename: str | None = None) -> dict[str, Any]:
+    row = _candidate_projection(candidate)
+    if filename is not None:
+        row["path"] = filename
+    return row
+
+
+def candidate_to_caption_log_row(candidate: CandidateRecord, *, path: Path) -> dict[str, Any]:
+    row = _candidate_projection(candidate)
+    row["path"] = str(path)
+    return row
 
 
 @dataclass(frozen=True)

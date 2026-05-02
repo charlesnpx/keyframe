@@ -16,7 +16,7 @@ from keyframe.dedupe import (
     has_meaningful_evidence_for_retention,
     hamming,
 )
-from keyframe.pipeline.contracts import as_candidate_record, candidate_records
+from keyframe.pipeline.contracts import CandidateRecord, as_candidate_record, candidate_records
 
 
 def coalesce_tiny_scenes(
@@ -117,14 +117,26 @@ def candidate_budget_for_scenes(base_clusters: int, scene_count: int, multiplier
     return max(base_clusters, min(scene_count, base_clusters * multiplier))
 
 
+def _records(candidates: Sequence[Mapping[str, Any] | CandidateRecord]) -> tuple[CandidateRecord, ...]:
+    return candidate_records(candidates)
+
+
+def _record_tokens(candidate: CandidateRecord, *, rescue: bool = False) -> set[str]:
+    if rescue and candidate.evidence.rescue_tokens:
+        return set(candidate.evidence.rescue_tokens)
+    if candidate.evidence.rescue_tokens:
+        return set(candidate.evidence.rescue_tokens)
+    return set(candidate.evidence.ocr_tokens)
+
+
 def score_candidate_for_rep(
-    candidate: Mapping[str, Any],
+    candidate: CandidateRecord,
     image: Any | None = None,
     transcript_density: float = 0.0,
     end_of_dwell_bonus: float | None = None,
 ) -> float:
     """Score a candidate for representative selection."""
-    sharpness = candidate.get("sharpness")
+    sharpness = candidate.visual.sharpness
     if sharpness is None and image is not None:
         from keyframe.frames import _laplacian_sharpness
 
@@ -135,7 +147,7 @@ def score_candidate_for_rep(
     transcript_bonus = min(max(float(transcript_density or 0.0), 0.0), 1.0) * 0.75
 
     if end_of_dwell_bonus is None:
-        end_of_dwell_bonus = float(candidate.get("end_of_dwell_bonus", 0.0) or 0.0)
+        end_of_dwell_bonus = float(candidate.selection.end_of_dwell_bonus or 0.0)
     dwell_bonus = min(max(float(end_of_dwell_bonus), 0.0), 1.0) * 0.5
     return normalized_sharpness + transcript_bonus + dwell_bonus
 
@@ -290,15 +302,16 @@ def build_rescue_shortlist(
     frames: Sequence[Image.Image],
     timestamps: Sequence[float],
     frame_indices: Sequence[int],
-    candidates: Sequence[Mapping[str, Any]],
+    candidates: Sequence[Mapping[str, Any] | CandidateRecord],
     pass1_clusters: int,
     *,
     sample_clusters: Mapping[int, int] | None = None,
     sample_scenes: Mapping[int, int] | None = None,
-) -> tuple[list[dict[str, Any]], list[dict[str, float]], int]:
+) -> tuple[tuple[CandidateRecord, ...], list[dict[str, float]], int]:
     """Rank non-selected sampled frames for bounded OCR rescue."""
+    candidates = _records(candidates)
     proxy_rows = proxy_content_scores(frames)
-    candidate_idxs = {int(c["sample_idx"]) for c in candidates}
+    candidate_idxs = {int(c.sample_idx) for c in candidates}
     rescue_budget = max(3, round(pass1_clusters * 0.35))
     scores = [row["proxy_content_score"] for row in proxy_rows]
     tau_proxy = float(np.percentile(scores, 75)) if scores else 0.0
@@ -327,7 +340,6 @@ def build_rescue_shortlist(
             "cluster_role": "rescue",
             "proxy_content_score": float(metrics["proxy_content_score"]),
             "rescue_priority": 0,
-            **metrics,
         })
 
     ranked.sort(
@@ -403,7 +415,10 @@ def build_rescue_shortlist(
             break
         add(row)
 
-    return shortlist[:cap], proxy_rows, rescue_budget
+    return tuple(
+        as_candidate_record(row, origin="rescue_shortlist")
+        for row in shortlist[:cap]
+    ), proxy_rows, rescue_budget
 
 
 def _marker_signature(tokens: set[str]) -> tuple[tuple[str, tuple[str, ...]], ...]:
@@ -442,32 +457,32 @@ def _content_reference_tokens(tokens: set[str]) -> set[str]:
 
 
 def _same_marker_covered(
-    rescue: Mapping[str, Any],
-    candidates: Sequence[Mapping[str, Any]],
+    rescue: CandidateRecord,
+    candidates: Sequence[CandidateRecord],
     dwell_ids: Sequence[int],
     *,
     scene_only: bool = False,
 ) -> bool:
-    rescue_tokens = set(rescue.get("rescue_tokens", rescue.get("ocr_tokens", [])))
+    rescue_tokens = _record_tokens(rescue, rescue=True)
     signature = _marker_signature(rescue_tokens)
     if not signature:
         return False
-    rescue_idx = int(rescue["sample_idx"])
+    rescue_idx = int(rescue.sample_idx)
     rescue_dwell = dwell_ids[rescue_idx] if 0 <= rescue_idx < len(dwell_ids) else None
-    rescue_scene = rescue.get("scene_id")
+    rescue_scene = rescue.temporal.scene_id
     for candidate in candidates:
-        candidate_tokens = set(candidate.get("rescue_tokens", candidate.get("ocr_tokens", [])))
+        candidate_tokens = _record_tokens(candidate, rescue=True)
         if _marker_signature(candidate_tokens) != signature:
             continue
         if scene_only:
-            if rescue_scene is not None and candidate.get("scene_id") == rescue_scene:
+            if rescue_scene is not None and candidate.temporal.scene_id == rescue_scene:
                 return True
             continue
-        candidate_idx = int(candidate["sample_idx"])
+        candidate_idx = int(candidate.sample_idx)
         candidate_dwell = dwell_ids[candidate_idx] if 0 <= candidate_idx < len(dwell_ids) else None
         if rescue_dwell is not None and candidate_dwell == rescue_dwell:
             return True
-        if abs(float(rescue["timestamp"]) - float(candidate["timestamp"])) <= 2.0:
+        if abs(float(rescue.timestamp) - float(candidate.timestamp)) <= 2.0:
             return True
     return False
 
@@ -477,39 +492,41 @@ def _marker_equivalent(tokens_a: set[str], tokens_b: set[str]) -> bool:
     return bool(signature_a) and signature_a == _marker_signature(tokens_b)
 
 
-def _candidate_dwell_id(candidate: Mapping[str, Any], dwell_ids: Sequence[int]) -> int | None:
-    if candidate.get("dwell_id") is not None:
-        return int(candidate["dwell_id"])
-    sample_idx = int(candidate["sample_idx"])
+def _candidate_dwell_id(candidate: CandidateRecord, dwell_ids: Sequence[int]) -> int | None:
+    if candidate.temporal.dwell_id is not None:
+        return int(candidate.temporal.dwell_id)
+    sample_idx = int(candidate.sample_idx)
     if 0 <= sample_idx < len(dwell_ids):
         return int(dwell_ids[sample_idx])
     return None
 
 
 def has_local_equivalent_coverage(
-    rescue: Mapping[str, Any],
-    candidates: Sequence[Mapping[str, Any]],
+    rescue: Mapping[str, Any] | CandidateRecord,
+    candidates: Sequence[Mapping[str, Any] | CandidateRecord],
     dwell_ids: Sequence[int],
     *,
     tolerance: float = 2.25,
 ) -> bool:
-    rescue_scene = rescue.get("scene_id")
-    rescue_tokens = set(rescue.get("rescue_tokens", rescue.get("ocr_tokens", [])))
+    rescue = as_candidate_record(rescue)
+    records = _records(candidates)
+    rescue_scene = rescue.temporal.scene_id
+    rescue_tokens = _record_tokens(rescue, rescue=True)
     rescue_dwell = _candidate_dwell_id(rescue, dwell_ids)
-    rescue_window = rescue.get("temporal_window_id")
-    for candidate in candidates:
-        if candidate.get("scene_id") != rescue_scene:
+    rescue_window = rescue.temporal.temporal_window_id
+    for candidate in records:
+        if candidate.temporal.scene_id != rescue_scene:
             continue
-        candidate_tokens = set(candidate.get("rescue_tokens", candidate.get("ocr_tokens", [])))
+        candidate_tokens = _record_tokens(candidate, rescue=True)
         if not _marker_equivalent(candidate_tokens, rescue_tokens):
             continue
         candidate_dwell = _candidate_dwell_id(candidate, dwell_ids)
         same_dwell = rescue_dwell is not None and candidate_dwell == rescue_dwell
-        near_time = abs(float(candidate["timestamp"]) - float(rescue["timestamp"])) <= tolerance
+        near_time = abs(float(candidate.timestamp) - float(rescue.timestamp)) <= tolerance
         same_window = (
             rescue_window is not None
-            and candidate.get("temporal_window_id") is not None
-            and int(candidate["temporal_window_id"]) == int(rescue_window)
+            and candidate.temporal.temporal_window_id is not None
+            and int(candidate.temporal.temporal_window_id) == int(rescue_window)
         )
         if same_dwell or near_time or same_window:
             return True
@@ -517,37 +534,37 @@ def has_local_equivalent_coverage(
 
 
 def _primary_for_rescue(
-    rescue: Mapping[str, Any],
-    candidates: Sequence[Mapping[str, Any]],
+    rescue: CandidateRecord,
+    candidates: Sequence[CandidateRecord],
     *,
     same_cluster: bool,
-) -> dict[str, Any] | None:
+) -> CandidateRecord | None:
     if same_cluster:
-        cluster = rescue.get("clip_cluster")
-        pool = [dict(c) for c in candidates if c.get("clip_cluster") == cluster]
+        cluster = rescue.visual.clip_cluster
+        pool = [c for c in candidates if c.visual.clip_cluster == cluster]
     else:
-        scene = rescue.get("scene_id")
-        pool = [dict(c) for c in candidates if scene is not None and c.get("scene_id") == scene]
+        scene = rescue.temporal.scene_id
+        pool = [c for c in candidates if scene is not None and c.temporal.scene_id == scene]
     if not pool:
         return None
-    return min(pool, key=lambda c: abs(float(c.get("timestamp", 0.0)) - float(rescue.get("timestamp", 0.0))))
+    return min(pool, key=lambda c: abs(float(c.timestamp) - float(rescue.timestamp)))
 
 
 def _rescue_reason(
-    rescue: Mapping[str, Any],
-    primary: Mapping[str, Any],
+    rescue: CandidateRecord,
+    primary: CandidateRecord,
     dwell_ids: Sequence[int],
-    candidates: Sequence[Mapping[str, Any]],
+    candidates: Sequence[CandidateRecord],
 ) -> str | None:
-    rescue_tokens = set(rescue.get("rescue_tokens", rescue.get("ocr_tokens", [])))
-    primary_tokens = set(primary.get("rescue_tokens", primary.get("ocr_tokens", [])))
-    rescue_score = float(rescue.get("proxy_content_score", 0.0) or 0.0)
-    primary_score = float(primary.get("proxy_content_score", 0.0) or 0.0)
-    rescue_scene = rescue.get("scene_id")
+    rescue_tokens = _record_tokens(rescue, rescue=True)
+    primary_tokens = _record_tokens(primary, rescue=True)
+    rescue_score = float(rescue.selection.proxy_content_score or 0.0)
+    primary_score = float(primary.selection.proxy_content_score or 0.0)
+    rescue_scene = rescue.temporal.scene_id
     same_scene_deltas = [
-        abs(float(candidate.get("timestamp", 0.0)) - float(rescue.get("timestamp", 0.0)))
+        abs(float(candidate.timestamp) - float(rescue.timestamp))
         for candidate in candidates
-        if rescue_scene is not None and candidate.get("scene_id") == rescue_scene
+        if rescue_scene is not None and candidate.temporal.scene_id == rescue_scene
     ]
     nearest_same_scene_dt = min(same_scene_deltas, default=float("inf"))
 
@@ -582,65 +599,74 @@ def _rescue_reason(
 
 
 def _as_promoted_rescue(
-    rescue: Mapping[str, Any],
-    primary: Mapping[str, Any] | None,
+    rescue: CandidateRecord,
+    primary: CandidateRecord | None,
     *,
     origin: str,
     reason: str,
     priority: int,
     next_cluster: int,
-) -> Any:
-    row = dict(rescue)
+) -> CandidateRecord:
+    clip_cluster = rescue.visual.clip_cluster
+    clip_cluster_size = rescue.visual.clip_cluster_size
     if primary is not None:
-        row["clip_cluster"] = primary.get("clip_cluster", row.get("clip_cluster", next_cluster))
-        row["clip_cluster_size"] = primary.get("clip_cluster_size", row.get("clip_cluster_size", 1))
-    elif row.get("clip_cluster") is None:
-        row["clip_cluster"] = next_cluster
-    row["cluster_role"] = "rescue"
-    row["candidate_score"] = float(row.get("proxy_content_score", 0.0) or 0.0)
-    row["rescue_origin"] = origin
-    row["rescue_reason"] = reason
-    row["rescue_priority"] = int(priority)
-    row.setdefault("retention_reason", "none")
-    roles = set(row.get("lineage_roles", []))
+        clip_cluster = primary.visual.clip_cluster if primary.visual.clip_cluster is not None else clip_cluster
+        clip_cluster_size = primary.visual.clip_cluster_size if primary.visual.clip_cluster_size is not None else clip_cluster_size
+    elif clip_cluster is None:
+        clip_cluster = next_cluster
+    roles = set(rescue.lineage.lineage_roles)
     roles.add("rescue")
-    row["lineage_roles"] = sorted(roles)
-    return as_candidate_record(row)
+    return (
+        rescue.with_visual(
+            clip_cluster=clip_cluster,
+            clip_cluster_size=clip_cluster_size or 1,
+            cluster_role="rescue",
+        )
+        .with_selection(
+            candidate_score=float(rescue.selection.proxy_content_score or 0.0),
+            rescue_origin=origin,
+            rescue_reason=reason,
+            rescue_priority=int(priority),
+            retention_reason=rescue.selection.retention_reason or "none",
+        )
+        .with_lineage(lineage_roles=tuple(sorted(roles)))
+    )
 
 
 def promote_rescue_candidates(
-    candidates: Sequence[Mapping[str, Any]],
-    rescue_shortlist: Sequence[Mapping[str, Any]],
+    candidates: Sequence[Mapping[str, Any] | CandidateRecord],
+    rescue_shortlist: Sequence[Mapping[str, Any] | CandidateRecord],
     dwell_ids: Sequence[int],
     *,
     rescue_budget: int,
     clip_embeddings: Any | None = None,
-) -> tuple[Any, ...]:
+) -> tuple[CandidateRecord, ...]:
     """Promote OCR-bearing rescue frames by bounded swap/additive rules."""
-    promoted = [as_candidate_record(c) for c in candidates]
+    promoted = list(_records(candidates))
+    rescue_shortlist = _records(rescue_shortlist)
     if rescue_budget <= 0 or not rescue_shortlist:
-        return tuple(sorted(promoted, key=lambda c: (float(c.get("timestamp", 0.0)), int(c.get("sample_idx", 0)))))
+        return tuple(sorted(promoted, key=lambda c: (float(c.timestamp), int(c.sample_idx))))
 
-    next_cluster = max((int(c.get("clip_cluster", -1)) for c in promoted if c.get("clip_cluster") is not None), default=-1) + 1
-    used_idxs = {int(c["sample_idx"]) for c in promoted}
+    next_cluster = max((int(c.visual.clip_cluster) for c in promoted if c.visual.clip_cluster is not None), default=-1) + 1
+    used_idxs = {int(c.sample_idx) for c in promoted}
     consumed = 0
     priority = 0
 
-    def maybe_swap(rescue: Mapping[str, Any], *, same_cluster: bool, origin: str) -> bool:
+    def maybe_swap(rescue: CandidateRecord, *, same_cluster: bool, origin: str) -> bool:
         nonlocal consumed, priority
         primary = _primary_for_rescue(rescue, promoted, same_cluster=same_cluster)
         if primary is None:
             return False
-        rescue_tokens = set(rescue.get("rescue_tokens", rescue.get("ocr_tokens", [])))
-        primary_tokens = set(primary.get("rescue_tokens", primary.get("ocr_tokens", [])))
+        rescue_tokens = _record_tokens(rescue, rescue=True)
+        primary_tokens = _record_tokens(primary, rescue=True)
         temporally_local = (
-            primary.get("scene_id") == rescue.get("scene_id")
+            primary.temporal.scene_id == rescue.temporal.scene_id
             and (
-                abs(float(primary.get("timestamp", 0.0)) - float(rescue.get("timestamp", 0.0))) <= 2.25
+                abs(float(primary.timestamp) - float(rescue.timestamp)) <= 2.25
                 or (
-                    rescue.get("temporal_window_id") is not None
-                    and primary.get("temporal_window_id") is not None
-                    and int(primary["temporal_window_id"]) == int(rescue["temporal_window_id"])
+                    rescue.temporal.temporal_window_id is not None
+                    and primary.temporal.temporal_window_id is not None
+                    and int(primary.temporal.temporal_window_id) == int(rescue.temporal.temporal_window_id)
                 )
                 or (
                     _candidate_dwell_id(primary, dwell_ids) is not None
@@ -650,7 +676,7 @@ def promote_rescue_candidates(
         )
         if (
             temporally_local
-            and _clip_cosine(clip_embeddings, int(rescue["sample_idx"]), int(primary["sample_idx"])) >= 0.93
+            and _clip_cosine(clip_embeddings, int(rescue.sample_idx), int(primary.sample_idx)) >= 0.93
             and _jaccard(rescue_tokens, primary_tokens) >= 0.7
         ):
             return False
@@ -659,10 +685,10 @@ def promote_rescue_candidates(
             return False
         if reason == "temporal_coverage":
             return False
-        rescue_idx = int(rescue["sample_idx"])
-        primary_idx = int(primary["sample_idx"])
+        rescue_idx = int(rescue.sample_idx)
+        primary_idx = int(primary.sample_idx)
         for i, candidate in enumerate(promoted):
-            if int(candidate["sample_idx"]) == primary_idx:
+            if int(candidate.sample_idx) == primary_idx:
                 priority += 1
                 promoted[i] = _as_promoted_rescue(
                     rescue,
@@ -681,7 +707,7 @@ def promote_rescue_candidates(
     for rescue in rescue_shortlist:
         if consumed >= rescue_budget:
             break
-        if int(rescue["sample_idx"]) in used_idxs:
+        if int(rescue.sample_idx) in used_idxs:
             continue
         if maybe_swap(rescue, same_cluster=True, origin="same_cluster_swap"):
             continue
@@ -689,7 +715,7 @@ def promote_rescue_candidates(
     for rescue in rescue_shortlist:
         if consumed >= rescue_budget:
             break
-        if int(rescue["sample_idx"]) in used_idxs:
+        if int(rescue.sample_idx) in used_idxs:
             continue
         if maybe_swap(rescue, same_cluster=False, origin="same_scene_generic_primary_swap"):
             continue
@@ -697,20 +723,20 @@ def promote_rescue_candidates(
     for rescue in rescue_shortlist:
         if consumed >= rescue_budget:
             break
-        rescue_idx = int(rescue["sample_idx"])
+        rescue_idx = int(rescue.sample_idx)
         if rescue_idx in used_idxs:
             continue
-        rescue_tokens = set(rescue.get("rescue_tokens", rescue.get("ocr_tokens", [])))
+        rescue_tokens = _record_tokens(rescue, rescue=True)
         redundant = False
         for candidate in promoted:
             temporally_local = (
-                candidate.get("scene_id") == rescue.get("scene_id")
+                candidate.temporal.scene_id == rescue.temporal.scene_id
                 and (
-                    abs(float(candidate.get("timestamp", 0.0)) - float(rescue.get("timestamp", 0.0))) <= 2.25
+                    abs(float(candidate.timestamp) - float(rescue.timestamp)) <= 2.25
                     or (
-                        rescue.get("temporal_window_id") is not None
-                        and candidate.get("temporal_window_id") is not None
-                        and int(candidate["temporal_window_id"]) == int(rescue["temporal_window_id"])
+                        rescue.temporal.temporal_window_id is not None
+                        and candidate.temporal.temporal_window_id is not None
+                        and int(candidate.temporal.temporal_window_id) == int(rescue.temporal.temporal_window_id)
                     )
                     or (
                         _candidate_dwell_id(candidate, dwell_ids) is not None
@@ -719,15 +745,15 @@ def promote_rescue_candidates(
                 )
             )
             if temporally_local and _marker_equivalent(
-                set(candidate.get("rescue_tokens", candidate.get("ocr_tokens", []))),
+                _record_tokens(candidate, rescue=True),
                 rescue_tokens,
             ):
                 redundant = True
                 break
-            candidate_tokens = set(candidate.get("rescue_tokens", candidate.get("ocr_tokens", [])))
+            candidate_tokens = _record_tokens(candidate, rescue=True)
             if (
                 temporally_local
-                and _clip_cosine(clip_embeddings, rescue_idx, int(candidate["sample_idx"])) >= 0.93
+                and _clip_cosine(clip_embeddings, rescue_idx, int(candidate.sample_idx)) >= 0.93
                 and _jaccard(rescue_tokens, candidate_tokens) >= 0.7
             ):
                 redundant = True
@@ -735,7 +761,7 @@ def promote_rescue_candidates(
         if redundant:
             continue
 
-        primary = _primary_for_rescue(rescue, promoted, same_cluster=False) or (promoted[0] if promoted else {})
+        primary = _primary_for_rescue(rescue, promoted, same_cluster=False) or (promoted[0] if promoted else None)
         if primary:
             reason = _rescue_reason(rescue, primary, dwell_ids, promoted)
             if reason is None:
@@ -763,4 +789,4 @@ def promote_rescue_candidates(
         used_idxs.add(rescue_idx)
         consumed += 1
 
-    return tuple(sorted(promoted, key=lambda c: (float(c.get("timestamp", 0.0)), int(c.get("sample_idx", 0)))))
+    return tuple(sorted(promoted, key=lambda c: (float(c.timestamp), int(c.sample_idx))))

@@ -61,7 +61,7 @@ from keyframe.scoring import (
     rescue_window_seconds,
     score_candidate_for_rep,
 )
-from keyframe.pipeline.contracts import as_candidate_record, candidate_records
+from keyframe.pipeline.contracts import CandidateRecord, as_candidate_record, candidate_records, candidate_to_caption_log_row
 
 
 # ── Video sampling ──────────────────────────────────────────────────────────
@@ -359,12 +359,11 @@ def clip_oversegment(
                 dwell_bonus = 1.0 if max(hamming(dhashes[idx], left), hamming(dhashes[idx], right)) <= 6 else 0.0
             else:
                 dwell_bonus = 0.0
-            cand = {
-                "sample_idx": int(idx),
-                "timestamp": timestamps[idx],
-                "sharpness": sharpness,
-                "end_of_dwell_bonus": dwell_bonus,
-            }
+            cand = CandidateRecord(
+                sample_idx=int(idx),
+                frame_idx=frame_indices[idx],
+                timestamp=float(timestamps[idx]),
+            ).with_visual(sharpness=float(sharpness)).with_selection(end_of_dwell_bonus=float(dwell_bonus))
             density = 0.0 if transcript_density is None else transcript_density.get(idx, 0.0)
             scored.append((score_candidate_for_rep(cand, frames[idx], density, dwell_bonus), idx, sharpness))
         best_score, best, best_sharpness = max(scored)
@@ -441,6 +440,7 @@ def clip_oversegment(
 # ── Pass 2: Florence-2 captioning ──────────────────────────────────────────
 
 def caption_candidates(candidates, frames, device="mps", preloaded=None):
+    candidates = candidate_records(candidates)
     print(f"\n── Pass 2: Florence-2 captioning ({len(candidates)} frames) ──")
 
     if preloaded:
@@ -456,7 +456,7 @@ def caption_candidates(candidates, frames, device="mps", preloaded=None):
 
     prompt = "<MORE_DETAILED_CAPTION>"
 
-    candidate_images = [frames[c["sample_idx"]] for c in candidates]
+    candidate_images = [frames[c.sample_idx] for c in candidates]
     batch_inputs = processor(
         text=[prompt] * len(candidates),
         images=candidate_images,
@@ -486,8 +486,8 @@ def caption_candidates(candidates, frames, device="mps", preloaded=None):
         )
         caption = parsed.get(prompt, text)
         captions.append(caption)
-        updated_candidates.append(cand.with_updates(caption=caption) if hasattr(cand, "with_updates") else {**cand, "caption": caption})
-        print(f"  [{i+1}/{len(candidates)}] {cand['timestamp']:5.1f}s → \"{caption[:120]}\"")
+        updated_candidates.append(cand.with_evidence(caption=caption))
+        print(f"  [{i+1}/{len(candidates)}] {cand.timestamp:5.1f}s -> \"{caption[:120]}\"")
 
     del model, processor
     if device == "mps":
@@ -561,11 +561,12 @@ def _is_macos():
 
 def ocr_candidates(candidates, frames, preloaded_engine=None):
     """Run OCR on each candidate frame. Uses Apple Vision on macOS, PaddleOCR elsewhere."""
+    candidates = candidate_records(candidates)
     use_apple = _is_macos()
     backend = "Apple Vision" if use_apple else "PaddleOCR"
     print(f"\n── Pass 2b: OCR text extraction ({len(candidates)} frames, {backend}) ──")
 
-    need_ocr = any("ocr_text" not in cand or cand["ocr_text"] is None for cand in candidates)
+    need_ocr = any(cand.evidence.ocr_text is None for cand in candidates)
     paddle_engine = None
     if not use_apple and need_ocr:
         if preloaded_engine:
@@ -583,23 +584,23 @@ def ocr_candidates(candidates, frames, preloaded_engine=None):
     ocr_texts = []
     updated_candidates = []
     for i, cand in enumerate(candidates):
-        if "ocr_text" in cand and cand["ocr_text"] is not None:
-            raw_text = str(cand["ocr_text"])
+        if cand.evidence.ocr_text is not None:
+            raw_text = str(cand.evidence.ocr_text)
             ocr_texts.append(raw_text)
             updated_candidates.append(cand)
             preview = raw_text[:120] if raw_text else "(no text)"
-            print(f"  [{i+1}/{len(candidates)}] {cand['timestamp']:5.1f}s → "
+            print(f"  [{i+1}/{len(candidates)}] {cand.timestamp:5.1f}s -> "
                   f"cached, {len(raw_text)} chars: \"{preview}\"")
             continue
 
-        img = frames[cand["sample_idx"]]
+        img = frames[cand.sample_idx]
         lines = _ocr_apple_vision(img) if use_apple else _ocr_paddle(img, paddle_engine)
 
         raw_text = " ".join(lines)
         ocr_texts.append(raw_text)
-        updated_candidates.append(cand.with_updates(ocr_text=raw_text) if hasattr(cand, "with_updates") else {**cand, "ocr_text": raw_text})
+        updated_candidates.append(cand.with_evidence(ocr_text=raw_text))
         preview = raw_text[:120] if raw_text else "(no text)"
-        print(f"  [{i+1}/{len(candidates)}] {cand['timestamp']:5.1f}s → "
+        print(f"  [{i+1}/{len(candidates)}] {cand.timestamp:5.1f}s -> "
               f"{len(lines)} lines, {len(raw_text)} chars: \"{preview}\"")
 
     return ocr_texts, tuple(updated_candidates)
@@ -642,6 +643,7 @@ def _build_hybrid_captions(filtered_ocr, florence_captions, candidates,
     embeds Florence-2 and OCR separately to avoid CLIP's 77-token limit.
     """
     print(f"\n── Hybrid caption analysis ──")
+    candidates = candidate_records(candidates)
     has_ocr = []
     updated_candidates = []
     for i, (ocr, flor) in enumerate(zip(filtered_ocr, florence_captions)):
@@ -649,9 +651,9 @@ def _build_hybrid_captions(filtered_ocr, florence_captions, candidates,
         has_ocr.append(has)
         tag = "both" if has else "florence"
         cand = candidates[i]
-        updated_candidates.append(cand.with_updates(caption_source=tag) if hasattr(cand, "with_updates") else {**cand, "caption_source": tag})
+        updated_candidates.append(cand.with_evidence(caption_source=tag))
         display = f"{flor[:60]} + OCR({len(ocr)}ch)" if has else flor[:100]
-        print(f"  [{i+1}/{len(filtered_ocr)}] {candidates[i]['timestamp']:5.1f}s → "
+        print(f"  [{i+1}/{len(filtered_ocr)}] {candidates[i].timestamp:5.1f}s -> "
               f"[{tag}] \"{display}\"")
     n_both = sum(has_ocr)
     print(f"  → {n_both} with OCR signal, {len(has_ocr) - n_both} Florence-2 only")
@@ -710,6 +712,7 @@ def _build_rescue_token_sets(raw_ocr_texts, max_tokens=120):
 
 
 def attach_ocr_token_attribution(candidates, raw_ocr_texts, filtered_ocr_texts, cleaned_token_sets):
+    candidates = candidate_records(candidates)
     raw_token_sets = _build_ocr_token_sets(raw_ocr_texts)
     filtered_token_sets = _build_ocr_token_sets(filtered_ocr_texts)
     rescue_token_sets = _build_rescue_token_sets(raw_ocr_texts)
@@ -720,27 +723,33 @@ def attach_ocr_token_attribution(candidates, raw_ocr_texts, filtered_ocr_texts, 
         raw_count = len(raw_tokens)
         filtered_count = len(filtered_tokens)
         cleaned_count = len(cleaned_tokens)
-        updates = {
-            "ocr_tokens": sorted(cleaned_tokens),
-            "dedupe_tokens": sorted(cleaned_tokens),
-            "rescue_tokens": sorted(rescue_tokens),
-            "raw_token_count": raw_count,
-            "filtered_token_count": filtered_count,
-            "cleaned_token_count": cleaned_count,
-            "cleaning_attrition_ratio": (
-            0.0 if raw_count == 0 else round((raw_count - cleaned_count) / raw_count, 4)
-            ),
-            "retention_reason": cand.get("retention_reason", "none"),
-            "retention_reasons_seen": cand.get("retention_reasons_seen", [cand.get("retention_reason", "none")]),
-        }
-        if cand.get("cluster_role"):
-            updates["lineage_roles"] = cand.get("lineage_roles", [cand["cluster_role"]])
-        updated_candidates.append(cand.with_updates(**updates) if hasattr(cand, "with_updates") else {**cand, **updates})
+        updated = cand.with_evidence(
+            ocr_tokens=tuple(sorted(cleaned_tokens)),
+            dedupe_tokens=tuple(sorted(cleaned_tokens)),
+            rescue_tokens=tuple(sorted(rescue_tokens)),
+            raw_token_count=raw_count,
+            filtered_token_count=filtered_count,
+            cleaned_token_count=cleaned_count,
+            cleaning_attrition_ratio=0.0 if raw_count == 0 else round((raw_count - cleaned_count) / raw_count, 4),
+        ).with_selection(
+            retention_reason=cand.selection.retention_reason or "none",
+        )
+        reasons_seen = set(cand.lineage.retention_reasons_seen) | {updated.selection.retention_reason or "none"}
+        roles = set(cand.lineage.lineage_roles)
+        if cand.visual.cluster_role:
+            roles.add(str(cand.visual.cluster_role))
+        updated_candidates.append(
+            updated.with_lineage(
+                retention_reasons_seen=tuple(sorted(reasons_seen)),
+                lineage_roles=tuple(sorted(roles)),
+            )
+        )
     return tuple(updated_candidates)
 
 
 def attach_rescue_ocr_metadata(candidates, raw_ocr_texts):
     """Attach temporary split OCR tokens while preserving raw OCR as cache."""
+    candidates = candidate_records(candidates)
     filtered_ocr = _filter_ocr_tokens(raw_ocr_texts)
     dedupe_token_sets = clean_ocr_token_sets(_build_ocr_token_sets(filtered_ocr))
     rescue_token_sets = _build_rescue_token_sets(raw_ocr_texts)
@@ -750,43 +759,46 @@ def attach_rescue_ocr_metadata(candidates, raw_ocr_texts):
     ):
         raw_tokens = _build_ocr_token_sets([raw_text])[0]
         filtered_tokens = _build_ocr_token_sets([filtered_text])[0]
-        updates = {
-            "ocr_text": raw_text,
-            "ocr_cache_source": cand.get("ocr_cache_source", "rescue"),
-            "ocr_tokens": sorted(dedupe_tokens),
-            "dedupe_tokens": sorted(dedupe_tokens),
-            "rescue_tokens": sorted(rescue_tokens),
-            "raw_token_count": len(raw_tokens),
-            "filtered_token_count": len(filtered_tokens),
-            "cleaned_token_count": len(dedupe_tokens),
-        }
-        updated_candidates.append(cand.with_updates(**updates) if hasattr(cand, "with_updates") else {**cand, **updates})
+        updated_candidates.append(
+            cand.with_evidence(
+                ocr_text=raw_text,
+                ocr_cache_source=cand.evidence.ocr_cache_source or "rescue",
+                ocr_tokens=tuple(sorted(dedupe_tokens)),
+                dedupe_tokens=tuple(sorted(dedupe_tokens)),
+                rescue_tokens=tuple(sorted(rescue_tokens)),
+                raw_token_count=len(raw_tokens),
+                filtered_token_count=len(filtered_tokens),
+                cleaned_token_count=len(dedupe_tokens),
+            )
+        )
     return tuple(updated_candidates)
 
 
 def _comparison_primary_sample_idxs(candidates, shortlist):
+    candidates = candidate_records(candidates)
+    shortlist = candidate_records(shortlist)
     selected: set[int] = set()
     for rescue in shortlist:
-        rescue_ts = float(rescue.get("timestamp", 0.0))
-        rescue_cluster = rescue.get("clip_cluster")
-        rescue_scene = rescue.get("scene_id")
+        rescue_ts = float(rescue.timestamp)
+        rescue_cluster = rescue.visual.clip_cluster
+        rescue_scene = rescue.temporal.scene_id
 
         same_cluster = [
             cand for cand in candidates
-            if rescue_cluster is not None and cand.get("clip_cluster") == rescue_cluster
+            if rescue_cluster is not None and cand.visual.clip_cluster == rescue_cluster
         ]
         same_scene = [
             cand for cand in candidates
-            if rescue_scene is not None and cand.get("scene_id") == rescue_scene
+            if rescue_scene is not None and cand.temporal.scene_id == rescue_scene
         ]
         for pool in (same_cluster, same_scene):
             if not pool:
                 continue
             primary = min(
                 pool,
-                key=lambda cand: abs(float(cand.get("timestamp", 0.0)) - rescue_ts),
+                key=lambda cand: abs(float(cand.timestamp) - rescue_ts),
             )
-            selected.add(int(primary["sample_idx"]))
+            selected.add(int(primary.sample_idx))
     return selected
 
 
@@ -803,6 +815,7 @@ def rescue_from_sampled_frames(
     sample_scenes=None,
     preloaded_engine=None,
 ):
+    candidates = candidate_records(candidates)
     window_seconds = rescue_window_seconds(timestamps)
     temporal_window_ids = assign_temporal_window_ids(
         timestamps,
@@ -810,16 +823,17 @@ def rescue_from_sampled_frames(
         window_seconds=window_seconds,
     )
     candidates = tuple(
-        as_candidate_record(cand).with_updates(
-            proxy_content_score=float(cand.get("proxy_content_score", 0.0) or 0.0),
-            **({"scene_id": sample_scenes.get(int(cand["sample_idx"]))} if sample_scenes else {}),
-            **(
-                {
-                    "temporal_window_id": temporal_window_ids[int(cand["sample_idx"])],
-                    "temporal_window_seconds": window_seconds,
-                }
-                if int(cand["sample_idx"]) < len(temporal_window_ids)
-                else {}
+        cand.with_selection(
+            proxy_content_score=float(cand.selection.proxy_content_score or 0.0),
+        ).with_temporal(
+            scene_id=sample_scenes.get(int(cand.sample_idx)) if sample_scenes else cand.temporal.scene_id,
+            temporal_window_id=(
+                temporal_window_ids[int(cand.sample_idx)]
+                if int(cand.sample_idx) < len(temporal_window_ids)
+                else None
+            ),
+            temporal_window_seconds=(
+                window_seconds if int(cand.sample_idx) < len(temporal_window_ids) else None
             ),
         )
         for cand in candidates
@@ -835,27 +849,27 @@ def rescue_from_sampled_frames(
         sample_scenes=sample_scenes,
     )
     candidates = tuple(
-        cand.with_updates(proxy_content_score=float(proxy_rows[int(cand["sample_idx"])]["proxy_content_score"]))
-        if 0 <= int(cand["sample_idx"]) < len(proxy_rows)
+        cand.with_selection(proxy_content_score=float(proxy_rows[int(cand.sample_idx)]["proxy_content_score"]))
+        if 0 <= int(cand.sample_idx) < len(proxy_rows)
         else cand
         for cand in candidates
     )
     if not shortlist:
         print("  Rescue shortlist: 0 frames")
-        return sorted(candidates, key=lambda c: c["timestamp"])
+        return tuple(sorted(candidates, key=lambda c: c.timestamp))
 
     shortlist = tuple(
-        as_candidate_record(row, origin="rescue_shortlist").with_updates(
-            dhash=dhashes[int(row["sample_idx"])],
-            dhash_hex=f"{dhashes[int(row['sample_idx'])]:016x}",
-            sharpness=float(_laplacian_sharpness(frames[int(row["sample_idx"])])),
+        row.with_visual(
+            dhash=dhashes[int(row.sample_idx)],
+            dhash_hex=f"{dhashes[int(row.sample_idx)]:016x}",
+            sharpness=float(_laplacian_sharpness(frames[int(row.sample_idx)])),
         )
         for row in shortlist
     )
 
     print(f"  Rescue shortlist: {len(shortlist)} frames, budget {rescue_budget}")
     comparison_idxs = _comparison_primary_sample_idxs(candidates, shortlist)
-    candidate_by_idx = {int(cand["sample_idx"]): cand for cand in candidates}
+    candidate_by_idx = {int(cand.sample_idx): cand for cand in candidates}
     comparison_primaries = [
         candidate_by_idx[sample_idx]
         for sample_idx in sorted(comparison_idxs)
@@ -864,16 +878,16 @@ def rescue_from_sampled_frames(
     ocr_batch = shortlist + tuple(comparison_primaries)
     rescue_ocr_texts, ocr_batch = ocr_candidates(ocr_batch, frames, preloaded_engine=preloaded_engine)
     ocr_batch = attach_rescue_ocr_metadata(ocr_batch, rescue_ocr_texts)
-    updated_by_idx = {int(cand["sample_idx"]): cand for cand in ocr_batch}
-    candidates = tuple(updated_by_idx.get(int(cand["sample_idx"]), cand) for cand in candidates)
-    shortlist = tuple(updated_by_idx.get(int(row["sample_idx"]), row) for row in shortlist)
+    updated_by_idx = {int(cand.sample_idx): cand for cand in ocr_batch}
+    candidates = tuple(updated_by_idx.get(int(cand.sample_idx), cand) for cand in candidates)
+    shortlist = tuple(updated_by_idx.get(int(row.sample_idx), row) for row in shortlist)
     print(
         "  Rescue OCR comparison primaries: "
         f"{len(comparison_primaries)} cached selected candidates"
     )
     dwell_ids = assign_dwell_ids(dhashes)
-    candidates = tuple(cand.with_updates(dwell_id=dwell_ids[int(cand["sample_idx"])]) for cand in candidates)
-    shortlist = tuple(row.with_updates(dwell_id=dwell_ids[int(row["sample_idx"])]) for row in shortlist)
+    candidates = tuple(cand.with_temporal(dwell_id=dwell_ids[int(cand.sample_idx)]) for cand in candidates)
+    shortlist = tuple(row.with_temporal(dwell_id=dwell_ids[int(row.sample_idx)]) for row in shortlist)
     promoted = promote_rescue_candidates(
         candidates,
         shortlist,
@@ -881,7 +895,7 @@ def rescue_from_sampled_frames(
         rescue_budget=rescue_budget,
         clip_embeddings=clip_emb,
     )
-    rescue_count = sum(1 for cand in promoted if cand.get("rescue_origin"))
+    rescue_count = sum(1 for cand in promoted if cand.selection.rescue_origin)
     print(f"  Rescue promotion: {len(candidates)} -> {len(promoted)} candidates ({rescue_count} promoted)")
     return promoted
 
@@ -1049,12 +1063,24 @@ def save_results(selected, frames, output_dir):
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
+    rows = []
     for s in selected:
-        ts = s["timestamp"]
-        fidx = s["frame_idx"]
+        if isinstance(s, CandidateRecord):
+            ts = s.timestamp
+            fidx = s.frame_idx
+            sample_idx = s.sample_idx
+        else:
+            ts = s["timestamp"]
+            fidx = s["frame_idx"]
+            sample_idx = s["sample_idx"]
         path = out / f"frame_{fidx:06d}_{ts:.2f}s.png"
-        frames[s["sample_idx"]].save(str(path))
-        s["path"] = str(path)
+        frames[sample_idx].save(str(path))
+        if isinstance(s, CandidateRecord):
+            rows.append(candidate_to_caption_log_row(s, path=path))
+        else:
+            row = dict(s)
+            row["path"] = str(path)
+            rows.append(row)
 
     log = [{
         "file": Path(s["path"]).name,
@@ -1094,7 +1120,7 @@ def save_results(selected, frames, output_dir):
         "low_information_filter_reason": s.get("low_information_filter_reason"),
         "dedupe_stage": s.get("dedupe_stage"),
         "merge_reason": s.get("merge_reason"),
-    } for s in selected]
+    } for s in rows]
 
     log_path = out / "captions.json"
     with open(log_path, "w") as f:

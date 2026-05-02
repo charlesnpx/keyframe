@@ -6,11 +6,13 @@ from typing import Any, Mapping
 
 from keyframe.pipeline.contracts import (
     CandidateBatch,
+    CandidateRecord,
     FeatureOutput,
     ProposalOutput,
     SampleTable,
     SamplingOutput,
     TemporalOutput,
+    candidate_to_trace_row,
 )
 
 
@@ -56,7 +58,12 @@ def _count_duplicates(values: list[Any]) -> int:
     return sum(1 for count in counts.values() if count > 1)
 
 
-def _candidate_id(stage: str, cand: Mapping[str, Any], index: int) -> str:
+def _as_trace_mapping(cand: Mapping[str, Any] | CandidateRecord) -> Mapping[str, Any]:
+    return candidate_to_trace_row(cand) if isinstance(cand, CandidateRecord) else cand
+
+
+def _candidate_id(stage: str, cand: Mapping[str, Any] | CandidateRecord, index: int) -> str:
+    cand = _as_trace_mapping(cand)
     sample_idx = _safe_int(cand.get("sample_idx"))
     timestamp = _safe_float(cand.get("timestamp"))
     if sample_idx is not None:
@@ -66,7 +73,8 @@ def _candidate_id(stage: str, cand: Mapping[str, Any], index: int) -> str:
     return f"{stage}:unknown:{index}"
 
 
-def _candidate_row(stage: str, cand: Mapping[str, Any], index: int) -> dict[str, Any]:
+def _candidate_row(stage: str, cand: Mapping[str, Any] | CandidateRecord, index: int) -> dict[str, Any]:
+    cand = _as_trace_mapping(cand)
     row = {
         "candidate_id": str(cand.get("candidate_id") or _candidate_id(stage, cand, index)),
         "sample_idx": _safe_int(cand.get("sample_idx")),

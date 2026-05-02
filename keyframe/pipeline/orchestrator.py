@@ -20,6 +20,7 @@ from keyframe.pipeline.contracts import (
     TemporalOutput,
     as_candidate_record,
     candidate_records,
+    candidate_to_manifest_row,
 )
 from keyframe.pipeline.qa_targets import write_debug_qa_trace
 from keyframe.pipeline.trace import NoOpTraceSink, SnapshotTraceSink, TraceSink
@@ -109,22 +110,22 @@ def _select_pass1_candidates(
             sample_clusters[s_start + local_idx] = cluster_offset + int(label)
         scene_cands = [
             {
-                **cand,
-                "sample_idx": s_start + cand["sample_idx"],
-                "clip_cluster": cand["clip_cluster"] + cluster_offset,
+                **row,
+                "sample_idx": s_start + row["sample_idx"],
+                "clip_cluster": row["clip_cluster"] + cluster_offset,
                 "scene_id": scene_id,
             }
-            for cand in scene_cands
+            for row in scene_cands
         ]
         cluster_offset += scene_clusters
         all_candidates.extend(scene_cands)
 
     candidates = tuple(
-        as_candidate_record(cand).with_updates(
-            dhash=dhashes[int(cand["sample_idx"])],
-            dhash_hex=f"{dhashes[int(cand['sample_idx'])]:016x}",
+        as_candidate_record(row).with_visual(
+            dhash=dhashes[int(row["sample_idx"])],
+            dhash_hex=f"{dhashes[int(row['sample_idx'])]:016x}",
         )
-        for cand in sorted(all_candidates, key=lambda c: c["timestamp"])
+        for row in sorted(all_candidates, key=lambda c: c["timestamp"])
     )
     return candidates, sample_clusters, sample_scenes
 
@@ -262,24 +263,27 @@ class ProposalStage:
             for sample_idx, window_id in enumerate(temporal_window_ids)
         }
         candidates = tuple(
-            cand.with_updates(
-                proxy_content_score=float(cand.get("proxy_content_score", 0.0) or 0.0),
-                scene_id=sample_scenes.get(int(cand["sample_idx"])),
-                **(
-                    {
-                        "temporal_window_id": temporal_window_ids[int(cand["sample_idx"])],
-                        "temporal_window_seconds": window_seconds,
-                    }
-                    if int(cand["sample_idx"]) < len(temporal_window_ids)
-                    else {}
+            cand.with_selection(
+                proxy_content_score=float(cand.selection.proxy_content_score or 0.0),
+            ).with_temporal(
+                scene_id=sample_scenes.get(int(cand.sample_idx)),
+                temporal_window_id=(
+                    temporal_window_ids[int(cand.sample_idx)]
+                    if int(cand.sample_idx) < len(temporal_window_ids)
+                    else None
+                ),
+                temporal_window_seconds=(
+                    window_seconds
+                    if int(cand.sample_idx) < len(temporal_window_ids)
+                    else None
                 ),
             )
             for cand in candidates
         )
         ctx.trace.exit("temporal.sample_context", temporal)
 
-        pass1_primary = [c for c in candidates if c.get("cluster_role") != "alt"]
-        cluster_alt = [c for c in candidates if c.get("cluster_role") == "alt"]
+        pass1_primary = [c for c in candidates if c.visual.cluster_role != "alt"]
+        cluster_alt = [c for c in candidates if c.visual.cluster_role == "alt"]
         ctx.trace.exit("proposal.pass1_primary", _candidate_batch("proposal.pass1_primary", pass1_primary))
         ctx.trace.exit("proposal.cluster_alt", _candidate_batch("proposal.cluster_alt", cluster_alt))
 
@@ -293,15 +297,15 @@ class ProposalStage:
             sample_scenes=sample_scenes,
         )
         candidates = tuple(
-            cand.with_updates(proxy_content_score=float(proxy_rows[int(cand["sample_idx"])]["proxy_content_score"]))
-            if 0 <= int(cand["sample_idx"]) < len(proxy_rows)
+            cand.with_selection(proxy_content_score=float(proxy_rows[int(cand.sample_idx)]["proxy_content_score"]))
+            if 0 <= int(cand.sample_idx) < len(proxy_rows)
             else cand
             for cand in candidates
         )
         shortlist = tuple(
-            as_candidate_record(row, origin="rescue_shortlist").with_updates(
-                dhash=features.dhashes[int(row["sample_idx"])],
-                dhash_hex=f"{features.dhashes[int(row['sample_idx'])]:016x}",
+            row.with_visual(
+                dhash=features.dhashes[int(row.sample_idx)],
+                dhash_hex=f"{features.dhashes[int(row.sample_idx)]:016x}",
             )
             for row in shortlist
         )
@@ -334,13 +338,13 @@ class RescueEvidenceStage:
             print("  Rescue shortlist: 0 frames")
             return
         shortlist = tuple(
-            row.with_updates(sharpness=float(_laplacian_sharpness(frames[int(row["sample_idx"])])))
+            row.with_visual(sharpness=float(_laplacian_sharpness(frames[int(row.sample_idx)])))
             for row in shortlist
         )
         proposal.rescue_shortlist = shortlist
         print(f"  Rescue shortlist: {len(shortlist)} frames, budget {proposal.rescue_budget}")
         comparison_idxs = _comparison_primary_sample_idxs(proposal.candidates, shortlist)
-        candidate_by_idx = {int(cand["sample_idx"]): cand for cand in proposal.candidates}
+        candidate_by_idx = {int(cand.sample_idx): cand for cand in proposal.candidates}
         comparison_primaries = [
             candidate_by_idx[sample_idx]
             for sample_idx in sorted(comparison_idxs)
@@ -349,9 +353,9 @@ class RescueEvidenceStage:
         ocr_batch = shortlist + tuple(comparison_primaries)
         rescue_ocr_texts, ocr_batch = ocr_candidates(ocr_batch, frames, preloaded_engine=self.preloader.get_ocr_engine())
         ocr_batch = attach_rescue_ocr_metadata(ocr_batch, rescue_ocr_texts)
-        updated_by_idx = {int(cand["sample_idx"]): cand for cand in ocr_batch}
-        proposal.rescue_shortlist = tuple(updated_by_idx.get(int(row["sample_idx"]), row) for row in shortlist)
-        proposal.candidates = tuple(updated_by_idx.get(int(cand["sample_idx"]), cand) for cand in proposal.candidates)
+        updated_by_idx = {int(cand.sample_idx): cand for cand in ocr_batch}
+        proposal.rescue_shortlist = tuple(updated_by_idx.get(int(row.sample_idx), row) for row in shortlist)
+        proposal.candidates = tuple(updated_by_idx.get(int(cand.sample_idx), cand) for cand in proposal.candidates)
         print(
             "  Rescue OCR comparison primaries: "
             f"{len(comparison_primaries)} cached selected candidates"
@@ -368,20 +372,20 @@ class RescueSelectionStage:
         candidates = proposal.candidates
         shortlist = proposal.rescue_shortlist
         if not shortlist:
-            promoted = sorted(candidates, key=lambda c: c["timestamp"])
+            promoted = tuple(sorted(candidates, key=lambda c: c.timestamp))
             ctx.trace.exit("selection.promoted_rescue_only", _candidate_batch("selection.promoted_rescue_only", []))
             ctx.trace.exit(self.name, _candidate_batch(self.name, promoted))
             return promoted
         dwell_ids = assign_dwell_ids(features.dhashes)
         candidates = tuple(
-            cand.with_updates(dwell_id=dwell_ids[int(cand["sample_idx"])])
-            if 0 <= int(cand["sample_idx"]) < len(dwell_ids)
+            cand.with_temporal(dwell_id=dwell_ids[int(cand.sample_idx)])
+            if 0 <= int(cand.sample_idx) < len(dwell_ids)
             else cand
             for cand in candidates
         )
         shortlist = tuple(
-            row.with_updates(dwell_id=dwell_ids[int(row["sample_idx"])])
-            if 0 <= int(row["sample_idx"]) < len(dwell_ids)
+            row.with_temporal(dwell_id=dwell_ids[int(row.sample_idx)])
+            if 0 <= int(row.sample_idx) < len(dwell_ids)
             else row
             for row in shortlist
         )
@@ -392,9 +396,9 @@ class RescueSelectionStage:
             rescue_budget=proposal.rescue_budget,
             clip_embeddings=features.clip_embeddings,
         )
-        rescue_count = sum(1 for cand in promoted if cand.get("rescue_origin"))
+        rescue_count = sum(1 for cand in promoted if cand.selection.rescue_origin)
         print(f"  Rescue promotion: {len(candidates)} -> {len(promoted)} candidates ({rescue_count} promoted)")
-        promoted_rescue_only = [cand for cand in promoted if cand.get("rescue_origin")]
+        promoted_rescue_only = [cand for cand in promoted if cand.selection.rescue_origin]
         ctx.trace.exit(
             "selection.promoted_rescue_only",
             _candidate_batch("selection.promoted_rescue_only", promoted_rescue_only),
@@ -475,11 +479,11 @@ class SurvivalStage:
 
         frames = sampling.frame_store.frames
         dhashes = features.dhashes
-        deduped = near_time_dedupe(candidates, [set(c.get("ocr_tokens", [])) for c in candidates], dhashes)
+        deduped = near_time_dedupe(candidates, [set(c.evidence.ocr_tokens) for c in candidates], dhashes)
         print(f"  Near-time dedupe: {len(candidates)} -> {len(deduped)} candidates")
         ctx.trace.exit("survival.after_near_dedupe", _candidate_batch("survival.after_near_dedupe", deduped))
 
-        deduped_token_sets = [set(c.get("ocr_tokens", [])) for c in deduped]
+        deduped_token_sets = [set(c.evidence.ocr_tokens) for c in deduped]
         globally_deduped = global_candidate_dedupe(deduped, deduped_token_sets, dhashes)
         print(f"  Global conservative dedupe: {len(deduped)} -> {len(globally_deduped)} candidates")
         ctx.trace.exit("survival.after_global_dedupe", _candidate_batch("survival.after_global_dedupe", globally_deduped))
@@ -492,7 +496,7 @@ class SurvivalStage:
         print(f"  Adjacent same-screen dedupe: {len(filtered)} -> {len(adjacent_deduped)} candidates")
         ctx.trace.exit("survival.after_adjacent_dedupe", _candidate_batch("survival.after_adjacent_dedupe", adjacent_deduped))
 
-        deduped_token_sets = [set(c.get("ocr_tokens", [])) for c in adjacent_deduped]
+        deduped_token_sets = [set(c.evidence.ocr_tokens) for c in adjacent_deduped]
         deduped_has_ocr = [len(tokens) >= 3 for tokens in deduped_token_sets]
         final = union_find_merge(adjacent_deduped, deduped_token_sets, deduped_has_ocr, frames)
         ctx.trace.exit("survival.final_pre_cap", _candidate_batch("survival.final_pre_cap", final))
@@ -505,7 +509,7 @@ class OutputStage:
 
     def run(
         self,
-        final: list[dict[str, Any]],
+        final: tuple[CandidateRecord, ...],
         sampling: SamplingOutput,
         temporal: TemporalOutput,
         output_dir: Path,
@@ -517,9 +521,8 @@ class OutputStage:
         from keyframe.manifest import write_manifest
 
         frames = sampling.frame_store.frames
-        final_rows = [cand.to_dict() if hasattr(cand, "to_dict") else dict(cand) for cand in final]
-        selected_imgs = {cand["sample_idx"]: frames[cand["sample_idx"]] for cand in final_rows}
-        caption_log_path = save_results(final_rows, selected_imgs, output_dir)
+        selected_imgs = {cand.sample_idx: frames[cand.sample_idx] for cand in final}
+        caption_log_path = save_results(final, selected_imgs, output_dir)
         manifest_metadata = {
             "scene_coalescence": temporal.scene_coalescence,
             "rescue": {
@@ -527,7 +530,14 @@ class OutputStage:
                 "rescue_budget": rescue_budget,
             },
         }
-        manifest_path = write_manifest(final_rows, output_dir, metadata=manifest_metadata)
+        manifest_rows = [
+            candidate_to_manifest_row(
+                cand,
+                filename=f"frame_{cand.frame_idx:06d}_{cand.timestamp:.2f}s.png",
+            )
+            for cand in final
+        ]
+        manifest_path = write_manifest(manifest_rows, output_dir, metadata=manifest_metadata)
         ctx.trace.exit("output.write_manifest", {
             "caption_log_path": str(caption_log_path),
             "manifest_path": str(manifest_path),
@@ -588,19 +598,21 @@ def extract_keyframes(
         candidates = RescueSelectionStage().run(proposal, sampling, features, ctx)
         post_rescue_candidate_count = len(candidates)
         candidates = tuple(
-            cand.with_updates(
-                **(
-                    {
-                        "dhash": features.dhashes[cand["sample_idx"]],
-                        "dhash_hex": f"{features.dhashes[cand['sample_idx']]:016x}",
-                    }
-                    if "dhash" not in cand
-                    else {}
+            cand.with_visual(
+                dhash=(
+                    cand.visual.dhash
+                    if cand.visual.dhash is not None
+                    else features.dhashes[cand.sample_idx]
                 ),
-                **(
-                    {"sharpness": float(_laplacian_sharpness(sampling.frame_store.frames[cand["sample_idx"]]))}
-                    if "sharpness" not in cand
-                    else {}
+                dhash_hex=(
+                    cand.visual.dhash_hex
+                    if cand.visual.dhash_hex is not None
+                    else f"{features.dhashes[cand.sample_idx]:016x}"
+                ),
+                sharpness=(
+                    cand.visual.sharpness
+                    if cand.visual.sharpness is not None
+                    else float(_laplacian_sharpness(sampling.frame_store.frames[cand.sample_idx]))
                 ),
             )
             for cand in candidates

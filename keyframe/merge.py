@@ -8,14 +8,14 @@ from typing import Any
 import numpy as np
 
 from keyframe.dedupe import (
-    _merge_metadata,
     has_differing_evidence,
     has_evidence_asymmetry,
     has_protective_caption_asymmetry,
     is_protected_candidate,
+    merge_candidate_lineage,
 )
 from keyframe.scoring import score_candidate_for_rep
-from keyframe.pipeline.contracts import candidate_records
+from keyframe.pipeline.contracts import CandidateRecord, candidate_records
 
 
 def jaccard_similarity(tokens_a: set[str], tokens_b: set[str]) -> float:
@@ -79,8 +79,8 @@ def _transcript_overlap(a: set[str], b: set[str]) -> int:
 
 
 def _should_merge(
-    cand_a: Mapping[str, Any],
-    cand_b: Mapping[str, Any],
+    cand_a: CandidateRecord,
+    cand_b: CandidateRecord,
     tokens_a: set[str],
     tokens_b: set[str],
     transcript_a: set[str],
@@ -105,7 +105,7 @@ def _should_merge(
     elif has_ocr_a != has_ocr_b:
         return False, "ocr-presence"
 
-    dt = abs(float(cand_a["timestamp"]) - float(cand_b["timestamp"]))
+    dt = abs(float(cand_a.timestamp) - float(cand_b.timestamp))
     overlap = _transcript_overlap(transcript_a, transcript_b)
     if dt > 30.0 and overlap < 2:
         return False, "time-transcript"
@@ -137,7 +137,7 @@ def _component_evidence_compatible(
 
 
 def union_find_merge(
-    candidates: Sequence[Mapping[str, Any]],
+    candidates: Sequence[Mapping[str, Any] | CandidateRecord],
     ocr_token_sets: Sequence[set[str]],
     has_ocr: Sequence[bool],
     frames: Sequence[Any] | Mapping[int, Any],
@@ -145,6 +145,7 @@ def union_find_merge(
 ) -> tuple[Any, ...]:
     """Merge candidate pairs with explicit vetoes and union-find components."""
     print("\n── Merging via deterministic union-find veto graph ──")
+    candidates = candidate_records(candidates)
     n = len(candidates)
     uf = _UnionFind(n)
     transcript_token_sets = transcript_token_sets or [set() for _ in candidates]
@@ -162,43 +163,46 @@ def union_find_merge(
                 comp_j = [idx for idx in range(n) if uf.find(idx) == uf.find(j)]
                 if not _component_evidence_compatible(comp_i, comp_j, candidates, ocr_token_sets):
                     continue
-                print(f"    {candidates[i]['timestamp']:5.1f}s ↔ {candidates[j]['timestamp']:5.1f}s (will merge)")
+                print(f"    {candidates[i].timestamp:5.1f}s ↔ {candidates[j].timestamp:5.1f}s (will merge)")
                 uf.union(i, j)
 
     groups: dict[int, list[int]] = {}
     for i in range(n):
         groups.setdefault(uf.find(i), []).append(i)
 
-    final: list[dict[str, Any]] = []
+    final: list[CandidateRecord] = []
     for cid, group_idxs in enumerate(groups.values()):
         def score_idx(idx: int) -> float:
             cand = candidates[idx]
-            if "candidate_score" in cand:
-                return float(cand["candidate_score"])
-            sample_idx = int(cand["sample_idx"])
+            if cand.selection.candidate_score is not None:
+                return float(cand.selection.candidate_score)
+            sample_idx = int(cand.sample_idx)
             image = frames[sample_idx]
             return float(score_candidate_for_rep(cand, image))
 
         best_idx = max(group_idxs, key=score_idx)
-        winner = dict(candidates[best_idx])
-        winner["caption_cluster"] = int(cid)
-        winner.setdefault("merged_from_sample_idxs", [winner["sample_idx"]])
-        winner.setdefault("merged_timestamps", [winner["timestamp"]])
-        winner.setdefault("retention_reason", "none")
-        winner.setdefault("retention_reasons_seen", [winner["retention_reason"]])
-        if winner.get("cluster_role"):
-            winner.setdefault("lineage_roles", [winner["cluster_role"]])
+        winner = candidates[best_idx].with_lineage(caption_cluster=int(cid))
+        if winner.selection.retention_reason is None:
+            winner = winner.with_selection(retention_reason="none")
+        reasons_seen = set(winner.lineage.retention_reasons_seen) | {winner.selection.retention_reason or "none"}
+        roles = set(winner.lineage.lineage_roles)
+        if winner.visual.cluster_role:
+            roles.add(str(winner.visual.cluster_role))
+        winner = winner.with_lineage(
+            retention_reasons_seen=tuple(sorted(reasons_seen)),
+            lineage_roles=tuple(sorted(roles)),
+        )
         for group_idx in group_idxs:
             if group_idx == best_idx:
                 continue
-            winner["dedupe_stage"] = "union_find_merge"
-            winner["merge_reason"] = "component"
-            _merge_metadata(winner, candidates[group_idx])
-        winner["merged_from"] = len(winner["merged_from_sample_idxs"])
-        winner["merged_captions"] = [candidates[i].get("caption", "") for i in group_idxs]
+            winner = merge_candidate_lineage(winner, candidates[group_idx], stage="union_find_merge", reason="component")
+        winner = winner.with_lineage(
+            merged_from=len(winner.lineage.merged_from_sample_idxs),
+            merged_captions=tuple(candidates[i].evidence.caption or "" for i in group_idxs),
+        )
         final.append(winner)
 
         tag = "" if len(group_idxs) == 1 else f" (merged {len(group_idxs)} candidates)"
-        print(f"  Group {cid}: kept {winner['timestamp']:.1f}s{tag}")
+        print(f"  Group {cid}: kept {winner.timestamp:.1f}s{tag}")
 
-    return candidate_records(sorted(final, key=lambda c: float(c.get("timestamp", 0.0))))
+    return tuple(sorted(final, key=lambda c: float(c.timestamp)))
