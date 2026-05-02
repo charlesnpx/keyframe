@@ -5,6 +5,7 @@ from keyframe.dedupe import (
     adjacent_same_screen_dedupe as _adjacent_same_screen_dedupe,
     clean_ocr_token_sets,
     canonical_markers,
+    content_area_duplicate_veto as _content_area_duplicate_veto,
     filter_low_information_candidates as _filter_low_information_candidates,
     global_candidate_dedupe as _global_candidate_dedupe,
     has_meaningful_evidence_for_retention,
@@ -13,6 +14,7 @@ from keyframe.dedupe import (
     near_time_dedupe as _near_time_dedupe,
     retain_cluster_alternates as _retain_cluster_alternates,
 )
+from keyframe.evidence import field_section_signatures, normalized_ocr_line_signatures
 from keyframe.pipeline.contracts import as_candidate_record
 
 
@@ -38,6 +40,11 @@ def adjacent_same_screen_dedupe(*args, **kwargs):
 
 def retain_cluster_alternates(*args, **kwargs):
     return _project(_retain_cluster_alternates(*args, **kwargs))
+
+
+def content_area_duplicate_veto(*args, **kwargs):
+    survivors, dropped = _content_area_duplicate_veto(*args, **kwargs)
+    return _project(survivors), dropped
 
 
 def test_half_second_ocr_neighbors_collapse():
@@ -402,6 +409,53 @@ def test_adjacent_same_screen_dedupe_respects_time_window():
     survivors = adjacent_same_screen_dedupe(candidates)
 
     assert [c["sample_idx"] for c in survivors] == [1, 2]
+
+
+def test_content_area_duplicate_veto_drops_cursor_jitter():
+    base = Image.new("RGB", (120, 80), "white")
+    jitter = base.copy()
+    jitter.putpixel((4, 4), (0, 0, 0))
+    candidates = [
+        {"sample_idx": 0, "timestamp": 10.0, "scene_id": 1, "dwell_id": 1, "ocr_tokens": ["page1", "form"]},
+        {"sample_idx": 1, "timestamp": 11.0, "scene_id": 1, "dwell_id": 1, "ocr_tokens": ["page1", "form"]},
+    ]
+
+    survivors, dropped = content_area_duplicate_veto(candidates, [base, jitter])
+
+    assert [row["sample_idx"] for row in survivors] == [0]
+    assert dropped[0]["reason"] == "near_identical_content_area"
+
+
+def test_content_area_duplicate_veto_preserves_form_state_delta():
+    image = Image.new("RGB", (120, 80), "white")
+    candidates = [
+        {"sample_idx": 0, "timestamp": 70.0, "scene_id": 1, "dwell_id": 1, "ocr_tokens": ["completed", "status", "date", "please", "selection"]},
+        {"sample_idx": 1, "timestamp": 80.0, "scene_id": 1, "dwell_id": 1, "ocr_tokens": ["completed", "status", "date", "24apr2026"]},
+    ]
+
+    survivors, dropped = content_area_duplicate_veto(candidates, [image, image.copy()])
+
+    assert [row["sample_idx"] for row in survivors] == [0, 1]
+    assert dropped == []
+
+
+def test_ocr_line_and_field_signatures_capture_key_page_and_field_deltas():
+    left_text = "Page 1\nStatus Draft\nApproved Date\nSigned on Behalf of the IMC By"
+    right_text = "Page 2\nStatus Approved\nApproved Date 24APR2026\nSource design reference"
+
+    left_lines = normalized_ocr_line_signatures(left_text)
+    right_lines = normalized_ocr_line_signatures(right_text)
+    left_fields = field_section_signatures(left_text)
+    right_fields = field_section_signatures(right_text)
+
+    assert "page 1" in left_lines
+    assert "page:1" in left_fields
+    assert "status:draft" in left_fields
+    assert "field:signed_on_behalf" in left_fields
+    assert "page:2" in right_fields
+    assert "status:approved" in right_fields
+    assert "date:24apr2026" in right_fields
+    assert {"reference:source", "reference:design", "reference:reference"} & set(right_fields)
 
 
 def test_retain_cluster_alternates_keeps_differing_evidence():

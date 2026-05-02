@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from keyframe.pipeline.contracts import CandidateRecord, candidate_to_manifest_row
+
 
 def transcript_window(segments: list[dict[str, Any]] | None, timestamp: float, radius: float = 5.0) -> str:
     if not segments:
@@ -43,6 +45,11 @@ def write_manifest(
     out.mkdir(parents=True, exist_ok=True)
     rows = []
     for item in selected:
+        if isinstance(item, CandidateRecord):
+            item = candidate_to_manifest_row(
+                item,
+                filename=f"frame_{item.frame_idx:06d}_{item.timestamp:.2f}s.png",
+            )
         timestamp = float(item.get("timestamp", 0.0))
         tokens = list(item.get("ocr_tokens", []))
         rows.append({
@@ -66,10 +73,13 @@ def write_manifest(
             "rescue_origins_seen": item.get("rescue_origins_seen", [item.get("rescue_origin")] if item.get("rescue_origin") else []),
             "rescue_priorities_seen": item.get("rescue_priorities_seen", [item.get("rescue_priority")] if item.get("rescue_priority") is not None else []),
             "proxy_content_score": item.get("proxy_content_score"),
+            "proposal_lane": item.get("proposal_lane"),
             "rescue_priority": item.get("rescue_priority"),
             "dwell_id": item.get("dwell_id"),
             "temporal_window_id": item.get("temporal_window_id"),
             "lineage_roles": item.get("lineage_roles", [item.get("cluster_role")] if item.get("cluster_role") else []),
+            "ocr_line_signature": item.get("ocr_line_signature", []),
+            "field_signature": item.get("field_signature", []),
             "raw_token_count": item.get("raw_token_count", 0),
             "filtered_token_count": item.get("filtered_token_count", 0),
             "cleaned_token_count": item.get("cleaned_token_count", len(tokens)),

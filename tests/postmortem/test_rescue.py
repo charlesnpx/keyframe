@@ -310,6 +310,38 @@ def test_rescue_candidate_records_proposal_lane_metadata(monkeypatch):
     assert all(row.get("proposal_lane") for row in shortlist)
 
 
+def test_content_area_delta_lane_proposes_settled_transition_frame(monkeypatch):
+    monkeypatch.setattr(
+        "keyframe.scoring.proxy_content_scores",
+        lambda frames: [
+            {
+                "proxy_content_score": 0.1,
+                "textline_score": 0.1,
+                "edge_score": 0.1,
+                "entropy": 0.1,
+                "dark_ratio": 0.0,
+                "bright_ratio": 0.0,
+            }
+            for _ in frames
+        ],
+    )
+    frames = [Image.new("RGB", (40, 40), "white") for _ in range(8)]
+    for idx in range(3, 8):
+        frames[idx] = Image.new("RGB", (40, 40), "black")
+
+    shortlist, *_ = build_rescue_shortlist_with_metadata(
+        frames,
+        [float(i) for i in range(len(frames))],
+        list(range(len(frames))),
+        [{"sample_idx": 0, "timestamp": 0.0, "scene_id": 0}],
+        pass1_clusters=3,
+        sample_scenes={i: 0 for i in range(len(frames))},
+    )
+
+    lane_by_idx = {row["sample_idx"]: row["proposal_lane"] for row in shortlist}
+    assert lane_by_idx[3] == "content_area_delta"
+
+
 def test_rescue_shortlist_order_is_deterministic_when_scores_tie(monkeypatch):
     monkeypatch.setattr(
         "keyframe.scoring.proxy_content_scores",

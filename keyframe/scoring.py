@@ -18,6 +18,7 @@ from keyframe.dedupe import (
     hamming,
 )
 from keyframe.pipeline.contracts import CandidateRecord, as_candidate_record, candidate_records
+from keyframe.visual import mean_abs_content_delta, proxy_frame_components
 
 
 def coalesce_tiny_scenes(
@@ -139,9 +140,9 @@ def score_candidate_for_rep(
     """Score a candidate for representative selection."""
     sharpness = candidate.visual.sharpness
     if sharpness is None and image is not None:
-        from keyframe.frames import _laplacian_sharpness
+        from keyframe.visual import laplacian_sharpness
 
-        sharpness = _laplacian_sharpness(image)
+        sharpness = laplacian_sharpness(image)
 
     sharpness = float(sharpness or 0.0)
     normalized_sharpness = min(sharpness / 1000.0, 1.5)
@@ -151,60 +152,6 @@ def score_candidate_for_rep(
         end_of_dwell_bonus = float(candidate.selection.end_of_dwell_bonus or 0.0)
     dwell_bonus = min(max(float(end_of_dwell_bonus), 0.0), 1.0) * 0.5
     return normalized_sharpness + transcript_bonus + dwell_bonus
-
-
-def _sobel_edges(gray_array: np.ndarray) -> np.ndarray:
-    padded = np.pad(gray_array.astype(np.float32), 1, mode="edge")
-    gx = (
-        -padded[:-2, :-2] + padded[:-2, 2:]
-        - 2 * padded[1:-1, :-2] + 2 * padded[1:-1, 2:]
-        - padded[2:, :-2] + padded[2:, 2:]
-    )
-    gy = (
-        -padded[:-2, :-2] - 2 * padded[:-2, 1:-1] - padded[:-2, 2:]
-        + padded[2:, :-2] + 2 * padded[2:, 1:-1] + padded[2:, 2:]
-    )
-    return np.hypot(gx, gy)
-
-
-def proxy_frame_components(image: Image.Image) -> dict[str, float]:
-    """Return raw cheap content metrics for all-sampled-frame rescue ranking."""
-    gray = image.convert("L").resize((160, 90), Image.Resampling.LANCZOS)
-    arr = np.asarray(gray, dtype=np.float32)
-    edges = _sobel_edges(arr)
-    total = max(arr.size, 1)
-    dark_ratio = float(np.count_nonzero(arr <= 24) / total)
-    bright_ratio = float(np.count_nonzero(arr >= 232) / total)
-
-    if edges.size:
-        threshold = max(float(np.percentile(edges, 75)), 12.0)
-        edge_mask = edges >= threshold
-        band_density = []
-        for start in range(0, edge_mask.shape[0], 3):
-            band = edge_mask[start:start + 3, :]
-            if band.size:
-                band_density.append(float(np.count_nonzero(band) / band.size))
-        textline_score = sum(1 for density in band_density if density >= 0.08) / max(len(band_density), 1)
-        edge_score = float(edges.mean())
-    else:
-        textline_score = 0.0
-        edge_score = 0.0
-
-    histogram = gray.histogram()
-    entropy = 0.0
-    for count in histogram:
-        if not count:
-            continue
-        p = count / total
-        entropy -= p * math.log2(p)
-
-    return {
-        "textline_score": float(textline_score),
-        "edge_score": float(edge_score),
-        "entropy": float(entropy),
-        "dark_ratio": dark_ratio,
-        "bright_ratio": bright_ratio,
-    }
 
 
 def _normalize(values: Sequence[float]) -> list[float]:
@@ -327,8 +274,17 @@ def build_rescue_shortlist(
         window_seconds=window_seconds,
     )
 
+    content_deltas = [0.0 for _ in frames]
+    for idx in range(1, len(frames)):
+        content_deltas[idx] = mean_abs_content_delta(frames[idx - 1], frames[idx])
+
     ranked: list[dict[str, Any]] = []
     for sample_idx, metrics in enumerate(proxy_rows):
+        previous_delta = content_deltas[sample_idx] if sample_idx < len(content_deltas) else 0.0
+        next_delta = content_deltas[sample_idx + 1] if sample_idx + 1 < len(content_deltas) else 0.0
+        metrics["content_area_delta_score"] = float(max(previous_delta, next_delta) / 255.0)
+        metrics["content_area_previous_delta"] = float(previous_delta)
+        metrics["content_area_next_delta"] = float(next_delta)
         if sample_idx in candidate_idxs:
             continue
         ranked.append({
@@ -342,6 +298,7 @@ def build_rescue_shortlist(
             "clip_cluster_size": 1,
             "cluster_role": "rescue",
             "proxy_content_score": float(metrics["proxy_content_score"]),
+            "content_area_delta_score": float(metrics["content_area_delta_score"]),
             "rescue_priority": 0,
         })
 
@@ -389,6 +346,51 @@ def build_rescue_shortlist(
         lane.append({**dict(row), "proposal_lane": proposal_lane})
         selected.add(sample_idx)
         return True
+
+    def build_content_area_delta_lane() -> list[dict[str, Any]]:
+        lane: list[dict[str, Any]] = []
+        selected: set[int] = set()
+        if len(frames) < 3:
+            return lane
+        meaningful = [delta for delta in content_deltas if delta >= 3.0]
+        if not meaningful:
+            return lane
+        threshold = max(3.0, float(np.percentile(meaningful, 70)))
+        rows_by_idx = {int(row["sample_idx"]): row for row in ranked}
+        scored: list[tuple[float, dict[str, Any]]] = []
+        for idx in range(1, len(frames) - 1):
+            if idx in candidate_idxs or idx not in rows_by_idx:
+                continue
+            prev_delta = float(content_deltas[idx])
+            next_delta = float(content_deltas[idx + 1])
+            local_peak = prev_delta >= threshold and prev_delta >= next_delta
+            settled_after_transition = prev_delta >= threshold and next_delta <= max(2.0, prev_delta * 0.60)
+            text_band_change = abs(
+                float(proxy_rows[idx].get("textline_score", 0.0))
+                - float(proxy_rows[idx - 1].get("textline_score", 0.0))
+            )
+            if not (local_peak or settled_after_transition or text_band_change >= 0.20):
+                continue
+            row = rows_by_idx[idx]
+            score = (
+                float(row.get("content_area_delta_score", 0.0))
+                + 0.25 * text_band_change
+                + 0.10 * float(row.get("proxy_content_score", 0.0))
+            )
+            scored.append((score, row))
+
+        scored.sort(
+            key=lambda item: (
+                item[0],
+                -float(item[1]["timestamp"]),
+                -int(item[1]["sample_idx"]),
+            ),
+            reverse=True,
+        )
+        cap = min(rescue_ocr_cap, max(rescue_budget * 2, temporal_window_count + scene_count, 8))
+        for _score, row in scored:
+            add_to_lane(lane, selected, row, "content_area_delta", cap)
+        return lane
 
     def build_legacy_proxy_lane() -> list[dict[str, Any]]:
         lane: list[dict[str, Any]] = []
@@ -470,6 +472,7 @@ def build_rescue_shortlist(
             if add_to_lane(coverage_lane, coverage_selected, row, "scene_coverage"):
                 break
 
+    content_delta_lane = build_content_area_delta_lane()
     legacy_lane = build_legacy_proxy_lane()
     final_rows: list[dict[str, Any]] = []
     final_selected: set[int] = set()
@@ -483,7 +486,7 @@ def build_rescue_shortlist(
             rescue_ocr_cap,
         )
 
-    for lane_rows in (legacy_lane, coverage_lane):
+    for lane_rows in (content_delta_lane, legacy_lane, coverage_lane):
         for row in lane_rows:
             add_final(row)
 

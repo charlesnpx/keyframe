@@ -99,6 +99,8 @@ class CandidateEvidenceMetadata:
     ocr_tokens: tuple[str, ...] = ()
     dedupe_tokens: tuple[str, ...] = ()
     rescue_tokens: tuple[str, ...] = ()
+    ocr_line_signature: tuple[str, ...] = ()
+    field_signature: tuple[str, ...] = ()
     raw_token_count: int | None = None
     filtered_token_count: int | None = None
     cleaned_token_count: int | None = None
@@ -110,6 +112,9 @@ class CandidateSelectionMetadata:
     candidate_score: float | None = None
     score: float | None = None
     proxy_content_score: float | None = None
+    content_area_delta_score: float | None = None
+    content_area_previous_delta: float | None = None
+    content_area_next_delta: float | None = None
     proposal_lane: str | None = None
     end_of_dwell_bonus: float | None = None
     rescue_origin: str | None = None

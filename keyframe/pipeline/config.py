@@ -10,6 +10,7 @@ class KeyframeExtractionConfig:
     sample_interval: float = 0.5
     pass1_clusters: int = 15
     similarity_threshold: float = 0.85
+    max_output_frames: int | None = None
     device: str | None = None
     verbose_trace: bool = False
     debug_qa_targets_path: Path | None = None
@@ -17,7 +18,7 @@ class KeyframeExtractionConfig:
 
 @dataclass
 class KeyframeExtractionResult:
-    final: list[dict[str, Any]]
+    final: Any
     output_dir: Path
     caption_log_path: Path
     manifest_path: Path

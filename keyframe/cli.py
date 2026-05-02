@@ -177,6 +177,7 @@ def cmd_extract(args):
                 sample_interval=args.sample_interval,
                 pass1_clusters=args.pass1_clusters,
                 similarity_threshold=args.similarity_threshold,
+                max_output_frames=getattr(args, "max_output_frames", None),
                 verbose_trace=bool(getattr(args, "verbose_trace", False)),
                 debug_qa_targets_path=(
                     Path(args.debug_qa_targets)
@@ -214,8 +215,18 @@ def cmd_extract(args):
 
         if manifest_frames is not None and manifest_dir is not None:
             from keyframe.manifest import write_manifest
+            from keyframe.pipeline.contracts import CandidateRecord, candidate_to_manifest_row
 
-            write_manifest(manifest_frames, manifest_dir, segments, metadata=manifest_run_metadata)
+            manifest_rows = [
+                candidate_to_manifest_row(
+                    frame,
+                    filename=f"frame_{frame.frame_idx:06d}_{frame.timestamp:.2f}s.png",
+                )
+                if isinstance(frame, CandidateRecord)
+                else dict(frame)
+                for frame in manifest_frames
+            ]
+            write_manifest(manifest_rows, manifest_dir, segments, metadata=manifest_run_metadata)
 
     # ── Summary ─────────────────────────────────────────────────────────
     elapsed = time.time() - t0
@@ -283,6 +294,8 @@ def _add_extract_args(parser):
                         help="Number of CLIP clusters in pass 1 (default: 15)")
     parser.add_argument("--similarity-threshold", "-t", type=float, default=0.85,
                         help="Deprecated no-op; deterministic merge vetoes are used")
+    parser.add_argument("--max-output-frames", type=int, default=None,
+                        help="Optional final frame cap applied after scoring and dedupe")
     parser.add_argument("--verbose-trace", action="store_true",
                         help="Write structured pipeline trace snapshots for debugging")
     parser.add_argument("--debug-qa-targets", default=None,

@@ -30,9 +30,11 @@ from keyframe.dedupe import (
     clean_ocr_token_sets,
     hamming,
 )
+from keyframe.evidence import field_section_signatures, normalized_ocr_line_signatures
 from keyframe.merge import build_ocr_token_sets
 from keyframe.scoring import score_candidate_for_rep
 from keyframe.pipeline.contracts import CandidateRecord, candidate_records, candidate_to_caption_log_row
+from keyframe.visual import laplacian_sharpness
 
 
 # ── Video sampling ──────────────────────────────────────────────────────────
@@ -278,8 +280,7 @@ class CLIPEncoder:
 
 def _laplacian_sharpness(pil_img):
     """Score frame sharpness via Laplacian variance (higher = sharper)."""
-    gray = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2GRAY)
-    return cv2.Laplacian(gray, cv2.CV_64F).var()
+    return laplacian_sharpness(pil_img)
 
 
 def clip_oversegment(
@@ -652,8 +653,8 @@ def attach_ocr_token_attribution(candidates, raw_ocr_texts, filtered_ocr_texts, 
     filtered_token_sets = _build_ocr_token_sets(filtered_ocr_texts)
     rescue_token_sets = _build_rescue_token_sets(raw_ocr_texts)
     updated_candidates = []
-    for cand, raw_tokens, filtered_tokens, cleaned_tokens, rescue_tokens in zip(
-        candidates, raw_token_sets, filtered_token_sets, cleaned_token_sets, rescue_token_sets
+    for cand, raw_text, raw_tokens, filtered_tokens, cleaned_tokens, rescue_tokens in zip(
+        candidates, raw_ocr_texts, raw_token_sets, filtered_token_sets, cleaned_token_sets, rescue_token_sets
     ):
         raw_count = len(raw_tokens)
         filtered_count = len(filtered_tokens)
@@ -662,6 +663,8 @@ def attach_ocr_token_attribution(candidates, raw_ocr_texts, filtered_ocr_texts, 
             ocr_tokens=tuple(sorted(cleaned_tokens)),
             dedupe_tokens=tuple(sorted(cleaned_tokens)),
             rescue_tokens=tuple(sorted(rescue_tokens)),
+            ocr_line_signature=normalized_ocr_line_signatures(raw_text),
+            field_signature=field_section_signatures(raw_text, rescue_tokens | cleaned_tokens),
             raw_token_count=raw_count,
             filtered_token_count=filtered_count,
             cleaned_token_count=cleaned_count,
@@ -701,6 +704,8 @@ def attach_rescue_ocr_metadata(candidates, raw_ocr_texts):
                 ocr_tokens=tuple(sorted(dedupe_tokens)),
                 dedupe_tokens=tuple(sorted(dedupe_tokens)),
                 rescue_tokens=tuple(sorted(rescue_tokens)),
+                ocr_line_signature=normalized_ocr_line_signatures(raw_text),
+                field_signature=field_section_signatures(raw_text, rescue_tokens | dedupe_tokens),
                 raw_token_count=len(raw_tokens),
                 filtered_token_count=len(filtered_tokens),
                 cleaned_token_count=len(dedupe_tokens),
@@ -795,10 +800,13 @@ def save_results(selected, frames, output_dir):
         "rescue_origins_seen": s.get("rescue_origins_seen", [s.get("rescue_origin")] if s.get("rescue_origin") else []),
         "rescue_priorities_seen": s.get("rescue_priorities_seen", [s.get("rescue_priority")] if s.get("rescue_priority") is not None else []),
         "proxy_content_score": s.get("proxy_content_score"),
+        "proposal_lane": s.get("proposal_lane"),
         "rescue_priority": s.get("rescue_priority"),
         "dwell_id": s.get("dwell_id"),
         "temporal_window_id": s.get("temporal_window_id"),
         "lineage_roles": s.get("lineage_roles", [s.get("cluster_role")] if s.get("cluster_role") else []),
+        "ocr_line_signature": s.get("ocr_line_signature", []),
+        "field_signature": s.get("field_signature", []),
         "raw_token_count": s.get("raw_token_count", 0),
         "filtered_token_count": s.get("filtered_token_count", 0),
         "cleaned_token_count": s.get("cleaned_token_count", len(s.get("ocr_tokens", []))),
@@ -830,6 +838,8 @@ def main():
                         help="Number of CLIP clusters in pass 1 (default: 15)")
     parser.add_argument("--similarity-threshold", "-t", type=float, default=0.85,
                         help="Deprecated no-op; deterministic merge vetoes are used")
+    parser.add_argument("--max-output-frames", type=int, default=None,
+                        help="Optional final frame cap applied after scoring and dedupe")
 
     args = parser.parse_args()
     from keyframe.pipeline import KeyframeExtractionConfig, extract_keyframes
@@ -841,12 +851,19 @@ def main():
             sample_interval=args.sample_interval,
             pass1_clusters=args.pass1_clusters,
             similarity_threshold=args.similarity_threshold,
+            max_output_frames=args.max_output_frames,
         ),
     )
 
     print(f"\nFinal key frames:")
     for s in result.final:
-        print(f"  {Path(s['path']).name}  \"{s['caption'][:100]}\"")
+        if isinstance(s, CandidateRecord):
+            filename = f"frame_{s.frame_idx:06d}_{s.timestamp:.2f}s.png"
+            caption = s.evidence.caption or ""
+        else:
+            filename = Path(s.get("path", "")).name
+            caption = str(s.get("caption", ""))
+        print(f"  {filename}  \"{caption[:100]}\"")
 
 
 if __name__ == "__main__":

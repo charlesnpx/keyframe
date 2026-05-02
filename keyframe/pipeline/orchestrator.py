@@ -59,7 +59,8 @@ def _select_pass1_candidates(
     cluster_allocs,
     dhashes,
 ) -> tuple[tuple[CandidateRecord, ...], dict[int, int], dict[int, int]]:
-    from keyframe.frames import clip_oversegment, _laplacian_sharpness
+    from keyframe.frames import clip_oversegment
+    from keyframe.visual import laplacian_sharpness
 
     all_candidates: list[dict[str, Any]] = []
     sample_clusters: dict[int, int] = {}
@@ -79,8 +80,8 @@ def _select_pass1_candidates(
         scene_clusters = min(scene_clusters, len(scene_emb))
 
         if scene_clusters < 2 or len(scene_emb) < 2:
-            best = max(range(len(scene_frames)), key=lambda i: _laplacian_sharpness(scene_frames[i]))
-            sharpness = _laplacian_sharpness(scene_frames[best])
+            best = max(range(len(scene_frames)), key=lambda i: laplacian_sharpness(scene_frames[i]))
+            sharpness = laplacian_sharpness(scene_frames[best])
             all_candidates.append({
                 "sample_idx": s_start + best,
                 "frame_idx": scene_fi[best],
@@ -349,10 +350,10 @@ class RescueEvidenceStage:
     def run(self, proposal: ProposalOutput, sampling: SamplingOutput, ctx: RunContext) -> None:
         from keyframe.frames import (
             _comparison_primary_sample_idxs,
-            _laplacian_sharpness,
             attach_rescue_ocr_metadata,
             ocr_candidates,
         )
+        from keyframe.visual import laplacian_sharpness
 
         shortlist = proposal.rescue_shortlist
         frames = sampling.frame_store.frames
@@ -360,7 +361,7 @@ class RescueEvidenceStage:
             print("  Rescue shortlist: 0 frames")
             return
         shortlist = tuple(
-            row.with_visual(sharpness=float(_laplacian_sharpness(frames[int(row.sample_idx)])))
+            row.with_visual(sharpness=float(laplacian_sharpness(frames[int(row.sample_idx)])))
             for row in shortlist
         )
         proposal.rescue_shortlist = shortlist
@@ -510,6 +511,7 @@ class SurvivalStage:
     ) -> tuple[CandidateRecord, ...]:
         from keyframe.dedupe import (
             adjacent_same_screen_dedupe,
+            content_area_duplicate_veto,
             filter_low_information_candidates,
             global_candidate_dedupe,
             near_time_dedupe,
@@ -538,9 +540,69 @@ class SurvivalStage:
         deduped_token_sets = [set(c.evidence.ocr_tokens) for c in adjacent_deduped]
         deduped_has_ocr = [len(tokens) >= 3 for tokens in deduped_token_sets]
         final = union_find_merge(adjacent_deduped, deduped_token_sets, deduped_has_ocr, frames)
-        ctx.trace.exit("survival.final_pre_cap", _candidate_batch("survival.final_pre_cap", final))
-        ctx.trace.exit("survival.final_post_cap", _candidate_batch("survival.final_post_cap", final))
-        return final
+        post_veto, dropped_duplicates = content_area_duplicate_veto(final, frames)
+        print(f"  Content-area duplicate veto: {len(final)} -> {len(post_veto)} candidates")
+        ctx.trace.exit(
+            "survival.after_content_area_veto",
+            _candidate_batch(
+                "survival.after_content_area_veto",
+                post_veto,
+                {"dropped_duplicates": dropped_duplicates},
+            ),
+        )
+        ctx.trace.exit("survival.final_pre_cap", _candidate_batch("survival.final_pre_cap", post_veto))
+
+        capped = post_veto
+        cap_drops: list[dict[str, Any]] = []
+        max_output_frames = ctx.config.max_output_frames
+        if max_output_frames is not None and max_output_frames >= 0 and len(post_veto) > max_output_frames:
+            ranked = sorted(
+                post_veto,
+                key=lambda cand: (
+                    len(cand.evidence.ocr_tokens),
+                    float(cand.selection.candidate_score or cand.selection.score or cand.visual.sharpness or 0.0),
+                    -float(cand.timestamp),
+                    -int(cand.sample_idx),
+                ),
+                reverse=True,
+            )
+            kept_idxs = {int(cand.sample_idx) for cand in ranked[:max_output_frames]}
+            capped = tuple(cand for cand in post_veto if int(cand.sample_idx) in kept_idxs)
+            cap_drops = [
+                {
+                    "sample_idx": int(cand.sample_idx),
+                    "timestamp": float(cand.timestamp),
+                    "reason": "max_output_frames",
+                }
+                for cand in post_veto
+                if int(cand.sample_idx) not in kept_idxs
+            ]
+            print(f"  Output cap: {len(post_veto)} -> {len(capped)} candidates")
+        cap_pressure = (
+            max(0, len(post_veto) - int(max_output_frames))
+            if max_output_frames is not None and max_output_frames >= 0
+            else 0
+        )
+        ctx.metadata["survival"] = {
+            "max_output_frames": max_output_frames,
+            "cap_pressure": cap_pressure,
+            "cap_dropped_frames": cap_drops,
+            "content_area_duplicate_drops": dropped_duplicates,
+        }
+        ctx.trace.exit(
+            "survival.final_post_cap",
+            _candidate_batch(
+                "survival.final_post_cap",
+                capped,
+                {
+                    "max_output_frames": max_output_frames,
+                    "cap_pressure": cap_pressure,
+                    "cap_dropped_frames": cap_drops,
+                    "content_area_duplicate_drops": dropped_duplicates,
+                },
+            ),
+        )
+        return capped
 
 
 class OutputStage:
@@ -568,6 +630,19 @@ class OutputStage:
         caption_log_path = save_results(final, selected_imgs, output_dir)
         manifest_metadata = {
             "scene_coalescence": temporal.scene_coalescence,
+            "output_cap": {
+                "max_output_frames": ctx.config.max_output_frames,
+                "applied": ctx.config.max_output_frames is not None,
+                "cap_pressure": (ctx.metadata.get("survival") or {}).get("cap_pressure")
+                if isinstance(ctx.metadata.get("survival"), dict)
+                else 0,
+                "dropped_frames": (ctx.metadata.get("survival") or {}).get("cap_dropped_frames", [])
+                if isinstance(ctx.metadata.get("survival"), dict)
+                else [],
+                "content_area_duplicate_drops": (ctx.metadata.get("survival") or {}).get("content_area_duplicate_drops", [])
+                if isinstance(ctx.metadata.get("survival"), dict)
+                else [],
+            },
             "rescue": {
                 "pre_rescue_candidate_count": pre_rescue_candidate_count,
                 "rescue_budget": rescue_budget,
@@ -613,7 +688,8 @@ def extract_keyframes(
     trace_sink: TraceSink | None = None,
 ) -> KeyframeExtractionResult:
     """Run the shared key-frame extraction pipeline and write frame artifacts."""
-    from keyframe.frames import ModelPreloader, _laplacian_sharpness
+    from keyframe.frames import ModelPreloader
+    from keyframe.visual import laplacian_sharpness
 
     cfg = config or KeyframeExtractionConfig()
     video_path = Path(video_path)
@@ -659,7 +735,7 @@ def extract_keyframes(
                 sharpness=(
                     cand.visual.sharpness
                     if cand.visual.sharpness is not None
-                    else float(_laplacian_sharpness(sampling.frame_store.frames[cand.sample_idx]))
+                    else float(laplacian_sharpness(sampling.frame_store.frames[cand.sample_idx]))
                 ),
             )
             for cand in candidates
