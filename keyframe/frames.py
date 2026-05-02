@@ -1,16 +1,10 @@
 #!/usr/bin/env python3
 """
-extract_florence.py
+Video, model, OCR, and output helpers used by the shared keyframe pipeline.
 
-Two-pass key frame extraction using unified CLIP embedding space:
-  Pass 1 (CLIP): Sample all frames, embed with CLIP, over-segment into ~15-20
-          clusters, pick one candidate per cluster.
-  Pass 2 (Florence-2 + CLIP text): Caption candidates with Florence-2, embed
-          captions with CLIP's text encoder (same space as image embeddings),
-          merge candidates whose captions are too similar.
-
-Usage:
-    python extract_florence.py input.mp4 [--output-dir frames] [--sample-interval 0.5]
+The executable path delegates to keyframe.pipeline.extract_keyframes; this
+module keeps the model-bound helpers that are still shared by the orchestrator
+and focused postmortem tests.
 
 Dependencies:
     pip install opencv-python torch transformers open-clip-torch scikit-learn numpy pillow
@@ -30,38 +24,15 @@ import open_clip
 from sklearn.cluster import AgglomerativeClustering
 import argparse
 import sys
-import time
 import json
 
 from keyframe.dedupe import (
-    adjacent_same_screen_dedupe,
     clean_ocr_token_sets,
-    compute_dhash,
-    filter_low_information_candidates,
-    global_candidate_dedupe,
     hamming,
-    near_time_dedupe,
-    retain_cluster_alternates,
 )
-from keyframe.manifest import write_manifest
-from keyframe.merge import (
-    build_ocr_token_sets,
-    jaccard_sim_matrix,
-    jaccard_similarity,
-    union_find_merge,
-)
-from keyframe.scoring import (
-    allocate_clusters_by_novelty,
-    assign_dwell_ids,
-    assign_temporal_window_ids,
-    build_rescue_shortlist,
-    candidate_budget_for_scenes,
-    coalesce_tiny_scenes,
-    promote_rescue_candidates,
-    rescue_window_seconds,
-    score_candidate_for_rep,
-)
-from keyframe.pipeline.contracts import CandidateRecord, as_candidate_record, candidate_records, candidate_to_caption_log_row
+from keyframe.merge import build_ocr_token_sets
+from keyframe.scoring import score_candidate_for_rep
+from keyframe.pipeline.contracts import CandidateRecord, candidate_records, candidate_to_caption_log_row
 
 
 # ── Video sampling ──────────────────────────────────────────────────────────
@@ -137,20 +108,6 @@ def detect_scenes(video_path, timestamps, threshold=27.0):
               f"({timestamps[s]:.1f}s - {timestamps[e]:.1f}s, "
               f"{e - s + 1} frames)")
     return scenes
-
-
-def _allocate_clusters(scenes, total_clusters, min_per_scene=2):
-    """Deprecated duration allocator retained for compatibility."""
-    total_frames = sum(e - s + 1 for s, e in scenes)
-    if total_frames == 0:
-        return [min_per_scene] * len(scenes)
-
-    allocs = []
-    for s, e in scenes:
-        scene_len = e - s + 1
-        share = max(min_per_scene, round(total_clusters * scene_len / total_frames))
-        allocs.append(share)
-    return allocs
 
 
 # ── Parallel model preloading ─────────────────────────────────────────────
@@ -660,28 +617,6 @@ def _build_hybrid_captions(filtered_ocr, florence_captions, candidates,
     return florence_captions, filtered_ocr, has_ocr, tuple(updated_candidates)
 
 
-# ── Merge: CLIP image similarity + Jaccard OCR overlap ───────────────────
-
-def _jaccard_similarity(tokens_a, tokens_b):
-    """Jaccard similarity between two sets of normalized tokens."""
-    return jaccard_similarity(tokens_a, tokens_b)
-
-
-def _jaccard_sim_matrix(token_sets, has_ocr_mask):
-    """Build a full Jaccard similarity matrix, vectorized over the OCR mask."""
-    return jaccard_sim_matrix(token_sets, has_ocr_mask)
-
-
-def _build_combined_sim(clip_sim, jaccard_sim, has_ocr_mask, ocr_weight):
-    """Build combined similarity: weighted blend where both have OCR, else CLIP only."""
-    both_ocr = np.outer(has_ocr_mask, has_ocr_mask)
-    fw = 1.0 - ocr_weight
-    combined = np.where(both_ocr,
-                        fw * clip_sim + ocr_weight * jaccard_sim,
-                        clip_sim)
-    return combined, both_ocr
-
-
 def _build_ocr_token_sets(filtered_ocr_texts):
     """Build normalized token sets from filtered OCR texts for Jaccard comparison."""
     return build_ocr_token_sets(filtered_ocr_texts, _normalize_token)
@@ -800,263 +735,6 @@ def _comparison_primary_sample_idxs(candidates, shortlist):
             )
             selected.add(int(primary.sample_idx))
     return selected
-
-
-def rescue_from_sampled_frames(
-    candidates,
-    frames,
-    timestamps,
-    frame_indices,
-    dhashes,
-    clip_emb,
-    pass1_clusters,
-    *,
-    sample_clusters=None,
-    sample_scenes=None,
-    preloaded_engine=None,
-):
-    candidates = candidate_records(candidates)
-    window_seconds = rescue_window_seconds(timestamps)
-    temporal_window_ids = assign_temporal_window_ids(
-        timestamps,
-        sample_scenes,
-        window_seconds=window_seconds,
-    )
-    candidates = tuple(
-        cand.with_selection(
-            proxy_content_score=float(cand.selection.proxy_content_score or 0.0),
-        ).with_temporal(
-            scene_id=sample_scenes.get(int(cand.sample_idx)) if sample_scenes else cand.temporal.scene_id,
-            temporal_window_id=(
-                temporal_window_ids[int(cand.sample_idx)]
-                if int(cand.sample_idx) < len(temporal_window_ids)
-                else None
-            ),
-            temporal_window_seconds=(
-                window_seconds if int(cand.sample_idx) < len(temporal_window_ids) else None
-            ),
-        )
-        for cand in candidates
-    )
-
-    (
-        shortlist,
-        proxy_rows,
-        rescue_budget,
-        rescue_ocr_cap,
-        _temporal_window_count,
-        _scene_count,
-        _legacy_proxy_dropped_count,
-    ) = build_rescue_shortlist(
-        frames,
-        timestamps,
-        frame_indices,
-        candidates,
-        pass1_clusters,
-        sample_clusters=sample_clusters,
-        sample_scenes=sample_scenes,
-    )
-    candidates = tuple(
-        cand.with_selection(proxy_content_score=float(proxy_rows[int(cand.sample_idx)]["proxy_content_score"]))
-        if 0 <= int(cand.sample_idx) < len(proxy_rows)
-        else cand
-        for cand in candidates
-    )
-    if not shortlist:
-        print("  Rescue shortlist: 0 frames")
-        return tuple(sorted(candidates, key=lambda c: c.timestamp))
-
-    shortlist = tuple(
-        row.with_visual(
-            dhash=dhashes[int(row.sample_idx)],
-            dhash_hex=f"{dhashes[int(row.sample_idx)]:016x}",
-            sharpness=float(_laplacian_sharpness(frames[int(row.sample_idx)])),
-        )
-        for row in shortlist
-    )
-
-    print(f"  Rescue shortlist: {len(shortlist)} frames, budget {rescue_budget}, OCR cap {rescue_ocr_cap}")
-    comparison_idxs = _comparison_primary_sample_idxs(candidates, shortlist)
-    candidate_by_idx = {int(cand.sample_idx): cand for cand in candidates}
-    comparison_primaries = [
-        candidate_by_idx[sample_idx]
-        for sample_idx in sorted(comparison_idxs)
-        if sample_idx in candidate_by_idx
-    ]
-    ocr_batch = shortlist + tuple(comparison_primaries)
-    rescue_ocr_texts, ocr_batch = ocr_candidates(ocr_batch, frames, preloaded_engine=preloaded_engine)
-    ocr_batch = attach_rescue_ocr_metadata(ocr_batch, rescue_ocr_texts)
-    updated_by_idx = {int(cand.sample_idx): cand for cand in ocr_batch}
-    candidates = tuple(updated_by_idx.get(int(cand.sample_idx), cand) for cand in candidates)
-    shortlist = tuple(updated_by_idx.get(int(row.sample_idx), row) for row in shortlist)
-    print(
-        "  Rescue OCR comparison primaries: "
-        f"{len(comparison_primaries)} cached selected candidates"
-    )
-    dwell_ids = assign_dwell_ids(dhashes)
-    candidates = tuple(cand.with_temporal(dwell_id=dwell_ids[int(cand.sample_idx)]) for cand in candidates)
-    shortlist = tuple(row.with_temporal(dwell_id=dwell_ids[int(row.sample_idx)]) for row in shortlist)
-    promoted = promote_rescue_candidates(
-        candidates,
-        shortlist,
-        dwell_ids,
-        rescue_budget=rescue_budget,
-        clip_embeddings=clip_emb,
-    )
-    rescue_count = sum(1 for cand in promoted if cand.selection.rescue_origin)
-    print(f"  Rescue promotion: {len(candidates)} -> {len(promoted)} candidates ({rescue_count} promoted)")
-    return promoted
-
-
-def merge_by_caption(candidates, clip_emb, ocr_token_sets, has_ocr, frames,
-                     similarity_threshold=0.85, ocr_weight=0.5):
-    """
-    Merge candidates using CLIP image embeddings (from Pass 1) for semantic
-    similarity and Jaccard token overlap for OCR deduplication.
-
-    Args:
-        clip_emb: Full CLIP image embedding array from Pass 1 (all sampled frames).
-        ocr_token_sets: List of normalized token sets (one per candidate).
-        has_ocr: List of bools — whether each candidate has substantial OCR.
-        frames: List of PIL images (all sampled frames) for sharpness scoring.
-        ocr_weight: Weight for Jaccard OCR similarity (0-1). CLIP image gets 1-ocr_weight.
-    """
-    print(f"\n── Merging via CLIP image + Jaccard OCR (threshold={similarity_threshold}) ──")
-
-    # CLIP image similarity for candidates only
-    candidate_indices = np.array([c["sample_idx"] for c in candidates])
-    cand_emb = clip_emb[candidate_indices]
-    clip_sim = cand_emb @ cand_emb.T
-    print(f"  CLIP image similarity: {cand_emb.shape[0]} candidates")
-
-    # Jaccard OCR similarity + combined matrix (vectorized)
-    has_ocr_mask = np.array(has_ocr, dtype=bool)
-    jaccard_sim = _jaccard_sim_matrix(ocr_token_sets, has_ocr_mask)
-    combined_sim, both_ocr = _build_combined_sim(clip_sim, jaccard_sim, has_ocr_mask, ocr_weight)
-
-    # Log merge decisions
-    merge_i, merge_j = np.where(np.triu(combined_sim > similarity_threshold, k=1))
-    for i, j in zip(merge_i, merge_j):
-        detail = ""
-        if both_ocr[i, j]:
-            detail = (f" [CLIP:{clip_sim[i, j]:.3f} "
-                      f"Jaccard:{jaccard_sim[i, j]:.3f}]")
-        print(f"    {candidates[i]['timestamp']:5.1f}s ↔ "
-              f"{candidates[j]['timestamp']:5.1f}s: "
-              f"{combined_sim[i, j]:.3f}{detail} (will merge)")
-
-    # Convert combined similarity to distance for clustering
-    combined_dist = 1.0 - combined_sim
-    np.fill_diagonal(combined_dist, 0)
-    combined_dist = np.clip(combined_dist, 0, None)
-
-    clustering = AgglomerativeClustering(
-        n_clusters=None,
-        metric="precomputed",
-        linkage="average",
-        distance_threshold=1 - similarity_threshold,
-    )
-    cap_labels = clustering.fit_predict(combined_dist)
-    n_clusters = len(set(cap_labels))
-    print(f"  Combined clusters: {n_clusters}")
-
-    # ── Intra-group OCR refinement ──
-    # For groups where members share OCR text, the global DF filter doesn't
-    # remove within-group common tokens. Re-filter OCR within each group to
-    # surface what actually differs, then re-cluster using Jaccard.
-    n_refined = 0
-    refined_labels = np.array(cap_labels, copy=True)
-    next_label = max(cap_labels) + 1
-
-    for cid in sorted(set(cap_labels)):
-        group_idxs = [i for i, l in enumerate(cap_labels) if l == cid]
-        if len(group_idxs) < 4:
-            continue
-        group_has_ocr = [has_ocr[i] for i in group_idxs]
-        if sum(group_has_ocr) < len(group_idxs) * 0.5:
-            continue
-
-        # Reconstruct text from token sets for intra-group DF filtering
-        group_ocr = [
-            " ".join(ocr_token_sets[i]) if has_ocr[i] else ""
-            for i in group_idxs
-        ]
-        local_filtered = _filter_ocr_tokens(group_ocr, max_tokens=70, df_cutoff=0.5)
-        local_token_sets = _build_ocr_token_sets(local_filtered)
-
-        non_empty = [s for s in local_token_sets if len(s) >= 3]
-        if len(non_empty) < 2:
-            continue
-
-        # Recompute combined similarity with locally-filtered Jaccard
-        gn = len(group_idxs)
-        group_arr = np.array(group_idxs)
-        local_clip = clip_sim[np.ix_(group_arr, group_arr)]
-        local_has_ocr = np.array([len(s) >= 3 for s in local_token_sets])
-        local_jaccard = _jaccard_sim_matrix(local_token_sets, local_has_ocr)
-        local_combined, _ = _build_combined_sim(
-            local_clip, local_jaccard, local_has_ocr, ocr_weight
-        )
-
-        local_dist = 1.0 - local_combined
-        np.fill_diagonal(local_dist, 0)
-        local_dist = np.clip(local_dist, 0, None)
-
-        sub_clustering = AgglomerativeClustering(
-            n_clusters=None,
-            metric="precomputed",
-            linkage="average",
-            distance_threshold=1 - similarity_threshold,
-        )
-        sub_labels = sub_clustering.fit_predict(local_dist)
-        n_sub = len(set(sub_labels))
-
-        if n_sub > 1:
-            n_refined += 1
-            print(f"  Group {cid} refined: {gn} candidates → {n_sub} sub-groups "
-                  f"(intra-group OCR filtering)")
-            for gi, idx in enumerate(group_idxs):
-                refined_labels[idx] = next_label + sub_labels[gi]
-                filt_preview = " ".join(list(local_token_sets[gi])[:10]) if local_token_sets[gi] else "(no OCR)"
-                print(f"    {candidates[idx]['timestamp']:5.1f}s → sub-group "
-                      f"{sub_labels[gi]}: \"{filt_preview}\"")
-            next_label += n_sub
-
-    if n_refined:
-        cap_labels = refined_labels
-        n_clusters = len(set(cap_labels))
-        print(f"  After refinement: {n_clusters} clusters")
-
-    # ── Build final frame list ──
-    final = []
-    for cid in sorted(set(cap_labels)):
-        group_idxs = [i for i, l in enumerate(cap_labels) if l == cid]
-        group_cands = [candidates[i] for i in group_idxs]
-
-        # Pick sharpest frame in group
-        sharpness = [_laplacian_sharpness(frames[c["sample_idx"]]) for c in group_cands]
-        best_local = np.argmax(sharpness)
-
-        winner = group_cands[best_local].copy()
-        winner["caption_cluster"] = int(cid)
-        winner["merged_from"] = len(group_idxs)
-        winner["merged_captions"] = [candidates[i].get("caption", "") for i in group_idxs]
-        winner["merged_timestamps"] = [candidates[i]["timestamp"] for i in group_idxs]
-        final.append(winner)
-
-        merged_tag = "" if len(group_idxs) == 1 else f" (merged {len(group_idxs)} candidates)"
-        print(f"  Group {cid}: kept {winner['timestamp']:.1f}s{merged_tag}")
-        caption_preview = candidates[group_idxs[best_local]].get("caption", "")
-        print(f"    \"{caption_preview[:120]}\"")
-        if len(group_idxs) > 1:
-            for i in group_idxs:
-                if i != group_idxs[best_local]:
-                    cap = candidates[i].get("caption", "")
-                    print(f"    dropped {candidates[i]['timestamp']:.1f}s: "
-                          f"\"{cap[:100]}\"")
-
-    final.sort(key=lambda c: c["timestamp"])
-    return final
 
 
 # ── Output ──────────────────────────────────────────────────────────────────

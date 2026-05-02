@@ -283,17 +283,6 @@ def _strictest_retention_reason(*reasons: str | None) -> str:
     return max(normalized, key=lambda reason: RETENTION_REASON_ORDER.get(reason, 0), default="none")
 
 
-def _as_sorted_strings(values: Any) -> list[str]:
-    if values is None:
-        return []
-    if isinstance(values, str):
-        return [values]
-    try:
-        return sorted({str(value) for value in values if value is not None})
-    except TypeError:
-        return [str(values)]
-
-
 def is_protected_candidate(candidate: Mapping[str, Any] | CandidateRecord) -> bool:
     """Return whether dedupe/merge stages should handle a candidate conservatively."""
     candidate = candidate_records((candidate,))[0]

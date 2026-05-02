@@ -606,49 +606,9 @@ def _strictly_subsumes_tokens(rescue_tokens: set[str], primary_tokens: set[str])
     return marker_subsumed and token_subsumed and rescue_tokens != primary_tokens
 
 
-def _same_marker_covered(
-    rescue: CandidateRecord,
-    candidates: Sequence[CandidateRecord],
-    dwell_ids: Sequence[int],
-    *,
-    scene_only: bool = False,
-) -> bool:
-    rescue_tokens = _record_tokens(rescue, rescue=True)
-    signature = _marker_signature(rescue_tokens)
-    if not signature:
-        return False
-    rescue_idx = int(rescue.sample_idx)
-    rescue_dwell = dwell_ids[rescue_idx] if 0 <= rescue_idx < len(dwell_ids) else None
-    rescue_scene = rescue.temporal.scene_id
-    for candidate in candidates:
-        candidate_tokens = _record_tokens(candidate, rescue=True)
-        if _marker_signature(candidate_tokens) != signature:
-            continue
-        if scene_only:
-            if rescue_scene is not None and candidate.temporal.scene_id == rescue_scene:
-                return True
-            continue
-        candidate_idx = int(candidate.sample_idx)
-        candidate_dwell = dwell_ids[candidate_idx] if 0 <= candidate_idx < len(dwell_ids) else None
-        if rescue_dwell is not None and candidate_dwell == rescue_dwell:
-            return True
-        if abs(float(rescue.timestamp) - float(candidate.timestamp)) <= 2.0:
-            return True
-    return False
-
-
 def _marker_equivalent(tokens_a: set[str], tokens_b: set[str]) -> bool:
     signature_a = _marker_signature(tokens_a)
     return bool(signature_a) and signature_a == _marker_signature(tokens_b)
-
-
-def _candidate_dwell_id(candidate: CandidateRecord, dwell_ids: Sequence[int]) -> int | None:
-    if candidate.temporal.dwell_id is not None:
-        return int(candidate.temporal.dwell_id)
-    sample_idx = int(candidate.sample_idx)
-    if 0 <= sample_idx < len(dwell_ids):
-        return int(dwell_ids[sample_idx])
-    return None
 
 
 def has_local_equivalent_coverage(
@@ -848,7 +808,6 @@ def _as_promoted_rescue(
 def _temporally_local(
     rescue: CandidateRecord,
     candidate: CandidateRecord,
-    dwell_ids: Sequence[int],
     *,
     tolerance: float = 2.25,
 ) -> bool:
@@ -888,7 +847,7 @@ def _preflight_rejection_detail(
     local_equivalent_coverage = has_local_equivalent_coverage(rescue, candidates, dwell_ids)
 
     for candidate in candidates:
-        if not _temporally_local(rescue, candidate, dwell_ids):
+        if not _temporally_local(rescue, candidate):
             continue
         candidate_tokens = _record_tokens(candidate, rescue=True)
         if _marker_redundant(rescue_tokens, candidate_tokens):
@@ -1120,7 +1079,7 @@ def promote_rescue_candidates(
         if not _strictly_subsumes_tokens(rescue_tokens, primary_tokens):
             return False
         if (
-            _temporally_local(rescue, primary, dwell_ids)
+            _temporally_local(rescue, primary)
             and _clip_token_redundant(
                 rescue_tokens,
                 primary_tokens,
@@ -1164,7 +1123,7 @@ def promote_rescue_candidates(
         rescue_tokens = _record_tokens(rescue, rescue=True)
         redundant = False
         for candidate in promoted:
-            temporally_local = _temporally_local(rescue, candidate, dwell_ids)
+            temporally_local = _temporally_local(rescue, candidate)
             candidate_tokens = _record_tokens(candidate, rescue=True)
             if temporally_local and _marker_redundant(rescue_tokens, candidate_tokens):
                 redundant = True

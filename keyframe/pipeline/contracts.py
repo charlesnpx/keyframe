@@ -3,18 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, Protocol, TypeVar
-
-
-InputT = TypeVar("InputT")
-OutputT = TypeVar("OutputT")
-
-
-class Stage(Protocol[InputT, OutputT]):
-    name: str
-
-    def run(self, inp: InputT, ctx: Any) -> OutputT:
-        ...
+from typing import Any
 
 
 @dataclass
