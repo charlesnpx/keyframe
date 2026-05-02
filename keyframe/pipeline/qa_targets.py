@@ -129,6 +129,24 @@ def _stage_summaries(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]
     return summaries
 
 
+def _promotion_preflight_rows(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    for record in records:
+        if record.get("event") != "decision":
+            continue
+        if record.get("stage") != "selection.rescue_promotion_preflight":
+            continue
+        payload = record.get("payload") or {}
+        if isinstance(payload.get("value"), Mapping):
+            payload = payload["value"]
+        if payload.get("name") != "promotion_preflight":
+            continue
+        report = payload.get("payload") or {}
+        rows = report.get("candidate_rows")
+        if isinstance(rows, list):
+            return [dict(row) for row in rows if isinstance(row, Mapping)]
+    return []
+
+
 def _nearest_in_stage(
     target_time: float,
     tolerance: float,
@@ -166,6 +184,39 @@ def _nearest_in_stage(
         "rescue_origin": candidate.get("rescue_origin"),
         "rescue_reason": candidate.get("rescue_reason"),
         "retention_reason": candidate.get("retention_reason"),
+    }
+
+
+def _nearest_promotion_preflight(
+    target_time: float,
+    tolerance: float,
+    rows: list[Mapping[str, Any]],
+) -> dict[str, Any]:
+    best: tuple[float, Mapping[str, Any]] | None = None
+    for row in rows:
+        timestamp = row.get("timestamp")
+        if timestamp is None:
+            continue
+        try:
+            delta = abs(float(timestamp) - target_time)
+        except (TypeError, ValueError):
+            continue
+        if best is None or delta < best[0]:
+            best = (delta, row)
+    if best is None or best[0] > tolerance:
+        return {"hit": False}
+    delta, row = best
+    return {
+        "hit": True,
+        "candidate_timestamp": row.get("timestamp"),
+        "sample_idx": row.get("sample_idx"),
+        "delta": delta,
+        "outcome": row.get("outcome"),
+        "phase_a_rank": row.get("phase_a_rank"),
+        "above_additive_headroom_cut": row.get("above_additive_headroom_cut"),
+        "rejection_branch": row.get("rejection_branch"),
+        "rejection_reason": row.get("rejection_reason"),
+        "nearest_competing_candidate_timestamp": row.get("nearest_competing_candidate_timestamp"),
     }
 
 
@@ -294,6 +345,7 @@ def build_debug_qa_trace(
 ) -> dict[str, Any]:
     stage_order = stage_order or DEFAULT_STAGE_ORDER
     stage_records = _stage_candidate_records(trace_records)
+    promotion_preflight_rows = _promotion_preflight_rows(trace_records)
     target_rows = []
     direct_hit_count = 0
     lineage_hit_count = 0
@@ -326,6 +378,11 @@ def build_debug_qa_trace(
             "best_matched_via": best["best_matched_via"],
             "nearest_final_timestamp": final.get("nearest_ts"),
             "nearest_final_delta": final.get("delta"),
+            "promotion_preflight": _nearest_promotion_preflight(
+                time,
+                tolerance,
+                promotion_preflight_rows,
+            ),
             "stage_membership": membership,
         })
     summaries = _stage_summaries(trace_records)

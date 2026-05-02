@@ -155,6 +155,106 @@ def test_debug_qa_trace_distinguishes_rescue_ocr_and_promotion():
     assert target["best_stage"] == "evidence.rescue_ocr_batch"
 
 
+def test_debug_qa_trace_attaches_promotion_preflight_row_by_tolerance():
+    records = [
+        {
+            "event": "decision",
+            "stage": "selection.rescue_promotion_preflight",
+            "payload": {
+                "name": "promotion_preflight",
+                "payload": {
+                    "candidate_rows": [
+                        {
+                            "sample_idx": 7,
+                            "timestamp": 42.2,
+                            "outcome": "eligible_above_headroom",
+                            "phase_a_rank": 1,
+                            "above_additive_headroom_cut": True,
+                            "rejection_branch": None,
+                            "rejection_reason": None,
+                            "nearest_competing_candidate_timestamp": 40.0,
+                        }
+                    ]
+                },
+            },
+        }
+    ]
+
+    payload = build_debug_qa_trace(
+        trace_records=records,
+        targets=[{"time": 42.0, "label": "rescue", "tolerance": 2.25}],
+        video="video.mp4",
+    )
+
+    preflight = payload["targets"][0]["promotion_preflight"]
+    assert preflight["hit"] is True
+    assert preflight["candidate_timestamp"] == 42.2
+    assert preflight["sample_idx"] == 7
+    assert preflight["outcome"] == "eligible_above_headroom"
+    assert preflight["phase_a_rank"] == 1
+    assert preflight["above_additive_headroom_cut"] is True
+    assert preflight["nearest_competing_candidate_timestamp"] == 40.0
+
+
+def test_debug_qa_trace_reads_materialized_promotion_preflight_decision():
+    sink = SnapshotTraceSink()
+    sink.decision(
+        "selection.rescue_promotion_preflight",
+        "promotion_preflight",
+        {
+            "candidate_rows": [
+                {
+                    "sample_idx": 7,
+                    "timestamp": 42.2,
+                    "outcome": "predicate_rejected",
+                    "phase_a_rank": 3,
+                    "above_additive_headroom_cut": False,
+                    "rejection_branch": "redundant_with_selected",
+                    "rejection_reason": "near_duplicate",
+                    "nearest_competing_candidate_timestamp": 40.0,
+                }
+            ]
+        },
+    )
+
+    payload = build_debug_qa_trace(
+        trace_records=sink.records,
+        targets=[{"time": 42.0, "label": "rescue", "tolerance": 2.25}],
+        video="video.mp4",
+    )
+
+    preflight = payload["targets"][0]["promotion_preflight"]
+    assert preflight["hit"] is True
+    assert preflight["candidate_timestamp"] == 42.2
+    assert preflight["sample_idx"] == 7
+    assert preflight["outcome"] == "predicate_rejected"
+    assert preflight["phase_a_rank"] == 3
+    assert preflight["above_additive_headroom_cut"] is False
+    assert preflight["rejection_branch"] == "redundant_with_selected"
+    assert preflight["rejection_reason"] == "near_duplicate"
+
+
+def test_debug_qa_trace_reports_promotion_preflight_miss_when_no_row_near_target():
+    records = [
+        {
+            "event": "decision",
+            "stage": "selection.rescue_promotion_preflight",
+            "payload": {
+                "name": "promotion_preflight",
+                "payload": {"candidate_rows": [{"sample_idx": 7, "timestamp": 100.0}]},
+            },
+        }
+    ]
+
+    payload = build_debug_qa_trace(
+        trace_records=records,
+        targets=[{"time": 42.0, "label": "rescue", "tolerance": 2.25}],
+        video="video.mp4",
+    )
+
+    assert payload["targets"][0]["promotion_preflight"] == {"hit": False}
+
+
 def test_debug_qa_trace_reports_rescue_shortlisted_but_not_ocrd():
     records = [
         {

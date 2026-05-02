@@ -633,6 +633,243 @@ def _as_promoted_rescue(
     )
 
 
+def _temporally_local(
+    rescue: CandidateRecord,
+    candidate: CandidateRecord,
+    dwell_ids: Sequence[int],
+) -> bool:
+    return (
+        candidate.temporal.scene_id == rescue.temporal.scene_id
+        and (
+            abs(float(candidate.timestamp) - float(rescue.timestamp)) <= 2.25
+            or (
+                rescue.temporal.temporal_window_id is not None
+                and candidate.temporal.temporal_window_id is not None
+                and int(candidate.temporal.temporal_window_id) == int(rescue.temporal.temporal_window_id)
+            )
+            or (
+                _candidate_dwell_id(candidate, dwell_ids) is not None
+                and _candidate_dwell_id(candidate, dwell_ids) == _candidate_dwell_id(rescue, dwell_ids)
+            )
+        )
+    )
+
+
+def _nearest_competing_candidate(
+    rescue: CandidateRecord,
+    candidates: Sequence[CandidateRecord],
+) -> CandidateRecord | None:
+    if not candidates:
+        return None
+    rescue_scene = rescue.temporal.scene_id
+    return min(
+        candidates,
+        key=lambda candidate: (
+            0 if rescue_scene is not None and candidate.temporal.scene_id == rescue_scene else 1,
+            abs(float(candidate.timestamp) - float(rescue.timestamp)),
+            int(candidate.sample_idx),
+        ),
+    )
+
+
+def _preflight_rejection_detail(
+    rescue: CandidateRecord,
+    candidates: Sequence[CandidateRecord],
+    dwell_ids: Sequence[int],
+    *,
+    clip_embeddings: Any | None,
+) -> dict[str, Any]:
+    rescue_tokens = _record_tokens(rescue, rescue=True)
+    rescue_idx = int(rescue.sample_idx)
+    nearest = _nearest_competing_candidate(rescue, candidates)
+    local_equivalent_coverage = has_local_equivalent_coverage(rescue, candidates, dwell_ids)
+
+    for candidate in candidates:
+        if not _temporally_local(rescue, candidate, dwell_ids):
+            continue
+        candidate_tokens = _record_tokens(candidate, rescue=True)
+        if _marker_equivalent(candidate_tokens, rescue_tokens):
+            return {
+                "eligible": False,
+                "reason": None,
+                "rejection_branch": "redundancy",
+                "rejection_reason": "temporally_local_marker_equivalent",
+                "competing_candidate": candidate,
+                "local_equivalent_coverage": local_equivalent_coverage,
+            }
+        if (
+            _clip_cosine(clip_embeddings, rescue_idx, int(candidate.sample_idx)) >= 0.93
+            and _jaccard(rescue_tokens, candidate_tokens) >= 0.7
+        ):
+            return {
+                "eligible": False,
+                "reason": None,
+                "rejection_branch": "redundancy",
+                "rejection_reason": "temporally_local_clip_token_similarity",
+                "competing_candidate": candidate,
+                "local_equivalent_coverage": local_equivalent_coverage,
+            }
+
+    primary = _primary_for_rescue(rescue, candidates, same_cluster=False) or (candidates[0] if candidates else None)
+    if primary:
+        reason = _rescue_reason(rescue, primary, dwell_ids, candidates)
+        if reason is None:
+            return {
+                "eligible": False,
+                "reason": None,
+                "rejection_branch": "rescue_reason",
+                "rejection_reason": "no_rescue_reason",
+                "competing_candidate": primary,
+                "local_equivalent_coverage": local_equivalent_coverage,
+            }
+        if (
+            reason == "evidence_marker"
+            and _has_marker_signature(rescue_tokens)
+            and local_equivalent_coverage
+        ):
+            return {
+                "eligible": False,
+                "reason": reason,
+                "rejection_branch": "local_equivalent_coverage",
+                "rejection_reason": "evidence_marker_local_equivalent_coverage",
+                "competing_candidate": primary,
+                "local_equivalent_coverage": local_equivalent_coverage,
+            }
+    else:
+        reason = "content_reference" if _content_reference_tokens(rescue_tokens) else "evidence_marker"
+
+    return {
+        "eligible": True,
+        "reason": reason,
+        "rejection_branch": None,
+        "rejection_reason": None,
+        "competing_candidate": primary or nearest,
+        "local_equivalent_coverage": local_equivalent_coverage,
+    }
+
+
+def rescue_promotion_preflight_report(
+    base_candidates: tuple[CandidateRecord, ...],
+    rescue_shortlist: tuple[CandidateRecord, ...],
+    current_promoted: tuple[CandidateRecord, ...],
+    dwell_ids: Sequence[int],
+    rescue_budget: int,
+    clip_embeddings: Any | None,
+) -> dict[str, Any]:
+    """Classify unpromoted rescue candidates without changing selection behavior."""
+    base_candidates = _records(base_candidates)
+    rescue_shortlist = _records(rescue_shortlist)
+    current_promoted = _records(current_promoted)
+    base_idxs = {int(candidate.sample_idx) for candidate in base_candidates}
+    current_by_idx = {int(candidate.sample_idx): candidate for candidate in current_promoted}
+    base_candidate_count = len(base_candidates)
+    current_post_rescue_count = len(current_promoted)
+    max_post_rescue_count = base_candidate_count + int(rescue_budget)
+    additive_output_headroom = max(0, max_post_rescue_count - current_post_rescue_count)
+    current_rescue_count = sum(1 for candidate in current_promoted if candidate.selection.rescue_origin)
+
+    rows: list[dict[str, Any]] = []
+    eligible_pending: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
+
+    for rescue in rescue_shortlist:
+        rescue_idx = int(rescue.sample_idx)
+        current = current_by_idx.get(rescue_idx)
+        if rescue_idx in base_idxs or (current is not None and not current.selection.rescue_origin):
+            status = "already_selected"
+            outcome = "already_selected"
+        elif current is not None and current.selection.rescue_origin:
+            status = "already_promoted"
+            outcome = "already_promoted"
+        else:
+            status = "unpromoted"
+            outcome = None
+
+        competing = _nearest_competing_candidate(rescue, current_promoted)
+        local_equivalent_coverage = has_local_equivalent_coverage(rescue, current_promoted, dwell_ids)
+        detail: dict[str, Any] = {
+            "eligible": False,
+            "reason": None,
+            "rejection_branch": None,
+            "rejection_reason": None,
+            "competing_candidate": competing,
+            "local_equivalent_coverage": local_equivalent_coverage,
+        }
+        if status == "unpromoted":
+            detail = _preflight_rejection_detail(
+                rescue,
+                current_promoted,
+                dwell_ids,
+                clip_embeddings=clip_embeddings,
+            )
+            if detail["eligible"]:
+                outcome = "eligible_pending"
+            else:
+                outcome = "predicate_rejected"
+
+        competing = detail.get("competing_candidate") or competing
+        competing_tokens = _record_tokens(competing, rescue=True) if competing is not None else set()
+        rescue_tokens = _record_tokens(rescue, rescue=True)
+        row = {
+            "sample_idx": rescue_idx,
+            "timestamp": float(rescue.timestamp),
+            "origin": rescue.origin,
+            "proxy_content_score": (
+                float(rescue.selection.proxy_content_score)
+                if rescue.selection.proxy_content_score is not None
+                else None
+            ),
+            "current_status": status,
+            "current_rescue_origin": current.selection.rescue_origin if current is not None else None,
+            "current_rescue_reason": current.selection.rescue_reason if current is not None else None,
+            "phase_a_eligible": bool(status == "unpromoted" and detail["eligible"]),
+            "phase_a_rank": None,
+            "above_additive_headroom_cut": None,
+            "outcome": outcome,
+            "binding_budget": "none",
+            "rejection_branch": detail.get("rejection_branch"),
+            "rejection_reason": detail.get("rejection_reason"),
+            "nearest_competing_candidate_sample_idx": (
+                int(competing.sample_idx) if competing is not None else None
+            ),
+            "nearest_competing_candidate_timestamp": (
+                float(competing.timestamp) if competing is not None else None
+            ),
+            "token_jaccard": float(_jaccard(rescue_tokens, competing_tokens)) if competing is not None else None,
+            "marker_equivalent": (
+                bool(_marker_equivalent(rescue_tokens, competing_tokens)) if competing is not None else False
+            ),
+            "local_equivalent_coverage": bool(detail.get("local_equivalent_coverage", False)),
+        }
+        if row["phase_a_eligible"]:
+            eligible_pending.append((len(eligible_pending) + 1, row, detail))
+        rows.append(row)
+
+    predicted_ordered_eligible: list[dict[str, Any]] = []
+    for rank, row, detail in eligible_pending:
+        above_headroom = rank <= additive_output_headroom
+        row["phase_a_rank"] = rank
+        row["above_additive_headroom_cut"] = above_headroom
+        row["outcome"] = "eligible_above_headroom" if above_headroom else "eligible_below_headroom"
+        row["binding_budget"] = "additive_output_headroom"
+        predicted_ordered_eligible.append({
+            "sample_idx": int(row["sample_idx"]),
+            "timestamp": float(row["timestamp"]),
+            "phase_a_rank": rank,
+            "above_additive_headroom_cut": above_headroom,
+            "reason": detail.get("reason"),
+        })
+
+    return {
+        "base_candidate_count": base_candidate_count,
+        "current_post_rescue_count": current_post_rescue_count,
+        "max_post_rescue_count": max_post_rescue_count,
+        "additive_output_headroom": additive_output_headroom,
+        "current_rescue_count": current_rescue_count,
+        "predicted_ordered_eligible": predicted_ordered_eligible,
+        "candidate_rows": rows,
+    }
+
+
 def promote_rescue_candidates(
     candidates: Sequence[Mapping[str, Any] | CandidateRecord],
     rescue_shortlist: Sequence[Mapping[str, Any] | CandidateRecord],

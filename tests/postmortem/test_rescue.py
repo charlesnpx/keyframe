@@ -1,12 +1,15 @@
 import numpy as np
 from PIL import Image
+import json
 
 from keyframe.frames import _comparison_primary_sample_idxs, ocr_candidates as _ocr_candidates
+from keyframe.pipeline.contracts import candidate_records
 from keyframe.scoring import (
     assign_dwell_ids,
     build_rescue_shortlist as _build_rescue_shortlist,
     promote_rescue_candidates as _promote_rescue_candidates,
     proxy_content_scores,
+    rescue_promotion_preflight_report,
 )
 
 
@@ -26,6 +29,31 @@ def build_rescue_shortlist(*args, **kwargs):
 def ocr_candidates(*args, **kwargs):
     texts, records = _ocr_candidates(*args, **kwargs)
     return texts, _project(records)
+
+
+def _cand(sample_idx, timestamp, *, scene=0, cluster=1, tokens=(), proxy=0.1, window=0):
+    return {
+        "sample_idx": sample_idx,
+        "frame_idx": sample_idx,
+        "timestamp": timestamp,
+        "clip_cluster": cluster,
+        "scene_id": scene,
+        "temporal_window_id": window,
+        "proxy_content_score": proxy,
+        "ocr_tokens": list(tokens),
+        "rescue_tokens": list(tokens),
+    }
+
+
+def _preflight(base, shortlist, current, dwell_ids, budget, embeddings=None):
+    return rescue_promotion_preflight_report(
+        candidate_records(base),
+        candidate_records(shortlist),
+        candidate_records(current),
+        dwell_ids,
+        budget,
+        embeddings,
+    )
 
 
 def test_proxy_content_scores_clamp_and_no_variance_normalizes_to_zero():
@@ -306,6 +334,106 @@ def test_temporal_coverage_rescue_adds_distinct_dense_evidence_without_swapping(
     assert [row["sample_idx"] for row in promoted] == [0, 10]
     assert promoted[1]["rescue_origin"] == "additive_rescue"
     assert promoted[1]["rescue_reason"] == "temporal_coverage"
+
+
+def test_promotion_preflight_classifies_eligible_candidate_above_headroom():
+    base = [_cand(0, 0.0, tokens=["intro"])]
+    shortlist = [_cand(10, 10.0, cluster=2, tokens=["page2", "alpha", "beta"], proxy=0.9, window=1)]
+
+    report = _preflight(base, shortlist, base, [0] * 11, 1)
+
+    row = report["candidate_rows"][0]
+    assert report["additive_output_headroom"] == 1
+    assert row["outcome"] == "eligible_above_headroom"
+    assert row["phase_a_eligible"] is True
+    assert row["phase_a_rank"] == 1
+    assert row["above_additive_headroom_cut"] is True
+
+
+def test_promotion_preflight_classifies_eligible_candidate_below_headroom():
+    base = [_cand(0, 0.0, tokens=["intro"])]
+    current = base + [
+        {
+            **_cand(5, 5.0, scene=1, cluster=2, tokens=["page1"], proxy=0.8),
+            "rescue_origin": "additive_rescue",
+            "rescue_reason": "evidence_marker",
+        }
+    ]
+    shortlist = [_cand(10, 10.0, scene=2, cluster=3, tokens=["page2", "alpha", "beta"], proxy=0.9)]
+
+    report = _preflight(base, shortlist, current, [0] * 11, 1)
+
+    row = report["candidate_rows"][0]
+    assert report["additive_output_headroom"] == 0
+    assert row["outcome"] == "eligible_below_headroom"
+    assert row["phase_a_rank"] == 1
+    assert row["above_additive_headroom_cut"] is False
+    assert row["binding_budget"] == "additive_output_headroom"
+
+
+def test_promotion_preflight_classifies_predicate_rejected_candidate_with_branch_details():
+    base = [_cand(0, 0.0, tokens=["page1"])]
+    shortlist = [_cand(1, 1.0, tokens=["page1"], proxy=0.9)]
+
+    report = _preflight(base, shortlist, base, [0, 0], 1)
+
+    row = report["candidate_rows"][0]
+    assert row["outcome"] == "predicate_rejected"
+    assert row["phase_a_eligible"] is False
+    assert row["phase_a_rank"] is None
+    assert row["rejection_branch"] == "redundancy"
+    assert row["rejection_reason"] == "temporally_local_marker_equivalent"
+    assert row["nearest_competing_candidate_sample_idx"] == 0
+    assert row["marker_equivalent"] is True
+
+
+def test_promotion_preflight_does_not_mutate_candidate_records_and_is_json_safe():
+    base_records = candidate_records([_cand(0, 0.0, tokens=["intro"])])
+    shortlist_records = candidate_records([_cand(10, 10.0, cluster=2, tokens=["page2"], proxy=0.9)])
+    before = [record.to_dict() for record in base_records + shortlist_records]
+
+    report = rescue_promotion_preflight_report(
+        base_records,
+        shortlist_records,
+        base_records,
+        [0] * 11,
+        1,
+        None,
+    )
+
+    assert [record.to_dict() for record in base_records + shortlist_records] == before
+    json.dumps(report)
+
+
+def test_promotion_preflight_predicate_rejected_and_below_headroom_are_mutually_exclusive():
+    base = [_cand(0, 0.0, tokens=["page1"])]
+    shortlist = [_cand(1, 1.0, tokens=["page1"], proxy=0.9)]
+
+    report = _preflight(base, shortlist, base, [0, 0], 0)
+
+    row = report["candidate_rows"][0]
+    assert row["outcome"] == "predicate_rejected"
+    assert row["outcome"] != "eligible_below_headroom"
+    assert row["binding_budget"] == "none"
+
+
+def test_promotion_preflight_does_not_change_promotion_output():
+    candidates = [_cand(0, 0.0, tokens=["intro"])]
+    shortlist = [_cand(10, 10.0, cluster=2, tokens=["page2", "alpha", "beta"], proxy=0.9)]
+    dwell_ids = [0] * 11
+
+    before = _promote_rescue_candidates(candidates, shortlist, dwell_ids, rescue_budget=1)
+    rescue_promotion_preflight_report(
+        candidate_records(candidates),
+        candidate_records(shortlist),
+        before,
+        dwell_ids,
+        1,
+        None,
+    )
+    after = _promote_rescue_candidates(candidates, shortlist, dwell_ids, rescue_budget=1)
+
+    assert [record.to_dict() for record in before] == [record.to_dict() for record in after]
 
 
 def test_ocr_candidates_skips_precached_ocr(monkeypatch):

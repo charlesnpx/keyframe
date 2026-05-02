@@ -367,7 +367,7 @@ class RescueSelectionStage:
     name = "selection.after_rescue"
 
     def run(self, proposal: ProposalOutput, sampling: SamplingOutput, features: FeatureOutput, ctx: RunContext) -> tuple[CandidateRecord, ...]:
-        from keyframe.scoring import assign_dwell_ids, promote_rescue_candidates
+        from keyframe.scoring import assign_dwell_ids, promote_rescue_candidates, rescue_promotion_preflight_report
 
         candidates = proposal.candidates
         shortlist = proposal.rescue_shortlist
@@ -396,6 +396,20 @@ class RescueSelectionStage:
             rescue_budget=proposal.rescue_budget,
             clip_embeddings=features.clip_embeddings,
         )
+        if ctx.config.verbose_trace or ctx.config.debug_qa_targets_path is not None:
+            preflight = rescue_promotion_preflight_report(
+                candidates,
+                shortlist,
+                promoted,
+                dwell_ids,
+                proposal.rescue_budget,
+                features.clip_embeddings,
+            )
+            ctx.trace.decision(
+                "selection.rescue_promotion_preflight",
+                "promotion_preflight",
+                preflight,
+            )
         rescue_count = sum(1 for cand in promoted if cand.selection.rescue_origin)
         print(f"  Rescue promotion: {len(candidates)} -> {len(promoted)} candidates ({rescue_count} promoted)")
         promoted_rescue_only = [cand for cand in promoted if cand.selection.rescue_origin]
