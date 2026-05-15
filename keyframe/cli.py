@@ -81,6 +81,9 @@ def delegated_result(
         "targets": {},
         "warnings": [],
     }
+    if target == "tools":
+        result["targets"]["tools"] = {"files": []}
+        return result
     for target_name, (src, dst) in _target_specs(target, install_root).items():
         if operation == "install" and perform:
             dst.parent.mkdir(parents=True, exist_ok=True)
@@ -100,6 +103,8 @@ def install_skills(target: str = "all", *, json_mode: bool = False, install_root
     if json_mode:
         print(json.dumps(result, indent=2))
         return []
+    if target == "tools":
+        return ["Tools target is managed by mise-en-place via pipx"]
     installed = []
     for target_name, info in result["targets"].items():
         for f in info["files"]:
@@ -247,7 +252,7 @@ def main():
     # Check for `install-skills` subcommand first
     if len(sys.argv) > 1 and sys.argv[1] == "install-skills":
         parser = argparse.ArgumentParser(prog="keyframe install-skills")
-        parser.add_argument("--target", choices=["claude", "codex", "all"], default="all")
+        parser.add_argument("--target", choices=["claude", "codex", "tools", "all"], default="all")
         op = parser.add_mutually_exclusive_group()
         op.add_argument("--plan", action="store_true", help="Print intended files without writing")
         op.add_argument("--install", action="store_true", help="Install skill files (default)")
