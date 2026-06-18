@@ -17,6 +17,7 @@ _ALLOWED_ARTIFACT_KINDS = frozenset({"asr", "diarization", "reference", "candida
 _ALLOWED_TIME_BASES = frozenset({"canonical_ms", "chunk_relative_ms", "sample_index", "frame_index"})
 _ALLOWED_TRANSFORM_TYPES = frozenset({"identity", "resample", "channel_map", "chunk", "offset_map", "other"})
 _LOCAL_ONLY_KEYS = frozenset({"original_audio_id", "canonical_audio_id", "local_audio_sha256"})
+_MILLISECOND_TIME_BASES = frozenset({"canonical_ms", "chunk_relative_ms"})
 
 
 @dataclass(frozen=True)
@@ -298,8 +299,16 @@ class TimelineOffsetMap:
             "target_transform_chain_id",
             _require_id(self.target_transform_chain_id, "target_transform_chain_id"),
         )
-        object.__setattr__(self, "source_time_basis", _validate_time_basis(self.source_time_basis, "source_time_basis"))
-        object.__setattr__(self, "target_time_basis", _validate_time_basis(self.target_time_basis, "target_time_basis"))
+        object.__setattr__(
+            self,
+            "source_time_basis",
+            _validate_millisecond_time_basis(self.source_time_basis, "source_time_basis"),
+        )
+        object.__setattr__(
+            self,
+            "target_time_basis",
+            _validate_millisecond_time_basis(self.target_time_basis, "target_time_basis"),
+        )
         segments = _as_tuple_of(self.segments, OffsetMapSegment, "offset_map.segments")
         if not segments:
             raise ValidationError("offset_map.segments is required")
@@ -432,9 +441,15 @@ def _validate_parameters(parameters: object, field_name: str) -> MappingProxyTyp
     for key, value in parameters.items():
         if not isinstance(key, str):
             raise ValidationError(f"{field_name} field names must be strings")
-        if value is not None and not isinstance(value, (str, int, float, bool)):
-            raise ValidationError(f"{field_name}.{key} must be a JSON scalar")
-        clean[key] = value
+        if value is None or isinstance(value, (str, bool, int)):
+            clean[key] = value
+            continue
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                raise ValidationError(f"{field_name}.{key} must be a finite JSON number")
+            clean[key] = value
+            continue
+        raise ValidationError(f"{field_name}.{key} must be a JSON scalar")
     return MappingProxyType(clean)
 
 
@@ -514,6 +529,13 @@ def _validate_time_basis(value: object, field_name: str) -> TimeBasis:
     if value not in _ALLOWED_TIME_BASES:
         raise ValidationError(f"{field_name} is not supported: {value}")
     return value  # type: ignore[return-value]
+
+
+def _validate_millisecond_time_basis(value: object, field_name: str) -> TimeBasis:
+    value = _validate_time_basis(value, field_name)
+    if value not in _MILLISECOND_TIME_BASES:
+        raise ValidationError(f"offset map {field_name} must be millisecond-based")
+    return value
 
 
 def _optional_id(value: object, field_name: str) -> str | None:

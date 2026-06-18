@@ -1,3 +1,5 @@
+import math
+
 import pytest
 
 from keyframe.diarization import (
@@ -243,6 +245,30 @@ def test_offset_map_segments_are_validated_and_bound_checked():
 
 
 @pytest.mark.parametrize(
+    "basis_field, basis_value, message",
+    [
+        ("source_time_basis", "sample_index", "source_time_basis must be millisecond-based"),
+        ("target_time_basis", "frame_index", "target_time_basis must be millisecond-based"),
+    ],
+)
+def test_offset_map_rejects_non_millisecond_time_bases(basis_field, basis_value, message):
+    kwargs = {
+        "offset_map_id": "offset-map-1",
+        "source_timeline_id": "source",
+        "target_timeline_id": "target",
+        "source_transform_chain_id": "source-chain",
+        "target_transform_chain_id": "target-chain",
+        "source_time_basis": "canonical_ms",
+        "target_time_basis": "canonical_ms",
+        "segments": (OffsetMapSegment(0, 1_000, 0, 1_000),),
+    }
+    kwargs[basis_field] = basis_value
+
+    with pytest.raises(ValidationError, match=message):
+        TimelineOffsetMap(**kwargs)
+
+
+@pytest.mark.parametrize(
     "segments",
     [
         (OffsetMapSegment(0, 1_000, 0, 1_000),),
@@ -283,3 +309,9 @@ def test_transform_chain_captures_auditable_steps():
 
     assert chain.to_dict()["transform_chain_id"] == "chunked-normalization"
     assert chain.to_dict()["steps"][1]["parameters"]["chunk_start_ms"] == 1_000
+
+
+@pytest.mark.parametrize("bad_value", [math.nan, math.inf, -math.inf])
+def test_transform_parameters_reject_non_finite_json_numbers(bad_value):
+    with pytest.raises(ValidationError, match="must be a finite JSON number"):
+        TransformStep("step-1", "resample", {"from_hz": bad_value})
