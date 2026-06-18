@@ -205,13 +205,29 @@ def build_candidate_bundle_from_recording(
 def validate_candidate_bundle_payload(payload: dict[str, Any]) -> None:
     data = _validate_metadata(payload, "candidate_bundle")
     _reject_forbidden_fields(data)
-    if data.get("mode") == "oracle_diagnostic":
-        if data.get("oracle_diagnostic") is not True:
+
+    mode = _validate_mode(data.get("mode"))
+    oracle_diagnostic = _validate_bool(data.get("oracle_diagnostic"), "candidate_bundle.oracle_diagnostic")
+    product_quality_reportable = _validate_bool(
+        data.get("product_quality_reportable"),
+        "candidate_bundle.product_quality_reportable",
+    )
+
+    _require_id(data.get("bundle_id"), "candidate_bundle.bundle_id")
+    _validate_metadata(data.get("audio"), "candidate_bundle.audio")
+    _validate_channel_payloads(data.get("channels"))
+    _validate_metadata(data.get("runtime_hints"), "candidate_bundle.runtime_hints")
+
+    if mode == "oracle_diagnostic":
+        if oracle_diagnostic is not True:
             raise ValidationError("oracle diagnostic bundles must be explicitly labeled")
-        if data.get("product_quality_reportable") is not False:
+        if product_quality_reportable is not False:
             raise ValidationError("oracle diagnostic bundles must be non-reportable")
-    if data.get("oracle_diagnostic") is True and data.get("mode") != "oracle_diagnostic":
-        raise ValidationError("product-quality bundles cannot be labeled oracle diagnostic")
+    else:
+        if oracle_diagnostic is True:
+            raise ValidationError("product-quality bundles cannot be labeled oracle diagnostic")
+        if product_quality_reportable is not True:
+            raise ValidationError("product-quality bundles must be reportable")
 
 
 def _audio_payload(timeline: AudioTimelineProvenance) -> dict[str, Any]:

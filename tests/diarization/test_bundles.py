@@ -179,7 +179,7 @@ def test_serialized_candidate_payload_validation_enforces_oracle_reportability()
         validate_candidate_bundle_payload(payload)
 
     payload.pop("oracle_diagnostic")
-    with pytest.raises(ValidationError, match="oracle diagnostic bundles must be explicitly labeled"):
+    with pytest.raises(ValidationError, match="candidate_bundle.oracle_diagnostic must be a boolean"):
         validate_candidate_bundle_payload(payload)
 
     payload = build_candidate_bundle_from_recording(
@@ -189,6 +189,85 @@ def test_serialized_candidate_payload_validation_enforces_oracle_reportability()
     ).to_dict()
     payload["oracle_diagnostic"] = True
     with pytest.raises(ValidationError, match="product-quality bundles cannot be labeled oracle diagnostic"):
+        validate_candidate_bundle_payload(payload)
+
+
+def test_serialized_candidate_payload_validation_rejects_unsupported_modes():
+    payload = build_candidate_bundle_from_recording(
+        _recording(),
+        artifact_id="reference-fixture",
+        bundle_id="candidate-fixture",
+    ).to_dict()
+    payload["mode"] = "unsupported"
+
+    with pytest.raises(ValidationError, match="candidate_bundle.mode is not supported"):
+        validate_candidate_bundle_payload(payload)
+
+
+@pytest.mark.parametrize(
+    ("key", "expected_message"),
+    [
+        ("bundle_id", "candidate_bundle.bundle_id is required"),
+        ("audio", "candidate_bundle.audio must be an object"),
+        ("mode", "candidate_bundle.mode is required"),
+        ("oracle_diagnostic", "candidate_bundle.oracle_diagnostic must be a boolean"),
+        ("product_quality_reportable", "candidate_bundle.product_quality_reportable must be a boolean"),
+        ("runtime_hints", "candidate_bundle.runtime_hints must be an object"),
+    ],
+)
+def test_serialized_candidate_payload_validation_rejects_missing_required_fields(key, expected_message):
+    payload = build_candidate_bundle_from_recording(
+        _recording(),
+        artifact_id="reference-fixture",
+        bundle_id="candidate-fixture",
+    ).to_dict()
+    payload.pop(key)
+
+    with pytest.raises(ValidationError, match=expected_message):
+        validate_candidate_bundle_payload(payload)
+
+
+def test_serialized_candidate_payload_validation_rejects_missing_channels():
+    payload = build_candidate_bundle_from_recording(
+        _recording(),
+        artifact_id="reference-fixture",
+        bundle_id="candidate-fixture",
+    ).to_dict()
+    payload.pop("channels")
+
+    with pytest.raises(ValidationError, match="candidate_bundle.channels must be an iterable"):
+        validate_candidate_bundle_payload(payload)
+
+
+@pytest.mark.parametrize(
+    ("channels", "expected_message"),
+    [
+        ([], "candidate_bundle.channels is required"),
+        ([{"channel_id": ""}], r"candidate_bundle.channels\[0\].channel_id is required"),
+        ([{"channel_id": "   "}], r"candidate_bundle.channels\[0\].channel_id is required"),
+    ],
+)
+def test_serialized_candidate_payload_validation_rejects_invalid_channel_payloads(channels, expected_message):
+    payload = build_candidate_bundle_from_recording(
+        _recording(),
+        artifact_id="reference-fixture",
+        bundle_id="candidate-fixture",
+    ).to_dict()
+    payload["channels"] = channels
+
+    with pytest.raises(ValidationError, match=expected_message):
+        validate_candidate_bundle_payload(payload)
+
+
+def test_product_quality_serialized_payloads_must_be_reportable():
+    payload = build_candidate_bundle_from_recording(
+        _recording(),
+        artifact_id="reference-fixture",
+        bundle_id="candidate-fixture",
+    ).to_dict()
+    payload["product_quality_reportable"] = False
+
+    with pytest.raises(ValidationError, match="product-quality bundles must be reportable"):
         validate_candidate_bundle_payload(payload)
 
 
