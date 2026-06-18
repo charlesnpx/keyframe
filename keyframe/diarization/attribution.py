@@ -58,6 +58,8 @@ def _attribute_word(word: CanonicalWord, spans: tuple[SpeakerSpan, ...]) -> Cano
         speaker_confidence = selected_span.confidence
 
     overlapping_speakers = {span.speaker_ref for span in matching_spans}
+    if speaker_ref is not None:
+        overlapping_speakers.add(speaker_ref)
     overlap = word.overlap or len(overlapping_speakers) > 1
     if selected_span is not None:
         overlap = overlap or selected_span.overlap

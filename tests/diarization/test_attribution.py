@@ -90,6 +90,20 @@ def test_overlap_sets_overlap_flag_without_inventing_missing_confidence():
     assert attributed.words[0].overlap is True
 
 
+def test_existing_word_speaker_counts_when_detecting_overlap():
+    recording = _recording(
+        speakers=(SpeakerRecord("backend-a"), SpeakerRecord("backend-b")),
+        words=(CanonicalWord("w-existing", "known", 200, 500, speaker_ref="backend-a", channel_id="ch-1"),),
+        speaker_spans=(SpeakerSpan("span-b", "backend-b", 250, 450, channel_id="ch-1", confidence=0.72),),
+    )
+
+    attributed = apply_session_local_attribution(recording)
+
+    assert attributed.words[0].speaker_ref == "backend-a"
+    assert attributed.words[0].display_label.label == "person_1"
+    assert attributed.words[0].overlap is True
+
+
 def test_word_attribution_respects_channel_ids():
     recording = _recording(
         words=(CanonicalWord("w-ch2", "right", 100, 200, channel_id="ch-2"),),
