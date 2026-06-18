@@ -154,6 +154,14 @@ def test_required_audio_identifiers_must_be_present_strings():
     "overrides, message",
     [
         (
+            {"channels": (ChannelRecord("ch-1"), ChannelRecord("ch-1"))},
+            "duplicate channel_id",
+        ),
+        (
+            {"speakers": (SpeakerRecord("spk-a"), SpeakerRecord("spk-a"))},
+            "duplicate speaker_ref",
+        ),
+        (
             {"words": (CanonicalWord("w-1", "hello", 0, 100), CanonicalWord("w-1", "again", 100, 200))},
             "duplicate word_id",
         ),
