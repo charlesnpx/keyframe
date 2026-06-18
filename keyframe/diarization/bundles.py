@@ -214,9 +214,13 @@ def validate_candidate_bundle_payload(payload: dict[str, Any]) -> None:
     )
 
     _require_id(data.get("bundle_id"), "candidate_bundle.bundle_id")
-    _validate_metadata(data.get("audio"), "candidate_bundle.audio")
-    _validate_channel_payloads(data.get("channels"))
-    _validate_metadata(data.get("runtime_hints"), "candidate_bundle.runtime_hints")
+    audio = _validate_audio_payload(data.get("audio"))
+    channels = _validate_channel_payloads(data.get("channels"))
+    runtime_hints = _validate_runtime_hints_payload(data.get("runtime_hints"), channels)
+    if audio["channel_count"] != len(channels):
+        raise ValidationError("candidate_bundle.audio.channel_count must match channels")
+    if runtime_hints["timeline"]["channel_ids"] != runtime_hints["channel_ids"]:
+        raise ValidationError("candidate_bundle.runtime_hints.timeline.channel_ids must match channels")
 
     if mode == "oracle_diagnostic":
         if oracle_diagnostic is not True:
@@ -281,14 +285,60 @@ def _validate_channel_payloads(value: object) -> tuple[dict[str, Any], ...]:
     seen: set[str] = set()
     for index, channel in enumerate(channels):
         payload = _validate_metadata(channel, f"candidate_bundle.channels[{index}]")
-        channel_id = payload.get("channel_id")
-        if not isinstance(channel_id, str) or not channel_id.strip():
-            raise ValidationError(f"candidate_bundle.channels[{index}].channel_id is required")
+        channel_id = _require_id(payload.get("channel_id"), f"candidate_bundle.channels[{index}].channel_id")
+        payload["channel_id"] = channel_id
         if channel_id in seen:
             raise ValidationError(f"duplicate candidate_bundle.channels.channel_id: {channel_id}")
         seen.add(channel_id)
         result.append(payload)
     return tuple(result)
+
+
+def _validate_audio_payload(value: object) -> dict[str, Any]:
+    payload = _validate_metadata(value, "candidate_bundle.audio")
+    payload["channel_count"] = _require_positive_int(
+        payload.get("channel_count"),
+        "candidate_bundle.audio.channel_count",
+    )
+    payload["duration_ms"] = _require_positive_int(
+        payload.get("duration_ms"),
+        "candidate_bundle.audio.duration_ms",
+    )
+    payload["sample_rate_hz"] = _require_positive_int(
+        payload.get("sample_rate_hz"),
+        "candidate_bundle.audio.sample_rate_hz",
+    )
+    payload["time_basis"] = _validate_time_basis(payload.get("time_basis"), "candidate_bundle.audio.time_basis")
+    return payload
+
+
+def _validate_runtime_hints_payload(
+    value: object,
+    channels: tuple[dict[str, Any], ...],
+) -> dict[str, Any]:
+    payload = _validate_metadata(value, "candidate_bundle.runtime_hints")
+    channel_ids = [channel["channel_id"] for channel in channels]
+    if payload.get("channel_ids") != channel_ids:
+        raise ValidationError("candidate_bundle.runtime_hints.channel_ids must match channels")
+    if payload.get("mode_supports_speaker_identity") is not False:
+        raise ValidationError("candidate_bundle.runtime_hints.mode_supports_speaker_identity must be false")
+
+    timeline = _validate_metadata(payload.get("timeline"), "candidate_bundle.runtime_hints.timeline")
+    timeline["channel_ids"] = _validate_channel_ids_list(
+        timeline.get("channel_ids"),
+        "candidate_bundle.runtime_hints.timeline.channel_ids",
+    )
+    payload["timeline"] = timeline
+    return payload
+
+
+def _validate_channel_ids_list(value: object, field_name: str) -> list[str]:
+    if not isinstance(value, list):
+        raise ValidationError(f"{field_name} must be a list")
+    result = []
+    for index, item in enumerate(value):
+        result.append(_require_id(item, f"{field_name}[{index}]"))
+    return result
 
 
 def _validate_metadata(value: object, field_name: str) -> dict[str, Any]:
@@ -354,6 +404,21 @@ def _validate_mode(value: object) -> CandidateBundleMode:
 def _validate_bool(value: object, field_name: str) -> bool:
     if not isinstance(value, bool):
         raise ValidationError(f"{field_name} must be a boolean")
+    return value
+
+
+def _require_positive_int(value: object, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValidationError(f"{field_name} must be an integer")
+    if value <= 0:
+        raise ValidationError(f"{field_name} must be greater than 0")
+    return value
+
+
+def _validate_time_basis(value: object, field_name: str) -> str:
+    value = _require_id(value, field_name)
+    if value not in {"canonical_ms", "chunk_relative_ms", "sample_index", "frame_index"}:
+        raise ValidationError(f"{field_name} is not supported: {value}")
     return value
 
 

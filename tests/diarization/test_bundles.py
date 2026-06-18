@@ -240,11 +240,42 @@ def test_serialized_candidate_payload_validation_rejects_missing_channels():
 
 
 @pytest.mark.parametrize(
+    ("audio", "expected_message"),
+    [
+        ({}, "candidate_bundle.audio.channel_count must be an integer"),
+        (
+            {
+                "channel_count": 2,
+                "duration_ms": 1200,
+                "sample_rate_hz": 16000,
+                "time_basis": "canonical_ms",
+            },
+            "candidate_bundle.audio.channel_count must match channels",
+        ),
+    ],
+)
+def test_serialized_candidate_payload_validation_rejects_invalid_audio_metadata(audio, expected_message):
+    payload = build_candidate_bundle_from_recording(
+        _recording(),
+        artifact_id="reference-fixture",
+        bundle_id="candidate-fixture",
+    ).to_dict()
+    payload["audio"] = audio
+
+    with pytest.raises(ValidationError, match=expected_message):
+        validate_candidate_bundle_payload(payload)
+
+
+@pytest.mark.parametrize(
     ("channels", "expected_message"),
     [
         ([], "candidate_bundle.channels is required"),
         ([{"channel_id": ""}], r"candidate_bundle.channels\[0\].channel_id is required"),
         ([{"channel_id": "   "}], r"candidate_bundle.channels\[0\].channel_id is required"),
+        (
+            [{"channel_id": "ch-1"}, {"channel_id": " ch-1 "}],
+            "duplicate candidate_bundle.channels.channel_id: ch-1",
+        ),
     ],
 )
 def test_serialized_candidate_payload_validation_rejects_invalid_channel_payloads(channels, expected_message):
@@ -254,6 +285,68 @@ def test_serialized_candidate_payload_validation_rejects_invalid_channel_payload
         bundle_id="candidate-fixture",
     ).to_dict()
     payload["channels"] = channels
+
+    with pytest.raises(ValidationError, match=expected_message):
+        validate_candidate_bundle_payload(payload)
+
+
+@pytest.mark.parametrize(
+    ("runtime_hints", "expected_message"),
+    [
+        ({}, "candidate_bundle.runtime_hints.channel_ids must match channels"),
+        (
+            {
+                "channel_ids": ["ch-1"],
+                "mode_supports_speaker_identity": True,
+                "timeline": {
+                    "channel_ids": ["ch-1"],
+                    "duration_ms": 1200,
+                    "sample_rate_hz": 16000,
+                    "time_basis": "canonical_ms",
+                },
+            },
+            "candidate_bundle.runtime_hints.mode_supports_speaker_identity must be false",
+        ),
+        (
+            {
+                "channel_ids": ["other-channel"],
+                "mode_supports_speaker_identity": False,
+                "timeline": {
+                    "channel_ids": ["other-channel"],
+                    "duration_ms": 1200,
+                    "sample_rate_hz": 16000,
+                    "time_basis": "canonical_ms",
+                },
+            },
+            "candidate_bundle.runtime_hints.channel_ids must match channels",
+        ),
+        (
+            {
+                "channel_ids": ["ch-1"],
+                "mode_supports_speaker_identity": False,
+            },
+            "candidate_bundle.runtime_hints.timeline must be an object",
+        ),
+        (
+            {
+                "channel_ids": ["ch-1"],
+                "mode_supports_speaker_identity": False,
+                "timeline": {"channel_ids": ["other-channel"]},
+            },
+            "candidate_bundle.runtime_hints.timeline.channel_ids must match channels",
+        ),
+    ],
+)
+def test_serialized_candidate_payload_validation_rejects_invalid_runtime_hints(
+    runtime_hints,
+    expected_message,
+):
+    payload = build_candidate_bundle_from_recording(
+        _recording(),
+        artifact_id="reference-fixture",
+        bundle_id="candidate-fixture",
+    ).to_dict()
+    payload["runtime_hints"] = runtime_hints
 
     with pytest.raises(ValidationError, match=expected_message):
         validate_candidate_bundle_payload(payload)
