@@ -108,7 +108,7 @@ def test_duplicate_display_labels_do_not_merge_distinct_speakers():
 def test_same_time_words_preserve_canonical_order_in_rendered_turns():
     recording = _recording(
         words=(
-            CanonicalWord("w-z", "first", 0, 100, speaker_ref="spk-a", channel_id="ch-1", speaker_confidence=0.9),
+            CanonicalWord("w-z", "first", 0, 200, speaker_ref="spk-a", channel_id="ch-1", speaker_confidence=0.9),
             CanonicalWord("w-a", "second", 0, 100, speaker_ref="spk-a", channel_id="ch-1", speaker_confidence=0.9),
         )
     )
@@ -116,6 +116,7 @@ def test_same_time_words_preserve_canonical_order_in_rendered_turns():
     transcript = render_transcript(recording)
 
     assert transcript.turns[0].word_ids == ("w-z", "w-a")
+    assert transcript.turns[0].end_ms == 200
     assert [word.word_id for word in transcript.words] == ["w-z", "w-a"]
 
 

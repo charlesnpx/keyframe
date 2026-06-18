@@ -156,9 +156,7 @@ def render_transcript(
     ordered_overlays = _ordered_overlays(overlays)
     overlay_result = _apply_overlays(attributed, ordered_overlays)
     indexed_words = tuple(enumerate(overlay_result.recording.words))
-    words = tuple(
-        word for _, word in sorted(indexed_words, key=lambda item: (item[1].start_ms, item[1].end_ms, item[0]))
-    )
+    words = tuple(word for _, word in sorted(indexed_words, key=lambda item: (item[1].start_ms, item[0])))
     rendered_words = tuple(_render_word(word, overlay_result.uncertain_word_ids) for word in words)
     turns = tuple(_build_turns(words, overlay_result.uncertain_word_ids, max_gap_ms, split_after_punctuation))
     return RenderedTranscript(
@@ -358,7 +356,7 @@ def _render_turn(index: int, words: list[CanonicalWord], uncertain_word_ids: fro
     return RenderedTurn(
         turn_id=f"turn_{index}",
         start_ms=words[0].start_ms,
-        end_ms=words[-1].end_ms,
+        end_ms=max(word.end_ms for word in words),
         label=_word_label(words[0]),
         word_ids=tuple(word.word_id for word in words),
         text=_join_words(words),
