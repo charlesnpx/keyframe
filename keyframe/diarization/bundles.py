@@ -167,7 +167,10 @@ def build_candidate_bundle(
     mode = _validate_mode(mode)
     audio = _audio_payload(reference.artifact.timeline)
     channels = _channel_payloads(reference, mode)
-    extra_hints = _validate_metadata(runtime_hints or {}, "candidate_bundle.runtime_hints")
+    extra_hints = _validate_metadata(
+        {} if runtime_hints is None else runtime_hints,
+        "candidate_bundle.runtime_hints",
+    )
     if _RESERVED_RUNTIME_HINT_KEYS.intersection(extra_hints):
         raise ValidationError("candidate_bundle.runtime_hints cannot override generated runtime metadata")
     hints = _default_runtime_hints(reference.artifact.timeline)
@@ -202,8 +205,11 @@ def build_candidate_bundle_from_recording(
 def validate_candidate_bundle_payload(payload: dict[str, Any]) -> None:
     data = _validate_metadata(payload, "candidate_bundle")
     _reject_forbidden_fields(data)
-    if data.get("mode") == "oracle_diagnostic" and data.get("product_quality_reportable") is not False:
-        raise ValidationError("oracle diagnostic bundles must be non-reportable")
+    if data.get("mode") == "oracle_diagnostic":
+        if data.get("oracle_diagnostic") is not True:
+            raise ValidationError("oracle diagnostic bundles must be explicitly labeled")
+        if data.get("product_quality_reportable") is not False:
+            raise ValidationError("oracle diagnostic bundles must be non-reportable")
     if data.get("oracle_diagnostic") is True and data.get("mode") != "oracle_diagnostic":
         raise ValidationError("product-quality bundles cannot be labeled oracle diagnostic")
 

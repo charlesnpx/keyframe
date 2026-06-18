@@ -124,6 +124,17 @@ def test_runtime_hint_overrides_cannot_corrupt_generated_metadata(reserved_key):
         )
 
 
+@pytest.mark.parametrize("runtime_hints", [[], "", False])
+def test_runtime_hint_builder_rejects_falsey_non_object_values(runtime_hints):
+    with pytest.raises(ValidationError, match="runtime_hints must be an object"):
+        build_candidate_bundle_from_recording(
+            _recording(),
+            artifact_id="reference-fixture",
+            bundle_id="candidate-fixture",
+            runtime_hints=runtime_hints,
+        )
+
+
 def test_authenticated_track_metadata_mode_includes_track_names_but_not_speaker_identity():
     bundle = build_candidate_bundle_from_recording(
         _recording(),
@@ -160,6 +171,15 @@ def test_serialized_candidate_payload_validation_enforces_oracle_reportability()
 
     payload["product_quality_reportable"] = True
     with pytest.raises(ValidationError, match="oracle diagnostic bundles must be non-reportable"):
+        validate_candidate_bundle_payload(payload)
+
+    payload["product_quality_reportable"] = False
+    payload["oracle_diagnostic"] = False
+    with pytest.raises(ValidationError, match="oracle diagnostic bundles must be explicitly labeled"):
+        validate_candidate_bundle_payload(payload)
+
+    payload.pop("oracle_diagnostic")
+    with pytest.raises(ValidationError, match="oracle diagnostic bundles must be explicitly labeled"):
         validate_candidate_bundle_payload(payload)
 
     payload = build_candidate_bundle_from_recording(
