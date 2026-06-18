@@ -45,9 +45,23 @@ def _require_id(value: object, field_name: str) -> str:
     return value
 
 
-def _validate_interval(start_ms: int, end_ms: int, *, context: str) -> tuple[int, int]:
-    start_ms = int(start_ms)
-    end_ms = int(end_ms)
+def _require_text(value: object, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise ValidationError(f"{field_name} must be a string")
+    if not value.strip():
+        raise ValidationError(f"{field_name} is required")
+    return value
+
+
+def _require_int(value: object, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValidationError(f"{field_name} must be an integer")
+    return value
+
+
+def _validate_interval(start_ms: object, end_ms: object, *, context: str) -> tuple[int, int]:
+    start_ms = _require_int(start_ms, f"{context}.start_ms")
+    end_ms = _require_int(end_ms, f"{context}.end_ms")
     if start_ms < 0:
         raise ValidationError(f"{context}.start_ms must be >= 0")
     if end_ms <= start_ms:
@@ -137,7 +151,7 @@ class CanonicalWord:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "word_id", _require_id(self.word_id, "word_id"))
-        object.__setattr__(self, "text", str(self.text))
+        object.__setattr__(self, "text", _require_text(self.text, f"word {self.word_id}.text"))
         start_ms, end_ms = _validate_interval(self.start_ms, self.end_ms, context=f"word {self.word_id}")
         object.__setattr__(self, "start_ms", start_ms)
         object.__setattr__(self, "end_ms", end_ms)
@@ -231,7 +245,7 @@ class CanonicalRecording:
         object.__setattr__(self, "original_audio_id", _require_id(self.original_audio_id, "original_audio_id"))
         object.__setattr__(self, "canonical_audio_id", _require_id(self.canonical_audio_id, "canonical_audio_id"))
         object.__setattr__(self, "timeline_id", _require_id(self.timeline_id, "timeline_id"))
-        duration_ms = int(self.duration_ms)
+        duration_ms = _require_int(self.duration_ms, "duration_ms")
         if duration_ms <= 0:
             raise ValidationError("duration_ms must be greater than 0")
         object.__setattr__(self, "duration_ms", duration_ms)

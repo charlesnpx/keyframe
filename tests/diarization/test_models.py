@@ -181,6 +181,31 @@ def test_canonical_item_ids_are_unique(overrides, message):
         _recording(**overrides)
 
 
+@pytest.mark.parametrize("text", [None, ""])
+def test_word_text_must_be_present_string(text):
+    with pytest.raises(ValidationError, match=r"word w-1\.text"):
+        CanonicalWord("w-1", text, 0, 1)
+
+
+@pytest.mark.parametrize(
+    "make_overrides, message",
+    [
+        (lambda: {"duration_ms": 1.9}, "duration_ms must be an integer"),
+        (
+            lambda: {"words": (CanonicalWord("w-1", "hello", 0.9, 2),)},
+            r"word w-1\.start_ms must be an integer",
+        ),
+        (
+            lambda: {"speaker_spans": (SpeakerSpan("span-1", "spk-a", 0, 2.1),)},
+            r"span span-1\.end_ms must be an integer",
+        ),
+    ],
+)
+def test_timing_fields_must_be_integers(make_overrides, message):
+    with pytest.raises(ValidationError, match=message):
+        _recording(**make_overrides())
+
+
 def test_display_label_scope_is_recording_only():
     with pytest.raises(ValidationError, match="scoped to one recording"):
         DisplayLabel(label="person_1", source="diarization_cluster", scope="global")
