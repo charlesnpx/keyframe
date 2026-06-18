@@ -1,0 +1,77 @@
+{
+  "canonical_audio_id": "fixture-degraded-output-canonical",
+  "channels": [
+    {
+      "channel_id": "ch-1",
+      "name": "mixed"
+    }
+  ],
+  "duration_ms": 1000,
+  "original_audio_id": "fixture-degraded-output-original",
+  "recording_id": "fixture-degraded-output",
+  "schema_version": 1,
+  "scoring_regions": [
+    {
+      "channel_id": "ch-1",
+      "end_ms": 950,
+      "region_id": "uem-1",
+      "start_ms": 0
+    }
+  ],
+  "speaker_spans": [
+    {
+      "channel_id": "ch-1",
+      "confidence": 0.1,
+      "end_ms": 300,
+      "overlap": false,
+      "span_id": "span-1",
+      "speaker_ref": "spk-unknown",
+      "start_ms": 100
+    }
+  ],
+  "speakers": [
+    {
+      "display_label": {
+        "confidence": null,
+        "label": "unknown",
+        "scope": "recording",
+        "source": "unknown",
+        "source_ref": null
+      },
+      "speaker_ref": "spk-unknown"
+    }
+  ],
+  "timeline_id": "fixture-degraded-output-timeline",
+  "words": [
+    {
+      "channel_id": "ch-1",
+      "display_label": {
+        "confidence": null,
+        "label": "unknown",
+        "scope": "recording",
+        "source": "unknown",
+        "source_ref": null
+      },
+      "end_ms": 300,
+      "overlap": false,
+      "speaker_confidence": 0.1,
+      "speaker_ref": "spk-unknown",
+      "start_ms": 100,
+      "text": "[inaudible]",
+      "text_confidence": 0.2,
+      "word_id": "w-1"
+    },
+    {
+      "channel_id": "ch-1",
+      "display_label": null,
+      "end_ms": 900,
+      "overlap": false,
+      "speaker_confidence": null,
+      "speaker_ref": null,
+      "start_ms": 700,
+      "text": "fragment",
+      "text_confidence": 0.35,
+      "word_id": "w-2"
+    }
+  ]
+}
