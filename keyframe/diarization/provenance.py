@@ -167,9 +167,8 @@ class AudioTimelineProvenance:
         if self.time_basis == "sample_index":
             return round(value * 1000 / self.sample_rate_hz)
         if self.time_basis == "frame_index":
-            if frame_rate_fps is None or not math.isfinite(float(frame_rate_fps)) or frame_rate_fps <= 0:
-                raise ValidationError("frame_rate_fps must be greater than 0 for frame_index conversion")
-            return round(value * 1000 / frame_rate_fps)
+            frame_rate = _require_positive_finite_number(frame_rate_fps, "frame_rate_fps")
+            return round(value * 1000 / frame_rate)
         raise ValidationError(f"time_basis is not supported: {self.time_basis}")
 
 
@@ -436,11 +435,22 @@ def _without_local_audio_identity(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _validate_non_overlapping_segments(segments: tuple[OffsetMapSegment, ...]) -> None:
+    _validate_non_overlapping_ranges(
+        tuple((segment.source_start_ms, segment.source_end_ms) for segment in segments),
+        "offset_map source segments",
+    )
+    _validate_non_overlapping_ranges(
+        tuple((segment.target_start_ms, segment.target_end_ms) for segment in segments),
+        "offset_map target segments",
+    )
+
+
+def _validate_non_overlapping_ranges(ranges: tuple[tuple[int, int], ...], field_name: str) -> None:
     previous_end = -1
-    for segment in segments:
-        if segment.source_start_ms < previous_end:
-            raise ValidationError("offset_map.segments must not overlap")
-        previous_end = segment.source_end_ms
+    for start_ms, end_ms in sorted(ranges):
+        if start_ms < previous_end:
+            raise ValidationError(f"{field_name} must not overlap")
+        previous_end = end_ms
 
 
 def _validate_interval(start_ms: object, end_ms: object, field_name: str) -> tuple[int, int]:
@@ -513,6 +523,15 @@ def _require_non_negative_int(value: object, field_name: str) -> int:
 def _require_positive_int(value: object, field_name: str) -> int:
     value = _require_int(value, field_name)
     if value <= 0:
+        raise ValidationError(f"{field_name} must be greater than 0")
+    return value
+
+
+def _require_positive_finite_number(value: object, field_name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValidationError(f"{field_name} must be a number")
+    value = float(value)
+    if not math.isfinite(value) or value <= 0:
         raise ValidationError(f"{field_name} must be greater than 0")
     return value
 

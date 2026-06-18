@@ -155,9 +155,15 @@ def test_chunk_relative_sample_index_and_frame_index_convert_to_canonical_ms():
     with pytest.raises(ValidationError, match="chunk_start_ms is required"):
         _timeline(time_basis="chunk_relative_ms").to_canonical_ms(250)
 
+    with pytest.raises(ValidationError, match="frame_rate_fps must be a number"):
+        _timeline(time_basis="frame_index").to_canonical_ms(30, frame_rate_fps="30")
+
+    with pytest.raises(ValidationError, match="frame_rate_fps must be greater than 0"):
+        _timeline(time_basis="frame_index").to_canonical_ms(30, frame_rate_fps=0.0)
+
 
 def test_offset_map_segments_are_validated_and_bound_checked():
-    with pytest.raises(ValidationError, match="must not overlap"):
+    with pytest.raises(ValidationError, match="source segments must not overlap"):
         TimelineOffsetMap(
             offset_map_id="offset-map-1",
             source_timeline_id="source",
@@ -167,6 +173,18 @@ def test_offset_map_segments_are_validated_and_bound_checked():
             source_time_basis="canonical_ms",
             target_time_basis="canonical_ms",
             segments=(OffsetMapSegment(0, 500, 0, 500), OffsetMapSegment(400, 900, 400, 900)),
+        )
+
+    with pytest.raises(ValidationError, match="target segments must not overlap"):
+        TimelineOffsetMap(
+            offset_map_id="offset-map-1",
+            source_timeline_id="source",
+            target_timeline_id="target",
+            source_transform_chain_id="source-chain",
+            target_transform_chain_id="target-chain",
+            source_time_basis="canonical_ms",
+            target_time_basis="canonical_ms",
+            segments=(OffsetMapSegment(0, 500, 0, 500), OffsetMapSegment(500, 900, 250, 650)),
         )
 
     offset_map = TimelineOffsetMap(
