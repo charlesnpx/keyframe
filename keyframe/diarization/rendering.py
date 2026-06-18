@@ -337,7 +337,7 @@ def _starts_new_turn(
     max_gap_ms: int,
     split_after_punctuation: bool,
 ) -> bool:
-    if _word_label(previous) != _word_label(current):
+    if previous.speaker_ref != current.speaker_ref:
         return True
     if previous.channel_id != current.channel_id:
         return True

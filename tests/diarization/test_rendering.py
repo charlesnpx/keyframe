@@ -88,6 +88,23 @@ def test_rename_overlay_changes_rendered_labels_without_mutating_recording():
     assert recording.to_dict() == original
 
 
+def test_duplicate_display_labels_do_not_merge_distinct_speakers():
+    recording = _recording(
+        words=(
+            CanonicalWord("w-1", "first", 0, 100, speaker_ref="spk-a", channel_id="ch-1", speaker_confidence=0.9),
+            CanonicalWord("w-2", "second", 150, 250, speaker_ref="spk-b", channel_id="ch-1", speaker_confidence=0.8),
+        )
+    )
+
+    transcript = render_transcript(
+        recording,
+        overlays=(RenameLabelOverlay(operation_id="op-rename", speaker_ref="spk-b", label="person_1"),),
+    )
+
+    assert [turn.label for turn in transcript.turns] == ["person_1", "person_1"]
+    assert [turn.word_ids for turn in transcript.turns] == [("w-1",), ("w-2",)]
+
+
 def test_merge_overlay_combines_clusters_before_turn_assembly():
     recording = _recording(
         words=(
