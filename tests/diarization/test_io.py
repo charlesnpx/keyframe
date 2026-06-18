@@ -80,8 +80,9 @@ def test_jsonl_round_trip_uses_one_stable_recording_per_line(tmp_path):
     "mutate, message",
     [
         (lambda payload: payload.pop("schema_version"), "recording.schema_version is required"),
-        (lambda payload: payload.update({"schema_version": 2}), "schema_version is not supported"),
-        (lambda payload: payload.update({"schema_version": 1.0}), "schema_version must be an integer"),
+        (lambda payload: payload.update({"schema_version": 1}), "schema_version is not supported"),
+        (lambda payload: payload.update({"schema_version": 3}), "schema_version is not supported"),
+        (lambda payload: payload.update({"schema_version": 2.0}), "schema_version must be an integer"),
     ],
 )
 def test_schema_version_checks_fail_closed(mutate, message):
@@ -92,8 +93,20 @@ def test_schema_version_checks_fail_closed(mutate, message):
         canonical_json_loads(json.dumps(payload))
 
 
-@pytest.mark.parametrize("field_name", ["channels", "speakers", "words", "speaker_spans", "scoring_regions"])
-def test_required_canonical_collection_fields_fail_closed_when_missing(field_name):
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "channels",
+        "sample_rate_hz",
+        "scoring_regions",
+        "speaker_spans",
+        "speakers",
+        "time_basis",
+        "transform_chain_id",
+        "words",
+    ],
+)
+def test_required_canonical_artifact_fields_fail_closed_when_missing(field_name):
     payload = json.loads((FIXTURE_DIR / "clean_two_speaker.json").read_text(encoding="utf-8"))
     payload.pop(field_name)
 

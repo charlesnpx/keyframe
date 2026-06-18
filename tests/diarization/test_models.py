@@ -98,11 +98,14 @@ def test_valid_multichannel_recording_preserves_overlap_and_nullable_confidence(
 
     payload = recording.to_dict()
 
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
     assert payload["words"][1]["overlap"] is True
     assert payload["words"][1]["speaker_confidence"] is None
     assert payload["speakers"][0]["display_label"]["label"] == "person_1"
     assert payload["speakers"][0]["display_label"]["scope"] == "recording"
+    assert payload["sample_rate_hz"] == 16_000
+    assert payload["time_basis"] == "canonical_ms"
+    assert payload["transform_chain_id"] == "identity"
 
 
 def test_serialization_is_deterministic_and_contains_no_persistent_identity_fields():
@@ -148,6 +151,20 @@ def test_required_audio_identifiers_must_be_present_strings():
 
     with pytest.raises(ValidationError, match="canonical_audio_id must be a string"):
         _recording(canonical_audio_id=42)
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"sample_rate_hz": 0}, "sample_rate_hz must be greater than 0"),
+        ({"transform_chain_id": ""}, "transform_chain_id is required"),
+        ({"time_basis": "wall_clock"}, "time_basis is not supported"),
+        ({"time_basis": "sample_index"}, "canonical recordings must use canonical_ms time_basis"),
+    ],
+)
+def test_recording_rejects_invalid_timeline_provenance_fields(overrides, message):
+    with pytest.raises(ValidationError, match=message):
+        _recording(**overrides)
 
 
 @pytest.mark.parametrize(
