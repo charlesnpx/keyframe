@@ -1,4 +1,5 @@
 import json
+import math
 import sys
 
 import pytest
@@ -219,6 +220,24 @@ def test_display_label_source_must_be_canonical():
 def test_confidence_values_are_bounded():
     with pytest.raises(ValidationError, match="must be between"):
         CanonicalWord("w-1", "hello", 0, 1, text_confidence=1.1)
+
+
+@pytest.mark.parametrize("confidence", [True, "0.8", math.nan])
+def test_confidence_values_must_be_finite_numbers(confidence):
+    with pytest.raises(ValidationError, match="must be"):
+        CanonicalWord("w-1", "hello", 0, 1, speaker_confidence=confidence)
+
+
+@pytest.mark.parametrize(
+    "factory, message",
+    [
+        (lambda: CanonicalWord("w-1", "hello", 0, 1, overlap="false"), r"word w-1\.overlap must be a boolean"),
+        (lambda: SpeakerSpan("span-1", "spk-a", 0, 1, overlap=1), r"span span-1\.overlap must be a boolean"),
+    ],
+)
+def test_overlap_flags_must_be_booleans(factory, message):
+    with pytest.raises(ValidationError, match=message):
+        factory()
 
 
 def test_existing_cli_video_dispatch_still_uses_extract_mode(monkeypatch, capsys):

@@ -8,6 +8,7 @@ or audio fingerprints.
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
@@ -59,6 +60,12 @@ def _require_int(value: object, field_name: str) -> int:
     return value
 
 
+def _require_bool(value: object, field_name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValidationError(f"{field_name} must be a boolean")
+    return value
+
+
 def _validate_interval(start_ms: object, end_ms: object, *, context: str) -> tuple[int, int]:
     start_ms = _require_int(start_ms, f"{context}.start_ms")
     end_ms = _require_int(end_ms, f"{context}.end_ms")
@@ -72,7 +79,11 @@ def _validate_interval(start_ms: object, end_ms: object, *, context: str) -> tup
 def _validate_confidence(value: float | None, *, field_name: str) -> float | None:
     if value is None:
         return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValidationError(f"{field_name} must be a number")
     value = float(value)
+    if not math.isfinite(value):
+        raise ValidationError(f"{field_name} must be a finite number")
     if not 0.0 <= value <= 1.0:
         raise ValidationError(f"{field_name} must be between 0.0 and 1.0")
     return value
@@ -155,6 +166,7 @@ class CanonicalWord:
         start_ms, end_ms = _validate_interval(self.start_ms, self.end_ms, context=f"word {self.word_id}")
         object.__setattr__(self, "start_ms", start_ms)
         object.__setattr__(self, "end_ms", end_ms)
+        object.__setattr__(self, "overlap", _require_bool(self.overlap, f"word {self.word_id}.overlap"))
         object.__setattr__(
             self,
             "text_confidence",
@@ -191,6 +203,7 @@ class SpeakerSpan:
         start_ms, end_ms = _validate_interval(self.start_ms, self.end_ms, context=f"span {self.span_id}")
         object.__setattr__(self, "start_ms", start_ms)
         object.__setattr__(self, "end_ms", end_ms)
+        object.__setattr__(self, "overlap", _require_bool(self.overlap, f"span {self.span_id}.overlap"))
         object.__setattr__(
             self,
             "confidence",
