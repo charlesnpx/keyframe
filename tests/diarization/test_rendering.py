@@ -105,6 +105,20 @@ def test_duplicate_display_labels_do_not_merge_distinct_speakers():
     assert [turn.word_ids for turn in transcript.turns] == [("w-1",), ("w-2",)]
 
 
+def test_same_time_words_preserve_canonical_order_in_rendered_turns():
+    recording = _recording(
+        words=(
+            CanonicalWord("w-z", "first", 0, 100, speaker_ref="spk-a", channel_id="ch-1", speaker_confidence=0.9),
+            CanonicalWord("w-a", "second", 0, 100, speaker_ref="spk-a", channel_id="ch-1", speaker_confidence=0.9),
+        )
+    )
+
+    transcript = render_transcript(recording)
+
+    assert transcript.turns[0].word_ids == ("w-z", "w-a")
+    assert [word.word_id for word in transcript.words] == ["w-z", "w-a"]
+
+
 def test_merge_overlay_combines_clusters_before_turn_assembly():
     recording = _recording(
         words=(
@@ -127,6 +141,8 @@ def test_merge_overlay_combines_clusters_before_turn_assembly():
     assert len(transcript.turns) == 1
     assert transcript.turns[0].word_ids == ("w-1", "w-2")
     assert transcript.turns[0].label == "person_1"
+    assert transcript.words[1].speaker_confidence is None
+    assert transcript.words[1].uncertain is True
 
 
 def test_split_overlay_reassigns_a_time_span_to_a_transcript_local_speaker():

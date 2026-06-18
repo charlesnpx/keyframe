@@ -155,7 +155,10 @@ def render_transcript(
     attributed = apply_session_local_attribution(recording)
     ordered_overlays = _ordered_overlays(overlays)
     overlay_result = _apply_overlays(attributed, ordered_overlays)
-    words = tuple(sorted(overlay_result.recording.words, key=lambda word: (word.start_ms, word.end_ms, word.word_id)))
+    indexed_words = tuple(enumerate(overlay_result.recording.words))
+    words = tuple(
+        word for _, word in sorted(indexed_words, key=lambda item: (item[1].start_ms, item[1].end_ms, item[0]))
+    )
     rendered_words = tuple(_render_word(word, overlay_result.uncertain_word_ids) for word in words)
     turns = tuple(_build_turns(words, overlay_result.uncertain_word_ids, max_gap_ms, split_after_punctuation))
     return RenderedTranscript(
@@ -232,6 +235,7 @@ def _merge_speakers(recording: CanonicalRecording, overlay: MergeSpeakersOverlay
         replace(
             word,
             speaker_ref=target_speaker_ref,
+            speaker_confidence=(word.speaker_confidence if word.speaker_ref == target_speaker_ref else None),
             display_label=target.display_label,
         )
         if word.speaker_ref in merged_refs
