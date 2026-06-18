@@ -225,6 +225,59 @@ def test_display_label_source_must_be_canonical():
         DisplayLabel(label="person_1", source="voice_profile")
 
 
+def test_display_label_source_ref_must_be_present_string_when_provided():
+    with pytest.raises(ValidationError, match="display_label.source_ref must be a string"):
+        DisplayLabel(label="person_1", source="diarization_cluster", source_ref=42)
+
+
+@pytest.mark.parametrize(
+    "factory, message",
+    [
+        (lambda: SpeakerRecord("spk-a", display_label={"label": "person_1"}), "speaker.display_label"),
+        (
+            lambda: CanonicalWord("w-1", "hello", 0, 1, display_label={"label": "person_1"}),
+            r"word w-1\.display_label",
+        ),
+    ],
+)
+def test_nested_display_labels_must_be_display_label_instances(factory, message):
+    with pytest.raises(ValidationError, match=message):
+        factory()
+
+
+@pytest.mark.parametrize(
+    "factory, message",
+    [
+        (lambda: ChannelRecord("ch-1", name=42), "channel.name must be a string"),
+        (lambda: CanonicalWord("w-1", "hello", 0, 1, speaker_ref=42), r"word w-1\.speaker_ref must be a string"),
+        (lambda: CanonicalWord("w-1", "hello", 0, 1, channel_id=42), r"word w-1\.channel_id must be a string"),
+        (lambda: SpeakerSpan("span-1", "spk-a", 0, 1, channel_id=42), r"span span-1\.channel_id must be a string"),
+        (
+            lambda: ScoringRegion("uem-1", 0, 1, channel_id=42),
+            r"scoring_region uem-1\.channel_id must be a string",
+        ),
+    ],
+)
+def test_optional_string_payload_fields_must_be_strings(factory, message):
+    with pytest.raises(ValidationError, match=message):
+        factory()
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"channels": ({"channel_id": "ch-1"},)}, r"channels\[0\] must be a ChannelRecord"),
+        ({"speakers": ({"speaker_ref": "spk-a"},)}, r"speakers\[0\] must be a SpeakerRecord"),
+        ({"words": ({"word_id": "w-1"},)}, r"words\[0\] must be a CanonicalWord"),
+        ({"speaker_spans": ({"span_id": "span-1"},)}, r"speaker_spans\[0\] must be a SpeakerSpan"),
+        ({"scoring_regions": ({"region_id": "uem-1"},)}, r"scoring_regions\[0\] must be a ScoringRegion"),
+    ],
+)
+def test_recording_collections_must_contain_canonical_model_instances(overrides, message):
+    with pytest.raises(ValidationError, match=message):
+        _recording(**overrides)
+
+
 def test_confidence_values_are_bounded():
     with pytest.raises(ValidationError, match="must be between"):
         CanonicalWord("w-1", "hello", 0, 1, text_confidence=1.1)

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
 
 SCHEMA_VERSION = 1
@@ -29,6 +29,7 @@ LabelSource = Literal[
     "unknown",
 ]
 LabelScope = Literal["recording"]
+_T = TypeVar("_T")
 
 
 class ValidationError(ValueError):
@@ -46,12 +47,24 @@ def _require_id(value: object, field_name: str) -> str:
     return value
 
 
+def _optional_id(value: object, field_name: str) -> str | None:
+    if value is None:
+        return None
+    return _require_id(value, field_name)
+
+
 def _require_text(value: object, field_name: str) -> str:
     if not isinstance(value, str):
         raise ValidationError(f"{field_name} must be a string")
     if not value.strip():
         raise ValidationError(f"{field_name} is required")
     return value
+
+
+def _optional_text(value: object, field_name: str) -> str | None:
+    if value is None:
+        return None
+    return _require_text(value, field_name)
 
 
 def _require_int(value: object, field_name: str) -> int:
@@ -89,6 +102,25 @@ def _validate_confidence(value: float | None, *, field_name: str) -> float | Non
     return value
 
 
+def _as_tuple_of(values: object, item_type: type[_T], field_name: str) -> tuple[_T, ...]:
+    try:
+        items = tuple(values)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise ValidationError(f"{field_name} must be an iterable") from exc
+    for index, item in enumerate(items):
+        if not isinstance(item, item_type):
+            raise ValidationError(f"{field_name}[{index}] must be a {item_type.__name__}")
+    return items
+
+
+def _validate_display_label(value: object, field_name: str) -> DisplayLabel | None:
+    if value is None:
+        return None
+    if not isinstance(value, DisplayLabel):
+        raise ValidationError(f"{field_name} must be a DisplayLabel")
+    return value
+
+
 @dataclass(frozen=True)
 class DisplayLabel:
     """A user-facing label for one recording, such as ``person_1``."""
@@ -107,6 +139,7 @@ class DisplayLabel:
         object.__setattr__(self, "source", source)
         if self.scope != "recording":
             raise ValidationError("display labels must be scoped to one recording")
+        object.__setattr__(self, "source_ref", _optional_id(self.source_ref, "display_label.source_ref"))
         object.__setattr__(
             self,
             "confidence",
@@ -126,6 +159,7 @@ class ChannelRecord:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "channel_id", _require_id(self.channel_id, "channel_id"))
+        object.__setattr__(self, "name", _optional_text(self.name, "channel.name"))
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -140,6 +174,7 @@ class SpeakerRecord:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "speaker_ref", _require_id(self.speaker_ref, "speaker_ref"))
+        object.__setattr__(self, "display_label", _validate_display_label(self.display_label, "speaker.display_label"))
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -163,6 +198,13 @@ class CanonicalWord:
     def __post_init__(self) -> None:
         object.__setattr__(self, "word_id", _require_id(self.word_id, "word_id"))
         object.__setattr__(self, "text", _require_text(self.text, f"word {self.word_id}.text"))
+        object.__setattr__(self, "speaker_ref", _optional_id(self.speaker_ref, f"word {self.word_id}.speaker_ref"))
+        object.__setattr__(self, "channel_id", _optional_id(self.channel_id, f"word {self.word_id}.channel_id"))
+        object.__setattr__(
+            self,
+            "display_label",
+            _validate_display_label(self.display_label, f"word {self.word_id}.display_label"),
+        )
         start_ms, end_ms = _validate_interval(self.start_ms, self.end_ms, context=f"word {self.word_id}")
         object.__setattr__(self, "start_ms", start_ms)
         object.__setattr__(self, "end_ms", end_ms)
@@ -200,6 +242,7 @@ class SpeakerSpan:
     def __post_init__(self) -> None:
         object.__setattr__(self, "span_id", _require_id(self.span_id, "span_id"))
         object.__setattr__(self, "speaker_ref", _require_id(self.speaker_ref, "speaker_ref"))
+        object.__setattr__(self, "channel_id", _optional_id(self.channel_id, f"span {self.span_id}.channel_id"))
         start_ms, end_ms = _validate_interval(self.start_ms, self.end_ms, context=f"span {self.span_id}")
         object.__setattr__(self, "start_ms", start_ms)
         object.__setattr__(self, "end_ms", end_ms)
@@ -225,6 +268,11 @@ class ScoringRegion:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "region_id", _require_id(self.region_id, "region_id"))
+        object.__setattr__(
+            self,
+            "channel_id",
+            _optional_id(self.channel_id, f"scoring_region {self.region_id}.channel_id"),
+        )
         start_ms, end_ms = _validate_interval(
             self.start_ms,
             self.end_ms,
@@ -263,11 +311,11 @@ class CanonicalRecording:
             raise ValidationError("duration_ms must be greater than 0")
         object.__setattr__(self, "duration_ms", duration_ms)
 
-        channels = tuple(self.channels)
-        speakers = tuple(self.speakers)
-        words = tuple(self.words)
-        speaker_spans = tuple(self.speaker_spans)
-        scoring_regions = tuple(self.scoring_regions)
+        channels = _as_tuple_of(self.channels, ChannelRecord, "channels")
+        speakers = _as_tuple_of(self.speakers, SpeakerRecord, "speakers")
+        words = _as_tuple_of(self.words, CanonicalWord, "words")
+        speaker_spans = _as_tuple_of(self.speaker_spans, SpeakerSpan, "speaker_spans")
+        scoring_regions = _as_tuple_of(self.scoring_regions, ScoringRegion, "scoring_regions")
         object.__setattr__(self, "channels", channels)
         object.__setattr__(self, "speakers", speakers)
         object.__setattr__(self, "words", words)
