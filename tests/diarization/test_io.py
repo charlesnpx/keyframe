@@ -50,7 +50,8 @@ def test_json_file_round_trip_is_stable(tmp_path):
 
     write_recording_json(target, recording)
 
-    assert target.read_text(encoding="utf-8") == source.read_text(encoding="utf-8")
+    assert target.read_bytes() == source.read_bytes()
+    assert b"\r\n" not in target.read_bytes()
     assert read_recording_json(target).to_dict() == recording.to_dict()
 
 
@@ -65,6 +66,7 @@ def test_jsonl_round_trip_uses_one_stable_recording_per_line(tmp_path):
 
     text = target.read_text(encoding="utf-8")
     assert text == canonical_jsonl_dumps(recordings)
+    assert b"\r\n" not in target.read_bytes()
     assert len(text.splitlines()) == 2
     assert [recording.to_dict() for recording in read_recordings_jsonl(target)] == [
         recording.to_dict() for recording in recordings
@@ -87,6 +89,15 @@ def test_schema_version_checks_fail_closed(mutate, message):
     mutate(payload)
 
     with pytest.raises(ValidationError, match=message):
+        canonical_json_loads(json.dumps(payload))
+
+
+@pytest.mark.parametrize("field_name", ["channels", "speakers", "words", "speaker_spans", "scoring_regions"])
+def test_required_canonical_collection_fields_fail_closed_when_missing(field_name):
+    payload = json.loads((FIXTURE_DIR / "clean_two_speaker.json").read_text(encoding="utf-8"))
+    payload.pop(field_name)
+
+    with pytest.raises(ValidationError, match=rf"recording\.{field_name} is required"):
         canonical_json_loads(json.dumps(payload))
 
 

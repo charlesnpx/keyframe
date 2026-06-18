@@ -76,16 +76,16 @@ def recording_from_dict(payload: Mapping[str, Any]) -> CanonicalRecording:
         canonical_audio_id=_required(data, "canonical_audio_id", "recording"),
         timeline_id=_required(data, "timeline_id", "recording"),
         duration_ms=_required(data, "duration_ms", "recording"),
-        channels=_decode_sequence(data.get("channels", ()), _channel_from_dict, "recording.channels"),
-        speakers=_decode_sequence(data.get("speakers", ()), _speaker_from_dict, "recording.speakers"),
-        words=_decode_sequence(data.get("words", ()), _word_from_dict, "recording.words"),
+        channels=_decode_sequence(_required(data, "channels", "recording"), _channel_from_dict, "recording.channels"),
+        speakers=_decode_sequence(_required(data, "speakers", "recording"), _speaker_from_dict, "recording.speakers"),
+        words=_decode_sequence(_required(data, "words", "recording"), _word_from_dict, "recording.words"),
         speaker_spans=_decode_sequence(
-            data.get("speaker_spans", ()),
+            _required(data, "speaker_spans", "recording"),
             _speaker_span_from_dict,
             "recording.speaker_spans",
         ),
         scoring_regions=_decode_sequence(
-            data.get("scoring_regions", ()),
+            _required(data, "scoring_regions", "recording"),
             _scoring_region_from_dict,
             "recording.scoring_regions",
         ),
@@ -127,7 +127,7 @@ def canonical_json_loads(text: str) -> CanonicalRecording:
 def write_recording_json(path: str | Path, recording: CanonicalRecording) -> None:
     """Write one canonical recording JSON artifact."""
 
-    Path(path).write_text(canonical_json_dumps(recording), encoding="utf-8")
+    Path(path).write_text(canonical_json_dumps(recording), encoding="utf-8", newline="\n")
 
 
 def read_recording_json(path: str | Path) -> CanonicalRecording:
@@ -174,7 +174,7 @@ def canonical_jsonl_loads(text: str) -> tuple[CanonicalRecording, ...]:
 def write_recordings_jsonl(path: str | Path, recordings: Iterable[CanonicalRecording]) -> None:
     """Write canonical recordings to a JSONL artifact."""
 
-    Path(path).write_text(canonical_jsonl_dumps(recordings), encoding="utf-8")
+    Path(path).write_text(canonical_jsonl_dumps(recordings), encoding="utf-8", newline="\n")
 
 
 def read_recordings_jsonl(path: str | Path) -> tuple[CanonicalRecording, ...]:
