@@ -1,0 +1,65 @@
+{
+  "canonical_audio_id": "fixture-missing-confidence-canonical",
+  "channels": [
+    {
+      "channel_id": "ch-1",
+      "name": "mixed"
+    }
+  ],
+  "duration_ms": 900,
+  "original_audio_id": "fixture-missing-confidence-original",
+  "recording_id": "fixture-missing-confidence",
+  "schema_version": 1,
+  "scoring_regions": [
+    {
+      "channel_id": "ch-1",
+      "end_ms": 700,
+      "region_id": "uem-1",
+      "start_ms": 0
+    }
+  ],
+  "speaker_spans": [
+    {
+      "channel_id": "ch-1",
+      "confidence": null,
+      "end_ms": 500,
+      "overlap": false,
+      "span_id": "span-1",
+      "speaker_ref": "spk-a",
+      "start_ms": 100
+    }
+  ],
+  "speakers": [
+    {
+      "display_label": {
+        "confidence": null,
+        "label": "person_1",
+        "scope": "recording",
+        "source": "diarization_cluster",
+        "source_ref": "spk-a"
+      },
+      "speaker_ref": "spk-a"
+    }
+  ],
+  "timeline_id": "fixture-missing-confidence-timeline",
+  "words": [
+    {
+      "channel_id": "ch-1",
+      "display_label": {
+        "confidence": null,
+        "label": "person_1",
+        "scope": "recording",
+        "source": "diarization_cluster",
+        "source_ref": null
+      },
+      "end_ms": 500,
+      "overlap": false,
+      "speaker_confidence": null,
+      "speaker_ref": "spk-a",
+      "start_ms": 100,
+      "text": "uncertain",
+      "text_confidence": null,
+      "word_id": "w-1"
+    }
+  ]
+}

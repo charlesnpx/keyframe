@@ -1,0 +1,38 @@
+{
+  "canonical_audio_id": "fixture-missing-speaker-canonical",
+  "channels": [
+    {
+      "channel_id": "ch-1",
+      "name": "mixed"
+    }
+  ],
+  "duration_ms": 900,
+  "original_audio_id": "fixture-missing-speaker-original",
+  "recording_id": "fixture-missing-speaker",
+  "schema_version": 1,
+  "scoring_regions": [
+    {
+      "channel_id": "ch-1",
+      "end_ms": 700,
+      "region_id": "uem-1",
+      "start_ms": 0
+    }
+  ],
+  "speaker_spans": [],
+  "speakers": [],
+  "timeline_id": "fixture-missing-speaker-timeline",
+  "words": [
+    {
+      "channel_id": "ch-1",
+      "display_label": null,
+      "end_ms": 500,
+      "overlap": false,
+      "speaker_confidence": null,
+      "speaker_ref": null,
+      "start_ms": 100,
+      "text": "unattributed",
+      "text_confidence": 0.7,
+      "word_id": "w-1"
+    }
+  ]
+}

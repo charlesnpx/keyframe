@@ -1,0 +1,102 @@
+{
+  "canonical_audio_id": "fixture-clean-two-speaker-canonical",
+  "channels": [
+    {
+      "channel_id": "ch-1",
+      "name": "mixed"
+    }
+  ],
+  "duration_ms": 1200,
+  "original_audio_id": "fixture-clean-two-speaker-original",
+  "recording_id": "fixture-clean-two-speaker",
+  "schema_version": 1,
+  "scoring_regions": [
+    {
+      "channel_id": "ch-1",
+      "end_ms": 1000,
+      "region_id": "uem-1",
+      "start_ms": 0
+    }
+  ],
+  "speaker_spans": [
+    {
+      "channel_id": "ch-1",
+      "confidence": 0.96,
+      "end_ms": 350,
+      "overlap": false,
+      "span_id": "span-1",
+      "speaker_ref": "spk-a",
+      "start_ms": 0
+    },
+    {
+      "channel_id": "ch-1",
+      "confidence": 0.94,
+      "end_ms": 850,
+      "overlap": false,
+      "span_id": "span-2",
+      "speaker_ref": "spk-b",
+      "start_ms": 450
+    }
+  ],
+  "speakers": [
+    {
+      "display_label": {
+        "confidence": 0.96,
+        "label": "person_1",
+        "scope": "recording",
+        "source": "diarization_cluster",
+        "source_ref": "spk-a"
+      },
+      "speaker_ref": "spk-a"
+    },
+    {
+      "display_label": {
+        "confidence": 0.94,
+        "label": "person_2",
+        "scope": "recording",
+        "source": "diarization_cluster",
+        "source_ref": "spk-b"
+      },
+      "speaker_ref": "spk-b"
+    }
+  ],
+  "timeline_id": "fixture-clean-two-speaker-timeline",
+  "words": [
+    {
+      "channel_id": "ch-1",
+      "display_label": {
+        "confidence": null,
+        "label": "person_1",
+        "scope": "recording",
+        "source": "diarization_cluster",
+        "source_ref": null
+      },
+      "end_ms": 300,
+      "overlap": false,
+      "speaker_confidence": 0.96,
+      "speaker_ref": "spk-a",
+      "start_ms": 0,
+      "text": "hello",
+      "text_confidence": 0.99,
+      "word_id": "w-1"
+    },
+    {
+      "channel_id": "ch-1",
+      "display_label": {
+        "confidence": null,
+        "label": "person_2",
+        "scope": "recording",
+        "source": "diarization_cluster",
+        "source_ref": null
+      },
+      "end_ms": 800,
+      "overlap": false,
+      "speaker_confidence": 0.94,
+      "speaker_ref": "spk-b",
+      "start_ms": 500,
+      "text": "there",
+      "text_confidence": 0.98,
+      "word_id": "w-2"
+    }
+  ]
+}
