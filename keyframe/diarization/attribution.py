@@ -95,7 +95,7 @@ def _assign_display_labels(
     for index, word in enumerate(words):
         if word.speaker_ref is not None:
             events.append((word.start_ms, index, word.speaker_ref))
-    span_offset = len(events)
+    span_offset = len(words)
     for index, span in enumerate(recording.speaker_spans):
         events.append((span.start_ms, span_offset + index, span.speaker_ref))
 

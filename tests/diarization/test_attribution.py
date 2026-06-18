@@ -57,6 +57,22 @@ def test_session_local_attribution_is_deterministic_across_repeated_runs():
     assert first.to_dict() == second.to_dict()
 
 
+def test_same_time_label_order_never_falls_back_to_backend_speaker_ref_sorting():
+    recording = _recording(
+        speakers=(SpeakerRecord("backend-a"), SpeakerRecord("backend-z")),
+        words=(
+            CanonicalWord("w-unknown", "unknown", 0, 50, channel_id="ch-2"),
+            CanonicalWord("w-known", "known", 100, 200, speaker_ref="backend-z", channel_id="ch-2"),
+        ),
+        speaker_spans=(SpeakerSpan("span-a", "backend-a", 100, 200, channel_id="ch-1", confidence=0.91),),
+    )
+
+    attributed = apply_session_local_attribution(recording)
+    speaker_labels = {speaker.speaker_ref: speaker.display_label.label for speaker in attributed.speakers}
+
+    assert speaker_labels == {"backend-a": "person_2", "backend-z": "person_1"}
+
+
 def test_unknown_speaker_words_remain_unknown_without_invented_confidence():
     recording = _recording(
         speakers=(),
