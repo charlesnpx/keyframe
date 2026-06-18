@@ -9,6 +9,7 @@
   "duration_ms": 900,
   "original_audio_id": "fixture-missing-speaker-original",
   "recording_id": "fixture-missing-speaker",
+  "sample_rate_hz": 16000,
   "schema_version": 1,
   "scoring_regions": [
     {
@@ -20,7 +21,9 @@
   ],
   "speaker_spans": [],
   "speakers": [],
+  "time_basis": "canonical_ms",
   "timeline_id": "fixture-missing-speaker-timeline",
+  "transform_chain_id": "identity",
   "words": [
     {
       "channel_id": "ch-1",

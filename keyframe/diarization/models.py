@@ -29,6 +29,8 @@ LabelSource = Literal[
     "unknown",
 ]
 LabelScope = Literal["recording"]
+TimeBasis = Literal["canonical_ms", "chunk_relative_ms", "sample_index", "frame_index"]
+_ALLOWED_TIME_BASES = frozenset({"canonical_ms", "chunk_relative_ms", "sample_index", "frame_index"})
 _T = TypeVar("_T")
 
 
@@ -73,10 +75,24 @@ def _require_int(value: object, field_name: str) -> int:
     return value
 
 
+def _require_positive_int(value: object, field_name: str) -> int:
+    value = _require_int(value, field_name)
+    if value <= 0:
+        raise ValidationError(f"{field_name} must be greater than 0")
+    return value
+
+
 def _require_bool(value: object, field_name: str) -> bool:
     if not isinstance(value, bool):
         raise ValidationError(f"{field_name} must be a boolean")
     return value
+
+
+def _validate_time_basis(value: object, field_name: str) -> TimeBasis:
+    value = _require_id(value, field_name)
+    if value not in _ALLOWED_TIME_BASES:
+        raise ValidationError(f"{field_name} is not supported: {value}")
+    return value  # type: ignore[return-value]
 
 
 def _validate_interval(start_ms: object, end_ms: object, *, context: str) -> tuple[int, int]:
@@ -294,6 +310,9 @@ class CanonicalRecording:
     canonical_audio_id: str
     timeline_id: str
     duration_ms: int
+    transform_chain_id: str = "identity"
+    sample_rate_hz: int = 16_000
+    time_basis: TimeBasis = "canonical_ms"
     channels: tuple[ChannelRecord, ...] = ()
     speakers: tuple[SpeakerRecord, ...] = ()
     words: tuple[CanonicalWord, ...] = ()
@@ -306,10 +325,10 @@ class CanonicalRecording:
         object.__setattr__(self, "original_audio_id", _require_id(self.original_audio_id, "original_audio_id"))
         object.__setattr__(self, "canonical_audio_id", _require_id(self.canonical_audio_id, "canonical_audio_id"))
         object.__setattr__(self, "timeline_id", _require_id(self.timeline_id, "timeline_id"))
-        duration_ms = _require_int(self.duration_ms, "duration_ms")
-        if duration_ms <= 0:
-            raise ValidationError("duration_ms must be greater than 0")
-        object.__setattr__(self, "duration_ms", duration_ms)
+        object.__setattr__(self, "transform_chain_id", _require_id(self.transform_chain_id, "transform_chain_id"))
+        object.__setattr__(self, "sample_rate_hz", _require_positive_int(self.sample_rate_hz, "sample_rate_hz"))
+        object.__setattr__(self, "time_basis", _validate_time_basis(self.time_basis, "time_basis"))
+        object.__setattr__(self, "duration_ms", _require_positive_int(self.duration_ms, "duration_ms"))
 
         channels = _as_tuple_of(self.channels, ChannelRecord, "channels")
         speakers = _as_tuple_of(self.speakers, SpeakerRecord, "speakers")

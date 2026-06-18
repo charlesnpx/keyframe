@@ -9,6 +9,7 @@
   "duration_ms": 900,
   "original_audio_id": "fixture-missing-confidence-original",
   "recording_id": "fixture-missing-confidence",
+  "sample_rate_hz": 16000,
   "schema_version": 1,
   "scoring_regions": [
     {
@@ -41,7 +42,9 @@
       "speaker_ref": "spk-a"
     }
   ],
+  "time_basis": "canonical_ms",
   "timeline_id": "fixture-missing-confidence-timeline",
+  "transform_chain_id": "identity",
   "words": [
     {
       "channel_id": "ch-1",

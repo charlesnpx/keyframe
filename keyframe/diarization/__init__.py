@@ -21,7 +21,21 @@ from keyframe.diarization.models import (
     ScoringRegion,
     SpeakerRecord,
     SpeakerSpan,
+    TimeBasis,
     ValidationError,
+)
+from keyframe.diarization.provenance import (
+    ArtifactKind,
+    AudioTimelineProvenance,
+    NormalizedArtifactProvenance,
+    OffsetMapSegment,
+    TimelineMergeValidation,
+    TimelineOffsetMap,
+    TransformChain,
+    TransformStep,
+    TransformType,
+    boundary_shift_degrades_scoring,
+    validate_timeline_merge,
 )
 
 __all__ = [
@@ -32,7 +46,18 @@ __all__ = [
     "ScoringRegion",
     "SpeakerRecord",
     "SpeakerSpan",
+    "TimeBasis",
     "ValidationError",
+    "ArtifactKind",
+    "AudioTimelineProvenance",
+    "NormalizedArtifactProvenance",
+    "OffsetMapSegment",
+    "TimelineMergeValidation",
+    "TimelineOffsetMap",
+    "TransformChain",
+    "TransformStep",
+    "TransformType",
+    "boundary_shift_degrades_scoring",
     "canonical_json_dumps",
     "canonical_json_loads",
     "canonical_jsonl_dumps",
@@ -42,6 +67,7 @@ __all__ = [
     "recording_from_dict",
     "recording_to_dict",
     "validate_schema_version",
+    "validate_timeline_merge",
     "write_recording_json",
     "write_recordings_jsonl",
 ]

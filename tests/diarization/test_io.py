@@ -92,8 +92,20 @@ def test_schema_version_checks_fail_closed(mutate, message):
         canonical_json_loads(json.dumps(payload))
 
 
-@pytest.mark.parametrize("field_name", ["channels", "speakers", "words", "speaker_spans", "scoring_regions"])
-def test_required_canonical_collection_fields_fail_closed_when_missing(field_name):
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "channels",
+        "sample_rate_hz",
+        "scoring_regions",
+        "speaker_spans",
+        "speakers",
+        "time_basis",
+        "transform_chain_id",
+        "words",
+    ],
+)
+def test_required_canonical_artifact_fields_fail_closed_when_missing(field_name):
     payload = json.loads((FIXTURE_DIR / "clean_two_speaker.json").read_text(encoding="utf-8"))
     payload.pop(field_name)
 
