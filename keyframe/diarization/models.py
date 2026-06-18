@@ -13,7 +13,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Literal, TypeVar
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _ALLOWED_LABEL_SOURCES = frozenset(
     {
         "diarization_cluster",
@@ -93,6 +93,13 @@ def _validate_time_basis(value: object, field_name: str) -> TimeBasis:
     if value not in _ALLOWED_TIME_BASES:
         raise ValidationError(f"{field_name} is not supported: {value}")
     return value  # type: ignore[return-value]
+
+
+def _validate_canonical_recording_time_basis(value: object) -> TimeBasis:
+    value = _validate_time_basis(value, "time_basis")
+    if value != "canonical_ms":
+        raise ValidationError("canonical recordings must use canonical_ms time_basis")
+    return value
 
 
 def _validate_interval(start_ms: object, end_ms: object, *, context: str) -> tuple[int, int]:
@@ -327,7 +334,7 @@ class CanonicalRecording:
         object.__setattr__(self, "timeline_id", _require_id(self.timeline_id, "timeline_id"))
         object.__setattr__(self, "transform_chain_id", _require_id(self.transform_chain_id, "transform_chain_id"))
         object.__setattr__(self, "sample_rate_hz", _require_positive_int(self.sample_rate_hz, "sample_rate_hz"))
-        object.__setattr__(self, "time_basis", _validate_time_basis(self.time_basis, "time_basis"))
+        object.__setattr__(self, "time_basis", _validate_canonical_recording_time_basis(self.time_basis))
         object.__setattr__(self, "duration_ms", _require_positive_int(self.duration_ms, "duration_ms"))
 
         channels = _as_tuple_of(self.channels, ChannelRecord, "channels")

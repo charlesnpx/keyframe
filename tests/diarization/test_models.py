@@ -98,7 +98,7 @@ def test_valid_multichannel_recording_preserves_overlap_and_nullable_confidence(
 
     payload = recording.to_dict()
 
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
     assert payload["words"][1]["overlap"] is True
     assert payload["words"][1]["speaker_confidence"] is None
     assert payload["speakers"][0]["display_label"]["label"] == "person_1"
@@ -159,6 +159,7 @@ def test_required_audio_identifiers_must_be_present_strings():
         ({"sample_rate_hz": 0}, "sample_rate_hz must be greater than 0"),
         ({"transform_chain_id": ""}, "transform_chain_id is required"),
         ({"time_basis": "wall_clock"}, "time_basis is not supported"),
+        ({"time_basis": "sample_index"}, "canonical recordings must use canonical_ms time_basis"),
     ],
 )
 def test_recording_rejects_invalid_timeline_provenance_fields(overrides, message):

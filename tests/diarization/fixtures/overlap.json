@@ -10,7 +10,7 @@
   "original_audio_id": "fixture-overlap-original",
   "recording_id": "fixture-overlap",
   "sample_rate_hz": 16000,
-  "schema_version": 1,
+  "schema_version": 2,
   "scoring_regions": [
     {
       "channel_id": "ch-1",
