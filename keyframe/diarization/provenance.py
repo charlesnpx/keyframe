@@ -325,12 +325,16 @@ class TimelineOffsetMap:
                 raise ValidationError("offset map segment exceeds source duration")
             if segment.target_end_ms > target.duration_ms:
                 raise ValidationError("offset map segment exceeds target duration")
+        _validate_source_coverage(self.segments, source.duration_ms)
 
     def convert_source_ms(self, source_ms: object) -> int:
         source_ms = _require_non_negative_int(source_ms, "source_ms")
         for segment in self.segments:
             if segment.contains_source_ms(source_ms):
                 return segment.convert_source_ms(source_ms)
+        terminal_segment = max(self.segments, key=lambda segment: segment.source_end_ms)
+        if source_ms == terminal_segment.source_end_ms:
+            return terminal_segment.target_end_ms
         raise ValidationError("source_ms is not covered by offset map")
 
 
@@ -457,6 +461,16 @@ def _validate_non_overlapping_ranges(ranges: tuple[tuple[int, int], ...], field_
         if start_ms < previous_end:
             raise ValidationError(f"{field_name} must not overlap")
         previous_end = end_ms
+
+
+def _validate_source_coverage(segments: tuple[OffsetMapSegment, ...], source_duration_ms: int) -> None:
+    expected_start_ms = 0
+    for segment in sorted(segments, key=lambda segment: segment.source_start_ms):
+        if segment.source_start_ms != expected_start_ms:
+            raise ValidationError("offset map must cover the full source timeline")
+        expected_start_ms = segment.source_end_ms
+    if expected_start_ms != source_duration_ms:
+        raise ValidationError("offset map must cover the full source timeline")
 
 
 def _validate_interval(start_ms: object, end_ms: object, field_name: str) -> tuple[int, int]:
