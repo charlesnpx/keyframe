@@ -162,7 +162,7 @@ def render_transcript(
         recording_id=recording.recording_id,
         turns=turns,
         words=rendered_words,
-        applied_overlay_ids=tuple(overlay.operation_id for overlay in ordered_overlays),
+        applied_overlay_ids=tuple(_validate_operation_id(overlay.operation_id) for overlay in ordered_overlays),
     )
 
 
@@ -206,14 +206,14 @@ def _apply_overlays(recording: CanonicalRecording, overlays: tuple[TranscriptOve
 
 
 def _rename_label(recording: CanonicalRecording, overlay: RenameLabelOverlay) -> CanonicalRecording:
-    _validate_speaker_exists(recording, overlay.speaker_ref)
+    speaker_ref = _validate_speaker_exists(recording, overlay.speaker_ref).speaker_ref
     label = _display_label(overlay.label, "reviewer_rename")
     speakers = tuple(
-        replace(speaker, display_label=label) if speaker.speaker_ref == overlay.speaker_ref else speaker
+        replace(speaker, display_label=label) if speaker.speaker_ref == speaker_ref else speaker
         for speaker in recording.speakers
     )
     words = tuple(
-        replace(word, display_label=label) if word.speaker_ref == overlay.speaker_ref else word
+        replace(word, display_label=label) if word.speaker_ref == speaker_ref else word
         for word in recording.words
     )
     return replace(recording, speakers=speakers, words=words)
@@ -221,6 +221,7 @@ def _rename_label(recording: CanonicalRecording, overlay: RenameLabelOverlay) ->
 
 def _merge_speakers(recording: CanonicalRecording, overlay: MergeSpeakersOverlay) -> CanonicalRecording:
     target = _validate_speaker_exists(recording, overlay.target_speaker_ref)
+    target_speaker_ref = target.speaker_ref
     source_refs = tuple(_require_ref(value, "merge_speakers.source_speaker_refs") for value in overlay.source_speaker_refs)
     if not source_refs:
         raise ValidationError("merge_speakers.source_speaker_refs is required")
@@ -230,7 +231,7 @@ def _merge_speakers(recording: CanonicalRecording, overlay: MergeSpeakersOverlay
     words = tuple(
         replace(
             word,
-            speaker_ref=overlay.target_speaker_ref,
+            speaker_ref=target_speaker_ref,
             display_label=target.display_label,
         )
         if word.speaker_ref in merged_refs
@@ -241,14 +242,14 @@ def _merge_speakers(recording: CanonicalRecording, overlay: MergeSpeakersOverlay
 
 
 def _split_speaker(recording: CanonicalRecording, overlay: SplitSpeakerOverlay) -> CanonicalRecording:
-    _validate_speaker_exists(recording, overlay.source_speaker_ref)
+    source_speaker_ref = _validate_speaker_exists(recording, overlay.source_speaker_ref).speaker_ref
     _ensure_valid_interval(overlay.start_ms, overlay.end_ms, "split_speaker")
-    _validate_new_speaker(recording, overlay.new_speaker_ref)
+    new_speaker_ref = _validate_new_speaker(recording, overlay.new_speaker_ref)
     label = _display_label(overlay.label or _next_person_label(recording), "reviewer_rename")
-    new_speaker = SpeakerRecord(speaker_ref=overlay.new_speaker_ref, display_label=label)
+    new_speaker = SpeakerRecord(speaker_ref=new_speaker_ref, display_label=label)
     words = tuple(
-        replace(word, speaker_ref=overlay.new_speaker_ref, speaker_confidence=None, display_label=label)
-        if word.speaker_ref == overlay.source_speaker_ref and _word_within(word, overlay.start_ms, overlay.end_ms)
+        replace(word, speaker_ref=new_speaker_ref, speaker_confidence=None, display_label=label)
+        if word.speaker_ref == source_speaker_ref and _word_within(word, overlay.start_ms, overlay.end_ms)
         else word
         for word in recording.words
     )
@@ -259,20 +260,26 @@ def _assign_span(recording: CanonicalRecording, overlay: AssignSpanOverlay) -> C
     _ensure_valid_interval(overlay.start_ms, overlay.end_ms, "assign_span")
     label = None
     assigned_speaker = None
+    speaker_ref = None
     if overlay.speaker_ref is not None:
         assigned_speaker = _ensure_speaker(recording, overlay.speaker_ref, overlay.label)
+        speaker_ref = assigned_speaker.speaker_ref
         label = assigned_speaker.display_label
-    words = tuple(
-        replace(
-            word,
-            speaker_ref=overlay.speaker_ref,
-            speaker_confidence=(word.speaker_confidence if word.speaker_ref == overlay.speaker_ref else None),
-            display_label=label,
-        )
-        if _word_within(word, overlay.start_ms, overlay.end_ms)
-        else word
-        for word in recording.words
-    )
+    words = []
+    for word in recording.words:
+        if _word_within(word, overlay.start_ms, overlay.end_ms):
+            words.append(
+                replace(
+                    word,
+                    speaker_ref=speaker_ref,
+                    speaker_confidence=(word.speaker_confidence if word.speaker_ref == speaker_ref else None),
+                    display_label=label,
+                )
+            )
+        elif overlay.label is not None and speaker_ref is not None and word.speaker_ref == speaker_ref:
+            words.append(replace(word, display_label=label))
+        else:
+            words.append(word)
     speakers = recording.speakers
     if assigned_speaker is not None:
         if any(speaker.speaker_ref == assigned_speaker.speaker_ref for speaker in speakers):
@@ -282,7 +289,7 @@ def _assign_span(recording: CanonicalRecording, overlay: AssignSpanOverlay) -> C
             )
         else:
             speakers = speakers + (assigned_speaker,)
-    return replace(recording, speakers=speakers, words=words)
+    return replace(recording, speakers=speakers, words=tuple(words))
 
 
 def _mark_uncertain(
@@ -390,6 +397,7 @@ def _display_label(label: str, source: str) -> DisplayLabel:
 
 
 def _ensure_speaker(recording: CanonicalRecording, speaker_ref: str, label: str | None) -> SpeakerRecord:
+    speaker_ref = _require_ref(speaker_ref, "speaker_ref")
     for speaker in recording.speakers:
         if speaker.speaker_ref == speaker_ref:
             if label is None:
@@ -420,10 +428,11 @@ def _validate_speaker_exists(recording: CanonicalRecording, speaker_ref: str) ->
     raise ValidationError(f"unknown speaker_ref: {speaker_ref}")
 
 
-def _validate_new_speaker(recording: CanonicalRecording, speaker_ref: str) -> None:
+def _validate_new_speaker(recording: CanonicalRecording, speaker_ref: str) -> str:
     speaker_ref = _require_ref(speaker_ref, "speaker_ref")
     if any(speaker.speaker_ref == speaker_ref for speaker in recording.speakers):
         raise ValidationError(f"speaker_ref already exists: {speaker_ref}")
+    return speaker_ref
 
 
 def _validate_word_ids(recording: CanonicalRecording, word_ids: tuple[str, ...], field_name: str) -> set[str]:

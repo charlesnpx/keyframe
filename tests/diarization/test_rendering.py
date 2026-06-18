@@ -152,13 +152,13 @@ def test_overlay_application_preserves_caller_order_for_dependent_edits():
         recording,
         overlays=(
             SplitSpeakerOverlay(
-                operation_id="op-z-split",
-                source_speaker_ref="spk-a",
-                new_speaker_ref="review-speaker-1",
+                operation_id=" op-z-split ",
+                source_speaker_ref=" spk-a ",
+                new_speaker_ref=" review-speaker-1 ",
                 start_ms=150,
                 end_ms=250,
             ),
-            RenameLabelOverlay(operation_id="op-a-rename", speaker_ref="review-speaker-1", label="Casey"),
+            RenameLabelOverlay(operation_id=" op-a-rename ", speaker_ref=" review-speaker-1 ", label="Casey"),
         ),
     )
 
@@ -191,6 +191,31 @@ def test_assign_span_overlay_assigns_unknown_words():
     assert transcript.words[1].uncertain is True
     assert transcript.turns[1].word_ids == ("w-2",)
     assert transcript.turns[1].label == "Taylor"
+
+
+def test_assign_span_label_updates_all_rendered_words_for_existing_speaker():
+    recording = _recording(
+        words=(
+            CanonicalWord("w-1", "known", 0, 100, speaker_ref="spk-b", channel_id="ch-1", speaker_confidence=0.8),
+            CanonicalWord("w-2", "also", 150, 250, speaker_ref="spk-b", channel_id="ch-1", speaker_confidence=0.8),
+        )
+    )
+
+    transcript = render_transcript(
+        recording,
+        overlays=(
+            AssignSpanOverlay(
+                operation_id="op-assign",
+                speaker_ref=" spk-b ",
+                start_ms=150,
+                end_ms=250,
+                label="Taylor",
+            ),
+        ),
+    )
+
+    assert [word.label for word in transcript.words] == ["Taylor", "Taylor"]
+    assert [turn.label for turn in transcript.turns] == ["Taylor"]
 
 
 def test_assign_span_overlay_clears_stale_confidence_when_reassigning_words():
