@@ -1,0 +1,312 @@
+"""Reference and redacted candidate bundle contracts."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Literal
+
+from keyframe.diarization.models import CanonicalRecording, ValidationError
+from keyframe.diarization.provenance import AudioTimelineProvenance, NormalizedArtifactProvenance
+
+
+CandidateBundleMode = Literal["product_realistic", "oracle_diagnostic", "authenticated_track_metadata"]
+_ALLOWED_BUNDLE_MODES = frozenset(
+    {
+        "product_realistic",
+        "oracle_diagnostic",
+        "authenticated_track_metadata",
+    }
+)
+_FORBIDDEN_CANDIDATE_FIELDS = frozenset(
+    {
+        "canonical_audio_id",
+        "corpus_identity",
+        "corpus_speaker_id",
+        "cross_recording_identity",
+        "display_label",
+        "evaluator_speaker_map",
+        "global_identity",
+        "local_audio_sha256",
+        "oracle",
+        "oracle_metadata",
+        "original_audio_id",
+        "participant_id",
+        "reference_speaker_id",
+        "role",
+        "role_label",
+        "speaker_ref",
+        "voice_profile",
+    }
+)
+_ORACLE_ONLY_MODES = frozenset({"oracle_diagnostic"})
+
+
+@dataclass(frozen=True)
+class ReferenceBundle:
+    """Evaluator-only bundle containing canonical reference data and mappings."""
+
+    recording: CanonicalRecording
+    artifact: NormalizedArtifactProvenance
+    evaluator_speaker_map: dict[str, str]
+    oracle_metadata: dict[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.recording, CanonicalRecording):
+            raise ValidationError("reference_bundle.recording must be a CanonicalRecording")
+        if not isinstance(self.artifact, NormalizedArtifactProvenance):
+            raise ValidationError("reference_bundle.artifact must be a NormalizedArtifactProvenance")
+        self.artifact.timeline.assert_consistent_with_recording(self.recording)
+        object.__setattr__(
+            self,
+            "evaluator_speaker_map",
+            _validate_string_map(self.evaluator_speaker_map, "reference_bundle.evaluator_speaker_map"),
+        )
+        object.__setattr__(
+            self,
+            "oracle_metadata",
+            _validate_optional_metadata(self.oracle_metadata, "reference_bundle.oracle_metadata"),
+        )
+
+    @classmethod
+    def from_recording(
+        cls,
+        recording: CanonicalRecording,
+        *,
+        artifact_id: str,
+        evaluator_speaker_map: dict[str, str] | None = None,
+        local_audio_sha256: str | None = None,
+        oracle_metadata: dict[str, Any] | None = None,
+    ) -> ReferenceBundle:
+        return cls(
+            recording=recording,
+            artifact=NormalizedArtifactProvenance.from_recording(
+                recording,
+                artifact_id=artifact_id,
+                artifact_kind="reference",
+                local_audio_sha256=local_audio_sha256,
+            ),
+            evaluator_speaker_map=evaluator_speaker_map or {
+                speaker.speaker_ref: speaker.speaker_ref for speaker in recording.speakers
+            },
+            oracle_metadata=oracle_metadata,
+        )
+
+    def to_evaluator_dict(self) -> dict[str, Any]:
+        return {
+            "artifact": self.artifact.to_integrity_dict(),
+            "evaluator_speaker_map": dict(self.evaluator_speaker_map),
+            "oracle_metadata": None if self.oracle_metadata is None else dict(self.oracle_metadata),
+            "recording": self.recording.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
+class CandidateBundle:
+    """Candidate-visible bundle with physically redacted runtime inputs."""
+
+    bundle_id: str
+    mode: CandidateBundleMode
+    audio: dict[str, Any]
+    channels: tuple[dict[str, Any], ...]
+    runtime_hints: dict[str, Any]
+    oracle_diagnostic: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "bundle_id", _require_id(self.bundle_id, "candidate_bundle.bundle_id"))
+        mode = _validate_mode(self.mode)
+        object.__setattr__(self, "mode", mode)
+        object.__setattr__(self, "oracle_diagnostic", _validate_bool(self.oracle_diagnostic, "oracle_diagnostic"))
+        if mode in _ORACLE_ONLY_MODES and not self.oracle_diagnostic:
+            raise ValidationError("oracle diagnostic bundles must be explicitly labeled")
+        if mode not in _ORACLE_ONLY_MODES and self.oracle_diagnostic:
+            raise ValidationError("product-quality bundles cannot be labeled oracle diagnostic")
+        object.__setattr__(self, "audio", _validate_metadata(self.audio, "candidate_bundle.audio"))
+        object.__setattr__(self, "channels", _validate_channel_payloads(self.channels))
+        object.__setattr__(
+            self,
+            "runtime_hints",
+            _validate_metadata(self.runtime_hints, "candidate_bundle.runtime_hints"),
+        )
+        self.validate()
+
+    @property
+    def product_quality_reportable(self) -> bool:
+        return not self.oracle_diagnostic
+
+    def validate(self) -> None:
+        _reject_forbidden_fields(self.to_dict())
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "audio": dict(self.audio),
+            "bundle_id": self.bundle_id,
+            "channels": [dict(channel) for channel in self.channels],
+            "mode": self.mode,
+            "oracle_diagnostic": self.oracle_diagnostic,
+            "product_quality_reportable": self.product_quality_reportable,
+            "runtime_hints": dict(self.runtime_hints),
+        }
+
+
+def build_candidate_bundle(
+    reference: ReferenceBundle,
+    *,
+    bundle_id: str,
+    mode: CandidateBundleMode = "product_realistic",
+    runtime_hints: dict[str, Any] | None = None,
+) -> CandidateBundle:
+    if not isinstance(reference, ReferenceBundle):
+        raise ValidationError("reference must be a ReferenceBundle")
+    mode = _validate_mode(mode)
+    audio = _audio_payload(reference.artifact.timeline)
+    channels = _channel_payloads(reference, mode)
+    hints = _default_runtime_hints(reference.artifact.timeline)
+    if runtime_hints:
+        hints.update(_validate_metadata(runtime_hints, "candidate_bundle.runtime_hints"))
+    return CandidateBundle(
+        bundle_id=bundle_id,
+        mode=mode,
+        audio=audio,
+        channels=channels,
+        runtime_hints=hints,
+        oracle_diagnostic=mode == "oracle_diagnostic",
+    )
+
+
+def build_candidate_bundle_from_recording(
+    recording: CanonicalRecording,
+    *,
+    artifact_id: str,
+    bundle_id: str,
+    mode: CandidateBundleMode = "product_realistic",
+    local_audio_sha256: str | None = None,
+    runtime_hints: dict[str, Any] | None = None,
+) -> CandidateBundle:
+    reference = ReferenceBundle.from_recording(
+        recording,
+        artifact_id=artifact_id,
+        local_audio_sha256=local_audio_sha256,
+    )
+    return build_candidate_bundle(reference, bundle_id=bundle_id, mode=mode, runtime_hints=runtime_hints)
+
+
+def validate_candidate_bundle_payload(payload: dict[str, Any]) -> None:
+    _reject_forbidden_fields(_validate_metadata(payload, "candidate_bundle"))
+
+
+def _audio_payload(timeline: AudioTimelineProvenance) -> dict[str, Any]:
+    return {
+        "channel_count": len(timeline.channel_ids),
+        "duration_ms": timeline.duration_ms,
+        "sample_rate_hz": timeline.sample_rate_hz,
+        "time_basis": timeline.time_basis,
+    }
+
+
+def _channel_payloads(reference: ReferenceBundle, mode: CandidateBundleMode) -> tuple[dict[str, Any], ...]:
+    if mode == "authenticated_track_metadata":
+        payloads = []
+        for channel in reference.recording.channels:
+            payload: dict[str, Any] = {"channel_id": channel.channel_id}
+            if channel.name is not None:
+                payload["track_name"] = channel.name
+            payloads.append(payload)
+        return tuple(payloads)
+    return tuple({"channel_id": channel.channel_id} for channel in reference.recording.channels)
+
+
+def _default_runtime_hints(timeline: AudioTimelineProvenance) -> dict[str, Any]:
+    return {
+        "channel_ids": list(timeline.channel_ids),
+        "mode_supports_speaker_identity": False,
+        "timeline": timeline.to_rendered_transcript_metadata(),
+    }
+
+
+def _reject_forbidden_fields(payload: object, path: str = "candidate_bundle") -> None:
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            if key in _FORBIDDEN_CANDIDATE_FIELDS:
+                raise ValidationError(f"{path}.{key} is forbidden in candidate bundles")
+            _reject_forbidden_fields(value, f"{path}.{key}")
+    elif isinstance(payload, list):
+        for index, value in enumerate(payload):
+            _reject_forbidden_fields(value, f"{path}[{index}]")
+
+
+def _validate_channel_payloads(value: object) -> tuple[dict[str, Any], ...]:
+    try:
+        channels = tuple(value)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise ValidationError("candidate_bundle.channels must be an iterable") from exc
+    if not channels:
+        raise ValidationError("candidate_bundle.channels is required")
+    result = []
+    seen: set[str] = set()
+    for index, channel in enumerate(channels):
+        payload = _validate_metadata(channel, f"candidate_bundle.channels[{index}]")
+        channel_id = payload.get("channel_id")
+        if not isinstance(channel_id, str) or not channel_id.strip():
+            raise ValidationError(f"candidate_bundle.channels[{index}].channel_id is required")
+        if channel_id in seen:
+            raise ValidationError(f"duplicate candidate_bundle.channels.channel_id: {channel_id}")
+        seen.add(channel_id)
+        result.append(payload)
+    return tuple(result)
+
+
+def _validate_metadata(value: object, field_name: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValidationError(f"{field_name} must be an object")
+    return {key: _validate_metadata_value(key, item, field_name) for key, item in value.items()}
+
+
+def _validate_optional_metadata(value: object, field_name: str) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    return _validate_metadata(value, field_name)
+
+
+def _validate_metadata_value(key: object, value: object, field_name: str) -> Any:
+    if not isinstance(key, str):
+        raise ValidationError(f"{field_name} field names must be strings")
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    if isinstance(value, list):
+        return [_validate_metadata_value(key, item, field_name) for item in value]
+    if isinstance(value, dict):
+        return _validate_metadata(value, f"{field_name}.{key}")
+    raise ValidationError(f"{field_name}.{key} must be JSON-compatible")
+
+
+def _validate_string_map(value: object, field_name: str) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise ValidationError(f"{field_name} must be an object")
+    result: dict[str, str] = {}
+    for key, item in value.items():
+        result[_require_id(key, f"{field_name}.key")] = _require_id(item, f"{field_name}.{key}")
+    return result
+
+
+def _validate_mode(value: object) -> CandidateBundleMode:
+    value = _require_id(value, "candidate_bundle.mode")
+    if value not in _ALLOWED_BUNDLE_MODES:
+        raise ValidationError(f"candidate_bundle.mode is not supported: {value}")
+    return value  # type: ignore[return-value]
+
+
+def _validate_bool(value: object, field_name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValidationError(f"{field_name} must be a boolean")
+    return value
+
+
+def _require_id(value: object, field_name: str) -> str:
+    if value is None:
+        raise ValidationError(f"{field_name} is required")
+    if not isinstance(value, str):
+        raise ValidationError(f"{field_name} must be a string")
+    value = value.strip()
+    if not value:
+        raise ValidationError(f"{field_name} is required")
+    return value
