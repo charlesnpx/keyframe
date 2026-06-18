@@ -1,3 +1,5 @@
+import math
+
 import pytest
 
 from keyframe.diarization import (
@@ -92,6 +94,36 @@ def test_product_realistic_candidate_bundle_exposes_only_runtime_audio_and_chann
     _assert_no_forbidden_fields(payload)
 
 
+def test_candidate_bundle_metadata_is_immutable_after_validation():
+    bundle = build_candidate_bundle_from_recording(
+        _recording(),
+        artifact_id="reference-fixture",
+        bundle_id="candidate-fixture",
+    )
+
+    with pytest.raises(TypeError):
+        bundle.runtime_hints["speaker_ref"] = "spk-a"
+    with pytest.raises(TypeError):
+        bundle.audio["original_audio_id"] = "leak"
+    with pytest.raises(TypeError):
+        bundle.channels[0]["participant_id"] = "P001"
+
+    payload = bundle.to_dict()
+    payload["runtime_hints"]["speaker_ref"] = "mutated-copy"
+    assert "speaker_ref" not in bundle.to_dict()["runtime_hints"]
+
+
+@pytest.mark.parametrize("reserved_key", ["channel_ids", "mode_supports_speaker_identity", "timeline"])
+def test_runtime_hint_overrides_cannot_corrupt_generated_metadata(reserved_key):
+    with pytest.raises(ValidationError, match="cannot override generated runtime metadata"):
+        build_candidate_bundle_from_recording(
+            _recording(),
+            artifact_id="reference-fixture",
+            bundle_id="candidate-fixture",
+            runtime_hints={reserved_key: "override"},
+        )
+
+
 def test_authenticated_track_metadata_mode_includes_track_names_but_not_speaker_identity():
     bundle = build_candidate_bundle_from_recording(
         _recording(),
@@ -118,6 +150,28 @@ def test_oracle_diagnostic_bundle_is_explicitly_non_reportable():
     _assert_no_forbidden_fields(payload)
 
 
+def test_serialized_candidate_payload_validation_enforces_oracle_reportability():
+    payload = build_candidate_bundle_from_recording(
+        _recording(),
+        artifact_id="reference-fixture",
+        bundle_id="diagnostic-fixture",
+        mode="oracle_diagnostic",
+    ).to_dict()
+
+    payload["product_quality_reportable"] = True
+    with pytest.raises(ValidationError, match="oracle diagnostic bundles must be non-reportable"):
+        validate_candidate_bundle_payload(payload)
+
+    payload = build_candidate_bundle_from_recording(
+        _recording(),
+        artifact_id="reference-fixture",
+        bundle_id="candidate-fixture",
+    ).to_dict()
+    payload["oracle_diagnostic"] = True
+    with pytest.raises(ValidationError, match="product-quality bundles cannot be labeled oracle diagnostic"):
+        validate_candidate_bundle_payload(payload)
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -141,6 +195,18 @@ def test_candidate_bundle_constructor_rejects_leaked_fields():
             audio={"duration_ms": 1200, "sample_rate_hz": 16000, "original_audio_id": "leak"},
             channels=({"channel_id": "ch-1"},),
             runtime_hints={},
+        )
+
+
+@pytest.mark.parametrize("bad_value", [math.nan, math.inf, -math.inf])
+def test_candidate_metadata_rejects_non_finite_json_numbers(bad_value):
+    with pytest.raises(ValidationError, match="must be a finite JSON number"):
+        CandidateBundle(
+            bundle_id="candidate-fixture",
+            mode="product_realistic",
+            audio={"duration_ms": 1200, "sample_rate_hz": 16000},
+            channels=({"channel_id": "ch-1"},),
+            runtime_hints={"score": bad_value},
         )
 
 

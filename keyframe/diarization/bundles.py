@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, Literal
 
 from keyframe.diarization.models import CanonicalRecording, ValidationError
@@ -39,6 +41,7 @@ _FORBIDDEN_CANDIDATE_FIELDS = frozenset(
     }
 )
 _ORACLE_ONLY_MODES = frozenset({"oracle_diagnostic"})
+_RESERVED_RUNTIME_HINT_KEYS = frozenset({"channel_ids", "mode_supports_speaker_identity", "timeline"})
 
 
 @dataclass(frozen=True)
@@ -120,12 +123,16 @@ class CandidateBundle:
             raise ValidationError("oracle diagnostic bundles must be explicitly labeled")
         if mode not in _ORACLE_ONLY_MODES and self.oracle_diagnostic:
             raise ValidationError("product-quality bundles cannot be labeled oracle diagnostic")
-        object.__setattr__(self, "audio", _validate_metadata(self.audio, "candidate_bundle.audio"))
-        object.__setattr__(self, "channels", _validate_channel_payloads(self.channels))
+        object.__setattr__(self, "audio", _freeze_metadata(_validate_metadata(self.audio, "candidate_bundle.audio")))
+        object.__setattr__(
+            self,
+            "channels",
+            tuple(_freeze_metadata(channel) for channel in _validate_channel_payloads(self.channels)),
+        )
         object.__setattr__(
             self,
             "runtime_hints",
-            _validate_metadata(self.runtime_hints, "candidate_bundle.runtime_hints"),
+            _freeze_metadata(_validate_metadata(self.runtime_hints, "candidate_bundle.runtime_hints")),
         )
         self.validate()
 
@@ -138,13 +145,13 @@ class CandidateBundle:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "audio": dict(self.audio),
+            "audio": _thaw_metadata(self.audio),
             "bundle_id": self.bundle_id,
-            "channels": [dict(channel) for channel in self.channels],
+            "channels": [_thaw_metadata(channel) for channel in self.channels],
             "mode": self.mode,
             "oracle_diagnostic": self.oracle_diagnostic,
             "product_quality_reportable": self.product_quality_reportable,
-            "runtime_hints": dict(self.runtime_hints),
+            "runtime_hints": _thaw_metadata(self.runtime_hints),
         }
 
 
@@ -160,9 +167,11 @@ def build_candidate_bundle(
     mode = _validate_mode(mode)
     audio = _audio_payload(reference.artifact.timeline)
     channels = _channel_payloads(reference, mode)
+    extra_hints = _validate_metadata(runtime_hints or {}, "candidate_bundle.runtime_hints")
+    if _RESERVED_RUNTIME_HINT_KEYS.intersection(extra_hints):
+        raise ValidationError("candidate_bundle.runtime_hints cannot override generated runtime metadata")
     hints = _default_runtime_hints(reference.artifact.timeline)
-    if runtime_hints:
-        hints.update(_validate_metadata(runtime_hints, "candidate_bundle.runtime_hints"))
+    hints.update(extra_hints)
     return CandidateBundle(
         bundle_id=bundle_id,
         mode=mode,
@@ -191,7 +200,12 @@ def build_candidate_bundle_from_recording(
 
 
 def validate_candidate_bundle_payload(payload: dict[str, Any]) -> None:
-    _reject_forbidden_fields(_validate_metadata(payload, "candidate_bundle"))
+    data = _validate_metadata(payload, "candidate_bundle")
+    _reject_forbidden_fields(data)
+    if data.get("mode") == "oracle_diagnostic" and data.get("product_quality_reportable") is not False:
+        raise ValidationError("oracle diagnostic bundles must be non-reportable")
+    if data.get("oracle_diagnostic") is True and data.get("mode") != "oracle_diagnostic":
+        raise ValidationError("product-quality bundles cannot be labeled oracle diagnostic")
 
 
 def _audio_payload(timeline: AudioTimelineProvenance) -> dict[str, Any]:
@@ -270,13 +284,33 @@ def _validate_optional_metadata(value: object, field_name: str) -> dict[str, Any
 def _validate_metadata_value(key: object, value: object, field_name: str) -> Any:
     if not isinstance(key, str):
         raise ValidationError(f"{field_name} field names must be strings")
-    if value is None or isinstance(value, (str, bool, int, float)):
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValidationError(f"{field_name}.{key} must be a finite JSON number")
         return value
     if isinstance(value, list):
         return [_validate_metadata_value(key, item, field_name) for item in value]
     if isinstance(value, dict):
         return _validate_metadata(value, f"{field_name}.{key}")
     raise ValidationError(f"{field_name}.{key} must be JSON-compatible")
+
+
+def _freeze_metadata(value: Any) -> Any:
+    if isinstance(value, dict):
+        return MappingProxyType({key: _freeze_metadata(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze_metadata(item) for item in value)
+    return value
+
+
+def _thaw_metadata(value: Any) -> Any:
+    if isinstance(value, MappingProxyType):
+        return {key: _thaw_metadata(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_metadata(item) for item in value]
+    return value
 
 
 def _validate_string_map(value: object, field_name: str) -> dict[str, str]:
