@@ -1,5 +1,13 @@
 """Session-local diarization benchmark domain models."""
 
+from keyframe.diarization.bundles import (
+    CandidateBundle,
+    CandidateBundleMode,
+    ReferenceBundle,
+    build_candidate_bundle,
+    build_candidate_bundle_from_recording,
+    validate_candidate_bundle_payload,
+)
 from keyframe.diarization.io import (
     canonical_json_dumps,
     canonical_json_loads,
@@ -50,14 +58,19 @@ __all__ = [
     "ValidationError",
     "ArtifactKind",
     "AudioTimelineProvenance",
+    "CandidateBundle",
+    "CandidateBundleMode",
     "NormalizedArtifactProvenance",
     "OffsetMapSegment",
+    "ReferenceBundle",
     "TimelineMergeValidation",
     "TimelineOffsetMap",
     "TransformChain",
     "TransformStep",
     "TransformType",
     "boundary_shift_degrades_scoring",
+    "build_candidate_bundle",
+    "build_candidate_bundle_from_recording",
     "canonical_json_dumps",
     "canonical_json_loads",
     "canonical_jsonl_dumps",
@@ -67,6 +80,7 @@ __all__ = [
     "recording_from_dict",
     "recording_to_dict",
     "validate_schema_version",
+    "validate_candidate_bundle_payload",
     "validate_timeline_merge",
     "write_recording_json",
     "write_recordings_jsonl",
