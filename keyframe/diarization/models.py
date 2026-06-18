@@ -13,6 +13,14 @@ from typing import Any, Literal
 
 
 SCHEMA_VERSION = 1
+_ALLOWED_LABEL_SOURCES = frozenset(
+    {
+        "diarization_cluster",
+        "channel_metadata",
+        "reviewer_rename",
+        "unknown",
+    }
+)
 LabelSource = Literal[
     "diarization_cluster",
     "channel_metadata",
@@ -26,8 +34,12 @@ class ValidationError(ValueError):
     """Raised when canonical diarization records are internally inconsistent."""
 
 
-def _require_id(value: str, field_name: str) -> str:
-    value = str(value).strip()
+def _require_id(value: object, field_name: str) -> str:
+    if value is None:
+        raise ValidationError(f"{field_name} is required")
+    if not isinstance(value, str):
+        raise ValidationError(f"{field_name} must be a string")
+    value = value.strip()
     if not value:
         raise ValidationError(f"{field_name} is required")
     return value
@@ -64,6 +76,10 @@ class DisplayLabel:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "label", _require_id(self.label, "display_label.label"))
+        source = _require_id(self.source, "display_label.source")
+        if source not in _ALLOWED_LABEL_SOURCES:
+            raise ValidationError(f"display_label.source is not supported: {source}")
+        object.__setattr__(self, "source", source)
         if self.scope != "recording":
             raise ValidationError("display labels must be scoped to one recording")
         object.__setattr__(
@@ -235,6 +251,9 @@ class CanonicalRecording:
     def validate(self) -> None:
         channel_ids = _unique_ids((channel.channel_id for channel in self.channels), "channel_id")
         speaker_refs = _unique_ids((speaker.speaker_ref for speaker in self.speakers), "speaker_ref")
+        _unique_ids((word.word_id for word in self.words), "word_id")
+        _unique_ids((span.span_id for span in self.speaker_spans), "span_id")
+        _unique_ids((region.region_id for region in self.scoring_regions), "region_id")
 
         for word in self.words:
             _validate_within_duration(word.start_ms, word.end_ms, self.duration_ms, f"word {word.word_id}")
@@ -262,7 +281,7 @@ class CanonicalRecording:
 def _unique_ids(values: object, field_name: str) -> set[str]:
     seen: set[str] = set()
     for value in values:
-        value = _require_id(str(value), field_name)
+        value = _require_id(value, field_name)
         if value in seen:
             raise ValidationError(f"duplicate {field_name}: {value}")
         seen.add(value)

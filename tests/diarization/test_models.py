@@ -141,9 +141,54 @@ def test_recording_validation_rejects_invalid_or_unresolved_references(make_over
         _recording(**make_overrides())
 
 
+def test_required_audio_identifiers_must_be_present_strings():
+    with pytest.raises(ValidationError, match="original_audio_id is required"):
+        _recording(original_audio_id=None)
+
+    with pytest.raises(ValidationError, match="canonical_audio_id must be a string"):
+        _recording(canonical_audio_id=42)
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        (
+            {"words": (CanonicalWord("w-1", "hello", 0, 100), CanonicalWord("w-1", "again", 100, 200))},
+            "duplicate word_id",
+        ),
+        (
+            {
+                "speaker_spans": (
+                    SpeakerSpan("span-1", "spk-a", 0, 100),
+                    SpeakerSpan("span-1", "spk-b", 100, 200),
+                )
+            },
+            "duplicate span_id",
+        ),
+        (
+            {
+                "scoring_regions": (
+                    ScoringRegion("uem-1", 0, 100),
+                    ScoringRegion("uem-1", 100, 200),
+                )
+            },
+            "duplicate region_id",
+        ),
+    ],
+)
+def test_canonical_item_ids_are_unique(overrides, message):
+    with pytest.raises(ValidationError, match=message):
+        _recording(**overrides)
+
+
 def test_display_label_scope_is_recording_only():
     with pytest.raises(ValidationError, match="scoped to one recording"):
         DisplayLabel(label="person_1", source="diarization_cluster", scope="global")
+
+
+def test_display_label_source_must_be_canonical():
+    with pytest.raises(ValidationError, match="source is not supported"):
+        DisplayLabel(label="person_1", source="voice_profile")
 
 
 def test_confidence_values_are_bounded():
