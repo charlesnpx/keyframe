@@ -180,7 +180,7 @@ def _ordered_overlays(overlays: tuple[TranscriptOverlay, ...]) -> tuple[Transcri
         if operation_id in seen:
             raise ValidationError(f"duplicate overlay.operation_id: {operation_id}")
         seen.add(operation_id)
-    return tuple(sorted(result, key=lambda item: item.operation_id))
+    return result
 
 
 def _apply_overlays(recording: CanonicalRecording, overlays: tuple[TranscriptOverlay, ...]) -> _OverlayResult:

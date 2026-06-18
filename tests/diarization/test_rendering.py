@@ -140,6 +140,32 @@ def test_split_overlay_reassigns_a_time_span_to_a_transcript_local_speaker():
     assert transcript.turns[1].uncertain is True
 
 
+def test_overlay_application_preserves_caller_order_for_dependent_edits():
+    recording = _recording(
+        words=(
+            CanonicalWord("w-1", "first", 0, 100, speaker_ref="spk-a", channel_id="ch-1", speaker_confidence=0.9),
+            CanonicalWord("w-2", "second", 150, 250, speaker_ref="spk-a", channel_id="ch-1", speaker_confidence=0.9),
+        )
+    )
+
+    transcript = render_transcript(
+        recording,
+        overlays=(
+            SplitSpeakerOverlay(
+                operation_id="op-z-split",
+                source_speaker_ref="spk-a",
+                new_speaker_ref="review-speaker-1",
+                start_ms=150,
+                end_ms=250,
+            ),
+            RenameLabelOverlay(operation_id="op-a-rename", speaker_ref="review-speaker-1", label="Casey"),
+        ),
+    )
+
+    assert [turn.label for turn in transcript.turns] == ["person_1", "Casey"]
+    assert transcript.applied_overlay_ids == ("op-z-split", "op-a-rename")
+
+
 def test_assign_span_overlay_assigns_unknown_words():
     recording = _recording(
         words=(
@@ -215,6 +241,6 @@ def test_rendered_transcript_payload_preserves_word_ids_and_overlay_provenance()
     payload = transcript.to_dict()
 
     assert payload["recording_id"] == "rec-rendering"
-    assert payload["applied_overlay_ids"] == ["op-a-overlap", "op-z-uncertain"]
+    assert payload["applied_overlay_ids"] == ["op-z-uncertain", "op-a-overlap"]
     assert payload["turns"][0]["word_ids"] == ["w-1"]
     assert payload["words"][0]["word_id"] == "w-1"
