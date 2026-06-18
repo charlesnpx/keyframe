@@ -1,5 +1,6 @@
 """Session-local diarization benchmark domain models."""
 
+from keyframe.diarization.attribution import apply_session_local_attribution
 from keyframe.diarization.bundles import (
     CandidateBundle,
     CandidateBundleMode,
@@ -68,6 +69,7 @@ __all__ = [
     "TransformChain",
     "TransformStep",
     "TransformType",
+    "apply_session_local_attribution",
     "boundary_shift_degrades_scoring",
     "build_candidate_bundle",
     "build_candidate_bundle_from_recording",
