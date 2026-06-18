@@ -38,6 +38,30 @@ def _recording():
     return read_recording_json("tests/diarization/fixtures/clean_two_speaker.json")
 
 
+def _candidate_audio():
+    return {
+        "channel_count": 1,
+        "duration_ms": 1200,
+        "sample_rate_hz": 16000,
+        "time_basis": "canonical_ms",
+    }
+
+
+def _candidate_runtime_hints():
+    return {
+        "channel_ids": ["ch-1"],
+        "mode_supports_speaker_identity": False,
+        "timeline": {
+            "channel_ids": ["ch-1"],
+            "duration_ms": 1200,
+            "sample_rate_hz": 16000,
+            "time_basis": "canonical_ms",
+            "timeline_id": "timeline-fixture",
+            "transform_chain_id": "transform-chain-fixture",
+        },
+    }
+
+
 def _walk_keys(value):
     if isinstance(value, dict):
         for key, item in value.items():
@@ -293,7 +317,7 @@ def test_serialized_candidate_payload_validation_rejects_invalid_channel_payload
 @pytest.mark.parametrize(
     ("runtime_hints", "expected_message"),
     [
-        ({}, "candidate_bundle.runtime_hints.channel_ids must match channels"),
+        ({}, "candidate_bundle.runtime_hints.channel_ids must be a list"),
         (
             {
                 "channel_ids": ["ch-1"],
@@ -303,6 +327,8 @@ def test_serialized_candidate_payload_validation_rejects_invalid_channel_payload
                     "duration_ms": 1200,
                     "sample_rate_hz": 16000,
                     "time_basis": "canonical_ms",
+                    "timeline_id": "timeline-fixture",
+                    "transform_chain_id": "transform-chain-fixture",
                 },
             },
             "candidate_bundle.runtime_hints.mode_supports_speaker_identity must be false",
@@ -316,6 +342,8 @@ def test_serialized_candidate_payload_validation_rejects_invalid_channel_payload
                     "duration_ms": 1200,
                     "sample_rate_hz": 16000,
                     "time_basis": "canonical_ms",
+                    "timeline_id": "timeline-fixture",
+                    "transform_chain_id": "transform-chain-fixture",
                 },
             },
             "candidate_bundle.runtime_hints.channel_ids must match channels",
@@ -331,7 +359,36 @@ def test_serialized_candidate_payload_validation_rejects_invalid_channel_payload
             {
                 "channel_ids": ["ch-1"],
                 "mode_supports_speaker_identity": False,
-                "timeline": {"channel_ids": ["other-channel"]},
+                "timeline": {"channel_ids": ["ch-1"]},
+            },
+            "candidate_bundle.runtime_hints.timeline.duration_ms must be an integer",
+        ),
+        (
+            {
+                "channel_ids": ["ch-1"],
+                "mode_supports_speaker_identity": False,
+                "timeline": {
+                    "channel_ids": ["ch-1"],
+                    "duration_ms": 1200,
+                    "sample_rate_hz": 16000,
+                    "time_basis": "canonical_ms",
+                    "transform_chain_id": "transform-chain-fixture",
+                },
+            },
+            "candidate_bundle.runtime_hints.timeline.timeline_id is required",
+        ),
+        (
+            {
+                "channel_ids": ["ch-1"],
+                "mode_supports_speaker_identity": False,
+                "timeline": {
+                    "channel_ids": ["other-channel"],
+                    "duration_ms": 1200,
+                    "sample_rate_hz": 16000,
+                    "time_basis": "canonical_ms",
+                    "timeline_id": "timeline-fixture",
+                    "transform_chain_id": "transform-chain-fixture",
+                },
             },
             "candidate_bundle.runtime_hints.timeline.channel_ids must match channels",
         ),
@@ -381,10 +438,23 @@ def test_candidate_bundle_validation_rejects_oracle_and_identity_leaks(payload):
 
 def test_candidate_bundle_constructor_rejects_leaked_fields():
     with pytest.raises(ValidationError, match="forbidden in candidate bundles"):
+        audio = _candidate_audio()
+        audio["original_audio_id"] = "leak"
         CandidateBundle(
             bundle_id="candidate-fixture",
             mode="product_realistic",
-            audio={"duration_ms": 1200, "sample_rate_hz": 16000, "original_audio_id": "leak"},
+            audio=audio,
+            channels=({"channel_id": "ch-1"},),
+            runtime_hints=_candidate_runtime_hints(),
+        )
+
+
+def test_candidate_bundle_constructor_rejects_incomplete_structural_payloads():
+    with pytest.raises(ValidationError, match="candidate_bundle.audio.channel_count must be an integer"):
+        CandidateBundle(
+            bundle_id="candidate-fixture",
+            mode="product_realistic",
+            audio={"duration_ms": 1200, "sample_rate_hz": 16000},
             channels=({"channel_id": "ch-1"},),
             runtime_hints={},
         )
@@ -393,12 +463,14 @@ def test_candidate_bundle_constructor_rejects_leaked_fields():
 @pytest.mark.parametrize("bad_value", [math.nan, math.inf, -math.inf])
 def test_candidate_metadata_rejects_non_finite_json_numbers(bad_value):
     with pytest.raises(ValidationError, match="must be a finite JSON number"):
+        runtime_hints = _candidate_runtime_hints()
+        runtime_hints["score"] = bad_value
         CandidateBundle(
             bundle_id="candidate-fixture",
             mode="product_realistic",
-            audio={"duration_ms": 1200, "sample_rate_hz": 16000},
+            audio=_candidate_audio(),
             channels=({"channel_id": "ch-1"},),
-            runtime_hints={"score": bad_value},
+            runtime_hints=runtime_hints,
         )
 
 

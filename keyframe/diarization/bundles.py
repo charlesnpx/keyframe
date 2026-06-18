@@ -123,17 +123,14 @@ class CandidateBundle:
             raise ValidationError("oracle diagnostic bundles must be explicitly labeled")
         if mode not in _ORACLE_ONLY_MODES and self.oracle_diagnostic:
             raise ValidationError("product-quality bundles cannot be labeled oracle diagnostic")
-        object.__setattr__(self, "audio", _freeze_metadata(_validate_metadata(self.audio, "candidate_bundle.audio")))
-        object.__setattr__(
-            self,
-            "channels",
-            tuple(_freeze_metadata(channel) for channel in _validate_channel_payloads(self.channels)),
+        audio, channels, runtime_hints = _validate_candidate_payload_parts(
+            self.audio,
+            self.channels,
+            self.runtime_hints,
         )
-        object.__setattr__(
-            self,
-            "runtime_hints",
-            _freeze_metadata(_validate_metadata(self.runtime_hints, "candidate_bundle.runtime_hints")),
-        )
+        object.__setattr__(self, "audio", _freeze_metadata(audio))
+        object.__setattr__(self, "channels", tuple(_freeze_metadata(channel) for channel in channels))
+        object.__setattr__(self, "runtime_hints", _freeze_metadata(runtime_hints))
         self.validate()
 
     @property
@@ -214,13 +211,7 @@ def validate_candidate_bundle_payload(payload: dict[str, Any]) -> None:
     )
 
     _require_id(data.get("bundle_id"), "candidate_bundle.bundle_id")
-    audio = _validate_audio_payload(data.get("audio"))
-    channels = _validate_channel_payloads(data.get("channels"))
-    runtime_hints = _validate_runtime_hints_payload(data.get("runtime_hints"), channels)
-    if audio["channel_count"] != len(channels):
-        raise ValidationError("candidate_bundle.audio.channel_count must match channels")
-    if runtime_hints["timeline"]["channel_ids"] != runtime_hints["channel_ids"]:
-        raise ValidationError("candidate_bundle.runtime_hints.timeline.channel_ids must match channels")
+    _validate_candidate_payload_parts(data.get("audio"), data.get("channels"), data.get("runtime_hints"))
 
     if mode == "oracle_diagnostic":
         if oracle_diagnostic is not True:
@@ -294,6 +285,30 @@ def _validate_channel_payloads(value: object) -> tuple[dict[str, Any], ...]:
     return tuple(result)
 
 
+def _validate_candidate_payload_parts(
+    audio_value: object,
+    channels_value: object,
+    runtime_hints_value: object,
+) -> tuple[dict[str, Any], tuple[dict[str, Any], ...], dict[str, Any]]:
+    audio = _validate_audio_payload(audio_value)
+    channels = _validate_channel_payloads(channels_value)
+    runtime_hints = _validate_runtime_hints_payload(runtime_hints_value, channels)
+    timeline = runtime_hints["timeline"]
+
+    if audio["channel_count"] != len(channels):
+        raise ValidationError("candidate_bundle.audio.channel_count must match channels")
+    if timeline["channel_ids"] != runtime_hints["channel_ids"]:
+        raise ValidationError("candidate_bundle.runtime_hints.timeline.channel_ids must match channels")
+    if timeline["duration_ms"] != audio["duration_ms"]:
+        raise ValidationError("candidate_bundle.runtime_hints.timeline.duration_ms must match audio")
+    if timeline["sample_rate_hz"] != audio["sample_rate_hz"]:
+        raise ValidationError("candidate_bundle.runtime_hints.timeline.sample_rate_hz must match audio")
+    if timeline["time_basis"] != audio["time_basis"]:
+        raise ValidationError("candidate_bundle.runtime_hints.timeline.time_basis must match audio")
+
+    return audio, channels, runtime_hints
+
+
 def _validate_audio_payload(value: object) -> dict[str, Any]:
     payload = _validate_metadata(value, "candidate_bundle.audio")
     payload["channel_count"] = _require_positive_int(
@@ -318,7 +333,11 @@ def _validate_runtime_hints_payload(
 ) -> dict[str, Any]:
     payload = _validate_metadata(value, "candidate_bundle.runtime_hints")
     channel_ids = [channel["channel_id"] for channel in channels]
-    if payload.get("channel_ids") != channel_ids:
+    payload["channel_ids"] = _validate_channel_ids_list(
+        payload.get("channel_ids"),
+        "candidate_bundle.runtime_hints.channel_ids",
+    )
+    if payload["channel_ids"] != channel_ids:
         raise ValidationError("candidate_bundle.runtime_hints.channel_ids must match channels")
     if payload.get("mode_supports_speaker_identity") is not False:
         raise ValidationError("candidate_bundle.runtime_hints.mode_supports_speaker_identity must be false")
@@ -327,6 +346,26 @@ def _validate_runtime_hints_payload(
     timeline["channel_ids"] = _validate_channel_ids_list(
         timeline.get("channel_ids"),
         "candidate_bundle.runtime_hints.timeline.channel_ids",
+    )
+    timeline["duration_ms"] = _require_positive_int(
+        timeline.get("duration_ms"),
+        "candidate_bundle.runtime_hints.timeline.duration_ms",
+    )
+    timeline["sample_rate_hz"] = _require_positive_int(
+        timeline.get("sample_rate_hz"),
+        "candidate_bundle.runtime_hints.timeline.sample_rate_hz",
+    )
+    timeline["time_basis"] = _validate_time_basis(
+        timeline.get("time_basis"),
+        "candidate_bundle.runtime_hints.timeline.time_basis",
+    )
+    timeline["timeline_id"] = _require_id(
+        timeline.get("timeline_id"),
+        "candidate_bundle.runtime_hints.timeline.timeline_id",
+    )
+    timeline["transform_chain_id"] = _require_id(
+        timeline.get("transform_chain_id"),
+        "candidate_bundle.runtime_hints.timeline.transform_chain_id",
     )
     payload["timeline"] = timeline
     return payload
