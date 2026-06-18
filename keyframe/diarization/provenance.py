@@ -307,7 +307,7 @@ class TimelineOffsetMap:
         object.__setattr__(self, "segments", segments)
 
     def validate_for(self, source: AudioTimelineProvenance, target: AudioTimelineProvenance) -> None:
-        _validate_shared_audio_metadata(source, target)
+        _validate_shared_audio_metadata(source, target, require_same_duration=False)
         if self.source_timeline_id != source.timeline_id:
             raise ValidationError("offset map source_timeline_id does not match source timeline")
         if self.target_timeline_id != target.timeline_id:
@@ -352,7 +352,6 @@ def validate_timeline_merge(
 ) -> TimelineMergeValidation:
     source_timeline = _coerce_timeline(source, "source")
     target_timeline = _coerce_timeline(target, "target")
-    _validate_shared_audio_metadata(source_timeline, target_timeline)
 
     direct_match = (
         source_timeline.timeline_id == target_timeline.timeline_id
@@ -360,6 +359,7 @@ def validate_timeline_merge(
         and source_timeline.time_basis == target_timeline.time_basis
     )
     if direct_match:
+        _validate_shared_audio_metadata(source_timeline, target_timeline)
         return TimelineMergeValidation(
             source_timeline_id=source_timeline.timeline_id,
             target_timeline_id=target_timeline.timeline_id,
@@ -367,6 +367,7 @@ def validate_timeline_merge(
             direct_timeline_match=True,
         )
     if offset_map is None:
+        _validate_shared_audio_metadata(source_timeline, target_timeline)
         raise ValidationError("timeline mismatch requires a validated offset map")
     offset_map.validate_for(source_timeline, target_timeline)
     return TimelineMergeValidation(
@@ -402,14 +403,19 @@ def _coerce_timeline(
     raise ValidationError(f"{field_name} must include AudioTimelineProvenance")
 
 
-def _validate_shared_audio_metadata(left: AudioTimelineProvenance, right: AudioTimelineProvenance) -> None:
+def _validate_shared_audio_metadata(
+    left: AudioTimelineProvenance,
+    right: AudioTimelineProvenance,
+    *,
+    require_same_duration: bool = True,
+) -> None:
     if left.original_audio_id != right.original_audio_id:
         raise ValidationError("original_audio_id conflicts between artifacts")
     if left.canonical_audio_id != right.canonical_audio_id:
         raise ValidationError("canonical_audio_id conflicts between artifacts")
     if left.sample_rate_hz != right.sample_rate_hz:
         raise ValidationError("sample_rate_hz conflicts between artifacts")
-    if left.duration_ms != right.duration_ms:
+    if require_same_duration and left.duration_ms != right.duration_ms:
         raise ValidationError("duration_ms conflicts between artifacts")
     if left.channel_ids != right.channel_ids:
         raise ValidationError("channel layout conflicts between artifacts")

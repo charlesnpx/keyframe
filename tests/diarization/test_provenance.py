@@ -121,15 +121,46 @@ def test_timeline_mismatch_requires_validated_offset_map():
     assert offset_map.convert_source_ms(250) == 550
 
 
+def test_offset_map_allows_chunk_relative_timeline_duration_to_differ_from_canonical_timeline():
+    source = _artifact(
+        "asr",
+        _timeline(
+            timeline_id="chunk-300-2000",
+            transform_chain_id="chunk-chain",
+            duration_ms=1_700,
+            time_basis="chunk_relative_ms",
+        ),
+    )
+    target = _artifact(
+        "diarization",
+        _timeline(timeline_id="canonical", transform_chain_id="canonical-chain", duration_ms=2_000),
+    )
+    offset_map = TimelineOffsetMap(
+        offset_map_id="chunk-to-canonical",
+        source_timeline_id="chunk-300-2000",
+        target_timeline_id="canonical",
+        source_transform_chain_id="chunk-chain",
+        target_transform_chain_id="canonical-chain",
+        source_time_basis="chunk_relative_ms",
+        target_time_basis="canonical_ms",
+        segments=(OffsetMapSegment(0, 1_700, 300, 2_000),),
+    )
+
+    result = validate_timeline_merge(source, target, offset_map=offset_map)
+
+    assert result.offset_map_id == "chunk-to-canonical"
+    assert offset_map.convert_source_ms(0) == 300
+    assert offset_map.convert_source_ms(1_699) == 1_999
+
+
 @pytest.mark.parametrize(
     "target_overrides, message",
     [
-        ({"duration_ms": 2_500}, "duration_ms conflicts"),
         ({"sample_rate_hz": 48_000}, "sample_rate_hz conflicts"),
         ({"channel_ids": ("ch-2",)}, "channel layout conflicts"),
     ],
 )
-def test_conflicting_audio_metadata_rejects_merge_even_with_offset_map(target_overrides, message):
+def test_conflicting_non_duration_audio_metadata_rejects_merge_even_with_offset_map(target_overrides, message):
     source = _timeline(timeline_id="source", transform_chain_id="source-chain")
     target = _timeline(timeline_id="target", transform_chain_id="target-chain", **target_overrides)
     offset_map = TimelineOffsetMap(
@@ -145,6 +176,14 @@ def test_conflicting_audio_metadata_rejects_merge_even_with_offset_map(target_ov
 
     with pytest.raises(ValidationError, match=message):
         validate_timeline_merge(source, target, offset_map=offset_map)
+
+
+def test_duration_mismatch_without_offset_map_rejects_merge():
+    source = _timeline(timeline_id="source", transform_chain_id="source-chain", duration_ms=1_700)
+    target = _timeline(timeline_id="target", transform_chain_id="target-chain", duration_ms=2_000)
+
+    with pytest.raises(ValidationError, match="duration_ms conflicts"):
+        validate_timeline_merge(source, target)
 
 
 def test_chunk_relative_sample_index_and_frame_index_convert_to_canonical_ms():
