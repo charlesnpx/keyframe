@@ -371,13 +371,6 @@ def evaluate_diarization_candidate(
         scoring_policy=policy,
         minimum_support_ms=minimum_slice_support_ms,
     )
-    mapping_reference_spans, mapping_candidate_spans = _mapping_spans(
-        reference.recording,
-        candidate,
-        reference_spans,
-        candidate_spans,
-        policy,
-    )
     boundary_mapping_intervals = tuple(
         interval
         for item in slices
@@ -385,7 +378,14 @@ def evaluate_diarization_candidate(
         for interval in item.intervals
     )
     mapping_intervals = _normalize_intervals((*scoring_intervals, *boundary_mapping_intervals))
-    speaker_mapping = _build_speaker_mapping(mapping_reference_spans, mapping_candidate_spans, mapping_intervals, policy)
+    speaker_mapping = _build_speaker_mapping_for_policy(
+        reference.recording,
+        candidate,
+        reference_spans,
+        candidate_spans,
+        mapping_intervals,
+        policy,
+    )
     policy_provenance = scoring_policy_report_provenance(policy)
 
     recording_internal_metrics = _score_metrics(
@@ -526,8 +526,9 @@ def _scoring_intervals(recording: CanonicalRecording, policy: ScoringPolicyManif
     collapse_channels = policy.channel_mode in {"mono_mix", "rendered_transcript"}
     if policy.uem_regions == "canonical_scoring_regions" and recording.scoring_regions:
         source_intervals = tuple(
-            EvaluationInterval(region.start_ms, region.end_ms, region.channel_id)
+            interval
             for region in recording.scoring_regions
+            for interval in _scoring_region_intervals(region.start_ms, region.end_ms, region.channel_id, recording)
         )
         if collapse_channels:
             _validate_collapsible_channel_uem(source_intervals, recording)
@@ -542,6 +543,17 @@ def _scoring_intervals(recording: CanonicalRecording, policy: ScoringPolicyManif
         )
         intervals = tuple(EvaluationInterval(0, recording.duration_ms, channel_id) for channel_id in channel_ids)
     return _normalize_intervals(intervals)
+
+
+def _scoring_region_intervals(
+    start_ms: int,
+    end_ms: int,
+    channel_id: str | None,
+    recording: CanonicalRecording,
+) -> tuple[EvaluationInterval, ...]:
+    if channel_id is not None or not recording.channels:
+        return (EvaluationInterval(start_ms, end_ms, channel_id),)
+    return tuple(EvaluationInterval(start_ms, end_ms, channel.channel_id) for channel in recording.channels)
 
 
 def _validate_collapsible_channel_uem(
@@ -604,18 +616,54 @@ def _spans_from_words(words: tuple[CanonicalWord, ...]) -> tuple[_SpanView, ...]
     return tuple(spans)
 
 
-def _mapping_spans(
+def _build_speaker_mapping_for_policy(
     recording: CanonicalRecording,
     candidate: NormalizedEngineOutput,
     reference_spans: tuple[_SpanView, ...],
     candidate_spans: tuple[_SpanView, ...],
+    scoring_intervals: tuple[EvaluationInterval, ...],
     policy: ScoringPolicyManifest,
-) -> tuple[tuple[_SpanView, ...], tuple[_SpanView, ...]]:
+) -> dict[str, str]:
     if policy.policy_kind == "product_transcript":
         reference_word_spans = _spans_from_words(_scoreable_words(recording.words, policy))
         candidate_word_spans = _spans_from_words(_scoreable_words(candidate.words, policy))
-        return reference_word_spans, candidate_word_spans
-    return reference_spans, candidate_spans
+        return _build_item_speaker_mapping(reference_word_spans, candidate_word_spans, scoring_intervals, policy)
+    return _build_speaker_mapping(reference_spans, candidate_spans, scoring_intervals, policy)
+
+
+def _build_item_speaker_mapping(
+    reference_items: tuple[_SpanView, ...],
+    candidate_items: tuple[_SpanView, ...],
+    scoring_intervals: tuple[EvaluationInterval, ...],
+    policy: ScoringPolicyManifest,
+) -> dict[str, str]:
+    weights: dict[tuple[str, str], int] = {}
+    scoreable_reference_speakers: set[str] = set()
+    for reference_item in reference_items:
+        if not _item_is_scoreable(reference_item, scoring_intervals):
+            continue
+        if not policy.score_overlap and _item_is_reference_overlap(reference_item, reference_items):
+            continue
+        scoreable_reference_speakers.add(reference_item.speaker_ref)
+        for candidate_item in candidate_items:
+            if not _channels_match(candidate_item.channel_id, reference_item.channel_id):
+                continue
+            if min(candidate_item.end_ms, reference_item.end_ms) <= max(
+                candidate_item.start_ms,
+                reference_item.start_ms,
+            ):
+                continue
+            key = (candidate_item.speaker_ref, reference_item.speaker_ref)
+            weights[key] = weights.get(key, 0) + 1
+
+    reference_speakers = tuple(sorted(scoreable_reference_speakers))
+    candidate_speakers = tuple(sorted({item.speaker_ref for item in candidate_items}))
+    if len(reference_speakers) > _MAX_EXACT_ASSIGNMENT_REFERENCES:
+        raise ValidationError(
+            "speaker assignment requires exact maximum-weight matching; "
+            "too many reference speakers for the bounded exact matcher"
+        )
+    return _exact_speaker_mapping(candidate_speakers, reference_speakers, weights)
 
 
 def _atomic_intervals(
@@ -868,25 +916,83 @@ def _score_product_transcript_metrics(
 ) -> dict[str, Any]:
     reference_score_words = _scoreable_words(reference_words, policy)
     candidate_score_words = _scoreable_words(candidate_words, policy)
-    word_metrics = _score_metrics(
-        _spans_from_words(reference_score_words),
-        _spans_from_words(candidate_score_words),
-        intervals,
-        speaker_mapping,
-        policy,
-    )
-    turn_metrics = _score_metrics(
-        _word_turn_spans(reference_score_words),
-        _word_turn_spans(candidate_score_words),
-        intervals,
-        speaker_mapping,
-        policy,
-    )
+    word_spans = _spans_from_words(reference_score_words)
+    candidate_word_spans = _spans_from_words(candidate_score_words)
+    turn_spans = _word_turn_spans(reference_score_words)
+    candidate_turn_spans = _word_turn_spans(candidate_score_words)
     return {
-        "speaker_count_error": abs(word_metrics["candidate_speaker_count"] - word_metrics["reference_speaker_count"]),
-        "turn_speaker_label_accuracy": turn_metrics["speaker_label_accuracy"],
-        "word_speaker_label_accuracy": word_metrics["speaker_label_accuracy"],
+        "speaker_count_error": abs(
+            len({span.speaker_ref for span in candidate_word_spans})
+            - len({span.speaker_ref for span in word_spans})
+        ),
+        "turn_speaker_label_accuracy": _label_accuracy_by_reference_items(
+            turn_spans,
+            candidate_turn_spans,
+            intervals,
+            speaker_mapping,
+            policy,
+        ),
+        "word_speaker_label_accuracy": _label_accuracy_by_reference_items(
+            word_spans,
+            candidate_word_spans,
+            intervals,
+            speaker_mapping,
+            policy,
+        ),
     }
+
+
+def _label_accuracy_by_reference_items(
+    reference_items: tuple[_SpanView, ...],
+    candidate_items: tuple[_SpanView, ...],
+    intervals: tuple[EvaluationInterval, ...],
+    speaker_mapping: dict[str, str],
+    policy: ScoringPolicyManifest,
+) -> float:
+    scoreable_reference_items = tuple(
+        item
+        for item in reference_items
+        if _item_is_scoreable(item, intervals)
+        and (policy.score_overlap or not _item_is_reference_overlap(item, reference_items))
+    )
+    if not scoreable_reference_items:
+        return 1.0 if not candidate_items else 0.0
+
+    matched_items = 0
+    for reference_item in scoreable_reference_items:
+        candidates = tuple(
+            item
+            for item in candidate_items
+            if _channels_match(item.channel_id, reference_item.channel_id)
+            and min(item.end_ms, reference_item.end_ms) > max(item.start_ms, reference_item.start_ms)
+        )
+        mapped_candidate_speakers = {
+            speaker_mapping[item.speaker_ref]
+            for item in candidates
+            if item.speaker_ref in speaker_mapping
+        }
+        if reference_item.speaker_ref in mapped_candidate_speakers:
+            matched_items += 1
+    return _round_metric(matched_items / len(scoreable_reference_items))
+
+
+def _item_is_scoreable(item: _SpanView, intervals: tuple[EvaluationInterval, ...]) -> bool:
+    return any(
+        _channels_match(item.channel_id, interval.channel_id)
+        and min(item.end_ms, interval.end_ms) > max(item.start_ms, interval.start_ms)
+        for interval in intervals
+    )
+
+
+def _item_is_reference_overlap(item: _SpanView, reference_items: tuple[_SpanView, ...]) -> bool:
+    if item.overlap:
+        return True
+    return any(
+        other is not item
+        and _channels_match(other.channel_id, item.channel_id)
+        and min(other.end_ms, item.end_ms) > max(other.start_ms, item.start_ms)
+        for other in reference_items
+    )
 
 
 def _scoreable_words(words: tuple[CanonicalWord, ...], policy: ScoringPolicyManifest) -> tuple[CanonicalWord, ...]:

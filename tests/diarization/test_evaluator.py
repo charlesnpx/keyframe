@@ -282,6 +282,57 @@ def test_per_channel_multichannel_scoring_requires_candidate_channel_attribution
         evaluate_diarization_candidate(_reference_bundle(multichannel), channel_less_words, scoring_policy=policy)
 
 
+def test_per_channel_scoring_expands_channel_less_uem_to_physical_channels():
+    recording = _recording()
+    multichannel = replace(
+        recording,
+        channels=(
+            recording.channels[0],
+            ChannelRecord("ch-2", "second"),
+        ),
+        words=(),
+        speakers=(recording.speakers[0],),
+        speaker_spans=(
+            SpeakerSpan(
+                span_id="span-1",
+                speaker_ref="spk-a",
+                start_ms=0,
+                end_ms=1_000,
+                channel_id="ch-1",
+            ),
+            SpeakerSpan(
+                span_id="span-2",
+                speaker_ref="spk-a",
+                start_ms=0,
+                end_ms=1_000,
+                channel_id="ch-2",
+            ),
+        ),
+        scoring_regions=(ScoringRegion("uem-all", 0, 1_000, channel_id=None),),
+    )
+    candidate = _candidate_output(multichannel, {"spk-a": "engine:local:speaker-1"})
+    single_channel_candidate = replace(
+        candidate,
+        speaker_spans=(candidate.speaker_spans[0],),
+    )
+    policy = _scoring_policy(
+        collar_ms=0,
+        metric_set=("diarization_error_rate", "miss_rate", "reference_speaker_ms", "missed_speaker_ms"),
+    )
+
+    result = evaluate_diarization_candidate(
+        _reference_bundle(multichannel),
+        single_channel_candidate,
+        scoring_policy=policy,
+    )
+    metrics = result.recording_metrics[0].metrics
+
+    assert metrics["reference_speaker_ms"] == 2_000
+    assert metrics["missed_speaker_ms"] == 1_000
+    assert metrics["miss_rate"] == 0.5
+    assert metrics["diarization_error_rate"] == 0.5
+
+
 def test_large_speaker_assignment_fails_closed_instead_of_using_greedy_mapping():
     recording = replace(
         _many_speaker_recording(),
@@ -966,6 +1017,60 @@ def test_product_transcript_metrics_use_words_not_coarse_candidate_spans():
     assert metrics["word_speaker_label_accuracy"] == 1.0
     assert metrics["turn_speaker_label_accuracy"] == 1.0
     assert metrics["speaker_count_error"] == 0
+
+
+def test_product_word_accuracy_counts_words_not_word_duration():
+    recording = _recording()
+    reference_recording = replace(
+        recording,
+        duration_ms=2_000,
+        speaker_spans=(),
+        words=(
+            replace(
+                recording.words[0],
+                word_id="w-long",
+                text="long",
+                speaker_ref="spk-a",
+                start_ms=0,
+                end_ms=1_000,
+                channel_id="ch-1",
+            ),
+            replace(
+                recording.words[1],
+                word_id="w-short-1",
+                text="short",
+                speaker_ref="spk-b",
+                start_ms=1_100,
+                end_ms=1_200,
+                channel_id="ch-1",
+            ),
+            replace(
+                recording.words[1],
+                word_id="w-short-2",
+                text="tiny",
+                speaker_ref="spk-b",
+                start_ms=1_300,
+                end_ms=1_400,
+                channel_id="ch-1",
+            ),
+        ),
+        scoring_regions=(ScoringRegion("uem-1", 0, 2_000, channel_id="ch-1"),),
+    )
+    candidate = _candidate_output(
+        reference_recording,
+        {
+            "spk-a": "engine:word:right",
+            "spk-b": "engine:word:right",
+        },
+    )
+    policy = default_scoring_policy("product_transcript")
+
+    result = evaluate_diarization_candidate(_reference_bundle(reference_recording), candidate, scoring_policy=policy)
+    metrics = result.recording_metrics[0].metrics
+
+    assert result.speaker_mapping == {"engine:word:right": "spk-b"}
+    assert metrics["word_speaker_label_accuracy"] == 0.666667
+    assert metrics["turn_speaker_label_accuracy"] == 0.5
 
 
 def test_speaker_mapping_stays_in_score_artifact_not_candidate_or_rendered_transcript():
