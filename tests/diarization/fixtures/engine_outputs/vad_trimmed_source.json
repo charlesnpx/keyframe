@@ -1,0 +1,26 @@
+{
+  "output_id": "vad-trimmed-source",
+  "segments": [
+    {
+      "channel_id": "ch-1",
+      "speaker_confidence": 0.92,
+      "speaker_id": "speaker-a",
+      "words": [
+        {
+          "end_ms": 300,
+          "speaker_confidence": 0.92,
+          "start_ms": 0,
+          "text": "hello",
+          "text_confidence": 0.99
+        },
+        {
+          "end_ms": 650,
+          "speaker_confidence": 0.91,
+          "start_ms": 350,
+          "text": "there",
+          "text_confidence": 0.98
+        }
+      ]
+    }
+  ]
+}
