@@ -3,7 +3,8 @@
   "recording_id": "fixture-degraded-output",
   "review_reasons": [
     "unsupported",
-    "speaker_attribution_unavailable"
+    "speaker_attribution_unavailable",
+    "low_speaker_confidence"
   ],
   "speaker_attribution": "unavailable",
   "state": "unsupported",
@@ -15,7 +16,8 @@
       "label": null,
       "overlap": false,
       "review_reasons": [
-        "speaker_attribution_unavailable"
+        "speaker_attribution_unavailable",
+        "low_speaker_confidence"
       ],
       "speaker_attribution": "unavailable",
       "start_ms": 100,
@@ -53,7 +55,8 @@
       "label": null,
       "overlap": false,
       "review_reasons": [
-        "speaker_attribution_unavailable"
+        "speaker_attribution_unavailable",
+        "low_speaker_confidence"
       ],
       "speaker_attribution": "unavailable",
       "speaker_confidence": 0.1,

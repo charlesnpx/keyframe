@@ -264,6 +264,7 @@ def render_transcript(
     suppress_labels = (
         requested_state in _LABEL_SUPPRESSED_STATES
         or "speaker_attribution_unavailable" in requested_review_reasons
+        or any(_word_has_unavailable_speaker_attribution(word) for word in words)
     )
     rendered_words = tuple(
         _render_word(word, overlay_result.uncertain_word_ids, min_speaker_confidence, suppress_labels)
@@ -559,17 +560,23 @@ def _word_review_reasons(
     suppress_labels: bool,
 ) -> tuple[ReviewReason, ...]:
     reasons: list[ReviewReason] = []
-    if suppress_labels or word.speaker_ref is None or word.display_label is None:
+    has_unavailable_attribution = _word_has_unavailable_speaker_attribution(word)
+    if suppress_labels or has_unavailable_attribution:
         reasons.append("speaker_attribution_unavailable")
-    elif word.speaker_confidence is None:
-        reasons.append("missing_speaker_confidence")
-    elif word.speaker_confidence < min_speaker_confidence:
-        reasons.append("low_speaker_confidence")
+    if not has_unavailable_attribution:
+        if word.speaker_confidence is None:
+            reasons.append("missing_speaker_confidence")
+        elif word.speaker_confidence < min_speaker_confidence:
+            reasons.append("low_speaker_confidence")
     if word.overlap:
         reasons.append("overlap_detected")
     if word.word_id in uncertain_word_ids:
         reasons.append("manual_uncertain")
     return _combine_review_reasons(reasons)
+
+
+def _word_has_unavailable_speaker_attribution(word: CanonicalWord) -> bool:
+    return word.speaker_ref is None or word.display_label is None
 
 
 def _combine_review_reasons(*reason_groups: tuple[ReviewReason, ...] | list[ReviewReason]) -> tuple[ReviewReason, ...]:

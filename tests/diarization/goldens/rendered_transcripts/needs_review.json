@@ -11,20 +11,15 @@
   "turns": [
     {
       "channel_id": "ch-1",
-      "display_label": {
-        "confidence": null,
-        "label": "person_1",
-        "scope": "recording",
-        "source": "diarization_cluster",
-        "source_ref": null
-      },
+      "display_label": null,
       "end_ms": 300,
-      "label": "person_1",
+      "label": null,
       "overlap": false,
       "review_reasons": [
+        "speaker_attribution_unavailable",
         "low_speaker_confidence"
       ],
-      "speaker_attribution": "unreliable",
+      "speaker_attribution": "unavailable",
       "start_ms": 100,
       "text": "[inaudible]",
       "turn_id": "turn_1",
@@ -55,20 +50,15 @@
   "words": [
     {
       "channel_id": "ch-1",
-      "display_label": {
-        "confidence": null,
-        "label": "person_1",
-        "scope": "recording",
-        "source": "diarization_cluster",
-        "source_ref": null
-      },
+      "display_label": null,
       "end_ms": 300,
-      "label": "person_1",
+      "label": null,
       "overlap": false,
       "review_reasons": [
+        "speaker_attribution_unavailable",
         "low_speaker_confidence"
       ],
-      "speaker_attribution": "unreliable",
+      "speaker_attribution": "unavailable",
       "speaker_confidence": 0.1,
       "start_ms": 100,
       "text": "[inaudible]",

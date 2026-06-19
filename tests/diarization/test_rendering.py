@@ -385,6 +385,24 @@ def test_speaker_attribution_unavailable_reason_keeps_text_without_labels():
     assert all(word.label is None and word.display_label is None for word in transcript.words)
 
 
+def test_inferred_speaker_attribution_unavailable_keeps_all_text_without_labels():
+    recording = _recording(
+        words=(
+            CanonicalWord("w-1", "known", 0, 100, speaker_ref="spk-a", channel_id="ch-1", speaker_confidence=0.9),
+            CanonicalWord("w-2", "unknown", 150, 250, channel_id="ch-1"),
+        )
+    )
+
+    transcript = render_transcript(recording)
+
+    assert transcript.state == "speaker_attribution_unavailable"
+    assert transcript.speaker_attribution == "unavailable"
+    assert transcript.review_reasons == ("speaker_attribution_unavailable",)
+    assert [word.text for word in transcript.words] == ["known", "unknown"]
+    assert all(turn.label is None and turn.display_label is None for turn in transcript.turns)
+    assert all(word.label is None and word.display_label is None for word in transcript.words)
+
+
 def test_diagnostic_and_unsupported_states_render_transcript_only_output():
     for state, expected_reasons in (
         ("diagnostic_only", ("diagnostic_only", "speaker_attribution_unavailable")),
