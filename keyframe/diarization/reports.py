@@ -696,6 +696,10 @@ class BenchmarkReport:
             raise ValidationError("passed benchmark reports cannot include failed gates")
         if self.status == "failed" and not has_failure:
             raise ValidationError("failed benchmark reports must include failed gates")
+        _validate_serialized_critical_span_diagnostic(
+            self.critical_span_policy,
+            self.critical_span_diagnostic,
+        )
 
     @property
     def metric_results(self) -> tuple[BenchmarkMetricResult, ...]:
@@ -986,6 +990,10 @@ def benchmark_report_from_dict(data: Mapping[str, Any]) -> BenchmarkReport:
         schema_version=_required(data, "schema_version", "benchmark_report"),
     )
     _validate_serialized_gates(gate_config, report.metric_results)
+    _validate_serialized_critical_span_diagnostic(
+        report.critical_span_policy,
+        report.critical_span_diagnostic,
+    )
     return report
 
 
@@ -1245,20 +1253,29 @@ def _matching_budget(
     matches = [
         budget
         for budget in gate_config.budgets
-        if budget.metric_name == result.metric_name
-        and (budget.scope_type is None or budget.scope_type == result.scope_type)
-        and (budget.scope_id is None or budget.scope_id == result.scope_id)
-        and (budget.slice_id is None or budget.slice_id == result.slice_id)
+        if _budget_matches_result(budget, result)
     ]
     if not matches:
         return None
-    return max(
-        matches,
-        key=lambda budget: sum(
-            1
-            for value in (budget.scope_type, budget.scope_id, budget.slice_id)
-            if value is not None
-        ),
+    return max(matches, key=_budget_specificity)
+
+
+def _budget_matches_result(budget: BenchmarkRegressionBudget, result: BenchmarkMetricResult) -> bool:
+    return (
+        budget.metric_name == result.metric_name
+        and (budget.scope_type is None or budget.scope_type == result.scope_type)
+        and (budget.scope_id is None or budget.scope_id == result.scope_id)
+        and (budget.slice_id is None or budget.slice_id == result.slice_id)
+    )
+
+
+def _budget_specificity(budget: BenchmarkRegressionBudget) -> tuple[bool, bool, bool, int]:
+    fields = (budget.scope_type, budget.scope_id, budget.slice_id)
+    return (
+        budget.scope_id is not None,
+        budget.slice_id is not None,
+        budget.scope_type is not None,
+        sum(value is not None for value in fields),
     )
 
 
@@ -1271,12 +1288,33 @@ def _validate_all_budgets_matched(
         for result in results
         if result.gate.budget_id is not None
     }
-    unmatched_budget_ids = {budget.budget_id for budget in gate_config.budgets} - matched_budget_ids
+    unmatched_budget_ids = {
+        budget.budget_id
+        for budget in gate_config.budgets
+        if budget.budget_id not in matched_budget_ids
+        and not _budget_is_shadowed_by_more_specific_match(budget, gate_config, results)
+    }
     if unmatched_budget_ids:
         raise ValidationError(
             "regression budgets did not match any metric result: "
             + ", ".join(sorted(unmatched_budget_ids))
         )
+
+
+def _budget_is_shadowed_by_more_specific_match(
+    budget: BenchmarkRegressionBudget,
+    gate_config: BenchmarkGateConfig,
+    results: tuple[BenchmarkMetricResult, ...],
+) -> bool:
+    covered_results = tuple(result for result in results if _budget_matches_result(budget, result))
+    if not covered_results:
+        return False
+    return all(
+        (selected := _matching_budget(result, gate_config)) is not None
+        and selected.budget_id != budget.budget_id
+        and _budget_specificity(selected) > _budget_specificity(budget)
+        for result in covered_results
+    )
 
 
 def _validate_serialized_gates(
@@ -1291,6 +1329,41 @@ def _validate_serialized_gates(
                 "metric_result gate does not match regression budget: "
                 f"{result.scope_id}/{result.metric_name}"
             )
+
+
+def _validate_serialized_critical_span_diagnostic(
+    policy: CriticalSpanPolicyDefinition | None,
+    diagnostic: CriticalSpanDiagnosticScore | None,
+) -> None:
+    if policy is None:
+        if diagnostic is not None:
+            raise ValidationError("critical_span_diagnostic requires a critical_span_policy")
+        return
+    if diagnostic is None:
+        raise ValidationError("critical_span_policy requires critical_span_diagnostic")
+    if diagnostic.policy_id != policy.policy_id or diagnostic.version != policy.version:
+        raise ValidationError("critical_span_diagnostic policy identity must match critical_span_policy")
+    if (
+        diagnostic.detected_critical_span_count + diagnostic.missed_critical_span_count
+        != diagnostic.critical_span_count
+    ):
+        raise ValidationError("critical_span_diagnostic counts must add up to critical_span_count")
+    expected_recall = (
+        None
+        if diagnostic.critical_span_count == 0
+        else _round_metric(diagnostic.detected_critical_span_count / diagnostic.critical_span_count)
+    )
+    if diagnostic.recall != expected_recall:
+        raise ValidationError("critical_span_diagnostic recall must match detected critical spans")
+    expected_status: RegressionGateStatus
+    if diagnostic.critical_span_count == 0:
+        expected_status = "unavailable"
+    elif expected_recall is not None and expected_recall < policy.minimum_recall:
+        expected_status = "failed"
+    else:
+        expected_status = "passed"
+    if diagnostic.status != expected_status:
+        raise ValidationError("critical_span_diagnostic status must match critical span policy")
 
 
 def _uncertainty_interval(values: tuple[float, ...], *, basis: str) -> UncertaintyInterval:

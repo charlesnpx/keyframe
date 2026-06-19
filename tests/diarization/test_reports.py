@@ -353,6 +353,45 @@ def test_slice_specific_regression_budget_can_pass_and_fail():
     assert "paired delta" in fail_overlap.gate.reasons[0]
 
 
+def test_slice_specific_budget_overrides_broad_slice_budget_independent_of_order():
+    report = build_benchmark_report(
+        "slice-override",
+        (
+            _case("rec-1", current_der=0.05, baseline_der=0.05, current_overlap_der=0.105, baseline_overlap_der=0.10),
+        ),
+        gate_config=BenchmarkGateConfig(
+            budgets=(
+                BenchmarkRegressionBudget(
+                    budget_id="all-slices",
+                    metric_name="diarization_error_rate",
+                    budget_kind="overlap",
+                    direction="lower_is_better",
+                    max_regression_delta=0.001,
+                    scope_type="slice",
+                ),
+                BenchmarkRegressionBudget(
+                    budget_id="overlap-specific",
+                    metric_name="diarization_error_rate",
+                    budget_kind="overlap",
+                    direction="lower_is_better",
+                    max_regression_delta=0.01,
+                    scope_type="slice",
+                    slice_id="overlap:true",
+                ),
+            )
+        ),
+    )
+
+    overlap = next(
+        result
+        for result in report.slice_results
+        if result.slice_id == "overlap:true" and result.metric_name == "diarization_error_rate"
+    )
+    assert report.status == "passed"
+    assert overlap.gate.status == "passed"
+    assert overlap.gate.budget_id == "overlap-specific"
+
+
 def test_configured_regression_budget_without_baseline_fails_report():
     report = build_benchmark_report(
         "missing-baseline",
@@ -601,6 +640,29 @@ def test_report_json_rejects_serialized_gate_that_conflicts_with_budget():
             break
 
     with pytest.raises(ValidationError, match="metric_result gate does not match regression budget"):
+        benchmark_report_json_loads(json.dumps(payload))
+
+
+def test_report_json_rejects_tampered_critical_span_diagnostic():
+    policy = CriticalSpanPolicyDefinition(
+        policy_id="critical-span-diagnostic",
+        version="v1",
+        description="Synthetic diagnostic hook for serious review spans.",
+        critical_severities=("serious",),
+        minimum_recall=0.5,
+    )
+    report = build_benchmark_report(
+        "tampered-critical-span",
+        (
+            _case("rec-1", current_der=0.05, baseline_der=0.05, current_overlap_der=0.10, baseline_overlap_der=0.10),
+        ),
+        review_signals=_signals(),
+        critical_span_policy=policy,
+    )
+    payload = report.to_dict()
+    payload["critical_span_diagnostic"]["recall"] = 0.0
+
+    with pytest.raises(ValidationError, match="critical_span_diagnostic recall"):
         benchmark_report_json_loads(json.dumps(payload))
 
 
