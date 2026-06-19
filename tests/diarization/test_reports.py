@@ -946,6 +946,47 @@ def test_report_json_rejects_tampered_review_signal_metric_gate():
         benchmark_report_json_loads(json.dumps(payload))
 
 
+def test_report_json_rejects_extra_review_signal_metric_result():
+    report = build_benchmark_report(
+        "extra-review-signal-metric",
+        (
+            _case("rec-1", current_der=0.05, baseline_der=0.05, current_overlap_der=0.10, baseline_overlap_der=0.10),
+        ),
+        review_signals=(
+            ReviewSignalSpan(
+                signal_id="minor-tn",
+                corpus_id="ami-smoke",
+                branch_id="separate-tracks",
+                recording_id="rec-1",
+                start_ms=0,
+                end_ms=100,
+                severity="minor",
+                reference_review_required=False,
+                predicted_review_required=False,
+            ),
+        ),
+    )
+    payload = report.to_dict()
+    over_flag = next(result for result in payload["branch_results"] if result["metric_name"] == "over_flag_rate")
+    extra_precision = dict(over_flag)
+    extra_precision.update(
+        {
+            "gate": {
+                "budget_id": None,
+                "reasons": ["no regression budget configured"],
+                "status": "unavailable",
+                "thresholds": {},
+            },
+            "metric_name": "precision",
+            "point_score": 1.0,
+        }
+    )
+    payload["branch_results"].append(extra_precision)
+
+    with pytest.raises(ValidationError, match="review-signal metric results"):
+        benchmark_report_json_loads(json.dumps(payload))
+
+
 def test_diagnostic_critical_span_policy_hook_scores_synthetic_spans():
     policy = CriticalSpanPolicyDefinition(
         policy_id="critical-span-diagnostic",

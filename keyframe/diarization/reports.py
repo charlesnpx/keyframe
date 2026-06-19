@@ -1652,11 +1652,18 @@ def _validate_serialized_review_signal_metric_results(
     _validate_review_signal_scope_calibrations(calibration, scope_calibrations)
     expected = _review_signal_metric_results(scope_calibrations, gate_config)
     expected_by_key = {_metric_result_key(result): result.to_dict() for result in expected}
-    actual_by_key = {
-        _metric_result_key(result): result.to_dict()
+    actual_review_signal_results = tuple(
+        result
         for result in results
-        if _metric_result_key(result) in expected_by_key
-    }
+        if result.scope_type in {"corpus", "branch", "recording"}
+        and result.metric_name in _REVIEW_SIGNAL_METRIC_NAMES
+    )
+    actual_by_key: dict[tuple[BenchmarkReportScopeType, str, str], dict[str, Any]] = {}
+    for result in actual_review_signal_results:
+        key = _metric_result_key(result)
+        if key in actual_by_key:
+            raise ValidationError("duplicate review-signal metric result")
+        actual_by_key[key] = result.to_dict()
     if set(actual_by_key) != set(expected_by_key):
         raise ValidationError("review-signal metric results must match review_signal_scope_calibrations")
     for key, expected_payload in expected_by_key.items():
