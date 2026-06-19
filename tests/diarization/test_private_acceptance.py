@@ -187,6 +187,23 @@ def test_private_acceptance_rejects_reference_speaker_identity_fields():
         private_acceptance_metadata_from_dict(payload)
 
 
+def test_private_annotation_quality_rejects_contradictory_double_annotation_rate():
+    with pytest.raises(
+        ValidationError,
+        match="double_annotated_sample_rate must match double_annotated_recording_count",
+    ):
+        _quality_metrics(
+            annotated_recording_count=20,
+            double_annotated_recording_count=0,
+            double_annotated_sample_rate=0.30,
+        )
+
+
+def test_private_annotation_quality_rejects_identity_metric_keys_from_direct_constructor():
+    with pytest.raises(ValidationError, match="agreement_metrics.speaker_ref must remain candidate-invisible"):
+        _quality_metrics(agreement_metrics={"speaker_ref": 0.99})
+
+
 def test_private_acceptance_slice_validation_for_no_score_and_reference_unstable_labels():
     with pytest.raises(ValidationError, match="no_score.*require.*no_score_region_count"):
         PrivateAcceptanceSlice(

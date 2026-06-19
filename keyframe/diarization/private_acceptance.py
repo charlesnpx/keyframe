@@ -185,11 +185,14 @@ class PrivateAnnotationQualityMetrics:
             )
         object.__setattr__(self, "annotated_recording_count", annotated)
         object.__setattr__(self, "double_annotated_recording_count", double_annotated)
-        object.__setattr__(
-            self,
-            "double_annotated_sample_rate",
-            _probability(self.double_annotated_sample_rate, "private_quality.double_annotated_sample_rate"),
-        )
+        sample_rate = _probability(self.double_annotated_sample_rate, "private_quality.double_annotated_sample_rate")
+        expected_rate = 0.0 if annotated == 0 else double_annotated / annotated
+        if not math.isclose(sample_rate, expected_rate, rel_tol=1e-9, abs_tol=1e-9):
+            raise ValidationError(
+                "private_quality.double_annotated_sample_rate must match "
+                "double_annotated_recording_count / annotated_recording_count"
+            )
+        object.__setattr__(self, "double_annotated_sample_rate", sample_rate)
         object.__setattr__(
             self,
             "agreement_metrics",
@@ -611,6 +614,8 @@ def _probability_map(value: object, field_name: str) -> dict[str, float]:
     result: dict[str, float] = {}
     for key, item in value.items():
         metric_name = _require_id(key, f"{field_name}.key")
+        if metric_name in _REFERENCE_IDENTITY_KEYS:
+            raise ValidationError(f"{field_name}.{metric_name} must remain candidate-invisible")
         result[metric_name] = _probability(item, f"{field_name}.{metric_name}")
     return result
 
