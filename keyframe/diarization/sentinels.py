@@ -7,7 +7,16 @@ from typing import Any, Literal
 
 from keyframe.diarization.bundles import ReferenceBundle
 from keyframe.diarization.engines import EngineConfigMetadata, NormalizedEngineOutput
-from keyframe.diarization.evaluator import DiarizationEvaluationResult, evaluate_diarization_candidate
+from keyframe.diarization.evaluator import (
+    _item_is_reference_overlap,
+    _item_is_scoreable,
+    _scoring_intervals,
+    _scoreable_words,
+    _spans_from_recording,
+    _spans_from_words,
+    DiarizationEvaluationResult,
+    evaluate_diarization_candidate,
+)
 from keyframe.diarization.manifests import ScoringPolicyManifest, default_scoring_policy
 from keyframe.diarization.models import CanonicalWord, SpeakerSpan, ValidationError
 from keyframe.diarization.provenance import NormalizedArtifactProvenance
@@ -195,6 +204,11 @@ def evaluate_sentinel_baselines(
         raise ValidationError("reference must be a ReferenceBundle")
     diagnostic_policy = diagnostic_policy or _default_diagnostic_policy()
     product_policy = product_policy or default_scoring_policy("product_transcript")
+    baseline_ids = _supported_sentinel_baseline_ids(
+        reference,
+        diagnostic_policy=diagnostic_policy,
+        product_policy=product_policy,
+    )
     checks = tuple(
         _evaluate_sentinel_check(
             reference,
@@ -203,7 +217,7 @@ def evaluate_sentinel_baselines(
             diagnostic_policy=diagnostic_policy,
             product_policy=product_policy,
         )
-        for baseline_id in SENTINEL_BASELINE_IDS
+        for baseline_id in baseline_ids
     )
     status: SentinelBaselineStatus = "passed" if all(check.passed for check in checks) else "failed"
     return SentinelBaselineReport(status=status, checks=checks)
@@ -281,8 +295,83 @@ def _sentinel_failures(baseline_id: SentinelBaselineId, metrics: dict[str, Any])
 def _default_diagnostic_policy() -> ScoringPolicyManifest:
     return replace(
         default_scoring_policy("diagnostic_diarization"),
+        policy_id="sentinel-diagnostic-diarization-v1",
+        description="Sentinel diagnostic diarization policy with zero collar and expanded health metrics.",
         collar_ms=0,
         metric_set=_DIAGNOSTIC_METRICS,
+    )
+
+
+def _supported_sentinel_baseline_ids(
+    reference: ReferenceBundle,
+    *,
+    diagnostic_policy: ScoringPolicyManifest,
+    product_policy: ScoringPolicyManifest,
+) -> tuple[SentinelBaselineId, ...]:
+    recording = reference.recording
+    diagnostic_intervals = _scoring_intervals(recording, diagnostic_policy)
+    diagnostic_spans = _scoreable_reference_spans(
+        _spans_from_recording(recording),
+        diagnostic_intervals,
+        diagnostic_policy,
+    )
+    diagnostic_speaker_refs = _speaker_refs_from_spans(diagnostic_spans)
+    product_intervals = _scoring_intervals(recording, product_policy)
+    product_word_spans = _scoreable_reference_spans(
+        _spans_from_words(_scoreable_words(recording.words, product_policy)),
+        product_intervals,
+        product_policy,
+    )
+    product_word_speaker_refs = _speaker_refs_from_spans(product_word_spans)
+
+    baseline_ids: list[SentinelBaselineId] = []
+    if diagnostic_spans:
+        baseline_ids.append("oracle")
+    if len(diagnostic_speaker_refs) >= 2:
+        baseline_ids.append("single_speaker_collapse")
+    if _has_channel_only_degradation_support(diagnostic_spans):
+        baseline_ids.append("channel_only")
+    if _has_timestamp_shift_degradation_support(diagnostic_spans, recording.duration_ms):
+        baseline_ids.append("timestamp_shifted")
+    if len(diagnostic_speaker_refs) >= 2:
+        baseline_ids.append("shuffled_speakers")
+    if len(product_word_speaker_refs) >= 2:
+        baseline_ids.append("perfect_text_wrong_speaker")
+    if product_word_spans:
+        baseline_ids.append("bad_text_perfect_speaker")
+    if len(product_word_speaker_refs) >= 2:
+        baseline_ids.append("bad_turn_builder")
+    return tuple(baseline_ids)
+
+
+def _scoreable_reference_spans(
+    spans: tuple[Any, ...],
+    intervals: tuple[Any, ...],
+    policy: ScoringPolicyManifest,
+) -> tuple[Any, ...]:
+    return tuple(
+        span
+        for span in spans
+        if _item_is_scoreable(span, intervals, policy)
+        and (policy.score_overlap or not _item_is_reference_overlap(span, spans, policy))
+    )
+
+
+def _speaker_refs_from_spans(spans: tuple[Any, ...]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(span.speaker_ref for span in spans))
+
+
+def _has_channel_only_degradation_support(spans: tuple[Any, ...]) -> bool:
+    speaker_refs_by_channel: dict[str | None, set[str]] = {}
+    for span in spans:
+        speaker_refs_by_channel.setdefault(span.channel_id, set()).add(span.speaker_ref)
+    return any(len(speaker_refs) >= 2 for speaker_refs in speaker_refs_by_channel.values())
+
+
+def _has_timestamp_shift_degradation_support(spans: tuple[Any, ...], duration_ms: int) -> bool:
+    return any(
+        _shift_interval(span.start_ms, span.end_ms, duration_ms) != (span.start_ms, span.end_ms)
+        for span in spans
     )
 
 
@@ -353,9 +442,13 @@ def _baseline_words(
             )
         )
     if baseline_id == "bad_turn_builder" and result:
+        existing_refs = tuple(dict.fromkeys(word.speaker_ref for word in result if word.speaker_ref is not None))
+        if len(existing_refs) < 2:
+            return tuple(result)
         first_start = min(word.start_ms for word in result)
         last_end = max(word.end_ms for word in result)
-        template = result[0]
+        template = next(word for word in result if word.speaker_ref is not None)
+        confuser_ref = next(speaker_ref for speaker_ref in existing_refs if speaker_ref != template.speaker_ref)
         result.append(
             replace(
                 template,
@@ -363,7 +456,7 @@ def _baseline_words(
                 text="sentinel bad turn",
                 start_ms=first_start,
                 end_ms=last_end,
-                speaker_ref=collapsed_ref,
+                speaker_ref=confuser_ref,
                 display_label=None,
             )
         )

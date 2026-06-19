@@ -46,11 +46,13 @@ def test_sentinel_outputs_are_labeled_as_fixture_baselines_not_candidate_engines
 
 def test_sentinel_baseline_report_passes_on_clean_two_speaker_fixture():
     report = evaluate_sentinel_baselines(_reference_bundle())
+    checks = _checks_by_id(report)
 
     assert report.status == "passed"
     assert report.passed is True
     assert [check.baseline_id for check in report.checks] == list(SENTINEL_BASELINE_IDS)
     assert all(check.passed for check in report.checks)
+    assert checks["oracle"].policy_id == "sentinel-diagnostic-diarization-v1"
     require_passing_sentinel_baselines(report)
 
 
@@ -130,12 +132,39 @@ def test_timestamp_shift_baseline_degrades_end_aligned_intervals():
     assert check.metrics["diarization_error_rate"] > 0.0
 
 
+def test_sentinel_report_skips_baselines_that_single_speaker_references_cannot_exercise():
+    reference = _reference_bundle()
+    recording = replace(
+        reference.recording,
+        duration_ms=1_000,
+        speakers=(SpeakerRecord("spk-a"),),
+        speaker_spans=(
+            SpeakerSpan(
+                span_id="span-single",
+                speaker_ref="spk-a",
+                start_ms=500,
+                end_ms=1_000,
+                channel_id="ch-1",
+            ),
+        ),
+        words=(),
+        scoring_regions=(ScoringRegion("uem-1", 0, 1_000, channel_id="ch-1"),),
+    )
+
+    report = evaluate_sentinel_baselines(ReferenceBundle.from_recording(recording, artifact_id="single-speaker-reference"))
+
+    assert report.status == "passed"
+    assert [check.baseline_id for check in report.checks] == ["oracle", "timestamp_shifted"]
+    require_passing_sentinel_baselines(report)
+
+
 def test_bad_turn_builder_preserves_word_attribution_while_degrading_turns():
     report = evaluate_sentinel_baselines(_reference_bundle())
     check = _checks_by_id(report)["bad_turn_builder"]
 
     assert check.metrics["word_speaker_label_accuracy"] == 1.0
     assert check.metrics["turn_speaker_label_accuracy"] < 1.0
+    assert check.metrics["speaker_count_error"] == 0
 
 
 def test_sentinel_gate_blocks_engine_benchmark_execution_when_health_fails():
