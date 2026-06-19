@@ -374,17 +374,26 @@ def evaluate_diarization_candidate(
     speaker_mapping = _build_speaker_mapping(reference_spans, candidate_spans, scoring_intervals, policy)
     policy_provenance = scoring_policy_report_provenance(policy)
 
+    recording_metrics = _score_metrics(reference_spans, candidate_spans, scoring_intervals, speaker_mapping, policy)
+    recording_status: EvaluationMetricStatus = (
+        "scored" if recording_metrics["scored_interval_ms"] > 0 else "insufficient_support"
+    )
     recording_row = DiarizationRecordingMetricRow(
         recording_id=reference.recording.recording_id,
         output_id=candidate.output_id,
         policy_id=policy.policy_id,
-        status="scored",
-        metrics=_score_metrics(reference_spans, candidate_spans, scoring_intervals, speaker_mapping, policy),
+        status=recording_status,
+        metrics=recording_metrics if recording_status == "scored" else {},
         speaker_mapping=speaker_mapping,
     )
     slice_rows: list[DiarizationSliceMetricRow] = []
     for item in slices:
-        scored_intervals = _clip_intervals_to_regions(item.intervals, scoring_intervals)
+        slice_scoring_intervals = (
+            raw_scoring_intervals
+            if item.slice_id == "speaker_change_boundary:within_collar"
+            else scoring_intervals
+        )
+        scored_intervals = _clip_intervals_to_regions(item.intervals, slice_scoring_intervals)
         scored_support_ms = _interval_support_ms(scored_intervals)
         row_status: EvaluationMetricStatus = (
             "scored"
