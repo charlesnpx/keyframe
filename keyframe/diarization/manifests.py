@@ -9,6 +9,10 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Literal
 
 from keyframe.diarization.models import ValidationError
+from keyframe.diarization.private_acceptance import (
+    PrivateAcceptanceMetadata,
+    private_acceptance_metadata_from_dict,
+)
 
 
 DATASET_MANIFEST_SCHEMA_VERSION = 1
@@ -266,6 +270,7 @@ class DatasetManifest:
     schema_version: int = DATASET_MANIFEST_SCHEMA_VERSION
     source_url: str | None = None
     notes: tuple[str, ...] = ()
+    private_acceptance: PrivateAcceptanceMetadata | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "schema_version", _validate_schema_version(self.schema_version))
@@ -278,6 +283,10 @@ class DatasetManifest:
         object.__setattr__(self, "attribution", _optional_text(self.attribution, "dataset_manifest.attribution"))
         object.__setattr__(self, "benchmarked", _require_bool(self.benchmarked, "dataset_manifest.benchmarked"))
         object.__setattr__(self, "source_url", _optional_url(self.source_url, "dataset_manifest.source_url"))
+        if self.private_acceptance is not None and not isinstance(self.private_acceptance, PrivateAcceptanceMetadata):
+            raise ValidationError("dataset_manifest.private_acceptance must be PrivateAcceptanceMetadata")
+        if self.private_acceptance is not None and self.role != "private_in_domain_acceptance":
+            raise ValidationError("dataset_manifest.private_acceptance requires private_in_domain_acceptance role")
         object.__setattr__(
             self,
             "notes",
@@ -333,7 +342,7 @@ class DatasetManifest:
                     raise ValidationError(f"dataset_split.expected_file_paths references unknown file: {path}")
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "access": self.access.to_dict(),
             "attribution": self.attribution,
             "benchmarked": self.benchmarked,
@@ -348,6 +357,9 @@ class DatasetManifest:
             "source_url": self.source_url,
             "splits": [split.to_dict() for split in self.splits],
         }
+        if self.private_acceptance is not None:
+            payload["private_acceptance"] = self.private_acceptance.to_dict()
+        return payload
 
 
 def dataset_manifest_to_dict(manifest: DatasetManifest) -> dict[str, Any]:
@@ -429,6 +441,7 @@ def dataset_manifest_from_dict(payload: dict[str, Any]) -> DatasetManifest:
             "license_url",
             "name",
             "notes",
+            "private_acceptance",
             "role",
             "schema_version",
             "scoring_policies",
@@ -450,6 +463,11 @@ def dataset_manifest_from_dict(payload: dict[str, Any]) -> DatasetManifest:
         scoring_policies=tuple(_scoring_policy_from_dict(item) for item in _sequence(data.get("scoring_policies", ()))),
         benchmarked=data.get("benchmarked", True),
         source_url=data.get("source_url"),
+        private_acceptance=(
+            None
+            if data.get("private_acceptance") is None
+            else private_acceptance_metadata_from_dict(data.get("private_acceptance"))
+        ),
         notes=tuple(_sequence(data.get("notes", ()))),
     )
 
