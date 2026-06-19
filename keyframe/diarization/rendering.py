@@ -323,11 +323,14 @@ def _build_turns(
 ) -> list[RenderedTurn]:
     turns: list[RenderedTurn] = []
     current: list[CanonicalWord] = []
+    current_end_ms = 0
     for word in words:
-        if current and _starts_new_turn(current[-1], word, max_gap_ms, split_after_punctuation):
+        if current and _starts_new_turn(current[-1], word, current_end_ms, max_gap_ms, split_after_punctuation):
             turns.append(_render_turn(len(turns) + 1, current, uncertain_word_ids))
             current = []
+            current_end_ms = 0
         current.append(word)
+        current_end_ms = max(current_end_ms, word.end_ms)
     if current:
         turns.append(_render_turn(len(turns) + 1, current, uncertain_word_ids))
     return turns
@@ -336,6 +339,7 @@ def _build_turns(
 def _starts_new_turn(
     previous: CanonicalWord,
     current: CanonicalWord,
+    current_turn_end_ms: int,
     max_gap_ms: int,
     split_after_punctuation: bool,
 ) -> bool:
@@ -345,7 +349,7 @@ def _starts_new_turn(
         return True
     if previous.overlap != current.overlap:
         return True
-    if current.start_ms - previous.end_ms > max_gap_ms:
+    if current.start_ms - current_turn_end_ms > max_gap_ms:
         return True
     if split_after_punctuation and previous.text.rstrip().endswith((".", "?", "!")):
         return True

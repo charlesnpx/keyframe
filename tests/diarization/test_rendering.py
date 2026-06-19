@@ -120,6 +120,22 @@ def test_same_time_words_preserve_canonical_order_in_rendered_turns():
     assert [word.word_id for word in transcript.words] == ["w-z", "w-a"]
 
 
+def test_turn_gap_uses_current_turn_max_end_for_overlapping_words():
+    recording = _recording(
+        words=(
+            CanonicalWord("w-1", "long", 0, 1000, speaker_ref="spk-a", channel_id="ch-1", speaker_confidence=0.9),
+            CanonicalWord("w-2", "short", 0, 100, speaker_ref="spk-a", channel_id="ch-1", speaker_confidence=0.9),
+            CanonicalWord("w-3", "tail", 950, 1050, speaker_ref="spk-a", channel_id="ch-1", speaker_confidence=0.9),
+        )
+    )
+
+    transcript = render_transcript(recording, max_gap_ms=100)
+
+    assert len(transcript.turns) == 1
+    assert transcript.turns[0].word_ids == ("w-1", "w-2", "w-3")
+    assert transcript.turns[0].end_ms == 1050
+
+
 def test_merge_overlay_combines_clusters_before_turn_assembly():
     recording = _recording(
         words=(
