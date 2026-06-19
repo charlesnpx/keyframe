@@ -1,0 +1,84 @@
+{
+  "applied_overlay_ids": [],
+  "recording_id": "fixture-clean-two-speaker",
+  "turns": [
+    {
+      "channel_id": "ch-1",
+      "display_label": {
+        "confidence": null,
+        "label": "person_1",
+        "scope": "recording",
+        "source": "diarization_cluster",
+        "source_ref": null
+      },
+      "end_ms": 300,
+      "label": "person_1",
+      "overlap": false,
+      "start_ms": 0,
+      "text": "hello",
+      "turn_id": "turn_1",
+      "uncertain": false,
+      "word_ids": [
+        "w-1"
+      ]
+    },
+    {
+      "channel_id": "ch-1",
+      "display_label": {
+        "confidence": null,
+        "label": "person_2",
+        "scope": "recording",
+        "source": "diarization_cluster",
+        "source_ref": null
+      },
+      "end_ms": 800,
+      "label": "person_2",
+      "overlap": false,
+      "start_ms": 500,
+      "text": "there",
+      "turn_id": "turn_2",
+      "uncertain": false,
+      "word_ids": [
+        "w-2"
+      ]
+    }
+  ],
+  "words": [
+    {
+      "channel_id": "ch-1",
+      "display_label": {
+        "confidence": null,
+        "label": "person_1",
+        "scope": "recording",
+        "source": "diarization_cluster",
+        "source_ref": null
+      },
+      "end_ms": 300,
+      "label": "person_1",
+      "overlap": false,
+      "speaker_confidence": 0.96,
+      "start_ms": 0,
+      "text": "hello",
+      "uncertain": false,
+      "word_id": "w-1"
+    },
+    {
+      "channel_id": "ch-1",
+      "display_label": {
+        "confidence": null,
+        "label": "person_2",
+        "scope": "recording",
+        "source": "diarization_cluster",
+        "source_ref": null
+      },
+      "end_ms": 800,
+      "label": "person_2",
+      "overlap": false,
+      "speaker_confidence": 0.94,
+      "start_ms": 500,
+      "text": "there",
+      "uncertain": false,
+      "word_id": "w-2"
+    }
+  ]
+}

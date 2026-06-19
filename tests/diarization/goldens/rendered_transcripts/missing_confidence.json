@@ -1,0 +1,46 @@
+{
+  "applied_overlay_ids": [],
+  "recording_id": "fixture-missing-confidence",
+  "turns": [
+    {
+      "channel_id": "ch-1",
+      "display_label": {
+        "confidence": null,
+        "label": "person_1",
+        "scope": "recording",
+        "source": "diarization_cluster",
+        "source_ref": null
+      },
+      "end_ms": 500,
+      "label": "person_1",
+      "overlap": false,
+      "start_ms": 100,
+      "text": "uncertain",
+      "turn_id": "turn_1",
+      "uncertain": true,
+      "word_ids": [
+        "w-1"
+      ]
+    }
+  ],
+  "words": [
+    {
+      "channel_id": "ch-1",
+      "display_label": {
+        "confidence": null,
+        "label": "person_1",
+        "scope": "recording",
+        "source": "diarization_cluster",
+        "source_ref": null
+      },
+      "end_ms": 500,
+      "label": "person_1",
+      "overlap": false,
+      "speaker_confidence": null,
+      "start_ms": 100,
+      "text": "uncertain",
+      "uncertain": true,
+      "word_id": "w-1"
+    }
+  ]
+}

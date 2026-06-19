@@ -1,0 +1,91 @@
+{
+  "canonical_audio_id": "fixture-authenticated-track-metadata-canonical",
+  "channels": [
+    {
+      "channel_id": "ch-agent",
+      "name": "agent-track"
+    },
+    {
+      "channel_id": "ch-customer",
+      "name": "customer-track"
+    }
+  ],
+  "duration_ms": 900,
+  "original_audio_id": "fixture-authenticated-track-metadata-original",
+  "recording_id": "fixture-authenticated-track-metadata",
+  "sample_rate_hz": 16000,
+  "schema_version": 2,
+  "scoring_regions": [
+    {
+      "channel_id": "ch-agent",
+      "end_ms": 850,
+      "region_id": "uem-agent",
+      "start_ms": 0
+    },
+    {
+      "channel_id": "ch-customer",
+      "end_ms": 850,
+      "region_id": "uem-customer",
+      "start_ms": 0
+    }
+  ],
+  "speaker_spans": [
+    {
+      "channel_id": "ch-agent",
+      "confidence": 1.0,
+      "end_ms": 250,
+      "overlap": false,
+      "span_id": "span-agent",
+      "speaker_ref": "spk-agent",
+      "start_ms": 0
+    },
+    {
+      "channel_id": "ch-customer",
+      "confidence": 1.0,
+      "end_ms": 650,
+      "overlap": false,
+      "span_id": "span-customer",
+      "speaker_ref": "spk-customer",
+      "start_ms": 300
+    }
+  ],
+  "speakers": [
+    {
+      "display_label": null,
+      "speaker_ref": "spk-agent"
+    },
+    {
+      "display_label": null,
+      "speaker_ref": "spk-customer"
+    }
+  ],
+  "time_basis": "canonical_ms",
+  "timeline_id": "fixture-authenticated-track-metadata-timeline",
+  "transform_chain_id": "identity",
+  "words": [
+    {
+      "channel_id": "ch-agent",
+      "display_label": null,
+      "end_ms": 220,
+      "overlap": false,
+      "speaker_confidence": 1.0,
+      "speaker_ref": "spk-agent",
+      "start_ms": 0,
+      "text": "agent",
+      "text_confidence": 0.99,
+      "word_id": "w-agent"
+    },
+    {
+      "channel_id": "ch-customer",
+      "display_label": null,
+      "end_ms": 620,
+      "overlap": false,
+      "speaker_confidence": 1.0,
+      "speaker_ref": "spk-customer",
+      "start_ms": 320,
+      "text": "customer",
+      "text_confidence": 0.98,
+      "word_id": "w-customer"
+    }
+  ]
+}
