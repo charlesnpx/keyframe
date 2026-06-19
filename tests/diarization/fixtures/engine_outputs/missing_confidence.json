@@ -1,0 +1,16 @@
+{
+  "output_id": "missing-confidence",
+  "segments": [
+    {
+      "channel_id": "ch-1",
+      "speaker_id": "speaker-a",
+      "words": [
+        {
+          "end_ms": 400,
+          "start_ms": 0,
+          "text": "uncertain"
+        }
+      ]
+    }
+  ]
+}

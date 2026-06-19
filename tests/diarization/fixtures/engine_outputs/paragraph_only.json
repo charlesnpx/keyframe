@@ -1,0 +1,12 @@
+{
+  "output_id": "paragraph-only",
+  "segments": [
+    {
+      "channel_id": "ch-1",
+      "end_ms": 900,
+      "speaker_id": "speaker-a",
+      "start_ms": 0,
+      "text": "This output has no word-level timing."
+    }
+  ]
+}
