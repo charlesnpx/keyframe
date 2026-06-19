@@ -562,6 +562,79 @@ def test_boundary_slice_mapping_uses_boundary_window_when_global_collar_removes_
     assert boundary_row.metrics["diarization_error_rate"] == 0.0
 
 
+def test_boundary_slice_mapping_does_not_override_recording_support_mapping():
+    recording = _recording()
+    reference_recording = replace(
+        recording,
+        duration_ms=850,
+        words=(),
+        speaker_spans=(
+            SpeakerSpan(
+                span_id="span-1",
+                speaker_ref="spk-a",
+                start_ms=0,
+                end_ms=600,
+                channel_id="ch-1",
+            ),
+            SpeakerSpan(
+                span_id="span-2",
+                speaker_ref="spk-b",
+                start_ms=600,
+                end_ms=850,
+                channel_id="ch-1",
+            ),
+        ),
+        scoring_regions=(ScoringRegion("uem-1", 0, 850, channel_id="ch-1"),),
+    )
+    candidate = _candidate_output(
+        reference_recording,
+        {
+            "spk-a": "engine:local:shared",
+            "spk-b": "engine:local:other",
+        },
+    )
+    boundary_conflicting_candidate = replace(
+        candidate,
+        speaker_spans=(
+            SpeakerSpan(
+                span_id="candidate-scored-support",
+                speaker_ref="engine:local:shared",
+                start_ms=250,
+                end_ms=350,
+                channel_id="ch-1",
+            ),
+            SpeakerSpan(
+                span_id="candidate-boundary-support",
+                speaker_ref="engine:local:shared",
+                start_ms=600,
+                end_ms=850,
+                channel_id="ch-1",
+            ),
+        ),
+    )
+    policy = _scoring_policy(
+        metric_set=(
+            "reference_speaker_ms",
+            "matched_speaker_ms",
+            "speaker_label_accuracy",
+            "diarization_error_rate",
+        ),
+    )
+
+    result = evaluate_diarization_candidate(
+        _reference_bundle(reference_recording),
+        boundary_conflicting_candidate,
+        scoring_policy=policy,
+    )
+    metrics = result.recording_metrics[0].metrics
+
+    assert result.speaker_mapping == {"engine:local:shared": "spk-a"}
+    assert metrics["reference_speaker_ms"] == 100
+    assert metrics["matched_speaker_ms"] == 100
+    assert metrics["speaker_label_accuracy"] == 1.0
+    assert metrics["diarization_error_rate"] == 0.0
+
+
 def test_diagnostic_collar_excludes_single_speaker_onset_offset_shift_from_metrics():
     recording = _recording()
     reference_recording = replace(

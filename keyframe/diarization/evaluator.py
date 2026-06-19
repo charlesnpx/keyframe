@@ -371,21 +371,31 @@ def evaluate_diarization_candidate(
         scoring_policy=policy,
         minimum_support_ms=minimum_slice_support_ms,
     )
-    boundary_mapping_intervals = tuple(
-        interval
-        for item in slices
-        if item.slice_id == "speaker_change_boundary:within_collar"
-        for interval in item.intervals
+    boundary_mapping_intervals = _normalize_intervals(
+        tuple(
+            interval
+            for item in slices
+            if item.slice_id == "speaker_change_boundary:within_collar"
+            for interval in item.intervals
+        )
     )
-    mapping_intervals = _normalize_intervals((*scoring_intervals, *boundary_mapping_intervals))
     speaker_mapping = _build_speaker_mapping_for_policy(
         reference.recording,
         candidate,
         reference_spans,
         candidate_spans,
-        mapping_intervals,
+        scoring_intervals,
         policy,
     )
+    if not speaker_mapping and boundary_mapping_intervals:
+        speaker_mapping = _build_speaker_mapping_for_policy(
+            reference.recording,
+            candidate,
+            reference_spans,
+            candidate_spans,
+            boundary_mapping_intervals,
+            policy,
+        )
     policy_provenance = scoring_policy_report_provenance(policy)
 
     recording_internal_metrics = _score_metrics(
