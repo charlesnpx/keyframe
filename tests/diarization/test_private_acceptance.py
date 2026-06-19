@@ -7,6 +7,9 @@ from keyframe.diarization import (
     DatasetManifest,
     DatasetSplitManifest,
     ExpectedDatasetFile,
+    PrivateAcceptanceCoverageObservation,
+    PrivateAcceptanceCoveragePlan,
+    PrivateAcceptanceCoverageSliceTarget,
     PrivateAcceptanceMetadata,
     PrivateAcceptanceSlice,
     PrivateAnnotationProtocol,
@@ -16,6 +19,7 @@ from keyframe.diarization import (
     ValidationError,
     dataset_manifest_json_dumps,
     dataset_manifest_json_loads,
+    evaluate_private_acceptance_coverage,
     evaluate_private_annotation_quality,
     private_acceptance_metadata_from_dict,
     private_acceptance_metadata_json_dumps,
@@ -67,7 +71,45 @@ def _quality_metrics(**overrides):
     return PrivateAnnotationQualityMetrics(**values)
 
 
-def _metadata(quality_metrics=_DEFAULT_QUALITY_METRICS):
+def _coverage_target(slice_id="adjudicated-core", **overrides):
+    values = {
+        "audio_quality_buckets": ("clean", "noisy"),
+        "capture_modes": ("mono_mix", "separate_tracks"),
+        "duration_buckets": ("short", "medium"),
+        "language_accent_domains": ("en-US/customer-success",),
+        "min_scored_duration_ms": 1_200_000,
+        "min_scored_recording_count": 10,
+        "overlap_ratio_buckets": ("none", "low", "medium"),
+        "platform_sources": ("zoom", "teams"),
+        "slice_id": slice_id,
+        "speaker_count_buckets": ("2", "3_plus"),
+    }
+    values.update(overrides)
+    return PrivateAcceptanceCoverageSliceTarget(**values)
+
+
+def _coverage_plan():
+    return PrivateAcceptanceCoveragePlan(
+        plan_id="private-coverage-v1",
+        version="2026-06-19",
+        targets=(
+            _coverage_target(
+                description="Core adjudicated private launch scope",
+            ),
+            _coverage_target(
+                "diagnostic-unadjudicated",
+                diagnostic_only=True,
+                min_scored_duration_ms=300_000,
+                min_scored_recording_count=2,
+                required=False,
+            ),
+        ),
+        validated_scope=("adjudicated-core",),
+        unsupported_scope=(),
+    )
+
+
+def _metadata(quality_metrics=_DEFAULT_QUALITY_METRICS, coverage_plan=None):
     if quality_metrics is _DEFAULT_QUALITY_METRICS:
         quality_metrics = _quality_metrics()
     return PrivateAcceptanceMetadata(
@@ -105,6 +147,7 @@ def _metadata(quality_metrics=_DEFAULT_QUALITY_METRICS):
             ),
         ),
         quality_metrics=quality_metrics,
+        coverage_plan=coverage_plan,
     )
 
 
@@ -170,13 +213,30 @@ def test_private_acceptance_manifest_round_trips_synthetic_annotation_labels():
 
 
 def test_private_acceptance_metadata_json_round_trip_is_stable():
-    metadata = _metadata()
+    metadata = _metadata(coverage_plan=_coverage_plan())
     text = private_acceptance_metadata_json_dumps(metadata)
 
     loaded = private_acceptance_metadata_json_loads(text)
 
     assert loaded.to_dict() == metadata.to_dict()
     assert '"schema_version": 1' in text
+    assert loaded.coverage_plan is not None
+    assert loaded.coverage_plan.targets[0].capture_modes == ("mono_mix", "separate_tracks")
+    assert loaded.coverage_plan.targets[0].to_dict() == {
+        "audio_quality_buckets": ["clean", "noisy"],
+        "capture_modes": ["mono_mix", "separate_tracks"],
+        "description": "Core adjudicated private launch scope",
+        "diagnostic_only": False,
+        "duration_buckets": ["short", "medium"],
+        "language_accent_domains": ["en-US/customer-success"],
+        "min_scored_duration_ms": 1_200_000,
+        "min_scored_recording_count": 10,
+        "overlap_ratio_buckets": ["none", "low", "medium"],
+        "platform_sources": ["zoom", "teams"],
+        "required": True,
+        "slice_id": "adjudicated-core",
+        "speaker_count_buckets": ["2", "3_plus"],
+    }
 
 
 def test_private_acceptance_rejects_reference_speaker_identity_fields():
@@ -256,3 +316,93 @@ def test_private_annotation_quality_gate_reports_unavailable_before_model_gates(
     assert result.blocks_model_gates is True
     assert result.metrics is None
     assert result.reasons == ("private annotation quality metrics are unavailable",)
+
+
+def test_private_acceptance_coverage_passes_when_required_launch_scope_is_represented():
+    metadata = _metadata(coverage_plan=_coverage_plan())
+
+    report = evaluate_private_acceptance_coverage(
+        metadata,
+        (
+            PrivateAcceptanceCoverageObservation(
+                slice_id="adjudicated-core",
+                scored_recording_count=12,
+                scored_duration_ms=1_400_000,
+            ),
+            PrivateAcceptanceCoverageObservation(
+                slice_id="diagnostic-unadjudicated",
+                scored_recording_count=1,
+                scored_duration_ms=60_000,
+            ),
+        ),
+    )
+    payload = report.to_dict()
+
+    assert report.status == "sufficient"
+    assert report.passed is True
+    assert report.failure_code is None
+    assert report.validated_scope == ("adjudicated-core",)
+    assert report.unsupported_scope == ()
+    assert payload["slice_results"][0]["status"] == "sufficient"
+    assert payload["slice_results"][1]["status"] == "diagnostic_only"
+    assert payload["slice_results"][1]["passed"] is True
+
+
+def test_private_acceptance_coverage_fails_with_insufficient_acceptance_coverage():
+    metadata = _metadata(coverage_plan=_coverage_plan())
+
+    report = evaluate_private_acceptance_coverage(
+        metadata,
+        (
+            PrivateAcceptanceCoverageObservation(
+                slice_id="adjudicated-core",
+                scored_recording_count=3,
+                scored_duration_ms=250_000,
+            ),
+        ),
+    )
+
+    assert report.status == "insufficient_acceptance_coverage"
+    assert report.passed is False
+    assert report.failure_code == "insufficient_acceptance_coverage"
+    assert report.validated_scope == ()
+    assert report.unsupported_scope == ("adjudicated-core",)
+    failed = report.slice_results[0]
+    assert failed.status == "insufficient_acceptance_coverage"
+    assert failed.reasons == (
+        "scored_recording_count below threshold",
+        "scored_duration_ms below threshold",
+    )
+
+
+def test_sparse_diagnostic_slices_do_not_fail_private_acceptance_coverage():
+    metadata = _metadata(coverage_plan=_coverage_plan())
+
+    report = evaluate_private_acceptance_coverage(
+        metadata,
+        (
+            PrivateAcceptanceCoverageObservation(
+                slice_id="adjudicated-core",
+                scored_recording_count=10,
+                scored_duration_ms=1_200_000,
+            ),
+        ),
+    )
+    diagnostic = next(result for result in report.slice_results if result.slice_id == "diagnostic-unadjudicated")
+
+    assert report.status == "sufficient"
+    assert diagnostic.status == "diagnostic_only"
+    assert diagnostic.scored_recording_count == 0
+    assert diagnostic.scored_duration_ms == 0
+    assert diagnostic.reasons == ("diagnostic slice is not promoted through private acceptance protocol",)
+
+
+def test_required_coverage_targets_must_be_promoted_through_private_acceptance_protocol():
+    with pytest.raises(ValidationError, match="requires adjudicated slice: diagnostic-unadjudicated"):
+        _metadata(
+            coverage_plan=PrivateAcceptanceCoveragePlan(
+                plan_id="bad-private-coverage",
+                version="1",
+                targets=(_coverage_target("diagnostic-unadjudicated"),),
+            )
+        )
