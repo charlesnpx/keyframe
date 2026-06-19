@@ -218,6 +218,30 @@ def test_chunk_relative_time_basis_requires_validated_offset():
         _adapter().normalize_raw_output(payload, artifact=_artifact())
 
 
+def test_transform_offset_map_requires_source_artifact():
+    with pytest.raises(ValidationError, match="transform_offset_map requires source_artifact"):
+        _adapter().normalize_raw_output(
+            _payload("clean_provider.json"),
+            artifact=_artifact(),
+            transform_offset_map=_plus_100_offset_map(),
+        )
+
+
+def test_direct_timeline_match_does_not_apply_unused_transform_offset_map():
+    output = _adapter().normalize_raw_output(
+        _payload("clean_provider.json"),
+        artifact=_artifact(),
+        source_artifact=_artifact(),
+        transform_offset_map=_plus_100_offset_map(),
+    )
+
+    assert [(word.start_ms, word.end_ms) for word in output.words] == [
+        (0, 300),
+        (350, 650),
+        (800, 1050),
+    ]
+
+
 def test_chunk_relative_time_basis_applies_transform_offset_map_after_chunk_offset():
     payload = {
         "output_id": "chunk-relative-offset-map",

@@ -181,8 +181,13 @@ class CannedJsonEngineAdapter:
     ) -> NormalizedEngineOutput:
         if not isinstance(artifact, NormalizedArtifactProvenance):
             raise ValidationError("artifact must be a NormalizedArtifactProvenance")
+        active_offset_map = None
+        if transform_offset_map is not None and source_artifact is None:
+            raise ValidationError("transform_offset_map requires source_artifact")
         if source_artifact is not None:
-            validate_timeline_merge(source_artifact, artifact, offset_map=transform_offset_map)
+            merge_validation = validate_timeline_merge(source_artifact, artifact, offset_map=transform_offset_map)
+            if merge_validation.offset_map_id is not None:
+                active_offset_map = transform_offset_map
         payload = _validate_metadata(raw_output, "raw_engine_output")
         output_id = _require_id(payload.get("output_id"), "raw_engine_output.output_id")
         segments = _sequence(payload.get("segments", ()), "raw_engine_output.segments")
@@ -236,7 +241,7 @@ class CannedJsonEngineAdapter:
                     word_payload,
                     segment_payload=segment_payload,
                     artifact=artifact,
-                    offset_map=transform_offset_map,
+                    offset_map=active_offset_map,
                     field_name=f"raw_engine_output.segments[{index}].words[{word_index}]",
                 )
                 if end_ms <= start_ms:
