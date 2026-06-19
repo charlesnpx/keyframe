@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from keyframe.diarization.models import CanonicalWord, SpeakerSpan, ValidationError
-from keyframe.diarization.provenance import NormalizedArtifactProvenance
+from keyframe.diarization.provenance import NormalizedArtifactProvenance, TimelineOffsetMap, validate_timeline_merge
 
 
 EngineOutputKind = Literal["word_spans"]
@@ -28,6 +28,8 @@ class DiarizationEngineAdapter(Protocol):
         raw_output: dict[str, Any],
         *,
         artifact: NormalizedArtifactProvenance,
+        source_artifact: NormalizedArtifactProvenance | None = None,
+        transform_offset_map: TimelineOffsetMap | None = None,
     ) -> "NormalizedEngineOutput":
         """Convert one saved raw engine output into the canonical candidate contract."""
 
@@ -174,9 +176,13 @@ class CannedJsonEngineAdapter:
         raw_output: dict[str, Any],
         *,
         artifact: NormalizedArtifactProvenance,
+        source_artifact: NormalizedArtifactProvenance | None = None,
+        transform_offset_map: TimelineOffsetMap | None = None,
     ) -> NormalizedEngineOutput:
         if not isinstance(artifact, NormalizedArtifactProvenance):
             raise ValidationError("artifact must be a NormalizedArtifactProvenance")
+        if source_artifact is not None:
+            validate_timeline_merge(source_artifact, artifact, offset_map=transform_offset_map)
         payload = _validate_metadata(raw_output, "raw_engine_output")
         output_id = _require_id(payload.get("output_id"), "raw_engine_output.output_id")
         segments = _sequence(payload.get("segments", ()), "raw_engine_output.segments")
@@ -187,8 +193,18 @@ class CannedJsonEngineAdapter:
         speaker_spans: list[SpeakerSpan] = []
         raw_speaker_evidence: list[RawSpeakerEvidence] = []
         speaker_refs: dict[tuple[str | None, str], str] = {}
+        final_event_ids: set[str] = set()
+        seen_word_keys: set[tuple[str, int, int, str, str | None]] = set()
         for index, segment in enumerate(segments):
             segment_payload = _validate_metadata(segment, f"raw_engine_output.segments[{index}]")
+            event_status = _event_status(segment_payload)
+            event_id = _optional_id(segment_payload.get("event_id"), f"raw_engine_output.segments[{index}].event_id")
+            if event_status == "partial":
+                continue
+            if event_status == "final" and event_id is not None:
+                if event_id in final_event_ids:
+                    continue
+                final_event_ids.add(event_id)
             if "words" not in segment_payload:
                 raise ValidationError("raw_engine_output.segments[].words is required")
             channel_id = _optional_id(segment_payload.get("channel_id"), f"raw_engine_output.segments[{index}].channel_id")
@@ -216,18 +232,16 @@ class CannedJsonEngineAdapter:
                     word,
                     f"raw_engine_output.segments[{index}].words[{word_index}]",
                 )
-                start_ms = _require_non_negative_int(
-                    word_payload.get("start_ms"),
-                    f"raw_engine_output.segments[{index}].words[{word_index}].start_ms",
-                )
-                end_ms = _require_non_negative_int(
-                    word_payload.get("end_ms"),
-                    f"raw_engine_output.segments[{index}].words[{word_index}].end_ms",
+                start_ms, end_ms = _canonical_word_interval(
+                    word_payload,
+                    segment_payload=segment_payload,
+                    artifact=artifact,
+                    offset_map=transform_offset_map,
+                    field_name=f"raw_engine_output.segments[{index}].words[{word_index}]",
                 )
                 if end_ms <= start_ms:
                     raise ValidationError("raw_engine_output word end_ms must be greater than start_ms")
-                span_start_ms = start_ms if span_start_ms is None else min(span_start_ms, start_ms)
-                span_end_ms = end_ms if span_end_ms is None else max(span_end_ms, end_ms)
+                text = _require_text(word_payload.get("text"), "raw_engine_output.word.text")
                 word_speaker_id = _optional_id(
                     word_payload.get("speaker_id", raw_speaker_id),
                     f"raw_engine_output.segments[{index}].words[{word_index}].speaker_id",
@@ -243,10 +257,16 @@ class CannedJsonEngineAdapter:
                                 channel_id=channel_id,
                             )
                         )
+                word_key = (channel_id or "", start_ms, end_ms, text, word_speaker_ref)
+                if word_key in seen_word_keys:
+                    continue
+                seen_word_keys.add(word_key)
+                span_start_ms = start_ms if span_start_ms is None else min(span_start_ms, start_ms)
+                span_end_ms = end_ms if span_end_ms is None else max(span_end_ms, end_ms)
                 words.append(
                     CanonicalWord(
                         word_id=_stable_word_id(output_id, len(words)),
-                        text=_require_text(word_payload.get("text"), "raw_engine_output.word.text"),
+                        text=text,
                         start_ms=start_ms,
                         end_ms=end_ms,
                         speaker_ref=word_speaker_ref,
@@ -321,6 +341,86 @@ def _speaker_ref_for(
             suffix += 1
         speaker_refs[key] = speaker_ref
     return speaker_refs[key]
+
+
+def _event_status(segment_payload: dict[str, Any]) -> str:
+    status = segment_payload.get("event_status", segment_payload.get("status", "final"))
+    status = _require_id(status, "raw_engine_output.segment.event_status")
+    if status not in {"partial", "final"}:
+        raise ValidationError(f"raw_engine_output.segment.event_status is not supported: {status}")
+    return status
+
+
+def _canonical_word_interval(
+    word_payload: dict[str, Any],
+    *,
+    segment_payload: dict[str, Any],
+    artifact: NormalizedArtifactProvenance,
+    offset_map: TimelineOffsetMap | None,
+    field_name: str,
+) -> tuple[int, int]:
+    time_basis = _raw_time_basis(word_payload, segment_payload, artifact)
+    start = _raw_timestamp(word_payload, "start", field_name)
+    end = _raw_timestamp(word_payload, "end", field_name)
+    if end <= start:
+        raise ValidationError("raw_engine_output word end must be greater than start")
+    if time_basis == "canonical_ms":
+        return int(start), int(end)
+    if time_basis == "chunk_relative_ms":
+        chunk_start_ms = _chunk_start_ms(word_payload, segment_payload, offset_map, field_name)
+        return int(start + chunk_start_ms), int(end + chunk_start_ms)
+    if time_basis == "sample_index":
+        return (
+            round(start * 1000 / artifact.timeline.sample_rate_hz),
+            round(end * 1000 / artifact.timeline.sample_rate_hz),
+        )
+    if time_basis == "frame_index":
+        frame_rate = _frame_rate(word_payload, segment_payload, field_name)
+        return (round(start * 1000 / frame_rate), round(end * 1000 / frame_rate))
+    raise ValidationError(f"raw_engine_output time_basis is not supported: {time_basis}")
+
+
+def _raw_time_basis(
+    word_payload: dict[str, Any],
+    segment_payload: dict[str, Any],
+    artifact: NormalizedArtifactProvenance,
+) -> str:
+    value = word_payload.get("time_basis", segment_payload.get("time_basis", artifact.timeline.time_basis))
+    value = _require_id(value, "raw_engine_output.time_basis")
+    if value not in {"canonical_ms", "chunk_relative_ms", "sample_index", "frame_index"}:
+        raise ValidationError(f"raw_engine_output.time_basis is not supported: {value}")
+    return value
+
+
+def _raw_timestamp(word_payload: dict[str, Any], name: str, field_name: str) -> int:
+    key = f"{name}_ms"
+    if key not in word_payload:
+        key = f"{name}"
+    return _require_non_negative_int(word_payload.get(key), f"{field_name}.{key}")
+
+
+def _chunk_start_ms(
+    word_payload: dict[str, Any],
+    segment_payload: dict[str, Any],
+    offset_map: TimelineOffsetMap | None,
+    field_name: str,
+) -> int:
+    value = word_payload.get("chunk_start_ms", segment_payload.get("chunk_start_ms"))
+    if value is not None:
+        return _require_non_negative_int(value, f"{field_name}.chunk_start_ms")
+    if offset_map is not None:
+        return offset_map.convert_source_ms(0)
+    raise ValidationError("chunk_relative_ms requires chunk_start_ms or transform_offset_map")
+
+
+def _frame_rate(word_payload: dict[str, Any], segment_payload: dict[str, Any], field_name: str) -> float:
+    value = word_payload.get("frame_rate_fps", segment_payload.get("frame_rate_fps"))
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValidationError(f"{field_name}.frame_rate_fps must be a number")
+    value = float(value)
+    if not math.isfinite(value) or value <= 0:
+        raise ValidationError(f"{field_name}.frame_rate_fps must be greater than 0")
+    return value
 
 
 def _stable_word_id(output_id: str, index: int) -> str:

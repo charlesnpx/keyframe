@@ -1,0 +1,19 @@
+{
+  "output_id": "chunk-relative",
+  "segments": [
+    {
+      "channel_id": "ch-1",
+      "chunk_start_ms": 1000,
+      "speaker_id": "speaker-a",
+      "time_basis": "chunk_relative_ms",
+      "words": [
+        {
+          "end_ms": 300,
+          "start_ms": 100,
+          "text": "chunked",
+          "text_confidence": 0.98
+        }
+      ]
+    }
+  ]
+}

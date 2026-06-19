@@ -9,6 +9,8 @@ from keyframe.diarization import (
     DiarizationEngineAdapter,
     EngineConfigMetadata,
     NormalizedArtifactProvenance,
+    OffsetMapSegment,
+    TimelineOffsetMap,
     ValidationError,
 )
 
@@ -33,6 +35,24 @@ def _artifact():
             duration_ms=1_200,
             channel_ids=("ch-1",),
         ),
+    )
+
+
+def _artifact_with_timeline(**overrides):
+    timeline = {
+        "original_audio_id": "original-audio-local",
+        "canonical_audio_id": "canonical-audio-local",
+        "timeline_id": "candidate-timeline",
+        "transform_chain_id": "identity",
+        "sample_rate_hz": 16_000,
+        "duration_ms": 1_200,
+        "channel_ids": ("ch-1",),
+    }
+    timeline.update(overrides)
+    return NormalizedArtifactProvenance(
+        artifact_id="candidate-engine-output",
+        artifact_kind="candidate",
+        timeline=AudioTimelineProvenance(**timeline),
     )
 
 
@@ -160,3 +180,86 @@ def test_model_config_metadata_is_attached_to_normalized_output():
         "provider": "fixture-provider",
     }
     assert payload["artifact"]["artifact_kind"] == "candidate"
+
+
+def test_chunk_relative_time_basis_normalizes_to_canonical_ms_with_chunk_offset():
+    output = _adapter().normalize_raw_output(_payload("chunk_relative.json"), artifact=_artifact())
+
+    assert [(word.start_ms, word.end_ms) for word in output.words] == [(1100, 1300)]
+    assert [(span.start_ms, span.end_ms) for span in output.speaker_spans] == [(1100, 1300)]
+
+
+def test_chunk_relative_time_basis_requires_validated_offset():
+    payload = _payload("chunk_relative.json")
+    payload["segments"][0].pop("chunk_start_ms")
+
+    with pytest.raises(ValidationError, match="chunk_relative_ms requires"):
+        _adapter().normalize_raw_output(payload, artifact=_artifact())
+
+
+def test_resampled_frame_index_time_basis_converts_to_canonical_ms():
+    output = _adapter().normalize_raw_output(_payload("frame_index.json"), artifact=_artifact())
+
+    assert [(word.start_ms, word.end_ms) for word in output.words] == [(1000, 2000)]
+
+
+def test_streaming_partial_final_outputs_use_stable_events_without_duplicate_words():
+    output = _adapter().normalize_raw_output(_payload("streaming_partial_final.json"), artifact=_artifact())
+
+    assert [word.word_id for word in output.words] == [
+        "streaming-output:word:000001",
+        "streaming-output:word:000002",
+    ]
+    assert [word.text for word in output.words] == ["hello", "there"]
+    assert all(word.text != "hel" for word in output.words)
+
+
+def test_duplicate_chunks_do_not_duplicate_words():
+    output = _adapter().normalize_raw_output(_payload("duplicate_chunks.json"), artifact=_artifact())
+
+    assert [word.text for word in output.words] == ["repeat"]
+    assert [word.word_id for word in output.words] == ["duplicate-chunks:word:000001"]
+
+
+def test_timeline_mismatch_rejects_without_valid_offset_map():
+    source = _artifact_with_timeline(
+        timeline_id="vad-trimmed",
+        transform_chain_id="vad-trim",
+        duration_ms=900,
+    )
+    target = _artifact()
+
+    with pytest.raises(ValidationError, match="duration_ms conflicts"):
+        _adapter().normalize_raw_output(
+            _payload("clean_provider.json"),
+            artifact=target,
+            source_artifact=source,
+        )
+
+
+def test_timeline_mismatch_accepts_valid_transform_offset_map():
+    source = _artifact_with_timeline(
+        timeline_id="vad-trimmed",
+        transform_chain_id="vad-trim",
+        duration_ms=900,
+    )
+    target = _artifact()
+    offset_map = TimelineOffsetMap(
+        offset_map_id="vad-trim-to-canonical",
+        source_timeline_id="vad-trimmed",
+        target_timeline_id="candidate-timeline",
+        source_transform_chain_id="vad-trim",
+        target_transform_chain_id="identity",
+        source_time_basis="canonical_ms",
+        target_time_basis="canonical_ms",
+        segments=(OffsetMapSegment(0, 900, 100, 1000),),
+    )
+
+    output = _adapter().normalize_raw_output(
+        _payload("clean_provider.json"),
+        artifact=target,
+        source_artifact=source,
+        transform_offset_map=offset_map,
+    )
+
+    assert output.words[0].text == "hello"

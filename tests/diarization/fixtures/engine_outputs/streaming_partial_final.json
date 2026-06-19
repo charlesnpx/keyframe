@@ -1,0 +1,57 @@
+{
+  "output_id": "streaming-output",
+  "segments": [
+    {
+      "channel_id": "ch-1",
+      "event_id": "evt-1",
+      "event_status": "partial",
+      "speaker_id": "speaker-a",
+      "words": [
+        {
+          "end_ms": 200,
+          "start_ms": 0,
+          "text": "hel"
+        }
+      ]
+    },
+    {
+      "channel_id": "ch-1",
+      "event_id": "evt-1",
+      "event_status": "final",
+      "speaker_id": "speaker-a",
+      "words": [
+        {
+          "end_ms": 300,
+          "start_ms": 0,
+          "text": "hello"
+        }
+      ]
+    },
+    {
+      "channel_id": "ch-1",
+      "event_id": "evt-1",
+      "event_status": "final",
+      "speaker_id": "speaker-a",
+      "words": [
+        {
+          "end_ms": 300,
+          "start_ms": 0,
+          "text": "hello"
+        }
+      ]
+    },
+    {
+      "channel_id": "ch-1",
+      "event_id": "evt-2",
+      "event_status": "final",
+      "speaker_id": "speaker-b",
+      "words": [
+        {
+          "end_ms": 700,
+          "start_ms": 400,
+          "text": "there"
+        }
+      ]
+    }
+  ]
+}
