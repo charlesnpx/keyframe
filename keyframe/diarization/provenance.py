@@ -154,6 +154,14 @@ class AudioTransformManifest:
         )
         if self.transform_config_hash != expected_config_hash:
             raise ValidationError("audio_transform_manifest.transform_config_hash does not match config")
+        expected_transform_id = _content_addressed_transform_id(
+            branch_id=self.branch_id,
+            original_audio_sha256=self.original_audio_sha256,
+            canonical_audio_sha256=self.canonical_audio_sha256,
+            transform_config_hash=self.transform_config_hash,
+        )
+        if self.transform_id != expected_transform_id:
+            raise ValidationError("audio_transform_manifest.transform_id does not match content address")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -204,7 +212,11 @@ def sha256_bytes(payload: bytes) -> str:
 
 def sha256_file(path: str | Path) -> str:
     path = Path(path)
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def hash_audio_transform_config(config: AudioTransformConfig) -> str:

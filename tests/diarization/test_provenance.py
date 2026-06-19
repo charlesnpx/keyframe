@@ -6,6 +6,7 @@ from keyframe.diarization import (
     AudioChannelMapping,
     AudioTimelineProvenance,
     AudioTransformConfig,
+    AudioTransformManifest,
     NormalizedArtifactProvenance,
     OffsetMapSegment,
     TimelineOffsetMap,
@@ -19,6 +20,7 @@ from keyframe.diarization import (
     normalize_transform_command,
     read_recording_json,
     sha256_bytes,
+    sha256_file,
     validate_timeline_merge,
 )
 
@@ -161,6 +163,29 @@ def test_audio_transform_manifest_records_integrity_only_transform_details():
     assert "transform_manifest" not in rendered["timeline"]
     _assert_no_audio_hashes(rendered)
     _assert_no_audio_hashes(monitoring)
+
+
+def test_audio_transform_manifest_rejects_forged_transform_id():
+    config = _transform_config()
+
+    with pytest.raises(ValidationError, match="transform_id does not match content address"):
+        AudioTransformManifest(
+            transform_id="audio-transform:separate_tracks:forged",
+            branch_id="separate_tracks",
+            original_audio_id="original-audio-local",
+            canonical_audio_id="canonical-audio-local",
+            original_audio_sha256=sha256_bytes(b"original"),
+            canonical_audio_sha256=sha256_bytes(b"canonical"),
+            transform_config_hash=config.config_hash,
+            config=config,
+        )
+
+
+def test_sha256_file_hashes_file_content(tmp_path):
+    path = tmp_path / "audio.fake"
+    path.write_bytes(b"canonical audio bytes")
+
+    assert sha256_file(path) == sha256_bytes(b"canonical audio bytes")
 
 
 def test_mono_mix_transform_manifest_is_reproducible_and_branch_specific():
