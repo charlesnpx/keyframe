@@ -286,11 +286,12 @@ def build_evaluation_slices(
     scoring_intervals = _scoring_intervals(recording, policy)
     reference_spans = _spans_from_recording(recording)
     atoms = _atomic_intervals(scoring_intervals, reference_spans)
+    scoreable_atoms = _policy_scoreable_reference_atoms(atoms, reference_spans, policy)
 
     overlap_intervals: list[EvaluationInterval] = []
     non_overlap_intervals: list[EvaluationInterval] = []
     speaker_count_intervals: dict[str, list[EvaluationInterval]] = {key: [] for key in ("0", "1", "2", "3_plus")}
-    for atom in atoms:
+    for atom in scoreable_atoms:
         active = _active_spans(reference_spans, atom)
         count = len({span.speaker_ref for span in active})
         has_overlap = count > 1 or any(span.overlap for span in active)
@@ -301,12 +302,18 @@ def build_evaluation_slices(
         speaker_count_intervals[_speaker_count_bucket(count)].append(atom)
 
     turn_duration_intervals = {
-        "short": _turn_duration_intervals(reference_spans, scoring_intervals, short=True),
-        "long": _turn_duration_intervals(reference_spans, scoring_intervals, short=False),
+        "short": _clip_intervals_to_regions(
+            _turn_duration_intervals(reference_spans, scoring_intervals, short=True),
+            scoreable_atoms,
+        ),
+        "long": _clip_intervals_to_regions(
+            _turn_duration_intervals(reference_spans, scoring_intervals, short=False),
+            scoreable_atoms,
+        ),
     }
     channel_mode = "mono" if len(recording.channels) <= 1 else "multichannel"
     channel_mode_intervals = {"mono": [], "multichannel": []}
-    channel_mode_intervals[channel_mode] = list(scoring_intervals)
+    channel_mode_intervals[channel_mode] = list(scoreable_atoms)
 
     slices = [
         _slice("overlap", "overlap", tuple(overlap_intervals), minimum_support_ms),
@@ -314,7 +321,10 @@ def build_evaluation_slices(
         _slice(
             "speaker_change_boundary",
             "within_collar",
-            _speaker_change_boundary_intervals(reference_spans, scoring_intervals, policy.collar_ms),
+            _clip_intervals_to_regions(
+                _speaker_change_boundary_intervals(reference_spans, scoring_intervals, policy.collar_ms),
+                scoreable_atoms,
+            ),
             minimum_support_ms,
         ),
         _slice("turn_duration", "short", tuple(turn_duration_intervals["short"]), minimum_support_ms),
@@ -415,10 +425,15 @@ def _validate_candidate_timeline(recording: CanonicalRecording, candidate: Norma
     timeline = candidate.artifact.timeline
     if timeline.time_basis != "canonical_ms" or recording.time_basis != "canonical_ms":
         raise ValidationError("central evaluator requires canonical_ms timelines")
+    channel_ids = set(timeline.channel_ids)
     for span in candidate.speaker_spans:
+        if span.channel_id is not None and span.channel_id not in channel_ids:
+            raise ValidationError("candidate speaker span channel_id conflicts with reference channel layout")
         if span.end_ms > recording.duration_ms:
             raise ValidationError("candidate speaker span ends after reference duration")
     for word in candidate.words:
+        if word.channel_id is not None and word.channel_id not in channel_ids:
+            raise ValidationError("candidate word channel_id conflicts with reference channel layout")
         if word.end_ms > recording.duration_ms:
             raise ValidationError("candidate word ends after reference duration")
 
@@ -493,6 +508,20 @@ def _active_spans(spans: tuple[_SpanView, ...], interval: EvaluationInterval) ->
         for span in spans
         if _channels_match(span.channel_id, interval.channel_id)
         and min(span.end_ms, interval.end_ms) > max(span.start_ms, interval.start_ms)
+    )
+
+
+def _policy_scoreable_reference_atoms(
+    atoms: tuple[EvaluationInterval, ...],
+    reference_spans: tuple[_SpanView, ...],
+    policy: ScoringPolicyManifest,
+) -> tuple[EvaluationInterval, ...]:
+    if policy.score_overlap:
+        return atoms
+    return tuple(
+        atom
+        for atom in atoms
+        if not _is_reference_overlap(_active_spans(reference_spans, atom))
     )
 
 
@@ -694,6 +723,16 @@ def _clip_interval_to_regions(
         channel_id = region.channel_id if region.channel_id is not None else interval.channel_id
         clipped.append(EvaluationInterval(start_ms, end_ms, channel_id))
     return tuple(clipped)
+
+
+def _clip_intervals_to_regions(
+    intervals: tuple[EvaluationInterval, ...],
+    regions: tuple[EvaluationInterval, ...],
+) -> tuple[EvaluationInterval, ...]:
+    clipped: list[EvaluationInterval] = []
+    for interval in intervals:
+        clipped.extend(_clip_interval_to_regions(interval, regions))
+    return _normalize_intervals(tuple(clipped))
 
 
 def _slice(

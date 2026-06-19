@@ -147,6 +147,37 @@ def test_candidate_from_different_recording_is_rejected_even_with_same_duration(
         evaluate_diarization_candidate(_reference_bundle(recording), candidate)
 
 
+def test_candidate_channels_must_match_reference_channel_layout():
+    recording = _recording()
+    reference = _reference_bundle(recording)
+    candidate = _candidate_output(
+        recording,
+        {
+            "spk-a": "engine:local:speaker-2",
+            "spk-b": "engine:local:speaker-1",
+        },
+    )
+    bad_span_channel = replace(
+        candidate,
+        speaker_spans=(
+            replace(candidate.speaker_spans[0], channel_id="not-a-channel"),
+            candidate.speaker_spans[1],
+        ),
+    )
+    bad_word_channel = replace(
+        candidate,
+        words=(
+            replace(candidate.words[0], channel_id="not-a-channel"),
+            candidate.words[1],
+        ),
+    )
+
+    with pytest.raises(ValidationError, match="speaker span channel_id conflicts"):
+        evaluate_diarization_candidate(reference, bad_span_channel)
+    with pytest.raises(ValidationError, match="word channel_id conflicts"):
+        evaluate_diarization_candidate(reference, bad_word_channel)
+
+
 def test_large_speaker_assignment_fails_closed_instead_of_using_greedy_mapping():
     recording = _many_speaker_recording()
     candidate = _candidate_output(
@@ -251,11 +282,15 @@ def test_product_policy_excludes_single_speaker_regions_flagged_as_overlap():
         scoring_policy=default_scoring_policy("product_transcript"),
     )
     metrics = result.recording_metrics[0].metrics
+    overlap_row = {row.slice_id: row for row in result.slice_metrics}["overlap:overlap"]
 
     assert result.speaker_mapping == {"engine:local:speaker-1": "spk-b"}
     assert metrics["reference_speaker_ms"] == 400
     assert metrics["matched_speaker_ms"] == 400
     assert metrics["speaker_label_accuracy"] == 1.0
+    assert overlap_row.status == "insufficient_support"
+    assert overlap_row.support_ms == 0
+    assert overlap_row.metrics == {}
 
 
 def test_speaker_mapping_stays_in_score_artifact_not_candidate_or_rendered_transcript():
