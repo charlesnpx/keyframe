@@ -2,6 +2,7 @@ import pytest
 
 from keyframe.diarization import (
     AudioTimelineProvenance,
+    BranchAcceptanceRecord,
     CandidateBundle,
     CanonicalRecording,
     CanonicalWord,
@@ -494,6 +495,44 @@ def test_mono_mix_asr_only_degraded_fallback_keeps_text_without_speaker_labels()
     assert [word.text for word in transcript.words] == ["hello", "there", "together"]
     assert all(word.label is None and word.display_label is None for word in transcript.words)
     assert all(turn.label is None and turn.display_label is None for turn in transcript.turns)
+
+
+def test_mono_mix_runners_reject_serialized_candidate_payloads():
+    bundle_payload = _mono_mix_bundle().to_dict()
+
+    with pytest.raises(ValidationError, match="candidate_bundle must be a CandidateBundle"):
+        run_mono_mix_branch(
+            bundle_payload,
+            asr_output=_mono_mix_asr_output(),
+            diarization_output=_mono_mix_diarization_output(),
+        )
+
+    with pytest.raises(ValidationError, match="candidate_bundle must be a CandidateBundle"):
+        build_asr_only_degraded_baseline(
+            bundle_payload,
+            asr_output=_mono_mix_asr_output(),
+        )
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ("quality_delta", "false_confidence_delta", "review_burden_delta"),
+)
+def test_branch_acceptance_record_requires_enforced_metric_deltas(field_name):
+    values = {
+        "branch_id": "mono_mix",
+        "decision": "accept_complex_branch",
+        "quality_delta": 0.1,
+        "false_confidence_delta": 0.0,
+        "review_burden_delta": -0.1,
+        "quality_gate_passed": True,
+        "false_confidence_gate_passed": True,
+        "review_burden_gate_passed": True,
+    }
+    values[field_name] = None
+
+    with pytest.raises(ValidationError, match=f"acceptance.{field_name} must be a number"):
+        BranchAcceptanceRecord(**values)
 
 
 def test_mono_mix_acceptance_decision_enforces_only_quality_false_confidence_and_review_burden():

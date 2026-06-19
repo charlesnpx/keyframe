@@ -159,11 +159,13 @@ class BranchAcceptanceRecord:
     def __post_init__(self) -> None:
         object.__setattr__(self, "branch_id", _validate_pipeline_branch_id(self.branch_id))
         object.__setattr__(self, "decision", _validate_pipeline_branch_decision(self.decision))
-        for field_name in ("quality_delta", "false_confidence_delta", "review_burden_delta", "cost_delta"):
-            value = getattr(self, field_name)
-            if value is not None:
-                object.__setattr__(self, field_name, _finite_number(value, f"acceptance.{field_name}"))
-        for field_name in ("job_failure_delta", "retry_delta"):
+        for field_name in ("quality_delta", "false_confidence_delta", "review_burden_delta"):
+            object.__setattr__(
+                self,
+                field_name,
+                _finite_number(getattr(self, field_name), f"acceptance.{field_name}"),
+            )
+        for field_name in ("cost_delta", "job_failure_delta", "retry_delta"):
             value = getattr(self, field_name)
             if value is not None:
                 object.__setattr__(self, field_name, _finite_number(value, f"acceptance.{field_name}"))
@@ -279,6 +281,8 @@ def run_mono_mix_branch(
     """Merge mono-mix ASR words with diarization spans for rendered transcript evaluation."""
 
     branch_id: PipelineBranchId = "mono_mix"
+    if not isinstance(candidate_bundle, CandidateBundle):
+        raise ValidationError("candidate_bundle must be a CandidateBundle")
     validate_pipeline_branch_candidate_inputs(branch_id, candidate_bundle)
     _validate_mono_mix_engine_outputs(candidate_bundle, asr_output=asr_output, diarization_output=diarization_output)
     result_output_id = _require_id(output_id or f"{candidate_bundle.bundle_id}:mono_mix", "pipeline.output_id")
@@ -319,6 +323,8 @@ def build_asr_only_degraded_baseline(
     """Build an ASR-only degraded transcript baseline for the mono-mix branch."""
 
     branch_id: PipelineBranchId = "mono_mix"
+    if not isinstance(candidate_bundle, CandidateBundle):
+        raise ValidationError("candidate_bundle must be a CandidateBundle")
     validate_pipeline_branch_candidate_inputs(branch_id, candidate_bundle)
     _validate_mono_mix_engine_output(candidate_bundle, asr_output, "asr_output")
     result_output_id = _require_id(
