@@ -215,7 +215,13 @@ class BenchmarkGateConfig:
     budgets: tuple[BenchmarkRegressionBudget, ...] = ()
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "budgets", _tuple_of(self.budgets, BenchmarkRegressionBudget, "gate_config.budgets"))
+        budgets = _tuple_of(self.budgets, BenchmarkRegressionBudget, "gate_config.budgets")
+        seen: set[str] = set()
+        for budget in budgets:
+            if budget.budget_id in seen:
+                raise ValidationError(f"gate_config.budgets contains duplicate budget_id: {budget.budget_id}")
+            seen.add(budget.budget_id)
+        object.__setattr__(self, "budgets", budgets)
 
     def to_dict(self) -> dict[str, Any]:
         return {"budgets": [budget.to_dict() for budget in self.budgets]}
@@ -682,6 +688,14 @@ class BenchmarkReport:
             CriticalSpanDiagnosticScore,
         ):
             raise ValidationError("benchmark_report.critical_span_diagnostic must be a CriticalSpanDiagnosticScore")
+        metric_results = self.metric_results
+        if not metric_results:
+            raise ValidationError("benchmark_report requires at least one metric result")
+        has_failure = _has_failed_gate(metric_results, self.critical_span_diagnostic)
+        if self.status == "passed" and has_failure:
+            raise ValidationError("passed benchmark reports cannot include failed gates")
+        if self.status == "failed" and not has_failure:
+            raise ValidationError("failed benchmark reports must include failed gates")
 
     @property
     def metric_results(self) -> tuple[BenchmarkMetricResult, ...]:

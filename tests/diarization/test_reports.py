@@ -496,6 +496,51 @@ def test_report_json_rejects_unsupported_schema_versions():
         benchmark_report_json_loads(json.dumps(payload))
 
 
+def test_report_json_rejects_status_that_conflicts_with_failed_gates():
+    report = build_benchmark_report(
+        "tampered-status",
+        (
+            _case("rec-1", current_der=0.05, baseline_der=0.05, current_overlap_der=0.13, baseline_overlap_der=0.10),
+        ),
+        gate_config=BenchmarkGateConfig(
+            budgets=(
+                BenchmarkRegressionBudget(
+                    budget_id="overlap-der",
+                    metric_name="diarization_error_rate",
+                    budget_kind="overlap",
+                    direction="lower_is_better",
+                    max_regression_delta=0.01,
+                    scope_type="slice",
+                    slice_id="overlap:true",
+                ),
+            )
+        ),
+    )
+    payload = report.to_dict()
+    payload["status"] = "passed"
+
+    with pytest.raises(ValidationError, match="passed benchmark reports cannot include failed gates"):
+        benchmark_report_json_loads(json.dumps(payload))
+
+
+def test_gate_config_rejects_duplicate_budget_ids():
+    with pytest.raises(ValidationError, match="duplicate budget_id"):
+        BenchmarkGateConfig(
+            budgets=(
+                BenchmarkRegressionBudget(
+                    budget_id="duplicate",
+                    metric_name="diarization_error_rate",
+                    max_regression_delta=0.01,
+                ),
+                BenchmarkRegressionBudget(
+                    budget_id="duplicate",
+                    metric_name="speaker_label_accuracy",
+                    max_regression_delta=0.01,
+                ),
+            )
+        )
+
+
 def test_review_signal_calibration_reports_serious_and_minor_breakdowns():
     calibration = calibrate_review_signals(_signals())
 
