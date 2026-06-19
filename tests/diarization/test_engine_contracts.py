@@ -683,6 +683,21 @@ def test_google_cumulative_streaming_finals_replace_prior_word_metadata_without_
     assert [word.speaker_ref for word in output.words] == ["engine:ch-1:2", "engine:ch-1:2"]
 
 
+def test_google_channel_tag_overrides_root_channel_fallback_for_multichannel_outputs():
+    payload = _payload("google_speech_provider.json")
+    payload["channel_id"] = "left"
+    for result in payload["results"]:
+        result["channelTag"] = 2
+
+    output = _hosted_adapter("google_speech").normalize_raw_output(
+        payload,
+        artifact=_provider_artifact(channel_ids=("left", "right")),
+    )
+
+    assert [word.channel_id for word in output.words] == ["right", "right"]
+    assert [word.speaker_ref for word in output.words] == ["engine:right:1", "engine:right:2"]
+
+
 def test_deepgram_saved_output_keeps_same_speaker_ids_channel_local():
     output = _hosted_adapter("deepgram").normalize_raw_output(
         _payload("deepgram_provider.json"),
@@ -707,6 +722,32 @@ def test_aws_channel_labels_map_to_canonical_artifact_channels():
     output = _hosted_adapter("aws_transcribe").normalize_raw_output(payload, artifact=_provider_artifact())
 
     assert [word.channel_id for word in output.words] == ["ch-1", "ch-1", "ch-1"]
+    assert [word.speaker_ref for word in output.words] == [
+        "engine:ch-1:spk-0",
+        "engine:ch-1:spk-0",
+        "engine:ch-1:spk-1",
+    ]
+
+
+def test_aws_speaker_labels_sidecar_normalizes_speaker_metadata():
+    payload = _payload("aws_transcribe_provider.json")
+    for item in payload["results"]["items"]:
+        item.pop("speaker_label", None)
+    payload["results"]["speaker_labels"] = {
+        "segments": [
+            {
+                "items": [
+                    {"end_time": "0.30", "speaker_label": "spk_0", "start_time": "0.00"},
+                    {"end_time": "0.64", "speaker_label": "spk_0", "start_time": "0.34"},
+                    {"end_time": "1.08", "speaker_label": "spk_1", "start_time": "0.80"},
+                ],
+                "speaker_label": "spk_0",
+            }
+        ]
+    }
+
+    output = _hosted_adapter("aws_transcribe").normalize_raw_output(payload, artifact=_provider_artifact())
+
     assert [word.speaker_ref for word in output.words] == [
         "engine:ch-1:spk-0",
         "engine:ch-1:spk-0",

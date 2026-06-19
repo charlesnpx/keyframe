@@ -913,6 +913,7 @@ def _aws_provider_words(
 ) -> tuple[CanonicalWord, ...]:
     results = _validate_metadata(payload.get("results"), "hosted_provider_output.results")
     items = _sequence(results.get("items"), "hosted_provider_output.results.items")
+    speaker_labels = _aws_speaker_labels_by_interval(results, offset_map=offset_map)
     words: list[CanonicalWord] = []
     for index, item in enumerate(items):
         context = f"hosted_provider_output.results.items[{index}]"
@@ -922,7 +923,11 @@ def _aws_provider_words(
         channel_id = _provider_channel_id(payload, value, artifact, context)
         start_ms, end_ms = _provider_interval_ms(value, context, offset_map)
         text = _aws_word_text(value, context)
-        raw_speaker_id = _provider_speaker_id(value, context, keys=("speaker_label", "speaker", "speaker_id"))
+        raw_speaker_id = _provider_speaker_id(
+            value,
+            context,
+            keys=("speaker_label", "speaker", "speaker_id"),
+        ) or speaker_labels.get((start_ms, end_ms))
         speaker_ref = _provider_speaker_ref(
             raw_speaker_id,
             channel_id=channel_id,
@@ -1092,6 +1097,41 @@ def _aws_word_alternative(payload: dict[str, Any], context: str) -> dict[str, An
     return _validate_metadata(alternatives[0], f"{context}.alternatives[0]")
 
 
+def _aws_speaker_labels_by_interval(
+    results: dict[str, Any],
+    *,
+    offset_map: TimelineOffsetMap | None,
+) -> dict[tuple[int, int], str]:
+    value = results.get("speaker_labels")
+    if value is None:
+        return {}
+    speaker_labels = _validate_metadata(value, "hosted_provider_output.results.speaker_labels")
+    labels: dict[tuple[int, int], str] = {}
+    segments = _sequence(
+        speaker_labels.get("segments", ()),
+        "hosted_provider_output.results.speaker_labels.segments",
+    )
+    for segment_index, segment_item in enumerate(segments):
+        segment = _validate_metadata(
+            segment_item,
+            f"hosted_provider_output.results.speaker_labels.segments[{segment_index}]",
+        )
+        items = _sequence(
+            segment.get("items", ()),
+            f"hosted_provider_output.results.speaker_labels.segments[{segment_index}].items",
+        )
+        for item_index, item in enumerate(items):
+            context = (
+                "hosted_provider_output.results.speaker_labels"
+                f".segments[{segment_index}].items[{item_index}]"
+            )
+            payload = _validate_metadata(item, context)
+            start_ms, end_ms = _provider_interval_ms(payload, context, offset_map)
+            speaker_label = _require_id(payload.get("speaker_label"), f"{context}.speaker_label")
+            labels[(start_ms, end_ms)] = speaker_label
+    return labels
+
+
 def _provider_channel_id(
     root_payload: dict[str, Any],
     payload: dict[str, Any],
@@ -1100,7 +1140,7 @@ def _provider_channel_id(
     *,
     provider_channel_index: int | None = None,
 ) -> str:
-    value = payload.get("channel_id", root_payload.get("channel_id"))
+    value = payload.get("channel_id")
     if value is not None:
         return _require_id(str(value), f"{context}.channel_id")
     if "channelTag" in payload:
@@ -1110,6 +1150,9 @@ def _provider_channel_id(
         return _aws_channel_label_to_artifact_channel(payload.get("channel_label"), artifact, context)
     if provider_channel_index is not None:
         return _artifact_channel_id(artifact, provider_channel_index, context)
+    value = root_payload.get("channel_id")
+    if value is not None:
+        return _require_id(str(value), "hosted_provider_output.channel_id")
     if len(artifact.timeline.channel_ids) == 1:
         return artifact.timeline.channel_ids[0]
     raise ValidationError(f"{context}.channel_id is required for multi-channel artifacts")
