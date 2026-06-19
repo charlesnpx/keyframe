@@ -1,10 +1,12 @@
 {
   "applied_overlay_ids": [],
-  "recording_id": "fixture-overlap",
+  "recording_id": "fixture-degraded-output",
   "review_reasons": [
-    "overlap_detected"
+    "speaker_attribution_unavailable",
+    "low_speaker_confidence",
+    "manual_review_required"
   ],
-  "speaker_attribution": "unreliable",
+  "speaker_attribution": "unavailable",
   "state": "needs_review",
   "turns": [
     {
@@ -16,15 +18,15 @@
         "source": "diarization_cluster",
         "source_ref": null
       },
-      "end_ms": 400,
+      "end_ms": 300,
       "label": "person_1",
-      "overlap": true,
+      "overlap": false,
       "review_reasons": [
-        "overlap_detected"
+        "low_speaker_confidence"
       ],
       "speaker_attribution": "unreliable",
       "start_ms": 100,
-      "text": "yes",
+      "text": "[inaudible]",
       "turn_id": "turn_1",
       "uncertain": false,
       "word_ids": [
@@ -33,24 +35,18 @@
     },
     {
       "channel_id": "ch-1",
-      "display_label": {
-        "confidence": null,
-        "label": "person_2",
-        "scope": "recording",
-        "source": "diarization_cluster",
-        "source_ref": null
-      },
-      "end_ms": 550,
-      "label": "person_2",
-      "overlap": true,
+      "display_label": null,
+      "end_ms": 900,
+      "label": null,
+      "overlap": false,
       "review_reasons": [
-        "overlap_detected"
+        "speaker_attribution_unavailable"
       ],
-      "speaker_attribution": "unreliable",
-      "start_ms": 250,
-      "text": "right",
+      "speaker_attribution": "unavailable",
+      "start_ms": 700,
+      "text": "fragment",
       "turn_id": "turn_2",
-      "uncertain": false,
+      "uncertain": true,
       "word_ids": [
         "w-2"
       ]
@@ -66,39 +62,33 @@
         "source": "diarization_cluster",
         "source_ref": null
       },
-      "end_ms": 400,
+      "end_ms": 300,
       "label": "person_1",
-      "overlap": true,
+      "overlap": false,
       "review_reasons": [
-        "overlap_detected"
+        "low_speaker_confidence"
       ],
       "speaker_attribution": "unreliable",
-      "speaker_confidence": 0.8,
+      "speaker_confidence": 0.1,
       "start_ms": 100,
-      "text": "yes",
+      "text": "[inaudible]",
       "uncertain": false,
       "word_id": "w-1"
     },
     {
       "channel_id": "ch-1",
-      "display_label": {
-        "confidence": null,
-        "label": "person_2",
-        "scope": "recording",
-        "source": "diarization_cluster",
-        "source_ref": null
-      },
-      "end_ms": 550,
-      "label": "person_2",
-      "overlap": true,
+      "display_label": null,
+      "end_ms": 900,
+      "label": null,
+      "overlap": false,
       "review_reasons": [
-        "overlap_detected"
+        "speaker_attribution_unavailable"
       ],
-      "speaker_attribution": "unreliable",
-      "speaker_confidence": 0.82,
-      "start_ms": 250,
-      "text": "right",
-      "uncertain": false,
+      "speaker_attribution": "unavailable",
+      "speaker_confidence": null,
+      "start_ms": 700,
+      "text": "fragment",
+      "uncertain": true,
       "word_id": "w-2"
     }
   ]

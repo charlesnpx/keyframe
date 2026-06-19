@@ -319,3 +319,84 @@ def test_rendered_transcript_payload_preserves_word_ids_and_overlay_provenance()
     assert payload["applied_overlay_ids"] == ["op-z-uncertain", "op-a-overlap"]
     assert payload["turns"][0]["word_ids"] == ["w-1"]
     assert payload["words"][0]["word_id"] == "w-1"
+
+
+def test_missing_speaker_confidence_is_unknown_review_evidence_not_confident():
+    recording = _recording(
+        words=(
+            CanonicalWord("w-1", "uncertain", 0, 100, speaker_ref="spk-a", channel_id="ch-1"),
+        )
+    )
+
+    transcript = render_transcript(recording)
+
+    assert transcript.state == "needs_review"
+    assert transcript.review_reasons == ("missing_speaker_confidence",)
+    assert transcript.speaker_attribution == "unreliable"
+    assert transcript.words[0].speaker_attribution == "unreliable"
+    assert transcript.words[0].review_reasons == ("missing_speaker_confidence",)
+    assert transcript.words[0].label == "person_1"
+
+
+def test_low_confidence_and_overlap_flags_route_to_needs_review_reasons():
+    recording = _recording(
+        words=(
+            CanonicalWord(
+                "w-1",
+                "borderline",
+                0,
+                100,
+                speaker_ref="spk-a",
+                channel_id="ch-1",
+                speaker_confidence=0.2,
+                overlap=True,
+            ),
+        )
+    )
+
+    transcript = render_transcript(recording, min_speaker_confidence=0.5)
+
+    assert transcript.state == "needs_review"
+    assert transcript.review_reasons == ("low_speaker_confidence", "overlap_detected")
+    assert transcript.turns[0].review_reasons == ("low_speaker_confidence", "overlap_detected")
+    assert transcript.words[0].speaker_attribution == "unreliable"
+
+
+def test_speaker_attribution_unavailable_state_keeps_text_without_labels():
+    transcript = render_transcript(_recording(), degraded_state="speaker_attribution_unavailable")
+
+    assert transcript.state == "speaker_attribution_unavailable"
+    assert transcript.speaker_attribution == "unavailable"
+    assert transcript.review_reasons == ("speaker_attribution_unavailable",)
+    assert transcript.turns[0].text == "hello there"
+    assert transcript.turns[0].label is None
+    assert transcript.turns[0].display_label is None
+    assert all(word.label is None and word.display_label is None for word in transcript.words)
+
+
+def test_diagnostic_and_unsupported_states_render_transcript_only_output():
+    for state, expected_reasons in (
+        ("diagnostic_only", ("diagnostic_only", "speaker_attribution_unavailable")),
+        ("unsupported", ("unsupported", "speaker_attribution_unavailable")),
+    ):
+        transcript = render_transcript(_recording(), degraded_state=state)
+
+        assert transcript.state == state
+        assert transcript.speaker_attribution == "unavailable"
+        assert transcript.review_reasons == expected_reasons
+        assert transcript.words[0].text == "hello"
+        assert all(turn.label is None for turn in transcript.turns)
+
+
+def test_abstention_state_survives_correction_overlay_rendering():
+    transcript = render_transcript(
+        _recording(),
+        degraded_state="diagnostic_only",
+        overlays=(RenameLabelOverlay(operation_id="op-rename", speaker_ref="spk-a", label="Alex"),),
+    )
+
+    assert transcript.state == "diagnostic_only"
+    assert transcript.speaker_attribution == "unavailable"
+    assert transcript.applied_overlay_ids == ("op-rename",)
+    assert transcript.words[0].label is None
+    assert transcript.words[0].display_label is None
