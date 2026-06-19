@@ -14,6 +14,7 @@ from keyframe.diarization.manifests import (
     scoring_policy_report_provenance,
 )
 from keyframe.diarization.models import CanonicalRecording, CanonicalWord, SpeakerSpan, ValidationError
+from keyframe.diarization.provenance import AudioTimelineProvenance
 
 
 EvaluationSliceStatus = Literal["ready", "insufficient_support"]
@@ -526,8 +527,11 @@ def _validate_candidate_timeline(
     candidate: NormalizedEngineOutput,
     policy: ScoringPolicyManifest,
 ) -> None:
-    candidate.artifact.timeline.assert_consistent_with_recording(recording)
     timeline = candidate.artifact.timeline
+    if policy.channel_mode == "mono_mix" and len(recording.channels) > 1:
+        _validate_mono_mix_candidate_timeline(recording, timeline)
+    else:
+        timeline.assert_consistent_with_recording(recording)
     if timeline.time_basis != "canonical_ms" or recording.time_basis != "canonical_ms":
         raise ValidationError("central evaluator requires canonical_ms timelines")
     channel_ids = set(timeline.channel_ids)
@@ -551,6 +555,28 @@ def _validate_candidate_timeline(
             raise ValidationError("candidate word channel_id conflicts with reference channel layout")
         if word.end_ms > recording.duration_ms:
             raise ValidationError("candidate word ends after reference duration")
+
+
+def _validate_mono_mix_candidate_timeline(
+    recording: CanonicalRecording,
+    timeline: AudioTimelineProvenance,
+) -> None:
+    if timeline.original_audio_id != recording.original_audio_id:
+        raise ValidationError("original_audio_id conflicts between artifacts")
+    if timeline.canonical_audio_id != recording.canonical_audio_id:
+        raise ValidationError("canonical_audio_id conflicts between artifacts")
+    if timeline.timeline_id != recording.timeline_id:
+        raise ValidationError("recording timeline_id conflicts with provenance")
+    if timeline.transform_chain_id != f"{recording.transform_chain_id}-mono-mix":
+        raise ValidationError("mono-mix candidate transform_chain_id conflicts with reference")
+    if timeline.sample_rate_hz != recording.sample_rate_hz:
+        raise ValidationError("sample_rate_hz conflicts between artifacts")
+    if timeline.duration_ms != recording.duration_ms:
+        raise ValidationError("duration_ms conflicts between artifacts")
+    if timeline.channel_ids != ("mono-mix",):
+        raise ValidationError("mono-mix scoring requires candidate mono-mix channel layout")
+    if timeline.time_basis != recording.time_basis:
+        raise ValidationError("recording time_basis conflicts with provenance")
 
 
 def _scoring_intervals(recording: CanonicalRecording, policy: ScoringPolicyManifest) -> tuple[EvaluationInterval, ...]:

@@ -222,6 +222,118 @@ def test_candidate_channels_must_match_reference_channel_layout():
         evaluate_diarization_candidate(reference, bad_word_channel)
 
 
+def test_mono_mix_scoring_accepts_mono_mix_candidate_timeline_for_multichannel_reference():
+    recording = _recording()
+    multichannel = replace(
+        recording,
+        channels=(
+            recording.channels[0],
+            ChannelRecord("ch-2", "second"),
+        ),
+        words=(),
+        speakers=(recording.speakers[0],),
+        speaker_spans=(
+            SpeakerSpan(
+                span_id="span-1",
+                speaker_ref="spk-a",
+                start_ms=0,
+                end_ms=1_000,
+                channel_id="ch-1",
+            ),
+            SpeakerSpan(
+                span_id="span-2",
+                speaker_ref="spk-a",
+                start_ms=0,
+                end_ms=1_000,
+                channel_id="ch-2",
+            ),
+        ),
+        scoring_regions=(ScoringRegion("uem-all", 0, 1_000, channel_id=None),),
+    )
+    candidate = _candidate_output(multichannel, {"spk-a": "engine:mono:speaker-1"})
+    mono_timeline = replace(
+        candidate.artifact.timeline,
+        channel_ids=("mono-mix",),
+        transform_chain_id=f"{multichannel.transform_chain_id}-mono-mix",
+    )
+    mono_candidate = replace(
+        candidate,
+        artifact=replace(candidate.artifact, timeline=mono_timeline),
+        speaker_spans=(
+            SpeakerSpan(
+                span_id="candidate-mono-span",
+                speaker_ref="engine:mono:speaker-1",
+                start_ms=0,
+                end_ms=1_000,
+                channel_id="mono-mix",
+            ),
+        ),
+    )
+    policy = _scoring_policy(
+        channel_mode="mono_mix",
+        collar_ms=0,
+        metric_set=("reference_speaker_ms", "matched_speaker_ms", "diarization_error_rate"),
+    )
+
+    result = evaluate_diarization_candidate(
+        _reference_bundle(multichannel),
+        mono_candidate,
+        scoring_policy=policy,
+    )
+    metrics = result.recording_metrics[0].metrics
+
+    assert result.speaker_mapping == {"engine:mono:speaker-1": "spk-a"}
+    assert metrics["reference_speaker_ms"] == 1_000
+    assert metrics["matched_speaker_ms"] == 1_000
+    assert metrics["diarization_error_rate"] == 0.0
+
+
+def test_mono_mix_scoring_rejects_stale_transform_chain():
+    recording = _recording()
+    multichannel = replace(
+        recording,
+        channels=(
+            recording.channels[0],
+            ChannelRecord("ch-2", "second"),
+        ),
+        words=(),
+        speakers=(recording.speakers[0],),
+        speaker_spans=(
+            SpeakerSpan(
+                span_id="span-1",
+                speaker_ref="spk-a",
+                start_ms=0,
+                end_ms=1_000,
+                channel_id="ch-1",
+            ),
+        ),
+    )
+    candidate = _candidate_output(multichannel, {"spk-a": "engine:mono:speaker-1"})
+    stale_timeline = replace(
+        candidate.artifact.timeline,
+        channel_ids=("mono-mix",),
+        transform_chain_id=multichannel.transform_chain_id,
+    )
+    stale_candidate = replace(
+        candidate,
+        artifact=replace(candidate.artifact, timeline=stale_timeline),
+        speaker_spans=(
+            replace(
+                candidate.speaker_spans[0],
+                channel_id="mono-mix",
+            ),
+        ),
+    )
+    policy = _scoring_policy(channel_mode="mono_mix", collar_ms=0)
+
+    with pytest.raises(ValidationError, match="mono-mix candidate transform_chain_id conflicts"):
+        evaluate_diarization_candidate(
+            _reference_bundle(multichannel),
+            stale_candidate,
+            scoring_policy=policy,
+        )
+
+
 def test_per_channel_multichannel_scoring_requires_candidate_channel_attribution():
     recording = _recording()
     multichannel = replace(
