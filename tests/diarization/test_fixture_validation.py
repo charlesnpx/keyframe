@@ -13,6 +13,7 @@ from keyframe.diarization import (
     ScoringPolicyManifest,
     build_candidate_bundle_from_recording,
     build_fixture_slice_metadata,
+    merge_fixture_validation_results,
     read_recording_json,
     validate_candidate_bundle_against_reference,
     validate_canonical_reference_payload,
@@ -194,6 +195,14 @@ def test_fixture_gate_allows_mono_mix_when_enabled_for_multichannel_reference():
     assert accepted.status == "valid"
     assert accepted.issues == ()
 
+    payload["channels"] = [{"channel_id": "wrong-channel"}]
+    payload["runtime_hints"]["channel_ids"] = ["wrong-channel"]
+    payload["runtime_hints"]["timeline"]["channel_ids"] = ["wrong-channel"]
+    wrong_mono_id = validate_fixture_gate(candidate_payloads=((payload, recording),), allow_mono_mix=True)
+
+    assert wrong_mono_id.status == "invalid_fixture"
+    assert wrong_mono_id.issues[0].category == "audio_metadata_mismatch"
+
 
 def test_fixture_gate_aggregates_slice_support_across_canonical_payloads():
     first = _payload("clean_two_speaker.json")
@@ -220,6 +229,36 @@ def test_fixture_gate_aggregates_slice_support_across_canonical_payloads():
         "fixture-clean-two-speaker",
         "fixture-clean-two-speaker-copy",
     )
+
+
+def test_merge_fixture_validation_results_aggregates_slice_support():
+    first_payload = _payload("clean_two_speaker.json")
+    second_payload = copy.deepcopy(first_payload)
+    second_payload["recording_id"] = "fixture-clean-two-speaker-copy"
+    second_payload["original_audio_id"] = "fixture-clean-two-speaker-copy-original"
+    second_payload["canonical_audio_id"] = "fixture-clean-two-speaker-copy-canonical"
+    second_payload["timeline_id"] = "fixture-clean-two-speaker-copy-timeline"
+
+    first = validate_canonical_reference_payload(
+        first_payload,
+        scoring_policy=_scoring_policy(),
+        minimum_slice_support=2,
+    )
+    second = validate_canonical_reference_payload(
+        second_payload,
+        scoring_policy=_scoring_policy(),
+        minimum_slice_support=2,
+    )
+
+    merged = merge_fixture_validation_results(first, second)
+    speaker_count_slices = [
+        item for item in merged.slice_metadata if item.dimension == "speaker_count" and item.value == "2"
+    ]
+
+    assert merged.status == "valid"
+    assert len(speaker_count_slices) == 1
+    assert speaker_count_slices[0].status == "ready"
+    assert speaker_count_slices[0].support_count == 2
 
 
 def test_missing_scoring_exports_are_invalid_fixture_results(tmp_path):

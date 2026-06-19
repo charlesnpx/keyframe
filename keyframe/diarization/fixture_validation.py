@@ -448,7 +448,11 @@ def merge_fixture_validation_results(*results: FixtureValidationResult) -> Fixtu
         issues.extend(result.issues)
         slice_metadata.extend(result.slice_metadata)
         checked_files.extend(result.checked_files)
-    return _result(issues, slice_metadata=tuple(slice_metadata), checked_files=tuple(checked_files))
+    return _result(
+        issues,
+        slice_metadata=_merge_slice_metadata(tuple(slice_metadata)),
+        checked_files=tuple(checked_files),
+    )
 
 
 def build_fixture_slice_metadata(
@@ -577,7 +581,34 @@ def _candidate_matches_expected_channels(
     candidate_channel_ids = tuple(channel["channel_id"] for channel in channels)
     if candidate_channel_ids == expected_channel_ids:
         return True
-    return allow_mono_mix and len(expected_channel_ids) > 1 and len(candidate_channel_ids) == 1
+    return allow_mono_mix and len(expected_channel_ids) > 1 and candidate_channel_ids == ("mono-mix",)
+
+
+def _merge_slice_metadata(slices: tuple[FixtureSliceMetadata, ...]) -> tuple[FixtureSliceMetadata, ...]:
+    grouped: dict[tuple[str, str, int], list[FixtureSliceMetadata]] = {}
+    for item in slices:
+        grouped.setdefault((item.dimension, item.value, item.minimum_support), []).append(item)
+
+    result: list[FixtureSliceMetadata] = []
+    for (dimension, value, minimum_support), items in sorted(grouped.items()):
+        recording_ids = _unique_preserving_order(
+            recording_id for item in items for recording_id in item.recording_ids
+        )
+        support_count = len(recording_ids)
+        status: FixtureSliceStatus = "ready" if support_count >= minimum_support else "insufficient_support"
+        result.append(
+            FixtureSliceMetadata(
+                slice_id=f"{dimension}:{value}",
+                dimension=dimension,
+                value=value,
+                status=status,
+                support_count=support_count,
+                minimum_support=minimum_support,
+                recording_ids=recording_ids,
+                metrics=_merge_metrics(tuple(item.metrics for item in items)),
+            )
+        )
+    return tuple(result)
 
 
 def _merge_metrics(values: tuple[dict[str, Any], ...]) -> dict[str, Any]:
@@ -709,6 +740,18 @@ def _unique_tuple_of_paths(values: object, field_name: str) -> tuple[str, ...]:
         if value not in seen:
             unique.append(value)
             seen.add(value)
+    return tuple(unique)
+
+
+def _unique_preserving_order(values: object) -> tuple[str, ...]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for value in values:
+        value = _require_id(value, "fixture_slice.recording_ids")
+        if value in seen:
+            continue
+        seen.add(value)
+        unique.append(value)
     return tuple(unique)
 
 
