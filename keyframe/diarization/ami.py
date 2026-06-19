@@ -72,6 +72,10 @@ class AMIBenchmarkBranchConfig:
             _require_bool(self.exposes_track_metadata, "ami_branch.exposes_track_metadata"),
         )
         object.__setattr__(self, "mixes_to_mono", _require_bool(self.mixes_to_mono, "ami_branch.mixes_to_mono"))
+        if self.branch == "mono_mix" and self.exposes_separate_tracks:
+            raise ValidationError("mono_mix branch cannot expose separate tracks")
+        if self.branch in {"separate_tracks", "authenticated_track_metadata"} and not self.exposes_separate_tracks:
+            raise ValidationError(f"{self.branch} branch must expose separate tracks")
         if self.branch == "mono_mix" and not self.mixes_to_mono:
             raise ValidationError("ami mono_mix branch must mix to mono")
         if self.branch != "mono_mix" and self.mixes_to_mono:
@@ -100,8 +104,12 @@ class AMISplitPlan:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "branch", _validate_ami_branch(self.branch))
-        object.__setattr__(self, "tuned_on_splits", _tuple_of_ids(self.tuned_on_splits, "ami_split.tuned_on_splits"))
-        evaluated_on_splits = _tuple_of_ids(self.evaluated_on_splits, "ami_split.evaluated_on_splits")
+        object.__setattr__(
+            self,
+            "tuned_on_splits",
+            _unique_tuple_of_ids(self.tuned_on_splits, "ami_split.tuned_on_splits"),
+        )
+        evaluated_on_splits = _unique_tuple_of_ids(self.evaluated_on_splits, "ami_split.evaluated_on_splits")
         if not evaluated_on_splits:
             raise ValidationError("ami_split.evaluated_on_splits is required")
         object.__setattr__(self, "evaluated_on_splits", evaluated_on_splits)
@@ -1177,6 +1185,16 @@ def _validate_slice_status(value: object) -> AMISliceStatus:
 
 def _tuple_of_ids(values: object, field_name: str) -> tuple[str, ...]:
     return tuple(_require_id(value, field_name) for value in _sequence(values, field_name))
+
+
+def _unique_tuple_of_ids(values: object, field_name: str) -> tuple[str, ...]:
+    result = _tuple_of_ids(values, field_name)
+    seen: set[str] = set()
+    for value in result:
+        if value in seen:
+            raise ValidationError(f"{field_name} contains duplicate split: {value}")
+        seen.add(value)
+    return result
 
 
 def _sequence(value: object, field_name: str) -> tuple[Any, ...]:

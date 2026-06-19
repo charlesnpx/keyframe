@@ -6,7 +6,9 @@ import pytest
 from keyframe.diarization import (
     AMI_BENCHMARK_BRANCHES,
     AMIAdapter,
+    AMIBenchmarkBranchConfig,
     AMIRecordingSource,
+    AMISplitPlan,
     AMISpeakerSegment,
     AMIWordAnnotation,
     DatasetCacheConfig,
@@ -198,6 +200,40 @@ def test_ami_branch_modes_expose_only_permitted_candidate_inputs():
         validate_candidate_bundle_payload(payload)
         for source_id in SOURCE_IDS:
             assert source_id not in _payload_text(payload)
+
+
+def test_ami_branch_config_rejects_impossible_direct_construction():
+    with pytest.raises(ValidationError, match="separate_tracks branch must expose separate tracks"):
+        AMIBenchmarkBranchConfig(
+            branch="separate_tracks",
+            exposes_separate_tracks=False,
+            exposes_track_metadata=False,
+            mixes_to_mono=False,
+        )
+
+    with pytest.raises(ValidationError, match="mono_mix branch cannot expose separate tracks"):
+        AMIBenchmarkBranchConfig(
+            branch="mono_mix",
+            exposes_separate_tracks=True,
+            exposes_track_metadata=False,
+            mixes_to_mono=True,
+        )
+
+
+def test_ami_split_plan_rejects_duplicate_split_ids():
+    with pytest.raises(ValidationError, match="tuned_on_splits contains duplicate split"):
+        AMISplitPlan(
+            branch="separate_tracks",
+            tuned_on_splits=("ami-public-dev", "ami-public-dev"),
+            evaluated_on_splits=("ami-public-holdout",),
+        )
+
+    with pytest.raises(ValidationError, match="evaluated_on_splits contains duplicate split"):
+        AMISplitPlan(
+            branch="separate_tracks",
+            tuned_on_splits=("ami-public-dev",),
+            evaluated_on_splits=("ami-public-holdout", "ami-public-holdout"),
+        )
 
 
 def test_ami_split_plan_rejects_holdout_tuning_and_run_record_identifies_frozen_splits(tmp_path):
