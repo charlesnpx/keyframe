@@ -261,7 +261,10 @@ def render_transcript(
     overlay_result = _apply_overlays(attributed, ordered_overlays)
     indexed_words = tuple(enumerate(overlay_result.recording.words))
     words = tuple(word for _, word in sorted(indexed_words, key=lambda item: (item[1].start_ms, item[0])))
-    suppress_labels = requested_state in _LABEL_SUPPRESSED_STATES
+    suppress_labels = (
+        requested_state in _LABEL_SUPPRESSED_STATES
+        or "speaker_attribution_unavailable" in requested_review_reasons
+    )
     rendered_words = tuple(
         _render_word(word, overlay_result.uncertain_word_ids, min_speaker_confidence, suppress_labels)
         for word in words

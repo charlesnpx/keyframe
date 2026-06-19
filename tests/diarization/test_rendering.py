@@ -374,6 +374,17 @@ def test_speaker_attribution_unavailable_state_keeps_text_without_labels():
     assert all(word.label is None and word.display_label is None for word in transcript.words)
 
 
+def test_speaker_attribution_unavailable_reason_keeps_text_without_labels():
+    transcript = render_transcript(_recording(), review_reasons=("speaker_attribution_unavailable",))
+
+    assert transcript.state == "speaker_attribution_unavailable"
+    assert transcript.speaker_attribution == "unavailable"
+    assert transcript.review_reasons == ("speaker_attribution_unavailable",)
+    assert transcript.turns[0].text == "hello there"
+    assert all(turn.label is None and turn.display_label is None for turn in transcript.turns)
+    assert all(word.label is None and word.display_label is None for word in transcript.words)
+
+
 def test_diagnostic_and_unsupported_states_render_transcript_only_output():
     for state, expected_reasons in (
         ("diagnostic_only", ("diagnostic_only", "speaker_attribution_unavailable")),
