@@ -100,7 +100,7 @@ def test_ami_adapter_validates_local_cache_and_exports_reference_and_candidate_a
 
     validation = adapter.validate_source("ami-public-dev", cache)
     recordings = adapter.normalize("ami-public-dev", cache)
-    results = adapter.export_references("ami-public-dev", recordings, build_artifact_layout(tmp_path / "artifacts"))
+    results = adapter.export_reference("ami-public-dev", recordings, build_artifact_layout(tmp_path / "artifacts"))
 
     assert validation.valid is True
     assert isinstance(adapter, AMIAdapter)

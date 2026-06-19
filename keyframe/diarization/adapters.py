@@ -288,7 +288,7 @@ class DatasetAdapter(Protocol):
         split_id: str,
         recordings: tuple[CanonicalRecording, ...],
         artifact_layout: BenchmarkArtifactLayout,
-    ) -> DatasetExportResult:
+    ) -> DatasetExportResult | tuple[DatasetExportResult, ...]:
         """Export reference bundle artifacts for central scoring."""
 
 

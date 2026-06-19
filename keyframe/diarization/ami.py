@@ -233,10 +233,10 @@ class AMIAdapter:
         split_id: str,
         recordings: tuple[CanonicalRecording, ...],
         artifact_layout: BenchmarkArtifactLayout,
-    ) -> DatasetExportResult:
-        if len(recordings) != 1:
-            raise ValidationError("AMIAdapter.export_reference expects exactly one recording")
-        return self._export_one(split_id, recordings[0], artifact_layout)
+    ) -> tuple[DatasetExportResult, ...]:
+        if not recordings:
+            raise ValidationError("AMIAdapter.export_reference requires at least one recording")
+        return tuple(self._export_one(split_id, recording, artifact_layout) for recording in recordings)
 
     def export_references(
         self,
@@ -244,9 +244,7 @@ class AMIAdapter:
         recordings: tuple[CanonicalRecording, ...],
         artifact_layout: BenchmarkArtifactLayout,
     ) -> tuple[DatasetExportResult, ...]:
-        if not recordings:
-            raise ValidationError("AMIAdapter.export_references requires at least one recording")
-        return tuple(self._export_one(split_id, recording, artifact_layout) for recording in recordings)
+        return self.export_reference(split_id, recordings, artifact_layout)
 
     def _effective_source_root(self, cache: DatasetCacheConfig) -> Path | None:
         if not isinstance(cache, DatasetCacheConfig):
