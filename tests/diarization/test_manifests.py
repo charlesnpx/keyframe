@@ -281,9 +281,16 @@ def test_scoring_policy_accepts_legacy_ignore_overlap_alias_without_serializing_
 def test_scoring_policy_rejects_unversioned_and_conflicting_overlap_policy():
     payload = default_scoring_policy("diagnostic_diarization").to_dict()
     payload.pop("version")
+    minimal_payload = {
+        "description": "Minimal policy",
+        "policy_id": "minimal-policy",
+        "version": "1",
+    }
 
     with pytest.raises(ValidationError, match="scoring_policy.version is required"):
         scoring_policy_from_dict(payload)
+    with pytest.raises(ValidationError, match="scoring_policy.policy_kind is required"):
+        scoring_policy_from_dict(minimal_payload)
     with pytest.raises(ValidationError, match="conflicts"):
         ScoringPolicyManifest(
             policy_id="conflict",
