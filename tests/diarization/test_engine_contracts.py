@@ -8,6 +8,8 @@ from keyframe.diarization import (
     CannedJsonEngineAdapter,
     DiarizationEngineAdapter,
     EngineConfigMetadata,
+    HostedProviderGovernance,
+    HostedProviderJsonAdapter,
     ModelArtifactGovernance,
     NormalizedArtifactProvenance,
     OffsetMapSegment,
@@ -52,6 +54,22 @@ def _whisperx_artifact(duration_ms=1_300):
             sample_rate_hz=16_000,
             duration_ms=duration_ms,
             channel_ids=("mono-mix",),
+        ),
+    )
+
+
+def _provider_artifact(channel_ids=("ch-1",), duration_ms=1_200):
+    return NormalizedArtifactProvenance(
+        artifact_id="candidate-hosted-provider-output",
+        artifact_kind="candidate",
+        timeline=AudioTimelineProvenance(
+            original_audio_id="original-audio-local",
+            canonical_audio_id="canonical-audio-local",
+            timeline_id="candidate-timeline",
+            transform_chain_id="identity",
+            sample_rate_hz=16_000,
+            duration_ms=duration_ms,
+            channel_ids=channel_ids,
         ),
     )
 
@@ -107,6 +125,22 @@ def _whisperx_adapter():
     )
 
 
+def _hosted_adapter(provider):
+    return HostedProviderJsonAdapter(
+        HostedProviderGovernance(
+            provider=provider,
+            region="us-east-1",
+            model_version="2026-06",
+            version_pinning="provider-version-pinned-in-run-record",
+            retention_policy="raw-json-retained-in-private-benchmark-artifacts",
+            raw_json_export=f"raw/provider_json/{provider}.json",
+            terms_constraints=("no live provider call in default test suite",),
+            parameters={"batch": provider != "google_speech", "live_api_enabled": False},
+        ),
+        config_id=f"{provider}-canned",
+    )
+
+
 def _vad_trimmed_source(duration_ms=900):
     return _artifact_with_timeline(
         timeline_id="vad-trimmed",
@@ -134,6 +168,10 @@ def test_canned_json_adapter_satisfies_engine_protocol():
 
 def test_self_hosted_whisperx_pyannote_adapter_satisfies_engine_protocol():
     assert isinstance(_whisperx_adapter(), DiarizationEngineAdapter)
+
+
+def test_hosted_provider_adapter_satisfies_engine_protocol():
+    assert isinstance(_hosted_adapter("aws_transcribe"), DiarizationEngineAdapter)
 
 
 def test_clean_engine_output_normalizes_to_canonical_words_spans_and_provenance():
@@ -558,3 +596,86 @@ def test_whisperx_runtime_preflight_reports_missing_optional_dependencies_withou
     assert "Install optional runtime packages" in status.reasons[0]
     assert status.requires_model_access is True
     assert status.requires_gpu is True
+
+
+def test_aws_transcribe_saved_output_normalizes_to_canonical_provider_artifact():
+    output = _hosted_adapter("aws_transcribe").normalize_raw_output(
+        _payload("aws_transcribe_provider.json"),
+        artifact=_provider_artifact(),
+    )
+
+    assert output.output_id == "aws-transcribe-canned"
+    assert [word.text for word in output.words] == ["hello", "there", "friend"]
+    assert [(word.start_ms, word.end_ms) for word in output.words] == [(0, 300), (340, 640), (800, 1080)]
+    assert [word.text_confidence for word in output.words] == [0.98, 0.96, 0.94]
+    assert [word.speaker_ref for word in output.words] == [
+        "engine:ch-1:spk-0",
+        "engine:ch-1:spk-0",
+        "engine:ch-1:spk-1",
+    ]
+    assert [(span.speaker_ref, span.start_ms, span.end_ms) for span in output.speaker_spans] == [
+        ("engine:ch-1:spk-0", 0, 640),
+        ("engine:ch-1:spk-1", 800, 1080),
+    ]
+
+
+def test_google_streaming_saved_output_uses_final_word_timestamps_only():
+    output = _hosted_adapter("google_speech").normalize_raw_output(
+        _payload("google_speech_provider.json"),
+        artifact=_provider_artifact(channel_ids=("1",)),
+    )
+
+    assert output.output_id == "google-speech-canned"
+    assert [word.text for word in output.words] == ["hello", "there"]
+    assert [word.word_id for word in output.words] == [
+        "google-speech-canned:word:000001",
+        "google-speech-canned:word:000002",
+    ]
+    assert [word.speaker_ref for word in output.words] == ["engine:1:1", "engine:1:2"]
+    assert all(word.text != "par" for word in output.words)
+
+
+def test_deepgram_saved_output_keeps_same_speaker_ids_channel_local():
+    output = _hosted_adapter("deepgram").normalize_raw_output(
+        _payload("deepgram_provider.json"),
+        artifact=_provider_artifact(channel_ids=("left", "right")),
+    )
+
+    assert [word.text for word in output.words] == ["left", "answer"]
+    assert [word.channel_id for word in output.words] == ["left", "right"]
+    assert [word.speaker_ref for word in output.words] == ["engine:left:0", "engine:right:0"]
+    assert len({word.speaker_ref for word in output.words}) == 2
+
+
+def test_hosted_provider_governance_is_attached_to_engine_config_without_live_call_state():
+    output = _hosted_adapter("aws_transcribe").normalize_raw_output(
+        _payload("aws_transcribe_provider.json"),
+        artifact=_provider_artifact(),
+    )
+
+    governance = output.to_dict()["config"]["parameters"]["hosted_provider_governance"]
+    assert governance["provider"] == "aws_transcribe"
+    assert governance["region"] == "us-east-1"
+    assert governance["model_version"] == "2026-06"
+    assert governance["version_pinning"] == "provider-version-pinned-in-run-record"
+    assert governance["retention_policy"] == "raw-json-retained-in-private-benchmark-artifacts"
+    assert governance["raw_json_export"] == "raw/provider_json/aws_transcribe.json"
+    assert governance["terms_constraints"] == ["no live provider call in default test suite"]
+    assert governance["parameters"]["live_api_enabled"] is False
+
+
+def test_hosted_provider_missing_word_timing_fails_closed():
+    payload = _payload("aws_transcribe_provider.json")
+    payload["results"]["items"][0].pop("start_time")
+
+    with pytest.raises(ValidationError, match="start is required|start_time is required"):
+        _hosted_adapter("aws_transcribe").normalize_raw_output(payload, artifact=_provider_artifact())
+
+
+def test_hosted_provider_missing_speaker_metadata_fails_closed():
+    payload = _payload("aws_transcribe_provider.json")
+    for item in payload["results"]["items"]:
+        item.pop("speaker_label", None)
+
+    with pytest.raises(ValidationError, match="speaker metadata"):
+        _hosted_adapter("aws_transcribe").normalize_raw_output(payload, artifact=_provider_artifact())
