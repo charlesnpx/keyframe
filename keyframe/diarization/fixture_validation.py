@@ -318,6 +318,18 @@ def validate_candidate_bundle_against_reference(
                 recording_id=recording.recording_id,
             )
         )
+    elif not _candidate_matches_expected_channels(
+        channels,
+        tuple(channel.channel_id for channel in recording.channels),
+        allow_mono_mix=allow_mono_mix,
+    ):
+        issues.append(
+            _issue(
+                "audio_metadata_mismatch",
+                "candidate channel ids do not match expected fixture mode",
+                recording_id=recording.recording_id,
+            )
+        )
     return _result(issues)
 
 
@@ -358,6 +370,7 @@ def validate_fixture_gate(
     scoring_policy: ScoringPolicyManifest | None = None,
     artifact_paths: dict[str, str] | None = None,
     minimum_slice_support: int = 1,
+    allow_mono_mix: bool = False,
 ) -> FixtureValidationResult:
     """Run the full fixture gate and aggregate invalid_fixture issues."""
 
@@ -373,7 +386,7 @@ def validate_fixture_gate(
             )
         )
     for payload, recording in candidate_payloads:
-        results.append(validate_candidate_bundle_against_reference(payload, recording))
+        results.append(validate_candidate_bundle_against_reference(payload, recording, allow_mono_mix=allow_mono_mix))
     if artifact_paths is not None:
         results.append(validate_scoring_exports(artifact_paths=artifact_paths))
     return merge_fixture_validation_results(*results)
@@ -507,6 +520,18 @@ def _channel_mode(recording: CanonicalRecording) -> str:
     if len(recording.channels) <= 1:
         return "mono"
     return "multichannel"
+
+
+def _candidate_matches_expected_channels(
+    channels: list[dict[str, Any]],
+    expected_channel_ids: tuple[str, ...],
+    *,
+    allow_mono_mix: bool,
+) -> bool:
+    candidate_channel_ids = tuple(channel["channel_id"] for channel in channels)
+    if candidate_channel_ids == expected_channel_ids:
+        return True
+    return allow_mono_mix and len(expected_channel_ids) > 1 and len(candidate_channel_ids) == 1
 
 
 def _merge_metrics(values: tuple[dict[str, Any], ...]) -> dict[str, Any]:

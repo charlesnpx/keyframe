@@ -1,9 +1,11 @@
 import copy
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 
 from keyframe.diarization import (
+    ChannelRecord,
     DatasetAccess,
     DatasetManifest,
     DatasetSplitManifest,
@@ -145,10 +147,41 @@ def test_candidate_validation_reports_redaction_and_audio_metadata_failures():
     channel_payload["runtime_hints"]["timeline"]["channel_ids"].append("ch-2")
     channel_mismatch = validate_candidate_bundle_against_reference(channel_payload, recording)
 
+    drift_payload = copy.deepcopy(payload)
+    drift_payload["channels"][0]["channel_id"] = "wrong-channel"
+    drift_payload["runtime_hints"]["channel_ids"][0] = "wrong-channel"
+    drift_payload["runtime_hints"]["timeline"]["channel_ids"][0] = "wrong-channel"
+    channel_drift = validate_candidate_bundle_against_reference(drift_payload, recording)
+
     assert leaked.status == "invalid_fixture"
     assert leaked.issues[0].category == "reference_leakage"
     assert mismatch.issues[0].category == "audio_metadata_mismatch"
     assert channel_mismatch.issues[0].category == "audio_metadata_mismatch"
+    assert channel_drift.issues[0].category == "audio_metadata_mismatch"
+
+
+def test_fixture_gate_allows_mono_mix_when_enabled_for_multichannel_reference():
+    recording = replace(
+        read_recording_json(FIXTURE_DIR / "clean_two_speaker.json"),
+        channels=(ChannelRecord("ch-1", name="mixed"), ChannelRecord("ch-2", name="room")),
+    )
+    payload = build_candidate_bundle_from_recording(
+        recording,
+        artifact_id="reference-fixture",
+        bundle_id="candidate-fixture",
+    ).to_dict()
+    payload["audio"]["channel_count"] = 1
+    payload["channels"] = [{"channel_id": "mono-mix"}]
+    payload["runtime_hints"]["channel_ids"] = ["mono-mix"]
+    payload["runtime_hints"]["timeline"]["channel_ids"] = ["mono-mix"]
+
+    rejected = validate_fixture_gate(candidate_payloads=((payload, recording),))
+    accepted = validate_fixture_gate(candidate_payloads=((payload, recording),), allow_mono_mix=True)
+
+    assert rejected.status == "invalid_fixture"
+    assert rejected.issues[0].category == "audio_metadata_mismatch"
+    assert accepted.status == "valid"
+    assert accepted.issues == ()
 
 
 def test_missing_scoring_exports_are_invalid_fixture_results(tmp_path):
