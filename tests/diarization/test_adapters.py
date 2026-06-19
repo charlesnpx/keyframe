@@ -283,6 +283,65 @@ def test_run_record_validation_rejects_unknown_split_and_inconsistent_evaluated_
         )
 
 
+def test_direct_run_record_constructor_validates_dataset_snapshot_identity(tmp_path):
+    manifest = _ami_manifest()
+
+    with pytest.raises(ValidationError, match="dataset_id must match dataset_snapshot.dataset_id"):
+        BenchmarkRunRecord(
+            run_id="run-001",
+            dataset_id="different-dataset",
+            dataset_snapshot=manifest.to_dict(),
+            split_id="ami-public-dev",
+            branch="feature/diarization-benchmark-platform",
+            artifact_layout=build_artifact_layout(tmp_path / "artifacts"),
+            cache_root=str(tmp_path / "cache"),
+            tuned_split_ids=(),
+            evaluated_split_ids=("ami-public-dev",),
+            execution_mode="default_no_network",
+            no_network=True,
+        )
+
+
+def test_direct_run_record_constructor_applies_non_redistributable_cache_policy(tmp_path):
+    manifest = DatasetManifest(
+        dataset_id="private-fixture",
+        name="Private Fixture",
+        role="private_in_domain_acceptance",
+        access=DatasetAccess(mode="local_only", redistribution="forbidden"),
+        license_url="https://example.com/license",
+        attribution="Private fixture",
+        expected_files=(
+            ExpectedDatasetFile(path="fixtures/private.json", checksum_sha256="0" * 64, file_role="manifest"),
+        ),
+        splits=(
+            DatasetSplitManifest(
+                split_id="private-split",
+                role="private_in_domain_acceptance",
+                expected_file_paths=("fixtures/private.json",),
+                scoring_policy_id="private-policy",
+            ),
+        ),
+        scoring_policies=(
+            ScoringPolicyManifest(policy_id="private-policy", version="1", description="Private policy"),
+        ),
+    )
+
+    with pytest.raises(ValidationError, match="require an explicit local cache path"):
+        BenchmarkRunRecord(
+            run_id="run-001",
+            dataset_id=manifest.dataset_id,
+            dataset_snapshot=manifest.to_dict(),
+            split_id="private-split",
+            branch="feature/diarization-benchmark-platform",
+            artifact_layout=build_artifact_layout(tmp_path / "artifacts"),
+            cache_root=None,
+            tuned_split_ids=(),
+            evaluated_split_ids=("private-split",),
+            execution_mode="full_benchmark",
+            no_network=False,
+        )
+
+
 @pytest.mark.parametrize(
     ("field_name", "kwargs"),
     [

@@ -205,11 +205,12 @@ class BenchmarkRunRecord:
         object.__setattr__(self, "schema_version", _validate_run_record_schema_version(self.schema_version))
         object.__setattr__(self, "run_id", _require_id(self.run_id, "run_record.run_id"))
         object.__setattr__(self, "dataset_id", _require_id(self.dataset_id, "run_record.dataset_id"))
-        object.__setattr__(
-            self,
-            "dataset_snapshot",
-            _validate_metadata(self.dataset_snapshot, "run_record.dataset_snapshot"),
+        dataset_snapshot = dataset_manifest_from_dict(
+            _validate_metadata(self.dataset_snapshot, "run_record.dataset_snapshot")
         )
+        object.__setattr__(self, "dataset_snapshot", dataset_snapshot.to_dict())
+        if self.dataset_id != dataset_snapshot.dataset_id:
+            raise ValidationError("run_record.dataset_id must match dataset_snapshot.dataset_id")
         object.__setattr__(self, "split_id", _require_id(self.split_id, "run_record.split_id"))
         object.__setattr__(self, "branch", _require_id(self.branch, "run_record.branch"))
         if not isinstance(self.artifact_layout, BenchmarkArtifactLayout):
@@ -228,10 +229,20 @@ class BenchmarkRunRecord:
             "derived_artifacts",
             _validate_string_map(self.derived_artifacts, "run_record.derived_artifacts"),
         )
+        manifest_split_ids = frozenset(split.split_id for split in dataset_snapshot.splits)
+        if self.split_id not in manifest_split_ids:
+            raise ValidationError(f"run_record.split_id is unknown: {self.split_id}")
+        _validate_manifest_split_ids(self.tuned_split_ids, manifest_split_ids, "run_record.tuned_split_ids")
+        _validate_manifest_split_ids(self.evaluated_split_ids, manifest_split_ids, "run_record.evaluated_split_ids")
         if self.split_id not in self.evaluated_split_ids:
             raise ValidationError("run_record.split_id must be included in evaluated_split_ids")
         if self.execution_mode == "default_no_network" and not self.no_network:
             raise ValidationError("default_no_network run records must set no_network")
+        ensure_adapter_cache_policy(
+            dataset_snapshot,
+            DatasetCacheConfig(cache_root=self.cache_root),
+            execution_mode=self.execution_mode,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -413,16 +424,9 @@ def benchmark_run_record_from_dict(payload: dict[str, Any]) -> BenchmarkRunRecor
     )
     dataset_snapshot = dataset_manifest_from_dict(_required(data, "dataset_snapshot", "run_record"))
     dataset_id = _required(data, "dataset_id", "run_record")
-    if dataset_id != dataset_snapshot.dataset_id:
-        raise ValidationError("run_record.dataset_id must match dataset_snapshot.dataset_id")
     split_id = _required(data, "split_id", "run_record")
-    manifest_split_ids = frozenset(split.split_id for split in dataset_snapshot.splits)
-    if split_id not in manifest_split_ids:
-        raise ValidationError(f"run_record.split_id is unknown: {split_id}")
     tuned_split_ids = tuple(_sequence(data.get("tuned_split_ids", ())))
     evaluated_split_ids = tuple(_sequence(_required(data, "evaluated_split_ids", "run_record")))
-    _validate_manifest_split_ids(tuned_split_ids, manifest_split_ids, "run_record.tuned_split_ids")
-    _validate_manifest_split_ids(evaluated_split_ids, manifest_split_ids, "run_record.evaluated_split_ids")
     return BenchmarkRunRecord(
         schema_version=_required(data, "schema_version", "run_record"),
         run_id=_required(data, "run_id", "run_record"),
