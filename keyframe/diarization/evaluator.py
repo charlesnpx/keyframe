@@ -958,15 +958,18 @@ def _score_product_transcript_metrics(
 ) -> dict[str, Any]:
     reference_score_words = _scoreable_words(reference_words, policy)
     candidate_score_words = _scoreable_words(candidate_words, policy)
-    word_spans = _product_scoreable_items(_spans_from_words(reference_score_words), intervals, policy)
+    reference_word_spans = _spans_from_words(reference_score_words)
+    candidate_word_items = _spans_from_words(candidate_score_words)
+    word_spans = _product_scoreable_items(reference_word_spans, intervals, policy)
     candidate_word_spans = _product_scoreable_items(
-        _spans_from_words(candidate_score_words),
+        candidate_word_items,
         intervals,
         policy,
         reference_items=word_spans,
     )
-    candidate_count_spans = _product_scoreable_items(
-        _spans_from_words(candidate_score_words),
+    candidate_count_spans = _product_candidate_count_items(
+        candidate_word_items,
+        reference_word_spans,
         intervals,
         policy,
     )
@@ -997,6 +1000,28 @@ def _score_product_transcript_metrics(
             policy,
         ),
     }
+
+
+def _product_candidate_count_items(
+    candidate_items: tuple[_SpanView, ...],
+    reference_items: tuple[_SpanView, ...],
+    intervals: tuple[EvaluationInterval, ...],
+    policy: ScoringPolicyManifest,
+) -> tuple[_SpanView, ...]:
+    if policy.score_overlap:
+        count_intervals = intervals
+    else:
+        reference_overlap_intervals = tuple(
+            item.interval
+            for item in reference_items
+            if _item_is_reference_overlap(item, reference_items, policy)
+        )
+        count_intervals = _subtract_intervals(intervals, reference_overlap_intervals)
+    return tuple(
+        item
+        for item in candidate_items
+        if _item_is_scoreable(item, count_intervals, policy)
+    )
 
 
 def _label_accuracy_by_reference_items(

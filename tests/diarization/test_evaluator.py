@@ -1170,6 +1170,79 @@ def test_product_speaker_count_includes_candidate_only_speakers_inside_scoring_r
     assert metrics["turn_speaker_label_accuracy"] == 1.0
 
 
+def test_product_speaker_count_excludes_candidate_only_speakers_in_reference_overlap():
+    recording = _recording()
+    reference_recording = replace(
+        recording,
+        duration_ms=1_000,
+        speaker_spans=(),
+        speakers=(
+            recording.speakers[0],
+            recording.speakers[1],
+        ),
+        words=(
+            replace(
+                recording.words[0],
+                word_id="w-overlap-a",
+                speaker_ref="spk-a",
+                start_ms=0,
+                end_ms=300,
+                channel_id="ch-1",
+            ),
+            replace(
+                recording.words[1],
+                word_id="w-overlap-b",
+                speaker_ref="spk-b",
+                start_ms=0,
+                end_ms=300,
+                channel_id="ch-1",
+            ),
+            replace(
+                recording.words[0],
+                word_id="w-score",
+                speaker_ref="spk-a",
+                start_ms=500,
+                end_ms=800,
+                channel_id="ch-1",
+            ),
+        ),
+        scoring_regions=(ScoringRegion("uem-1", 0, 1_000, channel_id="ch-1"),),
+    )
+    candidate = _candidate_output(
+        reference_recording,
+        {
+            "spk-a": "engine:word:speaker-1",
+            "spk-b": "engine:word:reference-overlap-speaker",
+        },
+    )
+    candidate_with_overlap_extra = replace(
+        candidate,
+        words=(
+            replace(
+                candidate.words[0],
+                word_id="w-extra-candidate",
+                speaker_ref="engine:word:speaker-2",
+                start_ms=100,
+                end_ms=200,
+                channel_id="ch-1",
+            ),
+            candidate.words[2],
+        ),
+    )
+
+    result = evaluate_diarization_candidate(
+        _reference_bundle(reference_recording),
+        candidate_with_overlap_extra,
+        scoring_policy=default_scoring_policy("product_transcript"),
+    )
+    metrics = result.recording_metrics[0].metrics
+
+    assert result.speaker_mapping == {"engine:word:speaker-1": "spk-a"}
+    assert metrics["speaker_count_error"] == 0
+    assert metrics["word_speaker_label_accuracy"] == 1.0
+    assert metrics["turn_speaker_label_accuracy"] == 1.0
+
+
 def test_product_word_accuracy_requires_candidate_overlap_inside_uem():
     recording = _recording()
     reference_recording = replace(
