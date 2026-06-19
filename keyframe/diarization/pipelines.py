@@ -292,12 +292,14 @@ def _run_track_merge_branch(
     if not isinstance(candidate_bundle, CandidateBundle):
         raise ValidationError("candidate_bundle must be a CandidateBundle")
     validate_pipeline_branch_candidate_inputs(branch_id, candidate_bundle)
+    candidate_payload = candidate_bundle.to_dict()
     outputs = _validate_track_engine_outputs(candidate_bundle, engine_outputs)
+    outputs = _outputs_in_candidate_channel_order(candidate_payload, outputs)
     result_output_id = _require_id(
         output_id or f"{candidate_bundle.bundle_id}:{branch_id}",
         "pipeline.output_id",
     )
-    channel_payloads = tuple(candidate_bundle.to_dict()["channels"])
+    channel_payloads = tuple(candidate_payload["channels"])
     merged_words, merged_spans, speaker_refs = _merge_track_outputs(branch_id, result_output_id, outputs)
     artifact = _branch_output_artifact(result_output_id, candidate_bundle, outputs)
     config = _branch_engine_config(branch_id, candidate_bundle, outputs)
@@ -453,6 +455,14 @@ def _validate_track_engine_outputs(
     if missing:
         raise ValidationError(f"engine_outputs missing per-track output for channel: {missing[0]}")
     return outputs
+
+
+def _outputs_in_candidate_channel_order(
+    candidate_payload: dict[str, Any],
+    outputs: tuple[NormalizedEngineOutput, ...],
+) -> tuple[NormalizedEngineOutput, ...]:
+    outputs_by_channel = {_single_output_channel(output): output for output in outputs}
+    return tuple(outputs_by_channel[channel_id] for channel_id in candidate_payload["runtime_hints"]["channel_ids"])
 
 
 def _branch_output_artifact(

@@ -145,6 +145,21 @@ def _branch_outputs():
     )
 
 
+def _tied_time_outputs():
+    return (
+        _track_output(
+            "left",
+            "left-tied-output",
+            (("left-tied", 100, 180, "raw-speaker-1", None),),
+        ),
+        _track_output(
+            "right",
+            "right-tied-output",
+            (("right-tied", 100, 180, "raw-speaker-1", None),),
+        ),
+    )
+
+
 def _colliding_channel_outputs():
     channel_ids = ("left:1", "left/1")
     return (
@@ -199,6 +214,20 @@ def test_separate_track_branch_merges_asr_per_track_outputs_on_timeline():
     ]
     assert result.to_dict()["branch_id"] == "separate_tracks"
     assert FORBIDDEN_SAFE_PAYLOAD_KEYS.isdisjoint(set(_walk_keys(result.to_dict())))
+
+
+def test_track_merge_is_deterministic_for_reordered_engine_outputs():
+    outputs = _tied_time_outputs()
+    bundle = _bundle("product_realistic")
+
+    first = run_separate_track_branch(bundle, outputs, output_id="tied-output")
+    second = run_separate_track_branch(bundle, tuple(reversed(outputs)), output_id="tied-output")
+
+    assert [word.to_dict() for word in first.output.words] == [word.to_dict() for word in second.output.words]
+    assert [span.to_dict() for span in first.output.speaker_spans] == [
+        span.to_dict() for span in second.output.speaker_spans
+    ]
+    assert [word.text for word in first.output.words] == ["left-tied", "right-tied"]
 
 
 def test_same_raw_speaker_id_on_different_tracks_remains_channel_local():
