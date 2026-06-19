@@ -252,6 +252,25 @@ def test_dry_run_run_record_is_no_network(tmp_path):
     assert record.no_network is True
 
 
+def test_dry_run_cache_policy_rejects_network_flags(tmp_path):
+    manifest = _ami_manifest()
+    cache = DatasetCacheConfig(cache_root=str(tmp_path / "cache"), allow_network=True)
+
+    with pytest.raises(ValidationError, match="no-network benchmark preparation must not allow network or downloads"):
+        ensure_adapter_cache_policy(manifest, cache, execution_mode="dry_run")
+
+    with pytest.raises(ValidationError, match="no-network benchmark preparation must not allow network or downloads"):
+        create_benchmark_run_record(
+            run_id="run-001",
+            manifest=manifest,
+            split_id="ami-public-dev",
+            branch="feature/diarization-benchmark-platform",
+            artifact_root=tmp_path / "artifacts",
+            cache=cache,
+            execution_mode="dry_run",
+        )
+
+
 def test_benchmark_run_record_json_round_trip_is_stable(tmp_path):
     manifest = _ami_manifest()
     record = create_benchmark_run_record(
@@ -389,6 +408,28 @@ def test_run_record_creation_rejects_split_lists_outside_manifest(tmp_path, fiel
     manifest = _ami_manifest()
 
     with pytest.raises(ValidationError, match=f"{field_name} contains unknown split"):
+        create_benchmark_run_record(
+            run_id="run-001",
+            manifest=manifest,
+            split_id="ami-public-dev",
+            branch="feature/diarization-benchmark-platform",
+            artifact_root=tmp_path / "artifacts",
+            cache=DatasetCacheConfig(cache_root=str(tmp_path / "cache")),
+            **kwargs,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "kwargs"),
+    [
+        ("run_record.tuned_split_ids", {"tuned_split_ids": ("ami-public-dev", "ami-public-dev")}),
+        ("run_record.evaluated_split_ids", {"evaluated_split_ids": ("ami-public-dev", "ami-public-dev")}),
+    ],
+)
+def test_run_record_creation_rejects_duplicate_split_lists(tmp_path, field_name, kwargs):
+    manifest = _ami_manifest()
+
+    with pytest.raises(ValidationError, match=f"{field_name} contains duplicate split"):
         create_benchmark_run_record(
             run_id="run-001",
             manifest=manifest,

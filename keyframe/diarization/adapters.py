@@ -316,8 +316,8 @@ def ensure_adapter_cache_policy(
     if not isinstance(cache, DatasetCacheConfig):
         raise ValidationError("cache must be a DatasetCacheConfig")
     execution_mode = _validate_execution_mode(execution_mode)
-    if execution_mode == "default_no_network" and (cache.allow_download or cache.allow_network):
-        raise ValidationError("default benchmark preparation must not allow network or downloads")
+    if execution_mode in {"default_no_network", "dry_run"} and (cache.allow_download or cache.allow_network):
+        raise ValidationError("no-network benchmark preparation must not allow network or downloads")
     if manifest.access.redistribution == "forbidden" and cache.cache_root is None:
         raise ValidationError("non-redistributable datasets require an explicit local cache path")
 
@@ -496,10 +496,14 @@ def _validate_execution_mode(value: object) -> BenchmarkExecutionMode:
 
 
 def _validate_manifest_split_ids(values: tuple[str, ...], manifest_split_ids: frozenset[str], field_name: str) -> None:
+    seen: set[str] = set()
     for value in values:
         value = _require_id(value, field_name)
+        if value in seen:
+            raise ValidationError(f"{field_name} contains duplicate split: {value}")
         if value not in manifest_split_ids:
             raise ValidationError(f"{field_name} contains unknown split: {value}")
+        seen.add(value)
 
 
 def _optional_local_path(value: object, field_name: str) -> str | None:
