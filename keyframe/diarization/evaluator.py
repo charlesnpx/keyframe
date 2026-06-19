@@ -360,7 +360,7 @@ def evaluate_diarization_candidate(
     if not isinstance(candidate, NormalizedEngineOutput):
         raise ValidationError("candidate must be a NormalizedEngineOutput")
     policy = _scoring_policy(scoring_policy)
-    _validate_candidate_timeline(reference.recording, candidate)
+    _validate_candidate_timeline(reference.recording, candidate, policy)
 
     reference_spans = _spans_from_recording(reference.recording)
     candidate_spans = _spans_from_candidate(candidate)
@@ -438,18 +438,32 @@ def _reference_recording(reference: ReferenceBundle | CanonicalRecording) -> Can
     raise ValidationError("reference must be a ReferenceBundle or CanonicalRecording")
 
 
-def _validate_candidate_timeline(recording: CanonicalRecording, candidate: NormalizedEngineOutput) -> None:
+def _validate_candidate_timeline(
+    recording: CanonicalRecording,
+    candidate: NormalizedEngineOutput,
+    policy: ScoringPolicyManifest,
+) -> None:
     candidate.artifact.timeline.assert_consistent_with_recording(recording)
     timeline = candidate.artifact.timeline
     if timeline.time_basis != "canonical_ms" or recording.time_basis != "canonical_ms":
         raise ValidationError("central evaluator requires canonical_ms timelines")
     channel_ids = set(timeline.channel_ids)
+    require_channels = policy.channel_mode == "per_channel" and len(recording.channels) > 1
     for span in candidate.speaker_spans:
+        if require_channels and span.channel_id is None:
+            raise ValidationError("per-channel scoring requires candidate speaker span channel_id")
         if span.channel_id is not None and span.channel_id not in channel_ids:
             raise ValidationError("candidate speaker span channel_id conflicts with reference channel layout")
         if span.end_ms > recording.duration_ms:
             raise ValidationError("candidate speaker span ends after reference duration")
     for word in candidate.words:
+        if (
+            require_channels
+            and not candidate.speaker_spans
+            and word.speaker_ref is not None
+            and word.channel_id is None
+        ):
+            raise ValidationError("per-channel scoring requires candidate word channel_id")
         if word.channel_id is not None and word.channel_id not in channel_ids:
             raise ValidationError("candidate word channel_id conflicts with reference channel layout")
         if word.end_ms > recording.duration_ms:
@@ -595,24 +609,26 @@ def _build_speaker_mapping(
     scoring_intervals: tuple[EvaluationInterval, ...],
     policy: ScoringPolicyManifest,
 ) -> dict[str, str]:
-    reference_speakers = tuple(sorted({span.speaker_ref for span in reference_spans}))
+    weights: dict[tuple[str, str], int] = {}
+    scoreable_reference_speakers: set[str] = set()
+    for atom in _atomic_intervals(scoring_intervals, reference_spans, candidate_spans):
+        active_reference_spans = _active_spans(reference_spans, atom)
+        if not policy.score_overlap and _is_reference_overlap(active_reference_spans):
+            continue
+        active_reference = {span.speaker_ref for span in active_reference_spans}
+        scoreable_reference_speakers.update(active_reference)
+        active_candidate = {span.speaker_ref for span in _active_spans(candidate_spans, atom)}
+        duration_ms = atom.duration_ms
+        for candidate_ref in active_candidate:
+            for reference_ref in active_reference:
+                weights[(candidate_ref, reference_ref)] = weights.get((candidate_ref, reference_ref), 0) + duration_ms
+    reference_speakers = tuple(sorted(scoreable_reference_speakers))
     candidate_speakers = tuple(sorted({span.speaker_ref for span in candidate_spans}))
     if len(reference_speakers) > _MAX_EXACT_ASSIGNMENT_REFERENCES:
         raise ValidationError(
             "speaker assignment requires exact maximum-weight matching; "
             "too many reference speakers for the bounded exact matcher"
         )
-    weights: dict[tuple[str, str], int] = {}
-    for atom in _atomic_intervals(scoring_intervals, reference_spans, candidate_spans):
-        active_reference_spans = _active_spans(reference_spans, atom)
-        if not policy.score_overlap and _is_reference_overlap(active_reference_spans):
-            continue
-        active_reference = {span.speaker_ref for span in active_reference_spans}
-        active_candidate = {span.speaker_ref for span in _active_spans(candidate_spans, atom)}
-        duration_ms = atom.duration_ms
-        for candidate_ref in active_candidate:
-            for reference_ref in active_reference:
-                weights[(candidate_ref, reference_ref)] = weights.get((candidate_ref, reference_ref), 0) + duration_ms
     return _exact_speaker_mapping(candidate_speakers, reference_speakers, weights)
 
 
@@ -666,6 +682,9 @@ def _score_metrics(
     hypothesis_speaker_ms = 0
     matched_speaker_ms = 0
     scored_interval_ms = 0
+    reference_speakers_scored: set[str] = set()
+    candidate_speakers_scored: set[str] = set()
+    mapped_candidate_speakers_scored: set[str] = set()
     for atom in _atomic_intervals(_normalize_intervals(intervals), reference_spans, candidate_spans):
         active_reference_spans = _active_spans(reference_spans, atom)
         if not policy.score_overlap and _is_reference_overlap(active_reference_spans):
@@ -677,6 +696,11 @@ def _score_metrics(
             for candidate_ref in active_candidate
             if candidate_ref in speaker_mapping
         }
+        reference_speakers_scored.update(active_reference)
+        candidate_speakers_scored.update(active_candidate)
+        mapped_candidate_speakers_scored.update(
+            candidate_ref for candidate_ref in active_candidate if candidate_ref in speaker_mapping
+        )
         duration_ms = atom.duration_ms
         scored_interval_ms += duration_ms
         reference_speaker_ms += duration_ms * len(active_reference)
@@ -692,14 +716,14 @@ def _score_metrics(
         speaker_label_accuracy = matched_speaker_ms / reference_speaker_ms
         diarization_error_rate = (missed_speaker_ms + false_alarm_speaker_ms) / reference_speaker_ms
     return {
-        "candidate_speaker_count": len({span.speaker_ref for span in candidate_spans}),
+        "candidate_speaker_count": len(candidate_speakers_scored),
         "diarization_error_rate": _round_metric(diarization_error_rate),
         "false_alarm_speaker_ms": false_alarm_speaker_ms,
         "hypothesis_speaker_ms": hypothesis_speaker_ms,
-        "mapped_candidate_speaker_count": len(speaker_mapping),
+        "mapped_candidate_speaker_count": len(mapped_candidate_speakers_scored),
         "matched_speaker_ms": matched_speaker_ms,
         "missed_speaker_ms": missed_speaker_ms,
-        "reference_speaker_count": len({span.speaker_ref for span in reference_spans}),
+        "reference_speaker_count": len(reference_speakers_scored),
         "reference_speaker_ms": reference_speaker_ms,
         "scored_interval_ms": scored_interval_ms,
         "speaker_label_accuracy": _round_metric(speaker_label_accuracy),

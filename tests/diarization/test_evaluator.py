@@ -184,15 +184,106 @@ def test_candidate_channels_must_match_reference_channel_layout():
         evaluate_diarization_candidate(reference, bad_word_channel)
 
 
+def test_per_channel_multichannel_scoring_requires_candidate_channel_attribution():
+    recording = _recording()
+    multichannel = replace(
+        recording,
+        channels=(
+            recording.channels[0],
+            ChannelRecord("ch-2", "second"),
+        ),
+        words=(
+            recording.words[0],
+            replace(recording.words[1], channel_id="ch-2"),
+        ),
+        speaker_spans=(
+            SpeakerSpan(
+                span_id="span-1",
+                speaker_ref="spk-a",
+                start_ms=0,
+                end_ms=500,
+                channel_id="ch-1",
+            ),
+            SpeakerSpan(
+                span_id="span-2",
+                speaker_ref="spk-b",
+                start_ms=500,
+                end_ms=1_000,
+                channel_id="ch-2",
+            ),
+        ),
+        scoring_regions=(
+            ScoringRegion("uem-1", 0, 1_000, channel_id="ch-1"),
+            ScoringRegion("uem-2", 0, 1_000, channel_id="ch-2"),
+        ),
+    )
+    candidate = _candidate_output(
+        multichannel,
+        {
+            "spk-a": "engine:local:speaker-1",
+            "spk-b": "engine:local:speaker-2",
+        },
+    )
+    policy = replace(
+        default_scoring_policy("diagnostic_diarization"),
+        channel_mode="per_channel",
+        collar_ms=0,
+    )
+    channel_less_spans = replace(
+        candidate,
+        speaker_spans=tuple(replace(span, channel_id=None) for span in candidate.speaker_spans),
+    )
+    channel_less_words = replace(
+        candidate,
+        speaker_spans=(),
+        words=tuple(replace(word, channel_id=None) for word in candidate.words),
+    )
+
+    with pytest.raises(ValidationError, match="per-channel scoring requires candidate speaker span channel_id"):
+        evaluate_diarization_candidate(_reference_bundle(multichannel), channel_less_spans, scoring_policy=policy)
+    with pytest.raises(ValidationError, match="per-channel scoring requires candidate word channel_id"):
+        evaluate_diarization_candidate(_reference_bundle(multichannel), channel_less_words, scoring_policy=policy)
+
+
 def test_large_speaker_assignment_fails_closed_instead_of_using_greedy_mapping():
-    recording = _many_speaker_recording()
+    recording = replace(
+        _many_speaker_recording(),
+        scoring_regions=(ScoringRegion("uem-1", 0, 2_000, channel_id="ch-1"),),
+    )
     candidate = _candidate_output(
         recording,
         {speaker.speaker_ref: f"engine:{speaker.speaker_ref}" for speaker in recording.speakers},
     )
 
     with pytest.raises(ValidationError, match="bounded exact matcher"):
-        evaluate_diarization_candidate(_reference_bundle(recording), candidate)
+        evaluate_diarization_candidate(
+            _reference_bundle(recording),
+            candidate,
+            scoring_policy=replace(default_scoring_policy("diagnostic_diarization"), collar_ms=0),
+        )
+
+
+def test_large_recordings_only_count_scoreable_reference_speakers_for_exact_mapping():
+    recording = replace(
+        _many_speaker_recording(),
+        scoring_regions=(ScoringRegion("uem-1", 0, 100, channel_id="ch-1"),),
+    )
+    candidate = _candidate_output(
+        recording,
+        {speaker.speaker_ref: f"engine:{speaker.speaker_ref}" for speaker in recording.speakers},
+    )
+
+    result = evaluate_diarization_candidate(
+        _reference_bundle(recording),
+        candidate,
+        scoring_policy=replace(default_scoring_policy("diagnostic_diarization"), collar_ms=0),
+    )
+    metrics = result.recording_metrics[0].metrics
+
+    assert result.speaker_mapping == {"engine:spk-00": "spk-00"}
+    assert metrics["reference_speaker_count"] == 1
+    assert metrics["candidate_speaker_count"] == 1
+    assert metrics["mapped_candidate_speaker_count"] == 1
 
 
 def test_reference_derived_slices_include_required_dimensions_and_sparse_statuses():
@@ -467,6 +558,58 @@ def test_collapsed_channel_policy_rejects_mismatched_per_channel_uem_regions():
             rendered_candidate,
             scoring_policy=policy,
         )
+
+
+def test_slice_metrics_count_only_speakers_inside_the_slice():
+    recording = _recording()
+    reference_recording = replace(
+        recording,
+        duration_ms=20_000,
+        words=(),
+        speaker_spans=(
+            SpeakerSpan(
+                span_id="span-1",
+                speaker_ref="spk-a",
+                start_ms=0,
+                end_ms=1_000,
+                channel_id="ch-1",
+            ),
+            SpeakerSpan(
+                span_id="span-2",
+                speaker_ref="spk-b",
+                start_ms=2_000,
+                end_ms=19_000,
+                channel_id="ch-1",
+            ),
+        ),
+        scoring_regions=(ScoringRegion("uem-1", 0, 20_000, channel_id="ch-1"),),
+    )
+    candidate = _candidate_output(
+        reference_recording,
+        {
+            "spk-a": "engine:local:speaker-1",
+            "spk-b": "engine:local:speaker-2",
+        },
+    )
+
+    result = evaluate_diarization_candidate(
+        _reference_bundle(reference_recording),
+        candidate,
+        scoring_policy=replace(default_scoring_policy("diagnostic_diarization"), collar_ms=0),
+    )
+    rows_by_slice = {row.slice_id: row for row in result.slice_metrics}
+    recording_metrics = result.recording_metrics[0].metrics
+    short_metrics = rows_by_slice["turn_duration:short"].metrics
+    long_metrics = rows_by_slice["turn_duration:long"].metrics
+
+    assert recording_metrics["reference_speaker_count"] == 2
+    assert recording_metrics["candidate_speaker_count"] == 2
+    assert short_metrics["reference_speaker_count"] == 1
+    assert short_metrics["candidate_speaker_count"] == 1
+    assert short_metrics["mapped_candidate_speaker_count"] == 1
+    assert long_metrics["reference_speaker_count"] == 1
+    assert long_metrics["candidate_speaker_count"] == 1
+    assert long_metrics["mapped_candidate_speaker_count"] == 1
 
 
 def test_overlap_reference_scores_overlap_slice_when_reference_supports_it():
