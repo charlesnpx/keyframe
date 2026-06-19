@@ -453,6 +453,21 @@ def test_private_acceptance_coverage_result_requires_diagnostic_flag_to_match_st
         )
 
 
+def test_private_acceptance_coverage_result_rejects_required_diagnostic_only_state():
+    with pytest.raises(ValidationError, match="coverage_result cannot be both required and diagnostic_only"):
+        PrivateAcceptanceCoverageSliceResult(
+            slice_id="adjudicated-core",
+            status="diagnostic_only",
+            required=True,
+            diagnostic_only=True,
+            scored_recording_count=0,
+            scored_duration_ms=0,
+            min_scored_recording_count=10,
+            min_scored_duration_ms=1_200_000,
+            reasons=("diagnostic slice is not promoted through private acceptance protocol",),
+        )
+
+
 def test_private_acceptance_coverage_report_rejects_sufficient_status_with_required_failure():
     failed_required_slice = PrivateAcceptanceCoverageSliceResult(
         slice_id="adjudicated-core",

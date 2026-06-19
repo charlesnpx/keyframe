@@ -506,6 +506,8 @@ class PrivateAcceptanceCoverageSliceResult:
         object.__setattr__(self, "reasons", reasons)
         if self.diagnostic_only != (self.status == "diagnostic_only"):
             raise ValidationError("coverage_result.diagnostic_only must match diagnostic_only status")
+        if self.required and self.diagnostic_only:
+            raise ValidationError("coverage_result cannot be both required and diagnostic_only")
         below_threshold = (
             self.scored_recording_count < self.min_scored_recording_count
             or self.scored_duration_ms < self.min_scored_duration_ms
