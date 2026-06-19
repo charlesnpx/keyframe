@@ -182,6 +182,9 @@ class AudioTransformManifest:
             raise ValidationError("transform original_audio_id conflicts with timeline")
         if self.canonical_audio_id != timeline.canonical_audio_id:
             raise ValidationError("transform canonical_audio_id conflicts with timeline")
+        output_channel_ids = tuple(mapping.output_channel_id for mapping in self.config.channel_mapping)
+        if output_channel_ids != timeline.channel_ids:
+            raise ValidationError("transform channel mapping conflicts with timeline channel_ids")
         if timeline.local_audio_sha256 is not None and timeline.local_audio_sha256 != self.canonical_audio_sha256:
             raise ValidationError("transform canonical_audio_sha256 conflicts with timeline local_audio_sha256")
 

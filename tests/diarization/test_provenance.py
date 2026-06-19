@@ -225,6 +225,13 @@ def test_transform_manifest_must_match_timeline_audio_identity_and_hash():
     with pytest.raises(ValidationError, match="canonical_audio_sha256 conflicts"):
         _timeline(local_audio_sha256=sha256_bytes(b"other"), transform_manifest=manifest)
 
+    with pytest.raises(ValidationError, match="channel mapping conflicts"):
+        _timeline(
+            channel_ids=("other-channel",),
+            local_audio_sha256=manifest.canonical_audio_sha256,
+            transform_manifest=manifest,
+        )
+
 
 def test_compatible_timeline_merge_is_direct():
     result = validate_timeline_merge(_artifact("asr"), _artifact("diarization"))
