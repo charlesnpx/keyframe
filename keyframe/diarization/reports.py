@@ -255,6 +255,8 @@ class BenchmarkEvaluationCase:
                 raise ValidationError("benchmark_case.baseline_evaluation recording_id must match evaluation")
             if self.baseline_evaluation.scoring_policy != self.evaluation.scoring_policy:
                 raise ValidationError("benchmark_case.baseline_evaluation scoring_policy must match evaluation")
+            if self.baseline_evaluation.reference_artifact != self.evaluation.reference_artifact:
+                raise ValidationError("benchmark_case.baseline_evaluation reference_artifact must match evaluation")
         object.__setattr__(
             self,
             "scored_duration_ms",
@@ -1776,7 +1778,7 @@ def _metric_result_key(result: BenchmarkMetricResult) -> tuple[BenchmarkReportSc
 def _is_serialized_review_signal_metric_result(result: BenchmarkMetricResult) -> bool:
     return (
         result.uncertainty.basis == "review_signal_metric"
-        or result.metric_name in {"false_confident_rate", "over_flag_rate"}
+        or result.metric_name in _REVIEW_SIGNAL_METRIC_NAMES
     )
 
 

@@ -389,6 +389,42 @@ def test_unscored_recording_baseline_does_not_provide_regression_delta():
     assert branch_der.gate.budget_id == "branch-der"
 
 
+def test_baseline_reference_artifact_must_match_evaluation():
+    base_case = _case(
+        "rec-1",
+        current_der=0.05,
+        baseline_der=0.05,
+        current_overlap_der=0.10,
+        baseline_overlap_der=0.10,
+    )
+    baseline = base_case.baseline_evaluation
+    assert baseline is not None
+    mismatched_baseline = DiarizationEvaluationResult(
+        recording_id=baseline.recording_id,
+        output_id=baseline.output_id,
+        scoring_policy=baseline.scoring_policy,
+        speaker_mapping=baseline.speaker_mapping,
+        slices=baseline.slices,
+        recording_metrics=baseline.recording_metrics,
+        slice_metrics=baseline.slice_metrics,
+        reference_artifact={"artifact_id": "different-reference", "artifact_kind": "reference"},
+        candidate_artifact=baseline.candidate_artifact,
+    )
+
+    with pytest.raises(ValidationError, match="reference_artifact must match evaluation"):
+        BenchmarkEvaluationCase(
+            corpus_id=base_case.corpus_id,
+            branch_id=base_case.branch_id,
+            evaluation=base_case.evaluation,
+            baseline_evaluation=mismatched_baseline,
+            scored_duration_ms=base_case.scored_duration_ms,
+            scored_words=base_case.scored_words,
+            scored_speaker_turns=base_case.scored_speaker_turns,
+            slice_scored_words=base_case.slice_scored_words,
+            slice_scored_speaker_turns=base_case.slice_scored_speaker_turns,
+        )
+
+
 def test_slice_specific_regression_budget_can_pass_and_fail():
     pass_report = build_benchmark_report(
         "slice-pass",
@@ -1066,6 +1102,27 @@ def test_report_json_rejects_review_signal_metric_without_calibration():
         {
             "metric_name": "false_confident_rate",
             "point_score": 0.0,
+        }
+    )
+    payload["branch_results"].append(forged)
+
+    with pytest.raises(ValidationError, match="require review_signal_calibration"):
+        benchmark_report_json_loads(json.dumps(payload))
+
+
+def test_report_json_rejects_precision_metric_without_calibration():
+    report = build_benchmark_report(
+        "forged-precision-without-calibration",
+        (
+            _case("rec-1", current_der=0.05, baseline_der=0.05, current_overlap_der=0.10, baseline_overlap_der=0.10),
+        ),
+    )
+    payload = report.to_dict()
+    forged = dict(payload["branch_results"][0])
+    forged.update(
+        {
+            "metric_name": "precision",
+            "point_score": 1.0,
         }
     )
     payload["branch_results"].append(forged)
