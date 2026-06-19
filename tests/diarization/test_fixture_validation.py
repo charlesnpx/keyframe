@@ -140,6 +140,28 @@ def test_invalid_negative_interval_returns_invalid_fixture_not_exception():
     assert "start_ms must be >= 0" in result.issues[0].message
 
 
+def test_duration_overflow_interval_returns_invalid_interval_issue():
+    payload = _payload("clean_two_speaker.json")
+    payload["words"][0]["end_ms"] = payload["duration_ms"] + 1
+
+    result = validate_canonical_reference_payload(payload, scoring_policy=_scoring_policy())
+
+    assert result.status == "invalid_fixture"
+    assert result.issues[0].category == "invalid_interval"
+    assert "ends after recording duration" in result.issues[0].message
+
+
+def test_duplicate_speaker_refs_return_schema_validation_issue():
+    payload = _payload("clean_two_speaker.json")
+    payload["speakers"][1]["speaker_ref"] = payload["speakers"][0]["speaker_ref"]
+
+    result = validate_canonical_reference_payload(payload, scoring_policy=_scoring_policy())
+
+    assert result.status == "invalid_fixture"
+    assert result.issues[0].category == "schema_validation"
+    assert "duplicate speaker_ref" in result.issues[0].message
+
+
 def test_missing_speaker_refs_return_invalid_fixture_result():
     result = validate_canonical_reference_payload(_payload("missing_speaker.json"), scoring_policy=_scoring_policy())
 

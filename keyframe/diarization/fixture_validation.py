@@ -660,9 +660,13 @@ def _merge_metrics(values: tuple[dict[str, Any], ...]) -> dict[str, Any]:
 
 
 def _category_for_model_error(message: str) -> FixtureIssueCategory:
-    if "start_ms must be >= 0" in message or "end_ms must be greater" in message:
+    if (
+        "start_ms must be >= 0" in message
+        or "end_ms must be greater" in message
+        or "ends after recording duration" in message
+    ):
         return "invalid_interval"
-    if "speaker_ref" in message:
+    if "references unknown speaker_ref" in message:
         return "unresolved_speaker"
     return "schema_validation"
 
