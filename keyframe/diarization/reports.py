@@ -952,7 +952,7 @@ def benchmark_report_from_dict(data: Mapping[str, Any]) -> BenchmarkReport:
     if not isinstance(data, Mapping):
         raise ValidationError("benchmark report data must be an object")
     gate_config = _gate_config_from_dict(_required(data, "gate_config", "benchmark_report"))
-    return BenchmarkReport(
+    report = BenchmarkReport(
         report_id=_required(data, "report_id", "benchmark_report"),
         status=_required(data, "status", "benchmark_report"),
         gate_config=gate_config,
@@ -985,6 +985,8 @@ def benchmark_report_from_dict(data: Mapping[str, Any]) -> BenchmarkReport:
         ),
         schema_version=_required(data, "schema_version", "benchmark_report"),
     )
+    _validate_serialized_gates(gate_config, report.metric_results)
+    return report
 
 
 def _observations_from_case(case: BenchmarkEvaluationCase) -> tuple[_MetricObservation, ...]:
@@ -1275,6 +1277,20 @@ def _validate_all_budgets_matched(
             "regression budgets did not match any metric result: "
             + ", ".join(sorted(unmatched_budget_ids))
         )
+
+
+def _validate_serialized_gates(
+    gate_config: BenchmarkGateConfig,
+    results: tuple[BenchmarkMetricResult, ...],
+) -> None:
+    _validate_all_budgets_matched(gate_config, results)
+    for result in results:
+        expected_gate = _evaluate_gate(result, gate_config)
+        if result.gate.to_dict() != expected_gate.to_dict():
+            raise ValidationError(
+                "metric_result gate does not match regression budget: "
+                f"{result.scope_id}/{result.metric_name}"
+            )
 
 
 def _uncertainty_interval(values: tuple[float, ...], *, basis: str) -> UncertaintyInterval:

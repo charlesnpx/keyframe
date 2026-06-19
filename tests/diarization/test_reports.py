@@ -568,6 +568,42 @@ def test_report_json_rejects_status_that_conflicts_with_failed_gates():
         benchmark_report_json_loads(json.dumps(payload))
 
 
+def test_report_json_rejects_serialized_gate_that_conflicts_with_budget():
+    report = build_benchmark_report(
+        "tampered-gate",
+        (
+            _case("rec-1", current_der=0.05, baseline_der=0.05, current_overlap_der=0.13, baseline_overlap_der=0.10),
+        ),
+        gate_config=BenchmarkGateConfig(
+            budgets=(
+                BenchmarkRegressionBudget(
+                    budget_id="overlap-der",
+                    metric_name="diarization_error_rate",
+                    budget_kind="overlap",
+                    direction="lower_is_better",
+                    max_regression_delta=0.01,
+                    scope_type="slice",
+                    slice_id="overlap:true",
+                ),
+            )
+        ),
+    )
+    payload = report.to_dict()
+    payload["status"] = "passed"
+    for result in payload["slice_results"]:
+        if result["slice_id"] == "overlap:true" and result["metric_name"] == "diarization_error_rate":
+            result["gate"] = {
+                "budget_id": "overlap-der",
+                "reasons": [],
+                "status": "passed",
+                "thresholds": {"max_regression_delta": 0.01},
+            }
+            break
+
+    with pytest.raises(ValidationError, match="metric_result gate does not match regression budget"):
+        benchmark_report_json_loads(json.dumps(payload))
+
+
 def test_gate_config_rejects_duplicate_budget_ids():
     with pytest.raises(ValidationError, match="duplicate budget_id"):
         BenchmarkGateConfig(
