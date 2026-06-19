@@ -607,6 +607,15 @@ def test_mono_mix_acceptance_decision_enforces_only_quality_false_confidence_and
         max_review_burden_delta=0.15,
         private_coverage_ready=False,
     )
+    simple_baseline = decide_mono_mix_branch_acceptance(
+        complex_quality_score=0.80,
+        baseline_quality_score=0.82,
+        complex_false_confident_rate=0.05,
+        baseline_false_confident_rate=0.05,
+        complex_review_burden_rate=0.10,
+        baseline_review_burden_rate=0.10,
+        min_quality_delta=0.0,
+    )
 
     assert accepted.decision == "accept_complex_branch"
     assert accepted.enforced_gates_passed is True
@@ -620,6 +629,8 @@ def test_mono_mix_acceptance_decision_enforces_only_quality_false_confidence_and
     assert rejected.decision == "ship_degraded_only"
     assert rejected.false_confidence_gate_passed is False
     assert coverage_gap.decision == "needs_more_private_coverage"
+    assert simple_baseline.decision == "accept_simple_baseline"
+    assert simple_baseline.quality_gate_passed is False
 
 
 def test_mono_mix_branch_report_compares_complex_branch_and_asr_only_baseline():
