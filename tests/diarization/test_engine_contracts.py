@@ -525,6 +525,28 @@ def test_whisperx_word_derived_spans_do_not_bridge_unknown_speaker_gaps():
     ]
 
 
+def test_whisperx_word_derived_spans_do_not_bridge_long_same_speaker_silences():
+    payload = {
+        "channel_id": "mono-mix",
+        "output_id": "word-speaker-silence",
+        "segments": [
+            {
+                "words": [
+                    {"end_ms": 100, "speaker": "A", "start_ms": 0, "word": "early"},
+                    {"end_ms": 5_100, "speaker": "A", "start_ms": 5_000, "word": "late"},
+                ]
+            }
+        ],
+    }
+
+    output = _whisperx_adapter().normalize_raw_output(payload, artifact=_whisperx_artifact(duration_ms=5_200))
+
+    assert [(span.speaker_ref, span.start_ms, span.end_ms) for span in output.speaker_spans] == [
+        ("engine:mono-mix:a", 0, 100),
+        ("engine:mono-mix:a", 5_000, 5_100),
+    ]
+
+
 def test_whisperx_runtime_preflight_reports_missing_optional_dependencies_without_import_failure():
     status = _whisperx_adapter().runtime_preflight(
         dependency_modules={"keyframe_missing_whisperx_for_test": "whisperx-test-only"}

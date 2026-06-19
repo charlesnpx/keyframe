@@ -24,6 +24,7 @@ _DEFAULT_WHISPERX_DEPENDENCIES = {
     "pyannote.audio": "pyannote.audio",
     "whisperx": "whisperx",
 }
+_WORD_DERIVED_TURN_GAP_MS = 900
 
 
 @runtime_checkable
@@ -970,13 +971,17 @@ def _spans_from_words(output_id: str, words: tuple[CanonicalWord, ...]) -> tuple
                 active_start_ms = None
                 active_end_ms = None
                 continue
-            if word.speaker_ref != active_speaker:
+            if (
+                word.speaker_ref != active_speaker
+                or active_end_ms is None
+                or word.start_ms - active_end_ms > _WORD_DERIVED_TURN_GAP_MS
+            ):
                 flush_active_span()
                 active_speaker = word.speaker_ref
                 active_start_ms = word.start_ms
                 active_end_ms = word.end_ms
             else:
-                active_end_ms = max(active_end_ms or word.end_ms, word.end_ms)
+                active_end_ms = max(active_end_ms, word.end_ms)
 
         flush_active_span()
     return tuple(spans)
