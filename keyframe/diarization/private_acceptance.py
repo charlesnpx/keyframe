@@ -555,14 +555,32 @@ class PrivateAcceptanceCoverageReport:
         results = _tuple_of(self.slice_results, PrivateAcceptanceCoverageSliceResult, "coverage_report.slice_results")
         if not results:
             raise ValidationError("coverage_report.slice_results is required")
+        result_ids = tuple(result.slice_id for result in results)
+        _unique_ids(result_ids, "coverage_report.slice_results.slice_id")
         object.__setattr__(self, "slice_results", results)
-        object.__setattr__(self, "validated_scope", _id_tuple(self.validated_scope, "coverage_report.validated_scope"))
+        validated_scope = _id_tuple(self.validated_scope, "coverage_report.validated_scope")
+        object.__setattr__(self, "validated_scope", validated_scope)
+        unsupported_scope = _id_tuple(self.unsupported_scope, "coverage_report.unsupported_scope")
         object.__setattr__(
             self,
             "unsupported_scope",
-            _id_tuple(self.unsupported_scope, "coverage_report.unsupported_scope"),
+            unsupported_scope,
         )
         object.__setattr__(self, "failure_code", _optional_id(self.failure_code, "coverage_report.failure_code"))
+        expected_validated_scope = tuple(
+            result.slice_id
+            for result in results
+            if result.required and result.status == "sufficient"
+        )
+        expected_unsupported_scope = tuple(
+            result.slice_id
+            for result in results
+            if result.required and result.status == "insufficient_acceptance_coverage"
+        )
+        if validated_scope != expected_validated_scope:
+            raise ValidationError("coverage_report.validated_scope must match sufficient required slices")
+        if unsupported_scope != expected_unsupported_scope:
+            raise ValidationError("coverage_report.unsupported_scope must match insufficient required slices")
         if self.status == "diagnostic_only":
             raise ValidationError("coverage_report.status cannot be diagnostic_only")
         has_required_insufficient = any(

@@ -475,8 +475,8 @@ def test_private_acceptance_coverage_report_rejects_sufficient_status_with_requi
             plan_version="2026-06-19",
             status="sufficient",
             slice_results=(failed_required_slice,),
-            validated_scope=("adjudicated-core",),
-            unsupported_scope=(),
+            validated_scope=(),
+            unsupported_scope=("adjudicated-core",),
         )
 
 
@@ -504,4 +504,56 @@ def test_private_acceptance_coverage_report_requires_required_failure_for_insuff
             validated_scope=("adjudicated-core",),
             unsupported_scope=(),
             failure_code="insufficient_acceptance_coverage",
+        )
+
+
+def test_private_acceptance_coverage_report_rejects_scope_that_contradicts_required_slices():
+    sufficient_required_slice = PrivateAcceptanceCoverageSliceResult(
+        slice_id="adjudicated-core",
+        status="sufficient",
+        required=True,
+        diagnostic_only=False,
+        scored_recording_count=10,
+        scored_duration_ms=1_200_000,
+        min_scored_recording_count=10,
+        min_scored_duration_ms=1_200_000,
+    )
+
+    with pytest.raises(
+        ValidationError,
+        match="coverage_report.validated_scope must match sufficient required slices",
+    ):
+        PrivateAcceptanceCoverageReport(
+            plan_id="private-coverage-v1",
+            plan_version="2026-06-19",
+            status="sufficient",
+            slice_results=(sufficient_required_slice,),
+            validated_scope=(),
+            unsupported_scope=("adjudicated-core",),
+        )
+
+
+def test_private_acceptance_coverage_report_rejects_duplicate_slice_results():
+    sufficient_required_slice = PrivateAcceptanceCoverageSliceResult(
+        slice_id="adjudicated-core",
+        status="sufficient",
+        required=True,
+        diagnostic_only=False,
+        scored_recording_count=10,
+        scored_duration_ms=1_200_000,
+        min_scored_recording_count=10,
+        min_scored_duration_ms=1_200_000,
+    )
+
+    with pytest.raises(
+        ValidationError,
+        match="duplicate coverage_report.slice_results.slice_id: adjudicated-core",
+    ):
+        PrivateAcceptanceCoverageReport(
+            plan_id="private-coverage-v1",
+            plan_version="2026-06-19",
+            status="sufficient",
+            slice_results=(sufficient_required_slice, sufficient_required_slice),
+            validated_scope=("adjudicated-core",),
+            unsupported_scope=(),
         )
