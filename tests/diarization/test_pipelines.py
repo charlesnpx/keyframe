@@ -2,6 +2,8 @@ import pytest
 
 from keyframe.diarization import (
     AudioTimelineProvenance,
+    BranchAcceptanceRecord,
+    CandidateBundle,
     CanonicalRecording,
     CanonicalWord,
     ChannelRecord,
@@ -13,12 +15,16 @@ from keyframe.diarization import (
     ReferenceBundle,
     SpeakerSpan,
     ValidationError,
+    build_asr_only_degraded_baseline,
     build_candidate_bundle,
+    build_mono_mix_branch_report,
     build_pipeline_branch_evaluation_case,
     create_pipeline_branch_run_record,
+    decide_mono_mix_branch_acceptance,
     read_dataset_manifest_json,
     render_branch_transcript,
     run_authenticated_track_metadata_branch,
+    run_mono_mix_branch,
     run_separate_track_branch,
     validate_pipeline_branch_payload,
 )
@@ -174,6 +180,88 @@ def _colliding_channel_outputs():
             "left-slash-output",
             (("slash-first", 200, 280, "raw-speaker-1", None),),
             channel_ids=channel_ids,
+        ),
+    )
+
+
+def _mono_mix_bundle(bundle_id="candidate-mono-mix"):
+    recording = _recording()
+    return CandidateBundle(
+        bundle_id=bundle_id,
+        mode="product_realistic",
+        audio={
+            "channel_count": 1,
+            "duration_ms": recording.duration_ms,
+            "sample_rate_hz": recording.sample_rate_hz,
+            "time_basis": "canonical_ms",
+        },
+        channels=({"channel_id": "mono-mix"},),
+        runtime_hints={
+            "channel_ids": ["mono-mix"],
+            "mode_supports_speaker_identity": False,
+            "timeline": {
+                "channel_ids": ["mono-mix"],
+                "duration_ms": recording.duration_ms,
+                "sample_rate_hz": recording.sample_rate_hz,
+                "time_basis": "canonical_ms",
+                "timeline_id": recording.timeline_id,
+                "transform_chain_id": f"{recording.transform_chain_id}-mono-mix",
+            },
+        },
+    )
+
+
+def _mono_mix_artifact(output_id):
+    recording = _recording()
+    return NormalizedArtifactProvenance(
+        artifact_id=f"{output_id}:artifact",
+        artifact_kind="candidate",
+        timeline=AudioTimelineProvenance(
+            original_audio_id=recording.original_audio_id,
+            canonical_audio_id=recording.canonical_audio_id,
+            timeline_id=recording.timeline_id,
+            transform_chain_id=f"{recording.transform_chain_id}-mono-mix",
+            sample_rate_hz=recording.sample_rate_hz,
+            duration_ms=recording.duration_ms,
+            channel_ids=("mono-mix",),
+        ),
+    )
+
+
+def _mono_mix_asr_output():
+    return NormalizedEngineOutput(
+        output_id="mono-asr",
+        output_kind="word_spans",
+        artifact=_mono_mix_artifact("mono-asr"),
+        config=EngineConfigMetadata(
+            adapter_id="test-mono-asr",
+            provider="test-provider",
+            model_name="mono-asr",
+        ),
+        words=(
+            CanonicalWord("asr-w-1", "hello", 0, 120, channel_id="mono-mix", text_confidence=0.99),
+            CanonicalWord("asr-w-2", "there", 160, 260, channel_id="mono-mix", text_confidence=0.98),
+            CanonicalWord("asr-w-3", "together", 320, 420, channel_id="mono-mix", text_confidence=0.97),
+        ),
+        speaker_spans=(),
+    )
+
+
+def _mono_mix_diarization_output():
+    return NormalizedEngineOutput(
+        output_id="mono-diarization",
+        output_kind="word_spans",
+        artifact=_mono_mix_artifact("mono-diarization"),
+        config=EngineConfigMetadata(
+            adapter_id="test-mono-diarization",
+            provider="test-provider",
+            model_name="mono-diarization",
+        ),
+        words=(),
+        speaker_spans=(
+            SpeakerSpan("dia-span-1", "raw-a", 0, 280, channel_id="mono-mix", confidence=0.92),
+            SpeakerSpan("dia-span-2", "raw-b", 300, 430, channel_id="mono-mix", confidence=None, overlap=True),
+            SpeakerSpan("dia-span-3", "raw-c", 330, 450, channel_id="mono-mix", confidence=0.81, overlap=True),
         ),
     )
 
@@ -363,3 +451,283 @@ def test_pipeline_branch_ids_flow_into_run_records_and_report_cases(tmp_path):
     assert record.branch == "separate_tracks"
     assert case.branch_id == "separate_tracks"
     assert case.evaluation.output_id == result.output.output_id
+
+
+def test_mono_mix_branch_renders_asr_words_with_diarization_spans_overlap_and_uncertainty():
+    result = run_mono_mix_branch(
+        _mono_mix_bundle(),
+        asr_output=_mono_mix_asr_output(),
+        diarization_output=_mono_mix_diarization_output(),
+        output_id="mono-complex",
+    )
+
+    transcript = render_branch_transcript(result)
+
+    assert result.branch_id == "mono_mix"
+    assert result.output.artifact.timeline.channel_ids == ("mono-mix",)
+    assert result.output.artifact.timeline.transform_chain_id == "identity-mono-mix"
+    assert [word.text for word in result.output.words] == ["hello", "there", "together"]
+    assert [word.speaker_ref for word in result.output.words] == [
+        "mono_mix:mono-mix:speaker_1",
+        "mono_mix:mono-mix:speaker_1",
+        "mono_mix:mono-mix:speaker_2",
+    ]
+    assert all(word.display_label is None for word in result.output.words)
+    assert [word.speaker_ref for word in result.recording.words] == [word.speaker_ref for word in result.output.words]
+    assert all(word.display_label is not None for word in result.recording.words)
+    assert [span.speaker_ref for span in result.output.speaker_spans] == [
+        "mono_mix:mono-mix:speaker_1",
+        "mono_mix:mono-mix:speaker_2",
+        "mono_mix:mono-mix:speaker_3",
+    ]
+    assert [turn.text for turn in transcript.turns] == ["hello there", "together"]
+    assert transcript.turns[0].label == "person_1"
+    assert transcript.words[2].overlap is True
+    assert transcript.words[2].uncertain is True
+    assert "overlap_detected" in transcript.words[2].review_reasons
+
+
+def test_mono_mix_asr_only_degraded_fallback_keeps_text_without_speaker_labels():
+    baseline = build_asr_only_degraded_baseline(
+        _mono_mix_bundle(),
+        asr_output=_mono_mix_asr_output(),
+        output_id="mono-baseline",
+    )
+
+    transcript = render_branch_transcript(baseline)
+
+    assert baseline.branch_id == "mono_mix"
+    assert baseline.metadata["baseline_kind"] == "asr_only_degraded_transcript"
+    assert transcript.state == "speaker_attribution_unavailable"
+    assert [word.text for word in transcript.words] == ["hello", "there", "together"]
+    assert all(word.label is None and word.display_label is None for word in transcript.words)
+    assert all(turn.label is None and turn.display_label is None for turn in transcript.turns)
+
+
+def test_mono_mix_runners_reject_serialized_candidate_payloads():
+    bundle_payload = _mono_mix_bundle().to_dict()
+
+    with pytest.raises(ValidationError, match="candidate_bundle must be a CandidateBundle"):
+        run_mono_mix_branch(
+            bundle_payload,
+            asr_output=_mono_mix_asr_output(),
+            diarization_output=_mono_mix_diarization_output(),
+        )
+
+    with pytest.raises(ValidationError, match="candidate_bundle must be a CandidateBundle"):
+        build_asr_only_degraded_baseline(
+            bundle_payload,
+            asr_output=_mono_mix_asr_output(),
+        )
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ("quality_delta", "false_confidence_delta", "review_burden_delta"),
+)
+def test_branch_acceptance_record_requires_enforced_metric_deltas(field_name):
+    values = {
+        "branch_id": "mono_mix",
+        "decision": "accept_complex_branch",
+        "quality_delta": 0.1,
+        "false_confidence_delta": 0.0,
+        "review_burden_delta": -0.1,
+        "quality_gate_passed": True,
+        "false_confidence_gate_passed": True,
+        "review_burden_gate_passed": True,
+    }
+    values[field_name] = None
+
+    with pytest.raises(ValidationError, match=f"acceptance.{field_name} must be a number"):
+        BranchAcceptanceRecord(**values)
+
+
+@pytest.mark.parametrize(
+    "field_name,bad_value",
+    (
+        ("complex_false_confident_rate", 1.01),
+        ("baseline_false_confident_rate", -0.01),
+        ("complex_review_burden_rate", 1.01),
+        ("baseline_review_burden_rate", -0.01),
+    ),
+)
+def test_mono_mix_acceptance_decision_rejects_impossible_rate_inputs(field_name, bad_value):
+    values = {
+        "complex_quality_score": 0.91,
+        "baseline_quality_score": 0.82,
+        "complex_false_confident_rate": 0.08,
+        "baseline_false_confident_rate": 0.05,
+        "complex_review_burden_rate": 0.20,
+        "baseline_review_burden_rate": 0.10,
+    }
+    values[field_name] = bad_value
+
+    with pytest.raises(ValidationError, match=f"{field_name} must be between 0 and 1"):
+        decide_mono_mix_branch_acceptance(**values)
+
+
+def test_mono_mix_acceptance_decision_enforces_only_quality_false_confidence_and_review_burden():
+    accepted = decide_mono_mix_branch_acceptance(
+        complex_quality_score=0.91,
+        baseline_quality_score=0.82,
+        complex_false_confident_rate=0.08,
+        baseline_false_confident_rate=0.05,
+        complex_review_burden_rate=0.20,
+        baseline_review_burden_rate=0.10,
+        min_quality_delta=0.02,
+        max_false_confidence_delta=0.05,
+        max_review_burden_delta=0.15,
+        latency_delta_ms=60_000,
+        cost_delta=99.0,
+        job_failure_delta=0.50,
+        retry_delta=0.25,
+        governance_delta={"provider_retention": "higher_than_baseline"},
+    )
+    rejected = decide_mono_mix_branch_acceptance(
+        complex_quality_score=0.91,
+        baseline_quality_score=0.82,
+        complex_false_confident_rate=0.40,
+        baseline_false_confident_rate=0.05,
+        complex_review_burden_rate=0.20,
+        baseline_review_burden_rate=0.10,
+        min_quality_delta=0.02,
+        max_false_confidence_delta=0.05,
+        max_review_burden_delta=0.15,
+        private_coverage_ready=True,
+    )
+    coverage_gap = decide_mono_mix_branch_acceptance(
+        complex_quality_score=0.91,
+        baseline_quality_score=0.82,
+        complex_false_confident_rate=0.08,
+        baseline_false_confident_rate=0.05,
+        complex_review_burden_rate=0.20,
+        baseline_review_burden_rate=0.10,
+        min_quality_delta=0.02,
+        max_false_confidence_delta=0.05,
+        max_review_burden_delta=0.15,
+        private_coverage_ready=False,
+    )
+    simple_baseline = decide_mono_mix_branch_acceptance(
+        complex_quality_score=0.80,
+        baseline_quality_score=0.82,
+        complex_false_confident_rate=0.05,
+        baseline_false_confident_rate=0.05,
+        complex_review_burden_rate=0.10,
+        baseline_review_burden_rate=0.10,
+        min_quality_delta=0.0,
+    )
+
+    assert accepted.decision == "accept_complex_branch"
+    assert accepted.enforced_gates_passed is True
+    assert accepted.to_dict()["non_enforced_fields"] == {
+        "cost_delta": 99.0,
+        "governance_delta": {"provider_retention": "higher_than_baseline"},
+        "job_failure_delta": 0.5,
+        "latency_delta_ms": 60_000,
+        "retry_delta": 0.25,
+    }
+    assert rejected.decision == "ship_degraded_only"
+    assert rejected.false_confidence_gate_passed is False
+    assert coverage_gap.decision == "needs_more_private_coverage"
+    assert simple_baseline.decision == "accept_simple_baseline"
+    assert simple_baseline.quality_gate_passed is False
+
+
+def test_mono_mix_branch_report_compares_complex_branch_and_asr_only_baseline():
+    bundle = _mono_mix_bundle()
+    complex_result = run_mono_mix_branch(
+        bundle,
+        asr_output=_mono_mix_asr_output(),
+        diarization_output=_mono_mix_diarization_output(),
+        output_id="mono-complex",
+    )
+    baseline = build_asr_only_degraded_baseline(
+        bundle,
+        asr_output=_mono_mix_asr_output(),
+        output_id="mono-baseline",
+    )
+    acceptance = decide_mono_mix_branch_acceptance(
+        complex_quality_score=0.90,
+        baseline_quality_score=0.80,
+        complex_false_confident_rate=0.05,
+        baseline_false_confident_rate=0.05,
+        complex_review_burden_rate=0.10,
+        baseline_review_burden_rate=0.20,
+        min_quality_delta=0.01,
+    )
+
+    report = build_mono_mix_branch_report(
+        complex_branch=complex_result,
+        simple_baseline=baseline,
+        acceptance=acceptance,
+    )
+    payload = report.to_dict()
+
+    assert payload["branch_id"] == "mono_mix"
+    assert payload["complex_branch"]["output_id"] == "mono-complex"
+    assert payload["simple_baseline"]["output_id"] == "mono-baseline"
+    assert payload["acceptance"]["decision"] == "accept_complex_branch"
+    assert payload["complex_transcript"]["turn_count"] == 2
+    assert payload["baseline_transcript"]["state"] == "speaker_attribution_unavailable"
+    assert FORBIDDEN_SAFE_PAYLOAD_KEYS.isdisjoint(set(_walk_keys(payload["complex_branch"])))
+
+
+def test_mono_mix_branch_report_rejects_inverted_complex_and_baseline_results():
+    bundle = _mono_mix_bundle()
+    complex_result = run_mono_mix_branch(
+        bundle,
+        asr_output=_mono_mix_asr_output(),
+        diarization_output=_mono_mix_diarization_output(),
+        output_id="mono-complex",
+    )
+    baseline = build_asr_only_degraded_baseline(
+        bundle,
+        asr_output=_mono_mix_asr_output(),
+        output_id="mono-baseline",
+    )
+    acceptance = decide_mono_mix_branch_acceptance(
+        complex_quality_score=0.90,
+        baseline_quality_score=0.80,
+        complex_false_confident_rate=0.05,
+        baseline_false_confident_rate=0.05,
+        complex_review_burden_rate=0.10,
+        baseline_review_burden_rate=0.20,
+        min_quality_delta=0.01,
+    )
+
+    with pytest.raises(ValidationError, match="complex_branch must be the non-baseline mono_mix result"):
+        build_mono_mix_branch_report(
+            complex_branch=baseline,
+            simple_baseline=complex_result,
+            acceptance=acceptance,
+        )
+
+
+def test_mono_mix_branch_report_rejects_unrelated_candidate_bundles():
+    complex_result = run_mono_mix_branch(
+        _mono_mix_bundle("candidate-mono-mix-a"),
+        asr_output=_mono_mix_asr_output(),
+        diarization_output=_mono_mix_diarization_output(),
+        output_id="mono-complex-a",
+    )
+    unrelated_baseline = build_asr_only_degraded_baseline(
+        _mono_mix_bundle("candidate-mono-mix-b"),
+        asr_output=_mono_mix_asr_output(),
+        output_id="mono-baseline-b",
+    )
+    acceptance = decide_mono_mix_branch_acceptance(
+        complex_quality_score=0.90,
+        baseline_quality_score=0.80,
+        complex_false_confident_rate=0.05,
+        baseline_false_confident_rate=0.05,
+        complex_review_burden_rate=0.10,
+        baseline_review_burden_rate=0.20,
+        min_quality_delta=0.01,
+    )
+
+    with pytest.raises(ValidationError, match="branches must use the same candidate bundle"):
+        build_mono_mix_branch_report(
+            complex_branch=complex_result,
+            simple_baseline=unrelated_baseline,
+            acceptance=acceptance,
+        )
