@@ -17,6 +17,7 @@ from keyframe.diarization.adapters import (
     DatasetExportResult,
     DatasetPreparationPlan,
     DatasetValidationResult,
+    build_artifact_layout,
     create_benchmark_run_record,
     plan_dataset_preparation,
 )
@@ -37,6 +38,7 @@ from keyframe.diarization.models import (
     SpeakerSpan,
     ValidationError,
 )
+from keyframe.diarization.scoring_exports import write_rttm, write_uem
 
 
 AMI_SAMPLE_RATE_HZ = 16_000
@@ -687,6 +689,11 @@ def create_ami_benchmark_run_record(
         tuned_on_splits=tuned_on_splits,
         evaluated_on_splits=evaluated_on_splits,
     )
+    run_artifacts = _ami_run_record_derived_artifacts(
+        artifact_root=artifact_root,
+        split_id=split_id,
+        overrides=derived_artifacts,
+    )
     return create_benchmark_run_record(
         run_id=run_id,
         manifest=manifest,
@@ -696,8 +703,25 @@ def create_ami_benchmark_run_record(
         cache=cache,
         tuned_split_ids=plan.tuned_on_splits,
         evaluated_split_ids=plan.evaluated_on_splits,
-        derived_artifacts=derived_artifacts,
+        derived_artifacts=run_artifacts,
     )
+
+
+def _ami_run_record_derived_artifacts(
+    *,
+    artifact_root: str | Path,
+    split_id: str,
+    overrides: dict[str, str] | None = None,
+) -> dict[str, str]:
+    split_id = _require_id(split_id, "split_id")
+    layout = build_artifact_layout(artifact_root)
+    artifacts = {
+        "rttm": (Path(layout.rttm_dir) / f"{split_id}.rttm").as_posix(),
+        "uem": (Path(layout.uem_dir) / f"{split_id}.uem").as_posix(),
+    }
+    if overrides is not None:
+        artifacts.update(overrides)
+    return artifacts
 
 
 def ami_dataset_snapshot_id(snapshot: DatasetManifest | dict[str, Any]) -> str:
@@ -792,6 +816,8 @@ def _write_ami_artifacts(
 ) -> dict[str, str]:
     canonical_path = Path(artifact_layout.canonical_references_dir) / f"{recording.recording_id}.canonical.json"
     reference_path = Path(artifact_layout.canonical_references_dir) / f"{recording.recording_id}.reference.json"
+    rttm_path = Path(artifact_layout.rttm_dir) / f"{recording.recording_id}.rttm"
+    uem_path = Path(artifact_layout.uem_dir) / f"{recording.recording_id}.uem"
     candidate_dir = Path(artifact_layout.candidate_bundles_dir)
     candidate_paths = {
         "separate_tracks": candidate_dir / f"{recording.recording_id}.separate_tracks.json",
@@ -802,6 +828,8 @@ def _write_ami_artifacts(
     canonical_path.parent.mkdir(parents=True, exist_ok=True)
     write_recording_json(canonical_path, recording)
     _write_json(reference_path, reference.to_evaluator_dict())
+    write_rttm(rttm_path, recording)
+    write_uem(uem_path, recording)
     for branch, path in candidate_paths.items():
         branch_name = _validate_ami_branch(branch)
         _write_json(
@@ -821,6 +849,8 @@ def _write_ami_artifacts(
             "authenticated_track_metadata"
         ].as_posix(),
         "reference_bundle": reference_path.as_posix(),
+        "rttm": rttm_path.as_posix(),
+        "uem": uem_path.as_posix(),
     }
 
 

@@ -31,6 +31,9 @@ from keyframe.diarization import (
     read_ami_words_xml,
     render_transcript,
     validate_candidate_bundle_payload,
+    validate_rttm_text,
+    validate_scoring_exports,
+    validate_uem_text,
 )
 
 
@@ -128,11 +131,22 @@ def test_ami_adapter_validates_local_cache_and_exports_reference_and_candidate_a
         assert result.split_id == "ami-public-dev"
         for path in result.artifact_paths.values():
             assert Path(path).is_file()
+        assert validate_scoring_exports(artifact_paths=result.artifact_paths).valid is True
 
     product_payload = json.loads(Path(results[0].artifact_paths["candidate_bundle"]).read_text(encoding="utf-8"))
+    rttm_rows = validate_rttm_text(Path(results[0].artifact_paths["rttm"]).read_text(encoding="utf-8"))
+    uem_rows = validate_uem_text(Path(results[0].artifact_paths["uem"]).read_text(encoding="utf-8"))
     authenticated_payload = json.loads(
         Path(results[0].artifact_paths["authenticated_track_metadata_candidate_bundle"]).read_text(encoding="utf-8")
     )
+    assert [(row.recording_id, row.channel_id, row.start_ms, row.duration_ms, row.speaker_ref) for row in rttm_rows] == [
+        ("ES2002a", "ihm-P1", 0, 900, "spk-1"),
+        ("ES2002a", "ihm-P2", 650, 650, "spk-2"),
+    ]
+    assert [(row.recording_id, row.channel_id, row.start_ms, row.end_ms) for row in uem_rows] == [
+        ("ES2002a", "ihm-P1", 0, 900),
+        ("ES2002a", "ihm-P2", 650, 1300),
+    ]
     validate_candidate_bundle_payload(product_payload)
     validate_candidate_bundle_payload(authenticated_payload)
     assert product_payload["channels"] == [{"channel_id": "ihm-P1"}, {"channel_id": "ihm-P2"}]
@@ -264,6 +278,8 @@ def test_ami_split_plan_rejects_holdout_tuning_and_run_record_identifies_frozen_
     assert record.split_id == "ami-public-holdout"
     assert record.tuned_split_ids == ("ami-public-dev",)
     assert record.evaluated_split_ids == ("ami-public-holdout",)
+    assert record.derived_artifacts["rttm"].endswith("/exports/rttm/ami-public-holdout.rttm")
+    assert record.derived_artifacts["uem"].endswith("/exports/uem/ami-public-holdout.uem")
     assert identifiers == {
         "branch": "separate_tracks",
         "dataset_id": "ami",
