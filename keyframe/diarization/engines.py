@@ -1266,10 +1266,13 @@ def _provider_speaker_ref(
 
 
 def _provider_event_status(payload: dict[str, Any]) -> str:
-    is_final = payload.get("isFinal")
-    if is_final is None:
-        return _event_status(payload)
-    return "final" if _require_bool(is_final, "hosted_provider_output.result.isFinal") else "partial"
+    if "isFinal" in payload:
+        is_final = _require_bool(payload.get("isFinal"), "hosted_provider_output.result.isFinal")
+        return "final" if is_final else "partial"
+    if "is_final" in payload:
+        is_final = _require_bool(payload.get("is_final"), "hosted_provider_output.result.is_final")
+        return "final" if is_final else "partial"
+    return _event_status(payload)
 
 
 def _whisper_diarization_rows(
