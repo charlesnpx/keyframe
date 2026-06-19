@@ -491,16 +491,17 @@ class PrivateAcceptanceCoverageSliceResult:
             "diagnostic_only",
             _require_bool(self.diagnostic_only, "coverage_result.diagnostic_only"),
         )
-        for field_name in (
-            "scored_recording_count",
-            "scored_duration_ms",
-            "min_scored_recording_count",
-            "min_scored_duration_ms",
-        ):
+        for field_name in ("scored_recording_count", "scored_duration_ms"):
             object.__setattr__(
                 self,
                 field_name,
                 _non_negative_int(getattr(self, field_name), f"coverage_result.{field_name}"),
+            )
+        for field_name in ("min_scored_recording_count", "min_scored_duration_ms"):
+            object.__setattr__(
+                self,
+                field_name,
+                _positive_int(getattr(self, field_name), f"coverage_result.{field_name}"),
             )
         reasons = tuple(_require_text(reason, "coverage_result.reasons") for reason in _sequence(self.reasons))
         object.__setattr__(self, "reasons", reasons)
@@ -645,11 +646,11 @@ class PrivateAcceptanceMetadata:
             raise ValidationError("private_acceptance.coverage_plan must be PrivateAcceptanceCoveragePlan")
         if self.coverage_plan is not None:
             allowed_slice_ids = {item.slice_id for item in slices if item.label == "adjudicated"}
-            required_slice_ids = {target.slice_id for target in self.coverage_plan.targets if target.required}
-            unknown_required = required_slice_ids - allowed_slice_ids
-            if unknown_required:
+            promoted_slice_ids = {target.slice_id for target in self.coverage_plan.targets if not target.diagnostic_only}
+            unknown_promoted = promoted_slice_ids - allowed_slice_ids
+            if unknown_promoted:
                 raise ValidationError(
-                    f"private_acceptance.coverage_plan requires adjudicated slice: {sorted(unknown_required)[0]}"
+                    f"private_acceptance.coverage_plan requires adjudicated slice: {sorted(unknown_promoted)[0]}"
                 )
 
     def to_dict(self) -> dict[str, Any]:

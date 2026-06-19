@@ -410,6 +410,23 @@ def test_required_coverage_targets_must_be_promoted_through_private_acceptance_p
         )
 
 
+def test_optional_non_diagnostic_coverage_targets_must_be_adjudicated():
+    with pytest.raises(ValidationError, match="requires adjudicated slice: diagnostic-unadjudicated"):
+        _metadata(
+            coverage_plan=PrivateAcceptanceCoveragePlan(
+                plan_id="bad-private-coverage",
+                version="1",
+                targets=(
+                    _coverage_target(
+                        "diagnostic-unadjudicated",
+                        diagnostic_only=False,
+                        required=False,
+                    ),
+                ),
+            )
+        )
+
+
 def test_private_acceptance_coverage_rejects_unknown_observation_slice_ids():
     with pytest.raises(ValidationError, match="coverage observation references unknown slice_id: stale-slice"):
         evaluate_private_acceptance_coverage(
@@ -434,6 +451,20 @@ def test_private_acceptance_coverage_result_rejects_impossible_sufficient_state(
             scored_recording_count=0,
             scored_duration_ms=0,
             min_scored_recording_count=10,
+            min_scored_duration_ms=1_200_000,
+        )
+
+
+def test_private_acceptance_coverage_result_requires_positive_minimum_thresholds():
+    with pytest.raises(ValidationError, match="coverage_result.min_scored_recording_count must be > 0"):
+        PrivateAcceptanceCoverageSliceResult(
+            slice_id="adjudicated-core",
+            status="sufficient",
+            required=True,
+            diagnostic_only=False,
+            scored_recording_count=0,
+            scored_duration_ms=0,
+            min_scored_recording_count=0,
             min_scored_duration_ms=1_200_000,
         )
 
