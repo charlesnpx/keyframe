@@ -105,6 +105,17 @@ def test_overlap_is_invalid_when_policy_ignores_overlap():
     assert [issue.category for issue in result.issues] == ["unsupported_overlap"]
 
 
+def test_unflagged_cross_speaker_span_overlap_is_invalid_when_policy_ignores_overlap():
+    payload = _payload("clean_two_speaker.json")
+    payload["speaker_spans"][0]["end_ms"] = 600
+    payload["speaker_spans"][1]["start_ms"] = 300
+
+    result = validate_canonical_reference_payload(payload, scoring_policy=_scoring_policy(ignore_overlap=True))
+
+    assert result.status == "invalid_fixture"
+    assert [issue.category for issue in result.issues] == ["unsupported_overlap"]
+
+
 def test_invalid_negative_interval_returns_invalid_fixture_not_exception():
     payload = _payload("clean_two_speaker.json")
     payload["words"][0]["start_ms"] = -1
@@ -229,6 +240,20 @@ def test_fixture_gate_aggregates_slice_support_across_canonical_payloads():
         "fixture-clean-two-speaker",
         "fixture-clean-two-speaker-copy",
     )
+
+
+def test_fixture_gate_returns_invalid_fixture_for_duplicate_canonical_recording_ids():
+    payload = _payload("clean_two_speaker.json")
+
+    result = validate_fixture_gate(
+        canonical_payloads=(payload, copy.deepcopy(payload)),
+        scoring_policy=_scoring_policy(),
+        minimum_slice_support=1,
+    )
+
+    assert result.status == "invalid_fixture"
+    assert result.issues[0].category == "schema_validation"
+    assert "duplicate canonical recording_id" in result.issues[0].message
 
 
 def test_merge_fixture_validation_results_aggregates_slice_support():

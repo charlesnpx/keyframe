@@ -258,7 +258,11 @@ def _canonical_recording_issues(
                 )
             )
 
-    has_overlap = any(word.overlap for word in recording.words) or any(span.overlap for span in recording.speaker_spans)
+    has_overlap = (
+        any(word.overlap for word in recording.words)
+        or any(span.overlap for span in recording.speaker_spans)
+        or _has_overlapping_speaker_spans(recording.speaker_spans)
+    )
     if has_overlap and (scoring_policy is None or scoring_policy.ignore_overlap):
         issues.append(
             _issue(
@@ -407,14 +411,26 @@ def validate_fixture_gate(
         results.append(validate_manifest_expected_files(manifest, root=expected_files_root))
     canonical_recordings: list[CanonicalRecording] = []
     canonical_issues: list[FixtureValidationIssue] = []
+    canonical_recording_ids: set[str] = set()
     for payload in canonical_payloads:
         try:
             recording = recording_from_dict(payload)
         except ValidationError as exc:
             results.append(_result((_issue(_category_for_model_error(str(exc)), str(exc)),)))
             continue
-        canonical_recordings.append(recording)
-        canonical_issues.extend(_canonical_recording_issues(recording, scoring_policy=scoring_policy))
+        recording_issues = list(_canonical_recording_issues(recording, scoring_policy=scoring_policy))
+        if recording.recording_id in canonical_recording_ids:
+            recording_issues.append(
+                _issue(
+                    "schema_validation",
+                    f"duplicate canonical recording_id: {recording.recording_id}",
+                    recording_id=recording.recording_id,
+                )
+            )
+        else:
+            canonical_recording_ids.add(recording.recording_id)
+            canonical_recordings.append(recording)
+        canonical_issues.extend(recording_issues)
     if canonical_recordings:
         results.append(
             _result(
@@ -520,6 +536,16 @@ def _overlap_ms(recording: CanonicalRecording) -> int:
     if not intervals:
         intervals = [(word.start_ms, word.end_ms) for word in recording.words if word.overlap]
     return _interval_union_ms(tuple(intervals))
+
+
+def _has_overlapping_speaker_spans(spans: tuple[Any, ...]) -> bool:
+    active: list[tuple[int, str]] = []
+    for span in sorted(spans, key=lambda item: (item.start_ms, item.end_ms, item.speaker_ref)):
+        active = [(end_ms, speaker_ref) for end_ms, speaker_ref in active if end_ms > span.start_ms]
+        if any(speaker_ref != span.speaker_ref for _, speaker_ref in active):
+            return True
+        active.append((span.end_ms, span.speaker_ref))
+    return False
 
 
 def _interval_union_ms(intervals: tuple[tuple[int, int], ...]) -> int:
