@@ -5,10 +5,12 @@ from pathlib import Path
 import pytest
 
 from keyframe.diarization import (
+    ChannelRecord,
     EngineConfigMetadata,
     NormalizedArtifactProvenance,
     NormalizedEngineOutput,
     ReferenceBundle,
+    ScoringRegion,
     SpeakerRecord,
     SpeakerSpan,
     build_candidate_bundle,
@@ -243,10 +245,12 @@ def test_diagnostic_collar_excludes_boundary_shift_from_metrics():
     recording = _recording()
     reference_recording = replace(
         recording,
+        duration_ms=2_000,
         speaker_spans=(
-            replace(recording.speaker_spans[0], end_ms=500, overlap=False),
-            replace(recording.speaker_spans[1], start_ms=500, end_ms=1000, overlap=False),
+            replace(recording.speaker_spans[0], start_ms=300, end_ms=1_000, overlap=False),
+            replace(recording.speaker_spans[1], start_ms=1_000, end_ms=1_700, overlap=False),
         ),
+        scoring_regions=(replace(recording.scoring_regions[0], end_ms=2_000),),
     )
     candidate = _candidate_output(
         reference_recording,
@@ -258,16 +262,16 @@ def test_diagnostic_collar_excludes_boundary_shift_from_metrics():
     shifted_candidate = replace(
         candidate,
         speaker_spans=(
-            replace(candidate.speaker_spans[0], end_ms=600),
-            replace(candidate.speaker_spans[1], start_ms=600),
+            replace(candidate.speaker_spans[0], end_ms=1_100),
+            replace(candidate.speaker_spans[1], start_ms=1_100),
         ),
     )
 
     result = evaluate_diarization_candidate(_reference_bundle(reference_recording), shifted_candidate)
     metrics = result.recording_metrics[0].metrics
 
-    assert metrics["reference_speaker_ms"] == 500
-    assert metrics["matched_speaker_ms"] == 500
+    assert metrics["reference_speaker_ms"] == 400
+    assert metrics["matched_speaker_ms"] == 400
     assert metrics["diarization_error_rate"] == 0.0
 
 
@@ -302,6 +306,78 @@ def test_diagnostic_collar_excludes_single_speaker_onset_offset_shift_from_metri
 
     assert metrics["reference_speaker_ms"] == 900
     assert metrics["matched_speaker_ms"] == 900
+    assert metrics["diarization_error_rate"] == 0.0
+
+
+def test_diagnostic_collar_excludes_uem_edge_onset_offset_shift_from_metrics():
+    recording = _recording()
+    reference_recording = replace(
+        recording,
+        duration_ms=1_000,
+        speakers=(recording.speakers[0],),
+        words=(),
+        speaker_spans=(
+            SpeakerSpan(
+                span_id="span-1",
+                speaker_ref="spk-a",
+                start_ms=0,
+                end_ms=1_000,
+                channel_id="ch-1",
+            ),
+        ),
+    )
+    candidate = _candidate_output(reference_recording, {"spk-a": "engine:local:speaker-1"})
+    shifted_candidate = replace(
+        candidate,
+        speaker_spans=(
+            replace(candidate.speaker_spans[0], start_ms=100, end_ms=900),
+        ),
+    )
+
+    result = evaluate_diarization_candidate(_reference_bundle(reference_recording), shifted_candidate)
+    metrics = result.recording_metrics[0].metrics
+
+    assert metrics["reference_speaker_ms"] == 500
+    assert metrics["matched_speaker_ms"] == 500
+    assert metrics["diarization_error_rate"] == 0.0
+
+
+def test_rendered_transcript_policy_collapses_physical_channels_for_scoring():
+    recording = _recording()
+    multichannel = replace(
+        recording,
+        channels=(
+            recording.channels[0],
+            ChannelRecord("ch-2", "second"),
+        ),
+        scoring_regions=(
+            ScoringRegion("uem-1", 0, 1_000, channel_id="ch-1"),
+            ScoringRegion("uem-2", 0, 1_000, channel_id="ch-2"),
+        ),
+    )
+    candidate = _candidate_output(
+        multichannel,
+        {
+            "spk-a": "engine:local:speaker-1",
+            "spk-b": "engine:local:speaker-2",
+        },
+    )
+    rendered_candidate = replace(
+        candidate,
+        words=tuple(replace(word, channel_id=None) for word in candidate.words),
+        speaker_spans=tuple(replace(span, channel_id=None) for span in candidate.speaker_spans),
+    )
+
+    result = evaluate_diarization_candidate(
+        _reference_bundle(multichannel),
+        rendered_candidate,
+        scoring_policy=default_scoring_policy("product_transcript"),
+    )
+    metrics = result.recording_metrics[0].metrics
+
+    assert metrics["reference_speaker_ms"] == 750
+    assert metrics["hypothesis_speaker_ms"] == 750
+    assert metrics["false_alarm_speaker_ms"] == 0
     assert metrics["diarization_error_rate"] == 0.0
 
 

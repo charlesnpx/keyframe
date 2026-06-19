@@ -448,13 +448,18 @@ def _validate_candidate_timeline(recording: CanonicalRecording, candidate: Norma
 
 
 def _scoring_intervals(recording: CanonicalRecording, policy: ScoringPolicyManifest) -> tuple[EvaluationInterval, ...]:
+    collapse_channels = policy.channel_mode in {"mono_mix", "rendered_transcript"}
     if policy.uem_regions == "canonical_scoring_regions" and recording.scoring_regions:
         intervals = tuple(
-            EvaluationInterval(region.start_ms, region.end_ms, region.channel_id)
+            EvaluationInterval(region.start_ms, region.end_ms, None if collapse_channels else region.channel_id)
             for region in recording.scoring_regions
         )
     else:
-        channel_ids: tuple[str | None, ...] = tuple(channel.channel_id for channel in recording.channels) or (None,)
+        channel_ids: tuple[str | None, ...] = (
+            (None,)
+            if collapse_channels
+            else tuple(channel.channel_id for channel in recording.channels) or (None,)
+        )
         intervals = tuple(EvaluationInterval(0, recording.duration_ms, channel_id) for channel_id in channel_ids)
     return _normalize_intervals(intervals)
 
@@ -673,7 +678,9 @@ def _reference_boundary_intervals(
         for span in reference_spans
         for point in (span.start_ms, span.end_ms)
         if any(
-            region.start_ms < point < region.end_ms and _channels_match(span.channel_id, region.channel_id)
+            region.start_ms <= point <= region.end_ms
+            and _channels_match(span.channel_id, region.channel_id)
+            and min(span.end_ms, region.end_ms) > max(span.start_ms, region.start_ms)
             for region in scoring_intervals
         )
     }
