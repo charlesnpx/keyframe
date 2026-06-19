@@ -313,6 +313,75 @@ def test_aggregate_metrics_are_weighted_by_scored_support():
     assert branch_der.scored_duration_ms == 1_000
 
 
+def test_unscored_recording_baseline_does_not_provide_regression_delta():
+    base_case = _case(
+        "rec-1",
+        current_der=0.105,
+        baseline_der=0.10,
+        current_overlap_der=0.10,
+        baseline_overlap_der=0.10,
+    )
+    baseline = base_case.baseline_evaluation
+    assert baseline is not None
+    unscored_baseline = DiarizationEvaluationResult(
+        recording_id=baseline.recording_id,
+        output_id=baseline.output_id,
+        scoring_policy=baseline.scoring_policy,
+        speaker_mapping=baseline.speaker_mapping,
+        slices=baseline.slices,
+        recording_metrics=(
+            DiarizationRecordingMetricRow(
+                recording_id=baseline.recording_id,
+                output_id=baseline.output_id,
+                policy_id="diagnostic-diarization-v1",
+                status="insufficient_support",
+                metrics={
+                    "diarization_error_rate": 0.10,
+                    "speaker_label_accuracy": 0.90,
+                },
+                speaker_mapping={},
+            ),
+        ),
+        slice_metrics=baseline.slice_metrics,
+        reference_artifact=baseline.reference_artifact,
+        candidate_artifact=baseline.candidate_artifact,
+    )
+    case = BenchmarkEvaluationCase(
+        corpus_id=base_case.corpus_id,
+        branch_id=base_case.branch_id,
+        evaluation=base_case.evaluation,
+        baseline_evaluation=unscored_baseline,
+        scored_duration_ms=base_case.scored_duration_ms,
+        scored_words=base_case.scored_words,
+        scored_speaker_turns=base_case.scored_speaker_turns,
+        slice_scored_words=base_case.slice_scored_words,
+        slice_scored_speaker_turns=base_case.slice_scored_speaker_turns,
+    )
+    report = build_benchmark_report(
+        "unscored-recording-baseline",
+        (case,),
+        gate_config=BenchmarkGateConfig(
+            budgets=(
+                BenchmarkRegressionBudget(
+                    budget_id="branch-der",
+                    metric_name="diarization_error_rate",
+                    direction="lower_is_better",
+                    max_regression_delta=0.01,
+                    scope_type="branch",
+                    scope_id="ami-smoke/separate-tracks",
+                ),
+            )
+        ),
+    )
+
+    branch_der = next(result for result in report.branch_results if result.metric_name == "diarization_error_rate")
+    assert report.status == "failed"
+    assert branch_der.baseline_score is None
+    assert branch_der.paired_delta is None
+    assert branch_der.gate.status == "unavailable"
+    assert branch_der.gate.budget_id == "branch-der"
+
+
 def test_slice_specific_regression_budget_can_pass_and_fail():
     pass_report = build_benchmark_report(
         "slice-pass",
@@ -829,6 +898,7 @@ def test_review_signal_budgets_gate_serialized_review_metric_results():
     over_flag = next(result for result in report.branch_results if result.metric_name == "over_flag_rate")
 
     assert report.status == "failed"
+    assert report.review_signal_scope_calibrations
     assert false_confident.point_score == 0.5
     assert false_confident.gate.status == "failed"
     assert false_confident.gate.budget_id == "false-confident-budget"
@@ -863,6 +933,7 @@ def test_report_json_rejects_tampered_review_signal_metric_gate():
     payload["status"] = "passed"
     for result in payload["branch_results"]:
         if result["metric_name"] == "false_confident_rate":
+            result["point_score"] = 0.1
             result["gate"] = {
                 "budget_id": "false-confident-budget",
                 "reasons": [],
@@ -871,7 +942,7 @@ def test_report_json_rejects_tampered_review_signal_metric_gate():
             }
             break
 
-    with pytest.raises(ValidationError, match="metric_result gate does not match regression budget"):
+    with pytest.raises(ValidationError, match="review-signal metric result"):
         benchmark_report_json_loads(json.dumps(payload))
 
 

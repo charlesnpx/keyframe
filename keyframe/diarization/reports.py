@@ -34,6 +34,8 @@ ReviewSignalSeverity = Literal["serious", "minor"]
 CriticalSpanPolicyScope = Literal["diagnostic_fixture"]
 MetricDirection = Literal["higher_is_better", "lower_is_better"]
 
+_REVIEW_SIGNAL_METRIC_NAMES = ("precision", "recall", "false_confident_rate", "over_flag_rate", "coverage")
+
 
 @dataclass(frozen=True)
 class UncertaintyInterval:
@@ -565,6 +567,57 @@ class ReviewSignalCalibration:
 
 
 @dataclass(frozen=True)
+class ReviewSignalScopeCalibration:
+    """Review-signal calibration for one report scope."""
+
+    scope_type: BenchmarkReportScopeType
+    scope_id: str
+    calibration: ReviewSignalCalibration
+    scored_duration_ms: int = 0
+    corpus_id: str | None = None
+    branch_id: str | None = None
+    recording_id: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "scope_type",
+            _validate_choice(
+                self.scope_type,
+                {"corpus", "branch", "recording"},
+                "review_scope_calibration.scope_type",
+            ),
+        )
+        object.__setattr__(self, "scope_id", _require_id(self.scope_id, "review_scope_calibration.scope_id"))
+        object.__setattr__(self, "corpus_id", _optional_id(self.corpus_id, "review_scope_calibration.corpus_id"))
+        object.__setattr__(self, "branch_id", _optional_id(self.branch_id, "review_scope_calibration.branch_id"))
+        object.__setattr__(
+            self,
+            "recording_id",
+            _optional_id(self.recording_id, "review_scope_calibration.recording_id"),
+        )
+        if not isinstance(self.calibration, ReviewSignalCalibration):
+            raise ValidationError("review_scope_calibration.calibration must be a ReviewSignalCalibration")
+        object.__setattr__(
+            self,
+            "scored_duration_ms",
+            _non_negative_int(self.scored_duration_ms, "review_scope_calibration.scored_duration_ms"),
+        )
+        _validate_review_signal_scope_identity(self)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "branch_id": self.branch_id,
+            "calibration": self.calibration.to_dict(),
+            "corpus_id": self.corpus_id,
+            "recording_id": self.recording_id,
+            "scored_duration_ms": self.scored_duration_ms,
+            "scope_id": self.scope_id,
+            "scope_type": self.scope_type,
+        }
+
+
+@dataclass(frozen=True)
 class CriticalSpanPolicyDefinition:
     """Versioned diagnostic policy hook for critical-span scoring."""
 
@@ -682,6 +735,7 @@ class BenchmarkReport:
     recording_results: tuple[BenchmarkMetricResult, ...] = ()
     slice_results: tuple[BenchmarkMetricResult, ...] = ()
     review_signal_calibration: ReviewSignalCalibration | None = None
+    review_signal_scope_calibrations: tuple[ReviewSignalScopeCalibration, ...] = ()
     critical_span_policy: CriticalSpanPolicyDefinition | None = None
     critical_span_diagnostic: CriticalSpanDiagnosticScore | None = None
     schema_version: int = BENCHMARK_REPORT_SCHEMA_VERSION
@@ -711,6 +765,15 @@ class BenchmarkReport:
             ReviewSignalCalibration,
         ):
             raise ValidationError("benchmark_report.review_signal_calibration must be a ReviewSignalCalibration")
+        object.__setattr__(
+            self,
+            "review_signal_scope_calibrations",
+            _tuple_of(
+                self.review_signal_scope_calibrations,
+                ReviewSignalScopeCalibration,
+                "benchmark_report.review_signal_scope_calibrations",
+            ),
+        )
         if self.critical_span_policy is not None and not isinstance(
             self.critical_span_policy,
             CriticalSpanPolicyDefinition,
@@ -725,6 +788,12 @@ class BenchmarkReport:
         if not metric_results:
             raise ValidationError("benchmark_report requires at least one metric result")
         _validate_serialized_gates(self.gate_config, metric_results)
+        _validate_serialized_review_signal_metric_results(
+            self.review_signal_calibration,
+            self.review_signal_scope_calibrations,
+            self.gate_config,
+            metric_results,
+        )
         has_failure = _has_failed_gate(metric_results, self.critical_span_diagnostic)
         if self.status == "passed" and has_failure:
             raise ValidationError("passed benchmark reports cannot include failed gates")
@@ -759,6 +828,9 @@ class BenchmarkReport:
             "review_signal_calibration": (
                 self.review_signal_calibration.to_dict() if self.review_signal_calibration is not None else None
             ),
+            "review_signal_scope_calibrations": [
+                calibration.to_dict() for calibration in self.review_signal_scope_calibrations
+            ],
             "schema_version": self.schema_version,
             "slice_results": [result.to_dict() for result in self.slice_results],
             "status": self.status,
@@ -804,7 +876,8 @@ def build_benchmark_report(
     recording_results = _metric_results_for_scope(observations, "recording", gate_config)
     slice_results = _metric_results_for_scope(observations, "slice", gate_config)
     review_calibration = calibrate_review_signals(review_signals) if review_signals else None
-    review_metric_results = _review_signal_metric_results(review_signals, gate_config) if review_calibration else ()
+    review_scope_calibrations = _review_signal_scope_calibrations(review_signals) if review_calibration else ()
+    review_metric_results = _review_signal_metric_results(review_scope_calibrations, gate_config)
     corpus_results = _sort_metric_results(
         corpus_results + tuple(result for result in review_metric_results if result.scope_type == "corpus")
     )
@@ -834,6 +907,7 @@ def build_benchmark_report(
         recording_results=recording_results,
         slice_results=slice_results,
         review_signal_calibration=review_calibration,
+        review_signal_scope_calibrations=review_scope_calibrations,
         critical_span_policy=critical_span_policy,
         critical_span_diagnostic=critical_score,
     )
@@ -1021,6 +1095,10 @@ def benchmark_report_from_dict(data: Mapping[str, Any]) -> BenchmarkReport:
             if data.get("review_signal_calibration") is not None
             else None
         ),
+        review_signal_scope_calibrations=tuple(
+            _review_scope_calibration_from_dict(item)
+            for item in _sequence(data.get("review_signal_scope_calibrations", ()))
+        ),
         critical_span_policy=(
             _critical_span_policy_from_dict(data["critical_span_policy"])
             if data.get("critical_span_policy") is not None
@@ -1043,8 +1121,11 @@ def benchmark_report_from_dict(data: Mapping[str, Any]) -> BenchmarkReport:
 
 def _observations_from_case(case: BenchmarkEvaluationCase) -> tuple[_MetricObservation, ...]:
     baseline_recording_metrics = (
-        case.baseline_evaluation.recording_metrics[0].metrics
-        if case.baseline_evaluation is not None and case.baseline_evaluation.recording_metrics
+        next(
+            (row.metrics for row in case.baseline_evaluation.recording_metrics if row.status == "scored"),
+            {},
+        )
+        if case.baseline_evaluation is not None
         else {}
     )
     observations: list[_MetricObservation] = []
@@ -1160,29 +1241,52 @@ def _sort_metric_results(results: tuple[BenchmarkMetricResult, ...]) -> tuple[Be
     return tuple(sorted(results, key=lambda item: (item.scope_type, item.scope_id, item.metric_name)))
 
 
-def _review_signal_metric_results(
+def _review_signal_scope_calibrations(
     signals: tuple[ReviewSignalSpan, ...],
-    gate_config: BenchmarkGateConfig,
-) -> tuple[BenchmarkMetricResult, ...]:
+) -> tuple[ReviewSignalScopeCalibration, ...]:
     groups: dict[tuple[BenchmarkReportScopeType, tuple[str, ...]], list[ReviewSignalSpan]] = {}
     for signal in signals:
         groups.setdefault(("corpus", (signal.corpus_id,)), []).append(signal)
         groups.setdefault(("branch", (signal.corpus_id, signal.branch_id)), []).append(signal)
         groups.setdefault(("recording", (signal.corpus_id, signal.branch_id, signal.recording_id)), []).append(signal)
 
-    results: list[BenchmarkMetricResult] = []
+    calibrations: list[ReviewSignalScopeCalibration] = []
     for (scope_type, key), grouped_signals in groups.items():
-        calibration = calibrate_review_signals(tuple(grouped_signals))
         scope_id, corpus_id, branch_id, recording_id = _review_signal_scope_fields(scope_type, key)
-        scored_duration_ms = sum(signal.end_ms - signal.start_ms for signal in grouped_signals)
-        for metric_name, point_score in _review_signal_metric_values(calibration):
-            result_without_gate = BenchmarkMetricResult(
+        calibrations.append(
+            ReviewSignalScopeCalibration(
                 scope_type=scope_type,
                 scope_id=scope_id,
+                calibration=calibrate_review_signals(tuple(grouped_signals)),
+                scored_duration_ms=sum(signal.end_ms - signal.start_ms for signal in grouped_signals),
+                corpus_id=corpus_id,
+                branch_id=branch_id,
+                recording_id=recording_id,
+            )
+        )
+    return tuple(
+        sorted(
+            calibrations,
+            key=lambda item: (item.scope_type, item.scope_id),
+        )
+    )
+
+
+def _review_signal_metric_results(
+    scope_calibrations: tuple[ReviewSignalScopeCalibration, ...],
+    gate_config: BenchmarkGateConfig,
+) -> tuple[BenchmarkMetricResult, ...]:
+    results: list[BenchmarkMetricResult] = []
+    for scope_calibration in scope_calibrations:
+        calibration = scope_calibration.calibration
+        for metric_name, point_score in _review_signal_metric_values(scope_calibration.calibration):
+            result_without_gate = BenchmarkMetricResult(
+                scope_type=scope_calibration.scope_type,
+                scope_id=scope_calibration.scope_id,
                 metric_name=metric_name,
                 point_score=point_score,
                 sample_count=calibration.total,
-                scored_duration_ms=scored_duration_ms,
+                scored_duration_ms=scope_calibration.scored_duration_ms,
                 scored_words=0,
                 scored_speaker_turns=0,
                 gate=RegressionGateResult(status="unavailable", reasons=("gate not evaluated",)),
@@ -1191,9 +1295,9 @@ def _review_signal_metric_results(
                     basis="review_signal_metric",
                     reason="review-signal metrics do not have paired samples",
                 ),
-                corpus_id=corpus_id,
-                branch_id=branch_id,
-                recording_id=recording_id,
+                corpus_id=scope_calibration.corpus_id,
+                branch_id=scope_calibration.branch_id,
+                recording_id=scope_calibration.recording_id,
             )
             results.append(
                 BenchmarkMetricResult(
@@ -1232,10 +1336,9 @@ def _review_signal_scope_fields(
 
 
 def _review_signal_metric_values(calibration: ReviewSignalCalibration) -> tuple[tuple[str, float], ...]:
-    metric_names = ("precision", "recall", "false_confident_rate", "over_flag_rate", "coverage")
     return tuple(
         (metric_name, value)
-        for metric_name in metric_names
+        for metric_name in _REVIEW_SIGNAL_METRIC_NAMES
         if (value := getattr(calibration, metric_name)) is not None
     )
 
@@ -1505,6 +1608,97 @@ def _validate_review_signal_breakdown_totals(calibration: ReviewSignalCalibratio
             raise ValidationError(f"review_calibration.{field_name} must match severity breakdown totals")
 
 
+def _validate_review_signal_scope_identity(scope_calibration: ReviewSignalScopeCalibration) -> None:
+    if scope_calibration.scope_type == "corpus":
+        if scope_calibration.corpus_id is None:
+            raise ValidationError("review_scope_calibration.corpus_id is required for corpus scopes")
+        if scope_calibration.branch_id is not None or scope_calibration.recording_id is not None:
+            raise ValidationError("corpus review-signal scopes cannot include branch or recording ids")
+        expected_scope_id = scope_calibration.corpus_id
+    elif scope_calibration.scope_type == "branch":
+        if scope_calibration.corpus_id is None or scope_calibration.branch_id is None:
+            raise ValidationError("review_scope_calibration branch scopes require corpus_id and branch_id")
+        if scope_calibration.recording_id is not None:
+            raise ValidationError("branch review-signal scopes cannot include recording_id")
+        expected_scope_id = f"{scope_calibration.corpus_id}/{scope_calibration.branch_id}"
+    else:
+        if (
+            scope_calibration.corpus_id is None
+            or scope_calibration.branch_id is None
+            or scope_calibration.recording_id is None
+        ):
+            raise ValidationError(
+                "review_scope_calibration recording scopes require corpus_id, branch_id, and recording_id"
+            )
+        expected_scope_id = (
+            f"{scope_calibration.corpus_id}/{scope_calibration.branch_id}/{scope_calibration.recording_id}"
+        )
+    if scope_calibration.scope_id != expected_scope_id:
+        raise ValidationError("review_scope_calibration.scope_id must match its scope identifiers")
+
+
+def _validate_serialized_review_signal_metric_results(
+    calibration: ReviewSignalCalibration | None,
+    scope_calibrations: tuple[ReviewSignalScopeCalibration, ...],
+    gate_config: BenchmarkGateConfig,
+    results: tuple[BenchmarkMetricResult, ...],
+) -> None:
+    if calibration is None:
+        if scope_calibrations:
+            raise ValidationError("review_signal_scope_calibrations require review_signal_calibration")
+        return
+    if not scope_calibrations:
+        raise ValidationError("review_signal_calibration requires review_signal_scope_calibrations")
+    _validate_review_signal_scope_calibrations(calibration, scope_calibrations)
+    expected = _review_signal_metric_results(scope_calibrations, gate_config)
+    expected_by_key = {_metric_result_key(result): result.to_dict() for result in expected}
+    actual_by_key = {
+        _metric_result_key(result): result.to_dict()
+        for result in results
+        if _metric_result_key(result) in expected_by_key
+    }
+    if set(actual_by_key) != set(expected_by_key):
+        raise ValidationError("review-signal metric results must match review_signal_scope_calibrations")
+    for key, expected_payload in expected_by_key.items():
+        if actual_by_key[key] != expected_payload:
+            raise ValidationError("review-signal metric result does not match review_signal_scope_calibrations")
+
+
+def _validate_review_signal_scope_calibrations(
+    calibration: ReviewSignalCalibration,
+    scope_calibrations: tuple[ReviewSignalScopeCalibration, ...],
+) -> None:
+    seen: set[tuple[BenchmarkReportScopeType, str]] = set()
+    by_scope_type: dict[BenchmarkReportScopeType, list[ReviewSignalScopeCalibration]] = {}
+    for scope_calibration in scope_calibrations:
+        key = (scope_calibration.scope_type, scope_calibration.scope_id)
+        if key in seen:
+            raise ValidationError(f"duplicate review_signal_scope_calibration: {scope_calibration.scope_id}")
+        seen.add(key)
+        by_scope_type.setdefault(scope_calibration.scope_type, []).append(scope_calibration)
+    for scope_type in ("corpus", "branch", "recording"):
+        scoped = tuple(by_scope_type.get(scope_type, ()))
+        if scoped:
+            _validate_review_signal_scope_totals(calibration, scoped, scope_type)
+    if not by_scope_type.get("corpus"):
+        raise ValidationError("review_signal_scope_calibrations require at least one corpus scope")
+
+
+def _validate_review_signal_scope_totals(
+    calibration: ReviewSignalCalibration,
+    scope_calibrations: tuple[ReviewSignalScopeCalibration, ...],
+    scope_type: BenchmarkReportScopeType,
+) -> None:
+    for field_name in ("total", "assessed", "true_positive", "false_positive", "false_negative", "true_negative"):
+        scoped_total = sum(getattr(item.calibration, field_name) for item in scope_calibrations)
+        if getattr(calibration, field_name) != scoped_total:
+            raise ValidationError(f"review_calibration.{field_name} must match {scope_type} scope totals")
+
+
+def _metric_result_key(result: BenchmarkMetricResult) -> tuple[BenchmarkReportScopeType, str, str]:
+    return result.scope_type, result.scope_id, result.metric_name
+
+
 def _validate_serialized_critical_span_diagnostic(
     policy: CriticalSpanPolicyDefinition | None,
     diagnostic: CriticalSpanDiagnosticScore | None,
@@ -1745,6 +1939,18 @@ def _review_calibration_from_dict(data: Mapping[str, Any]) -> ReviewSignalCalibr
         coverage=_required(data, "coverage", "review_calibration"),
         serious=_severity_breakdown_from_dict(_required(data, "serious", "review_calibration")),
         minor=_severity_breakdown_from_dict(_required(data, "minor", "review_calibration")),
+    )
+
+
+def _review_scope_calibration_from_dict(data: Mapping[str, Any]) -> ReviewSignalScopeCalibration:
+    return ReviewSignalScopeCalibration(
+        scope_type=_required(data, "scope_type", "review_scope_calibration"),
+        scope_id=_required(data, "scope_id", "review_scope_calibration"),
+        calibration=_review_calibration_from_dict(_required(data, "calibration", "review_scope_calibration")),
+        scored_duration_ms=data.get("scored_duration_ms", 0),
+        corpus_id=data.get("corpus_id"),
+        branch_id=data.get("branch_id"),
+        recording_id=data.get("recording_id"),
     )
 
 
