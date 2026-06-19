@@ -507,9 +507,10 @@ def _build_speaker_mapping(
     candidate_speakers = tuple(sorted({span.speaker_ref for span in candidate_spans}))
     weights: dict[tuple[str, str], int] = {}
     for atom in _atomic_intervals(scoring_intervals, reference_spans, candidate_spans):
-        active_reference = {span.speaker_ref for span in _active_spans(reference_spans, atom)}
-        if not policy.score_overlap and len(active_reference) > 1:
+        active_reference_spans = _active_spans(reference_spans, atom)
+        if not policy.score_overlap and _is_reference_overlap(active_reference_spans):
             continue
+        active_reference = {span.speaker_ref for span in active_reference_spans}
         active_candidate = {span.speaker_ref for span in _active_spans(candidate_spans, atom)}
         duration_ms = atom.duration_ms
         for candidate_ref in active_candidate:
@@ -596,9 +597,10 @@ def _score_metrics(
     matched_speaker_ms = 0
     scored_interval_ms = 0
     for atom in _atomic_intervals(_normalize_intervals(intervals), reference_spans, candidate_spans):
-        active_reference = {span.speaker_ref for span in _active_spans(reference_spans, atom)}
-        if not policy.score_overlap and len(active_reference) > 1:
+        active_reference_spans = _active_spans(reference_spans, atom)
+        if not policy.score_overlap and _is_reference_overlap(active_reference_spans):
             continue
+        active_reference = {span.speaker_ref for span in active_reference_spans}
         active_candidate = {span.speaker_ref for span in _active_spans(candidate_spans, atom)}
         mapped_candidate = {
             speaker_mapping[candidate_ref]
@@ -635,6 +637,10 @@ def _score_metrics(
     }
 
 
+def _is_reference_overlap(active_spans: tuple[_SpanView, ...]) -> bool:
+    return len({span.speaker_ref for span in active_spans}) > 1 or any(span.overlap for span in active_spans)
+
+
 def _turn_duration_intervals(
     reference_spans: tuple[_SpanView, ...],
     scoring_intervals: tuple[EvaluationInterval, ...],
@@ -659,14 +665,33 @@ def _speaker_change_boundary_intervals(
 ) -> tuple[EvaluationInterval, ...]:
     window_ms = max(collar_ms, 250)
     boundaries: set[tuple[int, str | None]] = set()
-    for span in reference_spans:
-        for point in (span.start_ms, span.end_ms):
+    channel_ids = tuple(sorted({span.channel_id for span in reference_spans}, key=lambda value: value or ""))
+    for channel_id in channel_ids:
+        points = tuple(
+            sorted(
+                {
+                    point
+                    for span in reference_spans
+                    if _channels_match(span.channel_id, channel_id)
+                    for point in (span.start_ms, span.end_ms)
+                }
+            )
+        )
+        for point in points:
+            if point <= 0:
+                continue
+            before = EvaluationInterval(max(0, point - 1), point, channel_id)
+            after = EvaluationInterval(point, point + 1, channel_id)
+            before_speakers = {span.speaker_ref for span in _active_spans(reference_spans, before)}
+            after_speakers = {span.speaker_ref for span in _active_spans(reference_spans, after)}
+            if not before_speakers or not after_speakers or before_speakers == after_speakers:
+                continue
             in_boundary_region = any(
-                region.start_ms < point < region.end_ms and _channels_match(span.channel_id, region.channel_id)
+                region.start_ms < point < region.end_ms and _channels_match(channel_id, region.channel_id)
                 for region in scoring_intervals
             )
             if in_boundary_region:
-                boundaries.add((point, span.channel_id))
+                boundaries.add((point, channel_id))
     intervals = tuple(
         EvaluationInterval(max(0, point - window_ms), point + window_ms, channel_id)
         for point, channel_id in sorted(boundaries, key=lambda item: (item[0], item[1] or ""))

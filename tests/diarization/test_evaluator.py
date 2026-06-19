@@ -11,6 +11,7 @@ from keyframe.diarization import (
     SpeakerSpan,
     build_candidate_bundle,
     build_evaluation_slices,
+    default_scoring_policy,
     evaluate_diarization_candidate,
     read_recording_json,
     render_transcript,
@@ -122,10 +123,29 @@ def test_reference_derived_slices_include_required_dimensions_and_sparse_statuse
     assert by_id["overlap:overlap"].status == "insufficient_support"
     assert by_id["speaker_count:1"].status == "ready"
     assert by_id["speaker_count:2"].status == "insufficient_support"
+    assert by_id["speaker_change_boundary:within_collar"].status == "insufficient_support"
     assert by_id["turn_duration:short"].status == "ready"
     assert by_id["turn_duration:long"].status == "insufficient_support"
     assert by_id["channel_mode:mono"].status == "ready"
     assert by_id["channel_mode:multichannel"].status == "insufficient_support"
+
+
+def test_speaker_change_boundary_slice_requires_actual_speaker_change():
+    recording = _recording()
+    contiguous_change = replace(
+        recording,
+        speaker_spans=(
+            replace(recording.speaker_spans[0], end_ms=500, overlap=False),
+            replace(recording.speaker_spans[1], start_ms=500, overlap=False),
+        ),
+    )
+
+    slices = build_evaluation_slices(contiguous_change, minimum_support_ms=1)
+    by_id = {item.slice_id: item for item in slices}
+
+    boundary = by_id["speaker_change_boundary:within_collar"]
+    assert boundary.status == "ready"
+    assert [(item.start_ms, item.end_ms) for item in boundary.intervals] == [(250, 750)]
 
 
 def test_overlap_reference_scores_overlap_slice_when_reference_supports_it():
@@ -145,6 +165,41 @@ def test_overlap_reference_scores_overlap_slice_when_reference_supports_it():
     assert overlap_row.status == "scored"
     assert overlap_row.support_ms == 500
     assert overlap_row.metrics["speaker_label_accuracy"] == 1.0
+
+
+def test_product_policy_excludes_single_speaker_regions_flagged_as_overlap():
+    recording = _recording()
+    overlap_flagged = replace(
+        recording,
+        speaker_spans=(
+            replace(recording.speaker_spans[0], overlap=True),
+            recording.speaker_spans[1],
+        ),
+        words=(
+            replace(recording.words[0], overlap=True),
+            recording.words[1],
+        ),
+    )
+    reference = _reference_bundle(overlap_flagged)
+    candidate = _candidate_output(
+        overlap_flagged,
+        {
+            "spk-a": "engine:local:speaker-2",
+            "spk-b": "engine:local:speaker-1",
+        },
+    )
+
+    result = evaluate_diarization_candidate(
+        reference,
+        candidate,
+        scoring_policy=default_scoring_policy("product_transcript"),
+    )
+    metrics = result.recording_metrics[0].metrics
+
+    assert result.speaker_mapping == {"engine:local:speaker-1": "spk-b"}
+    assert metrics["reference_speaker_ms"] == 400
+    assert metrics["matched_speaker_ms"] == 400
+    assert metrics["speaker_label_accuracy"] == 1.0
 
 
 def test_speaker_mapping_stays_in_score_artifact_not_candidate_or_rendered_transcript():
