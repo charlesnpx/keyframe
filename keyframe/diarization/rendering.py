@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict, dataclass, replace
 from typing import Any, Literal
 
@@ -16,6 +17,71 @@ from keyframe.diarization.models import (
     ValidationError,
 )
 
+
+RenderedTranscriptState = Literal[
+    "confident_pipeline",
+    "needs_review",
+    "diagnostic_only",
+    "unsupported",
+    "speaker_attribution_unavailable",
+]
+SpeakerAttributionState = Literal["available", "unreliable", "unavailable"]
+ReviewReason = Literal[
+    "unsupported",
+    "diagnostic_only",
+    "speaker_attribution_unavailable",
+    "low_speaker_confidence",
+    "missing_speaker_confidence",
+    "overlap_detected",
+    "manual_uncertain",
+    "manual_review_required",
+]
+
+_ALLOWED_RENDERED_TRANSCRIPT_STATES = frozenset(
+    {
+        "confident_pipeline",
+        "needs_review",
+        "diagnostic_only",
+        "unsupported",
+        "speaker_attribution_unavailable",
+    }
+)
+_ALLOWED_REVIEW_REASONS = frozenset(
+    {
+        "unsupported",
+        "diagnostic_only",
+        "speaker_attribution_unavailable",
+        "low_speaker_confidence",
+        "missing_speaker_confidence",
+        "overlap_detected",
+        "manual_uncertain",
+        "manual_review_required",
+    }
+)
+_REVIEW_REASON_ORDER: tuple[ReviewReason, ...] = (
+    "unsupported",
+    "diagnostic_only",
+    "speaker_attribution_unavailable",
+    "low_speaker_confidence",
+    "missing_speaker_confidence",
+    "overlap_detected",
+    "manual_uncertain",
+    "manual_review_required",
+)
+_FORCED_STATE_REASONS: dict[RenderedTranscriptState, tuple[ReviewReason, ...]] = {
+    "confident_pipeline": (),
+    "needs_review": ("manual_review_required",),
+    "diagnostic_only": ("diagnostic_only",),
+    "unsupported": ("unsupported",),
+    "speaker_attribution_unavailable": ("speaker_attribution_unavailable",),
+}
+_LABEL_SUPPRESSED_STATES = frozenset(
+    {
+        "diagnostic_only",
+        "unsupported",
+        "speaker_attribution_unavailable",
+    }
+)
 
 OverlayOperationType = Literal[
     "rename_label",
@@ -41,9 +107,13 @@ class RenderedWord:
     uncertain: bool = False
     overlap: bool = False
     display_label: DisplayLabel | None = None
+    speaker_attribution: SpeakerAttributionState = "available"
+    review_reasons: tuple[ReviewReason, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        payload["review_reasons"] = list(self.review_reasons)
+        return payload
 
 
 @dataclass(frozen=True)
@@ -60,10 +130,13 @@ class RenderedTurn:
     uncertain: bool = False
     overlap: bool = False
     display_label: DisplayLabel | None = None
+    speaker_attribution: SpeakerAttributionState = "available"
+    review_reasons: tuple[ReviewReason, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["word_ids"] = list(self.word_ids)
+        payload["review_reasons"] = list(self.review_reasons)
         return payload
 
 
@@ -75,11 +148,17 @@ class RenderedTranscript:
     turns: tuple[RenderedTurn, ...]
     words: tuple[RenderedWord, ...]
     applied_overlay_ids: tuple[str, ...] = ()
+    state: RenderedTranscriptState = "confident_pipeline"
+    review_reasons: tuple[ReviewReason, ...] = ()
+    speaker_attribution: SpeakerAttributionState = "available"
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "applied_overlay_ids": list(self.applied_overlay_ids),
             "recording_id": self.recording_id,
+            "review_reasons": list(self.review_reasons),
+            "speaker_attribution": self.speaker_attribution,
+            "state": self.state,
             "turns": [turn.to_dict() for turn in self.turns],
             "words": [word.to_dict() for word in self.words],
         }
@@ -163,6 +242,9 @@ def render_transcript(
     label_source: LabelSource = "diarization_cluster",
     max_gap_ms: int = 900,
     split_after_punctuation: bool = True,
+    degraded_state: RenderedTranscriptState | None = None,
+    review_reasons: tuple[ReviewReason, ...] = (),
+    min_speaker_confidence: float = 0.5,
 ) -> RenderedTranscript:
     """Return transcript turns assembled from immutable canonical evidence."""
 
@@ -170,19 +252,48 @@ def render_transcript(
         raise ValidationError("recording must be a CanonicalRecording")
     if max_gap_ms < 0:
         raise ValidationError("max_gap_ms must be >= 0")
+    requested_state = _validate_degraded_state(degraded_state)
+    requested_review_reasons = _validate_review_reasons(review_reasons)
+    min_speaker_confidence = _validate_min_speaker_confidence(min_speaker_confidence)
 
     attributed = apply_session_local_attribution(recording, label_source=label_source)
     ordered_overlays = _ordered_overlays(overlays)
     overlay_result = _apply_overlays(attributed, ordered_overlays)
     indexed_words = tuple(enumerate(overlay_result.recording.words))
     words = tuple(word for _, word in sorted(indexed_words, key=lambda item: (item[1].start_ms, item[0])))
-    rendered_words = tuple(_render_word(word, overlay_result.uncertain_word_ids) for word in words)
-    turns = tuple(_build_turns(words, overlay_result.uncertain_word_ids, max_gap_ms, split_after_punctuation))
+    suppress_labels = (
+        requested_state in _LABEL_SUPPRESSED_STATES
+        or "speaker_attribution_unavailable" in requested_review_reasons
+        or any(_word_has_unavailable_speaker_attribution(word) for word in words)
+    )
+    rendered_words = tuple(
+        _render_word(word, overlay_result.uncertain_word_ids, min_speaker_confidence, suppress_labels)
+        for word in words
+    )
+    turns = tuple(
+        _build_turns(
+            words,
+            overlay_result.uncertain_word_ids,
+            max_gap_ms,
+            split_after_punctuation,
+            min_speaker_confidence,
+            suppress_labels,
+        )
+    )
+    transcript_review_reasons = _combine_review_reasons(
+        _FORCED_STATE_REASONS[requested_state or "confident_pipeline"],
+        requested_review_reasons,
+        *(word.review_reasons for word in rendered_words),
+    )
+    state = _resolve_transcript_state(requested_state, transcript_review_reasons)
     return RenderedTranscript(
         recording_id=recording.recording_id,
         turns=turns,
         words=rendered_words,
         applied_overlay_ids=tuple(_validate_operation_id(overlay.operation_id) for overlay in ordered_overlays),
+        state=state,
+        review_reasons=transcript_review_reasons,
+        speaker_attribution=_transcript_speaker_attribution(state, rendered_words),
     )
 
 
@@ -339,19 +450,37 @@ def _build_turns(
     uncertain_word_ids: frozenset[str],
     max_gap_ms: int,
     split_after_punctuation: bool,
+    min_speaker_confidence: float,
+    suppress_labels: bool,
 ) -> list[RenderedTurn]:
     turns: list[RenderedTurn] = []
     current: list[CanonicalWord] = []
     current_end_ms = 0
     for word in words:
         if current and _starts_new_turn(current[-1], word, current_end_ms, max_gap_ms, split_after_punctuation):
-            turns.append(_render_turn(len(turns) + 1, current, uncertain_word_ids))
+            turns.append(
+                _render_turn(
+                    len(turns) + 1,
+                    current,
+                    uncertain_word_ids,
+                    min_speaker_confidence,
+                    suppress_labels,
+                )
+            )
             current = []
             current_end_ms = 0
         current.append(word)
         current_end_ms = max(current_end_ms, word.end_ms)
     if current:
-        turns.append(_render_turn(len(turns) + 1, current, uncertain_word_ids))
+        turns.append(
+            _render_turn(
+                len(turns) + 1,
+                current,
+                uncertain_word_ids,
+                min_speaker_confidence,
+                suppress_labels,
+            )
+        )
     return turns
 
 
@@ -375,34 +504,120 @@ def _starts_new_turn(
     return False
 
 
-def _render_turn(index: int, words: list[CanonicalWord], uncertain_word_ids: frozenset[str]) -> RenderedTurn:
+def _render_turn(
+    index: int,
+    words: list[CanonicalWord],
+    uncertain_word_ids: frozenset[str],
+    min_speaker_confidence: float,
+    suppress_labels: bool,
+) -> RenderedTurn:
+    review_reasons = _combine_review_reasons(
+        *(_word_review_reasons(word, uncertain_word_ids, min_speaker_confidence, suppress_labels) for word in words)
+    )
     return RenderedTurn(
         turn_id=f"turn_{index}",
         start_ms=words[0].start_ms,
         end_ms=max(word.end_ms for word in words),
-        label=_word_label(words[0]),
+        label=_word_label(words[0], suppress_labels),
         word_ids=tuple(word.word_id for word in words),
         text=_join_words(words),
-        display_label=_word_display_label(words[0]),
+        display_label=_word_display_label(words[0], suppress_labels),
         channel_id=words[0].channel_id,
         uncertain=any(word.word_id in uncertain_word_ids or word.speaker_confidence is None for word in words),
         overlap=any(word.overlap for word in words),
+        speaker_attribution=_speaker_attribution_from_reasons(review_reasons),
+        review_reasons=review_reasons,
     )
 
 
-def _render_word(word: CanonicalWord, uncertain_word_ids: frozenset[str]) -> RenderedWord:
+def _render_word(
+    word: CanonicalWord,
+    uncertain_word_ids: frozenset[str],
+    min_speaker_confidence: float,
+    suppress_labels: bool,
+) -> RenderedWord:
+    review_reasons = _word_review_reasons(word, uncertain_word_ids, min_speaker_confidence, suppress_labels)
     return RenderedWord(
         word_id=word.word_id,
         text=word.text,
         start_ms=word.start_ms,
         end_ms=word.end_ms,
-        label=_word_label(word),
-        display_label=_word_display_label(word),
+        label=_word_label(word, suppress_labels),
+        display_label=_word_display_label(word, suppress_labels),
         channel_id=word.channel_id,
         speaker_confidence=word.speaker_confidence,
         uncertain=word.word_id in uncertain_word_ids or word.speaker_confidence is None,
         overlap=word.overlap,
+        speaker_attribution=_speaker_attribution_from_reasons(review_reasons),
+        review_reasons=review_reasons,
     )
+
+
+def _word_review_reasons(
+    word: CanonicalWord,
+    uncertain_word_ids: frozenset[str],
+    min_speaker_confidence: float,
+    suppress_labels: bool,
+) -> tuple[ReviewReason, ...]:
+    reasons: list[ReviewReason] = []
+    has_unavailable_attribution = _word_has_unavailable_speaker_attribution(word)
+    if suppress_labels or has_unavailable_attribution:
+        reasons.append("speaker_attribution_unavailable")
+    if not has_unavailable_attribution:
+        if word.speaker_confidence is None:
+            reasons.append("missing_speaker_confidence")
+        elif word.speaker_confidence < min_speaker_confidence:
+            reasons.append("low_speaker_confidence")
+    if word.overlap:
+        reasons.append("overlap_detected")
+    if word.word_id in uncertain_word_ids:
+        reasons.append("manual_uncertain")
+    return _combine_review_reasons(reasons)
+
+
+def _word_has_unavailable_speaker_attribution(word: CanonicalWord) -> bool:
+    return word.speaker_ref is None or word.display_label is None
+
+
+def _combine_review_reasons(*reason_groups: tuple[ReviewReason, ...] | list[ReviewReason]) -> tuple[ReviewReason, ...]:
+    seen = {reason for reasons in reason_groups for reason in reasons}
+    for reason in seen:
+        _validate_review_reason(reason)
+    return tuple(reason for reason in _REVIEW_REASON_ORDER if reason in seen)
+
+
+def _speaker_attribution_from_reasons(review_reasons: tuple[ReviewReason, ...]) -> SpeakerAttributionState:
+    if "speaker_attribution_unavailable" in review_reasons:
+        return "unavailable"
+    if review_reasons:
+        return "unreliable"
+    return "available"
+
+
+def _transcript_speaker_attribution(
+    state: RenderedTranscriptState,
+    rendered_words: tuple[RenderedWord, ...],
+) -> SpeakerAttributionState:
+    if state in _LABEL_SUPPRESSED_STATES:
+        return "unavailable"
+    if any(word.speaker_attribution == "unavailable" for word in rendered_words):
+        return "unavailable"
+    if state != "confident_pipeline" or any(word.speaker_attribution == "unreliable" for word in rendered_words):
+        return "unreliable"
+    return "available"
+
+
+def _resolve_transcript_state(
+    requested_state: RenderedTranscriptState | None,
+    review_reasons: tuple[ReviewReason, ...],
+) -> RenderedTranscriptState:
+    if requested_state is not None and requested_state != "confident_pipeline":
+        return requested_state
+    if "speaker_attribution_unavailable" in review_reasons:
+        return "speaker_attribution_unavailable"
+    if review_reasons:
+        return "needs_review"
+    return "confident_pipeline"
 
 
 def _join_words(words: list[CanonicalWord]) -> str:
@@ -415,11 +630,15 @@ def _join_words(words: list[CanonicalWord]) -> str:
     return text
 
 
-def _word_label(word: CanonicalWord) -> str | None:
+def _word_label(word: CanonicalWord, suppress_labels: bool) -> str | None:
+    if suppress_labels:
+        return None
     return None if word.display_label is None else word.display_label.label
 
 
-def _word_display_label(word: CanonicalWord) -> DisplayLabel | None:
+def _word_display_label(word: CanonicalWord, suppress_labels: bool) -> DisplayLabel | None:
+    if suppress_labels:
+        return None
     return word.display_label
 
 
@@ -479,6 +698,41 @@ def _validate_word_ids(recording: CanonicalRecording, word_ids: tuple[str, ...],
 
 def _validate_operation_id(value: str) -> str:
     return _require_ref(value, "overlay.operation_id")
+
+
+def _validate_degraded_state(value: str | None) -> RenderedTranscriptState | None:
+    if value is None:
+        return None
+    value = _require_ref(value, "degraded_state")
+    if value not in _ALLOWED_RENDERED_TRANSCRIPT_STATES:
+        raise ValidationError(f"degraded_state is not supported: {value}")
+    return value  # type: ignore[return-value]
+
+
+def _validate_review_reasons(values: tuple[ReviewReason, ...]) -> tuple[ReviewReason, ...]:
+    try:
+        reasons = tuple(values)
+    except TypeError as exc:
+        raise ValidationError("review_reasons must be an iterable") from exc
+    return _combine_review_reasons(list(reasons))
+
+
+def _validate_review_reason(value: object) -> ReviewReason:
+    value = _require_ref(value, "review_reasons")
+    if value not in _ALLOWED_REVIEW_REASONS:
+        raise ValidationError(f"review_reasons contains unsupported reason: {value}")
+    return value  # type: ignore[return-value]
+
+
+def _validate_min_speaker_confidence(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValidationError("min_speaker_confidence must be a number")
+    value = float(value)
+    if not math.isfinite(value):
+        raise ValidationError("min_speaker_confidence must be a finite number")
+    if not 0.0 <= value <= 1.0:
+        raise ValidationError("min_speaker_confidence must be between 0.0 and 1.0")
+    return value
 
 
 def _require_ref(value: object, field_name: str) -> str:

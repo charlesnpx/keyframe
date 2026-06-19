@@ -1,6 +1,11 @@
 {
   "applied_overlay_ids": [],
   "recording_id": "fixture-missing-confidence",
+  "review_reasons": [
+    "missing_speaker_confidence"
+  ],
+  "speaker_attribution": "unreliable",
+  "state": "needs_review",
   "turns": [
     {
       "channel_id": "ch-1",
@@ -14,6 +19,10 @@
       "end_ms": 500,
       "label": "person_1",
       "overlap": false,
+      "review_reasons": [
+        "missing_speaker_confidence"
+      ],
+      "speaker_attribution": "unreliable",
       "start_ms": 100,
       "text": "uncertain",
       "turn_id": "turn_1",
@@ -36,6 +45,10 @@
       "end_ms": 500,
       "label": "person_1",
       "overlap": false,
+      "review_reasons": [
+        "missing_speaker_confidence"
+      ],
+      "speaker_attribution": "unreliable",
       "speaker_confidence": null,
       "start_ms": 100,
       "text": "uncertain",

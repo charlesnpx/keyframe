@@ -1,6 +1,11 @@
 {
   "applied_overlay_ids": [],
   "recording_id": "fixture-overlap",
+  "review_reasons": [
+    "overlap_detected"
+  ],
+  "speaker_attribution": "unreliable",
+  "state": "needs_review",
   "turns": [
     {
       "channel_id": "ch-1",
@@ -14,6 +19,10 @@
       "end_ms": 400,
       "label": "person_1",
       "overlap": true,
+      "review_reasons": [
+        "overlap_detected"
+      ],
+      "speaker_attribution": "unreliable",
       "start_ms": 100,
       "text": "yes",
       "turn_id": "turn_1",
@@ -34,6 +43,10 @@
       "end_ms": 550,
       "label": "person_2",
       "overlap": true,
+      "review_reasons": [
+        "overlap_detected"
+      ],
+      "speaker_attribution": "unreliable",
       "start_ms": 250,
       "text": "right",
       "turn_id": "turn_2",
@@ -56,6 +69,10 @@
       "end_ms": 400,
       "label": "person_1",
       "overlap": true,
+      "review_reasons": [
+        "overlap_detected"
+      ],
+      "speaker_attribution": "unreliable",
       "speaker_confidence": 0.8,
       "start_ms": 100,
       "text": "yes",
@@ -74,6 +91,10 @@
       "end_ms": 550,
       "label": "person_2",
       "overlap": true,
+      "review_reasons": [
+        "overlap_detected"
+      ],
+      "speaker_attribution": "unreliable",
       "speaker_confidence": 0.82,
       "start_ms": 250,
       "text": "right",

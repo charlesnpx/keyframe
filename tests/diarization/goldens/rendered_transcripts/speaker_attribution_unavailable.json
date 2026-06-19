@@ -1,0 +1,84 @@
+{
+  "applied_overlay_ids": [],
+  "recording_id": "fixture-degraded-output",
+  "review_reasons": [
+    "speaker_attribution_unavailable",
+    "low_speaker_confidence"
+  ],
+  "speaker_attribution": "unavailable",
+  "state": "speaker_attribution_unavailable",
+  "turns": [
+    {
+      "channel_id": "ch-1",
+      "display_label": null,
+      "end_ms": 300,
+      "label": null,
+      "overlap": false,
+      "review_reasons": [
+        "speaker_attribution_unavailable",
+        "low_speaker_confidence"
+      ],
+      "speaker_attribution": "unavailable",
+      "start_ms": 100,
+      "text": "[inaudible]",
+      "turn_id": "turn_1",
+      "uncertain": false,
+      "word_ids": [
+        "w-1"
+      ]
+    },
+    {
+      "channel_id": "ch-1",
+      "display_label": null,
+      "end_ms": 900,
+      "label": null,
+      "overlap": false,
+      "review_reasons": [
+        "speaker_attribution_unavailable"
+      ],
+      "speaker_attribution": "unavailable",
+      "start_ms": 700,
+      "text": "fragment",
+      "turn_id": "turn_2",
+      "uncertain": true,
+      "word_ids": [
+        "w-2"
+      ]
+    }
+  ],
+  "words": [
+    {
+      "channel_id": "ch-1",
+      "display_label": null,
+      "end_ms": 300,
+      "label": null,
+      "overlap": false,
+      "review_reasons": [
+        "speaker_attribution_unavailable",
+        "low_speaker_confidence"
+      ],
+      "speaker_attribution": "unavailable",
+      "speaker_confidence": 0.1,
+      "start_ms": 100,
+      "text": "[inaudible]",
+      "uncertain": false,
+      "word_id": "w-1"
+    },
+    {
+      "channel_id": "ch-1",
+      "display_label": null,
+      "end_ms": 900,
+      "label": null,
+      "overlap": false,
+      "review_reasons": [
+        "speaker_attribution_unavailable"
+      ],
+      "speaker_attribution": "unavailable",
+      "speaker_confidence": null,
+      "start_ms": 700,
+      "text": "fragment",
+      "uncertain": true,
+      "word_id": "w-2"
+    }
+  ]
+}
