@@ -8,8 +8,10 @@ from keyframe.diarization import (
     CannedJsonEngineAdapter,
     DiarizationEngineAdapter,
     EngineConfigMetadata,
+    ModelArtifactGovernance,
     NormalizedArtifactProvenance,
     OffsetMapSegment,
+    SelfHostedWhisperXPyannoteAdapter,
     TimelineOffsetMap,
     ValidationError,
 )
@@ -34,6 +36,22 @@ def _artifact():
             sample_rate_hz=16_000,
             duration_ms=1_200,
             channel_ids=("ch-1",),
+        ),
+    )
+
+
+def _whisperx_artifact(duration_ms=1_300):
+    return NormalizedArtifactProvenance(
+        artifact_id="candidate-whisperx-output",
+        artifact_kind="candidate",
+        timeline=AudioTimelineProvenance(
+            original_audio_id="original-audio-local",
+            canonical_audio_id="canonical-audio-local",
+            timeline_id="candidate-timeline",
+            transform_chain_id="identity-mono-mix",
+            sample_rate_hz=16_000,
+            duration_ms=duration_ms,
+            channel_ids=("mono-mix",),
         ),
     )
 
@@ -69,6 +87,26 @@ def _adapter():
     )
 
 
+def _whisperx_adapter():
+    return SelfHostedWhisperXPyannoteAdapter(
+        ModelArtifactGovernance(
+            checkpoint="pyannote/speaker-diarization-3.1",
+            package_versions={"pyannote.audio": "3.1.0", "whisperx": "3.2.0"},
+            runtime_config={
+                "allow_download": False,
+                "cache_root": "/models/local",
+                "compute_type": "float16",
+                "device": "cuda",
+                "requires_gpu": True,
+            },
+            accepted_terms=("pyannote gated model terms accepted locally",),
+            registry_source="https://huggingface.co/pyannote/speaker-diarization-3.1",
+        ),
+        config_id="local-whisperx-pyannote",
+        model_version="2026-06",
+    )
+
+
 def _vad_trimmed_source(duration_ms=900):
     return _artifact_with_timeline(
         timeline_id="vad-trimmed",
@@ -92,6 +130,10 @@ def _plus_100_offset_map(source_end_ms=900, target_end_ms=1000):
 
 def test_canned_json_adapter_satisfies_engine_protocol():
     assert isinstance(_adapter(), DiarizationEngineAdapter)
+
+
+def test_self_hosted_whisperx_pyannote_adapter_satisfies_engine_protocol():
+    assert isinstance(_whisperx_adapter(), DiarizationEngineAdapter)
 
 
 def test_clean_engine_output_normalizes_to_canonical_words_spans_and_provenance():
@@ -378,3 +420,71 @@ def test_timeline_mismatch_accepts_valid_transform_offset_map():
     assert output.words[0].text == "hello"
     assert [(word.start_ms, word.end_ms) for word in output.words] == [(100, 400), (450, 750)]
     assert [(span.start_ms, span.end_ms) for span in output.speaker_spans] == [(100, 750)]
+
+
+def test_whisperx_pyannote_saved_output_normalizes_to_canonical_candidate_artifact():
+    output = _whisperx_adapter().normalize_raw_output(
+        _payload("whisperx_pyannote_output.json"),
+        artifact=_whisperx_artifact(),
+    )
+
+    assert output.output_id == "whisperx-pyannote-saved"
+    assert [word.text for word in output.words] == ["Hello", "there", "friend"]
+    assert [(word.start_ms, word.end_ms) for word in output.words] == [
+        (20, 310),
+        (360, 680),
+        (820, 1150),
+    ]
+    assert [word.speaker_ref for word in output.words] == [
+        "engine:mono-mix:speaker-00",
+        "engine:mono-mix:speaker-00",
+        "engine:mono-mix:speaker-01",
+    ]
+    assert [span.speaker_ref for span in output.speaker_spans] == [
+        "engine:mono-mix:speaker-00",
+        "engine:mono-mix:speaker-01",
+    ]
+    assert [(span.start_ms, span.end_ms) for span in output.speaker_spans] == [(0, 740), (740, 1220)]
+    assert [item.raw_speaker_id for item in output.raw_speaker_evidence] == ["SPEAKER_00", "SPEAKER_01"]
+    assert all(word.display_label is None for word in output.words)
+
+
+def test_whisperx_governance_is_attached_to_engine_config():
+    output = _whisperx_adapter().normalize_raw_output(
+        _payload("whisperx_pyannote_output.json"),
+        artifact=_whisperx_artifact(),
+    )
+
+    governance = output.to_dict()["config"]["parameters"]["model_governance"]
+    assert governance["checkpoint"] == "pyannote/speaker-diarization-3.1"
+    assert governance["package_versions"] == {"pyannote.audio": "3.1.0", "whisperx": "3.2.0"}
+    assert governance["runtime_config"]["cache_root"] == "/models/local"
+    assert governance["accepted_terms"] == ["pyannote gated model terms accepted locally"]
+    assert governance["registry_source"] == "https://huggingface.co/pyannote/speaker-diarization-3.1"
+
+
+def test_whisperx_word_segments_fall_back_to_pyannote_intervals_for_speakers():
+    output = _whisperx_adapter().normalize_raw_output(
+        _payload("whisperx_pyannote_word_segments.json"),
+        artifact=_whisperx_artifact(duration_ms=1_000),
+    )
+
+    assert [word.text for word in output.words] == ["first", "second"]
+    assert [word.speaker_ref for word in output.words] == [
+        "engine:mono-mix:speaker-00",
+        "engine:mono-mix:speaker-01",
+    ]
+    assert [item.source_field for item in output.raw_speaker_evidence] == ["speaker", "speaker"]
+
+
+def test_whisperx_runtime_preflight_reports_missing_optional_dependencies_without_import_failure():
+    status = _whisperx_adapter().runtime_preflight(
+        dependency_modules={"keyframe_missing_whisperx_for_test": "whisperx-test-only"}
+    )
+
+    assert status.status == "unsupported"
+    assert status.available is False
+    assert status.missing_packages == ("whisperx-test-only",)
+    assert "Install optional runtime packages" in status.reasons[0]
+    assert status.requires_model_access is True
+    assert status.requires_gpu is True
