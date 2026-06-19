@@ -1,0 +1,23 @@
+{
+  "access": {
+    "instructions": "Placeholder only. CALLHOME-style corpora require authenticated or licensed acquisition outside default automation.",
+    "mode": "auth_required",
+    "redistribution": "forbidden",
+    "url": null
+  },
+  "attribution": null,
+  "benchmarked": false,
+  "dataset_id": "callhome-gated-placeholder",
+  "expected_files": [],
+  "license_url": null,
+  "name": "CALLHOME Gated Placeholder",
+  "notes": [
+    "Gated placeholder for later licensed manual evaluation.",
+    "Forbidden redistribution prevents default CI or full-download paths."
+  ],
+  "role": "gated_manual",
+  "schema_version": 1,
+  "scoring_policies": [],
+  "source_url": null,
+  "splits": []
+}
