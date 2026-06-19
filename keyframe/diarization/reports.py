@@ -459,6 +459,20 @@ class ReviewSignalSeverityBreakdown:
             if value is not None:
                 object.__setattr__(self, field_name, _validate_probability(value, f"severity_breakdown.{field_name}"))
         object.__setattr__(self, "coverage", _validate_probability(self.coverage, "severity_breakdown.coverage"))
+        _validate_review_signal_summary(
+            total=self.total,
+            assessed=self.assessed,
+            true_positive=self.true_positive,
+            false_positive=self.false_positive,
+            false_negative=self.false_negative,
+            true_negative=self.true_negative,
+            precision=self.precision,
+            recall=self.recall,
+            false_confident_rate=self.false_confident_rate,
+            over_flag_rate=self.over_flag_rate,
+            coverage=self.coverage,
+            context=f"severity_breakdown.{self.severity}",
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -512,6 +526,25 @@ class ReviewSignalCalibration:
             raise ValidationError("review_calibration.serious must be a ReviewSignalSeverityBreakdown")
         if not isinstance(self.minor, ReviewSignalSeverityBreakdown):
             raise ValidationError("review_calibration.minor must be a ReviewSignalSeverityBreakdown")
+        if self.serious.severity != "serious":
+            raise ValidationError("review_calibration.serious must contain serious breakdown")
+        if self.minor.severity != "minor":
+            raise ValidationError("review_calibration.minor must contain minor breakdown")
+        _validate_review_signal_summary(
+            total=self.total,
+            assessed=self.assessed,
+            true_positive=self.true_positive,
+            false_positive=self.false_positive,
+            false_negative=self.false_negative,
+            true_negative=self.true_negative,
+            precision=self.precision,
+            recall=self.recall,
+            false_confident_rate=self.false_confident_rate,
+            over_flag_rate=self.over_flag_rate,
+            coverage=self.coverage,
+            context="review_calibration",
+        )
+        _validate_review_signal_breakdown_totals(self)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1329,6 +1362,52 @@ def _validate_serialized_gates(
                 "metric_result gate does not match regression budget: "
                 f"{result.scope_id}/{result.metric_name}"
             )
+
+
+def _validate_review_signal_summary(
+    *,
+    total: int,
+    assessed: int,
+    true_positive: int,
+    false_positive: int,
+    false_negative: int,
+    true_negative: int,
+    precision: float | None,
+    recall: float | None,
+    false_confident_rate: float | None,
+    over_flag_rate: float | None,
+    coverage: float,
+    context: str,
+) -> None:
+    if assessed != true_positive + false_positive + false_negative + true_negative:
+        raise ValidationError(f"{context}.assessed must match confusion-matrix counts")
+    if assessed > total:
+        raise ValidationError(f"{context}.assessed must be <= total")
+    expected_rates = {
+        "precision": _rate(true_positive, true_positive + false_positive),
+        "recall": _rate(true_positive, true_positive + false_negative),
+        "false_confident_rate": _rate(false_negative, true_positive + false_negative),
+        "over_flag_rate": _rate(false_positive, false_positive + true_negative),
+        "coverage": _rate(assessed, total) or 0.0,
+    }
+    actual_rates = {
+        "precision": precision,
+        "recall": recall,
+        "false_confident_rate": false_confident_rate,
+        "over_flag_rate": over_flag_rate,
+        "coverage": coverage,
+    }
+    for field_name, expected_value in expected_rates.items():
+        if actual_rates[field_name] != expected_value:
+            raise ValidationError(f"{context}.{field_name} must match confusion-matrix counts")
+
+
+def _validate_review_signal_breakdown_totals(calibration: ReviewSignalCalibration) -> None:
+    breakdowns = (calibration.serious, calibration.minor)
+    for field_name in ("total", "assessed", "true_positive", "false_positive", "false_negative", "true_negative"):
+        breakdown_total = sum(getattr(breakdown, field_name) for breakdown in breakdowns)
+        if getattr(calibration, field_name) != breakdown_total:
+            raise ValidationError(f"review_calibration.{field_name} must match severity breakdown totals")
 
 
 def _validate_serialized_critical_span_diagnostic(

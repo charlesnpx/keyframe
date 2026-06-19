@@ -643,6 +643,50 @@ def test_report_json_rejects_serialized_gate_that_conflicts_with_budget():
         benchmark_report_json_loads(json.dumps(payload))
 
 
+def test_report_json_rejects_tampered_review_signal_calibration_rate():
+    report = build_benchmark_report(
+        "tampered-review-calibration-rate",
+        (
+            _case("rec-1", current_der=0.05, baseline_der=0.05, current_overlap_der=0.10, baseline_overlap_der=0.10),
+        ),
+        review_signals=_signals(),
+    )
+    payload = report.to_dict()
+    payload["review_signal_calibration"]["recall"] = 1.0
+
+    with pytest.raises(ValidationError, match="review_calibration.recall"):
+        benchmark_report_json_loads(json.dumps(payload))
+
+
+def test_report_json_rejects_tampered_review_signal_breakdown_totals():
+    report = build_benchmark_report(
+        "tampered-review-calibration-breakdown",
+        (
+            _case("rec-1", current_der=0.05, baseline_der=0.05, current_overlap_der=0.10, baseline_overlap_der=0.10),
+        ),
+        review_signals=_signals(),
+    )
+    payload = report.to_dict()
+    payload["review_signal_calibration"]["minor"].update(
+        {
+            "assessed": 0,
+            "coverage": 0.0,
+            "false_confident_rate": None,
+            "false_negative": 0,
+            "false_positive": 0,
+            "over_flag_rate": None,
+            "precision": None,
+            "recall": None,
+            "total": 0,
+            "true_negative": 0,
+            "true_positive": 0,
+        }
+    )
+
+    with pytest.raises(ValidationError, match="review_calibration.total"):
+        benchmark_report_json_loads(json.dumps(payload))
+
+
 def test_report_json_rejects_tampered_critical_span_diagnostic():
     policy = CriticalSpanPolicyDefinition(
         policy_id="critical-span-diagnostic",
