@@ -1,0 +1,23 @@
+{
+  "access": {
+    "instructions": "Placeholder only. Robustness fixtures are curated locally before benchmark admission.",
+    "mode": "local_only",
+    "redistribution": "forbidden",
+    "url": null
+  },
+  "attribution": null,
+  "benchmarked": false,
+  "dataset_id": "robustness-local-placeholder",
+  "expected_files": [],
+  "license_url": null,
+  "name": "Robustness Local Placeholder",
+  "notes": [
+    "Adversarial and robustness material must be explicitly admitted before benchmark scoring.",
+    "Local-only access prevents accidental redistribution."
+  ],
+  "role": "adversarial",
+  "schema_version": 1,
+  "scoring_policies": [],
+  "source_url": null,
+  "splits": []
+}

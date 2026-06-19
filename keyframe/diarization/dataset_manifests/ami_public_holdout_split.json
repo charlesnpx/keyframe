@@ -1,0 +1,12 @@
+{
+  "dataset_id": "ami",
+  "notes": [
+    "Public holdout split descriptor for AMI manifest validation.",
+    "Raw AMI audio and annotations are acquired manually from the corpus source."
+  ],
+  "recording_ids": [
+    "ES2003a",
+    "ES2003b"
+  ],
+  "split_id": "ami-public-holdout"
+}

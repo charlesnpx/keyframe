@@ -1,0 +1,12 @@
+{
+  "dataset_id": "ami",
+  "notes": [
+    "Public development split descriptor for AMI manifest validation.",
+    "Raw AMI audio and annotations are acquired manually from the corpus source."
+  ],
+  "recording_ids": [
+    "ES2002a",
+    "ES2002b"
+  ],
+  "split_id": "ami-public-dev"
+}

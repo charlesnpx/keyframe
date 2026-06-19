@@ -1,0 +1,71 @@
+{
+  "access": {
+    "instructions": "Acquire corpus audio and annotations from the AMI/OpenSLR distribution; do not fetch in default CI.",
+    "mode": "public_manual",
+    "redistribution": "allowed",
+    "url": "https://www.openslr.org/16/"
+  },
+  "attribution": "AMI Meeting Corpus, released under Creative Commons Attribution 4.0 International.",
+  "benchmarked": true,
+  "dataset_id": "ami",
+  "expected_files": [
+    {
+      "checksum_sha256": "3de421b49a168ab7867a08fd043b4e6cabc9d42ca515d31541e10df7a506872b",
+      "file_role": "split",
+      "path": "keyframe/diarization/dataset_manifests/ami_public_dev_split.json",
+      "size_bytes": 285,
+      "source_url": "https://groups.inf.ed.ac.uk/ami/corpus/"
+    },
+    {
+      "checksum_sha256": "2334aead82e2d13d99ccd686b7e90223d68653e7daacd061a098195c0b354311",
+      "file_role": "split",
+      "path": "keyframe/diarization/dataset_manifests/ami_public_holdout_split.json",
+      "size_bytes": 285,
+      "source_url": "https://groups.inf.ed.ac.uk/ami/corpus/"
+    }
+  ],
+  "license_url": "https://groups.inf.ed.ac.uk/ami/corpus/license.shtml",
+  "name": "AMI Meeting Corpus",
+  "notes": [
+    "First concrete diarization benchmark manifest.",
+    "Manifest records split descriptors committed with the package; raw corpus media remains manually acquired."
+  ],
+  "role": "public_dev",
+  "schema_version": 1,
+  "scoring_policies": [
+    {
+      "collar_ms": 250,
+      "description": "Initial diarization policy for AMI manifest smoke/dev validation.",
+      "ignore_overlap": false,
+      "policy_id": "ami-diarization-v1",
+      "version": "1"
+    }
+  ],
+  "source_url": "https://groups.inf.ed.ac.uk/ami/corpus/",
+  "splits": [
+    {
+      "expected_file_paths": [
+        "keyframe/diarization/dataset_manifests/ami_public_dev_split.json"
+      ],
+      "recording_ids": [
+        "ES2002a",
+        "ES2002b"
+      ],
+      "role": "public_dev",
+      "scoring_policy_id": "ami-diarization-v1",
+      "split_id": "ami-public-dev"
+    },
+    {
+      "expected_file_paths": [
+        "keyframe/diarization/dataset_manifests/ami_public_holdout_split.json"
+      ],
+      "recording_ids": [
+        "ES2003a",
+        "ES2003b"
+      ],
+      "role": "public_holdout",
+      "scoring_policy_id": "ami-diarization-v1",
+      "split_id": "ami-public-holdout"
+    }
+  ]
+}
