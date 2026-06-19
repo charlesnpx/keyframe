@@ -235,6 +235,17 @@ def validate_canonical_recording(
 
     if not isinstance(recording, CanonicalRecording):
         raise ValidationError("recording must be a CanonicalRecording")
+    return _result(
+        _canonical_recording_issues(recording, scoring_policy=scoring_policy),
+        slice_metadata=build_fixture_slice_metadata((recording,), minimum_support=minimum_slice_support),
+    )
+
+
+def _canonical_recording_issues(
+    recording: CanonicalRecording,
+    *,
+    scoring_policy: ScoringPolicyManifest | None,
+) -> tuple[FixtureValidationIssue, ...]:
     issues: list[FixtureValidationIssue] = []
 
     for word in recording.words:
@@ -257,10 +268,7 @@ def validate_canonical_recording(
             )
         )
 
-    return _result(
-        issues,
-        slice_metadata=build_fixture_slice_metadata((recording,), minimum_support=minimum_slice_support),
-    )
+    return tuple(issues)
 
 
 def validate_candidate_bundle_against_reference(
@@ -311,6 +319,17 @@ def validate_candidate_bundle_against_reference(
             _issue(
                 "audio_metadata_mismatch",
                 "candidate audio timeline_id does not match canonical reference",
+                recording_id=recording.recording_id,
+            )
+        )
+    allowed_transform_chain_ids = {recording.transform_chain_id}
+    if allow_mono_mix and len(recording.channels) > 1 and len(channels) == 1:
+        allowed_transform_chain_ids.add(f"{recording.transform_chain_id}-mono-mix")
+    if timeline["transform_chain_id"] not in allowed_transform_chain_ids:
+        issues.append(
+            _issue(
+                "audio_metadata_mismatch",
+                "candidate audio transform_chain_id does not match canonical reference",
                 recording_id=recording.recording_id,
             )
         )
@@ -386,16 +405,34 @@ def validate_fixture_gate(
     results: list[FixtureValidationResult] = []
     if manifest is not None:
         results.append(validate_manifest_expected_files(manifest, root=expected_files_root))
+    canonical_recordings: list[CanonicalRecording] = []
+    canonical_issues: list[FixtureValidationIssue] = []
     for payload in canonical_payloads:
+        try:
+            recording = recording_from_dict(payload)
+        except ValidationError as exc:
+            results.append(_result((_issue(_category_for_model_error(str(exc)), str(exc)),)))
+            continue
+        canonical_recordings.append(recording)
+        canonical_issues.extend(_canonical_recording_issues(recording, scoring_policy=scoring_policy))
+    if canonical_recordings:
         results.append(
-            validate_canonical_reference_payload(
-                payload,
-                scoring_policy=scoring_policy,
-                minimum_slice_support=minimum_slice_support,
+            _result(
+                canonical_issues,
+                slice_metadata=build_fixture_slice_metadata(
+                    tuple(canonical_recordings),
+                    minimum_support=minimum_slice_support,
+                ),
             )
         )
     for payload, recording in candidate_payloads:
-        results.append(validate_candidate_bundle_against_reference(payload, recording, allow_mono_mix=allow_mono_mix))
+        results.append(
+            validate_candidate_bundle_against_reference(
+                payload,
+                recording,
+                allow_mono_mix=allow_mono_mix,
+            )
+        )
     if artifact_paths is not None:
         results.append(validate_scoring_exports(artifact_paths=artifact_paths))
     return merge_fixture_validation_results(*results)

@@ -157,12 +157,17 @@ def test_candidate_validation_reports_redaction_and_audio_metadata_failures():
     timeline_payload["runtime_hints"]["timeline"]["timeline_id"] = "wrong-timeline"
     timeline_drift = validate_candidate_bundle_against_reference(timeline_payload, recording)
 
+    transform_payload = copy.deepcopy(payload)
+    transform_payload["runtime_hints"]["timeline"]["transform_chain_id"] = "wrong-transform"
+    transform_drift = validate_candidate_bundle_against_reference(transform_payload, recording)
+
     assert leaked.status == "invalid_fixture"
     assert leaked.issues[0].category == "reference_leakage"
     assert mismatch.issues[0].category == "audio_metadata_mismatch"
     assert channel_mismatch.issues[0].category == "audio_metadata_mismatch"
     assert channel_drift.issues[0].category == "audio_metadata_mismatch"
     assert timeline_drift.issues[0].category == "audio_metadata_mismatch"
+    assert transform_drift.issues[0].category == "audio_metadata_mismatch"
 
 
 def test_fixture_gate_allows_mono_mix_when_enabled_for_multichannel_reference():
@@ -179,6 +184,7 @@ def test_fixture_gate_allows_mono_mix_when_enabled_for_multichannel_reference():
     payload["channels"] = [{"channel_id": "mono-mix"}]
     payload["runtime_hints"]["channel_ids"] = ["mono-mix"]
     payload["runtime_hints"]["timeline"]["channel_ids"] = ["mono-mix"]
+    payload["runtime_hints"]["timeline"]["transform_chain_id"] = "identity-mono-mix"
 
     rejected = validate_fixture_gate(candidate_payloads=((payload, recording),))
     accepted = validate_fixture_gate(candidate_payloads=((payload, recording),), allow_mono_mix=True)
@@ -187,6 +193,33 @@ def test_fixture_gate_allows_mono_mix_when_enabled_for_multichannel_reference():
     assert rejected.issues[0].category == "audio_metadata_mismatch"
     assert accepted.status == "valid"
     assert accepted.issues == ()
+
+
+def test_fixture_gate_aggregates_slice_support_across_canonical_payloads():
+    first = _payload("clean_two_speaker.json")
+    second = copy.deepcopy(first)
+    second["recording_id"] = "fixture-clean-two-speaker-copy"
+    second["original_audio_id"] = "fixture-clean-two-speaker-copy-original"
+    second["canonical_audio_id"] = "fixture-clean-two-speaker-copy-canonical"
+    second["timeline_id"] = "fixture-clean-two-speaker-copy-timeline"
+
+    result = validate_fixture_gate(
+        canonical_payloads=(first, second),
+        scoring_policy=_scoring_policy(),
+        minimum_slice_support=2,
+    )
+
+    speaker_count_slices = [
+        item for item in result.slice_metadata if item.dimension == "speaker_count" and item.value == "2"
+    ]
+    assert result.status == "valid"
+    assert len(speaker_count_slices) == 1
+    assert speaker_count_slices[0].status == "ready"
+    assert speaker_count_slices[0].support_count == 2
+    assert speaker_count_slices[0].recording_ids == (
+        "fixture-clean-two-speaker",
+        "fixture-clean-two-speaker-copy",
+    )
 
 
 def test_missing_scoring_exports_are_invalid_fixture_results(tmp_path):
