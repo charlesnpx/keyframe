@@ -504,8 +504,16 @@ class PrivateAcceptanceCoverageSliceResult:
             )
         reasons = tuple(_require_text(reason, "coverage_result.reasons") for reason in _sequence(self.reasons))
         object.__setattr__(self, "reasons", reasons)
-        if self.status == "sufficient" and reasons:
-            raise ValidationError("sufficient coverage results cannot include reasons")
+        if self.diagnostic_only != (self.status == "diagnostic_only"):
+            raise ValidationError("coverage_result.diagnostic_only must match diagnostic_only status")
+        below_threshold = (
+            self.scored_recording_count < self.min_scored_recording_count
+            or self.scored_duration_ms < self.min_scored_duration_ms
+        )
+        if self.status == "sufficient" and (reasons or below_threshold):
+            raise ValidationError("sufficient coverage results must meet minimum coverage without reasons")
+        if self.status == "insufficient_acceptance_coverage" and not below_threshold:
+            raise ValidationError("insufficient coverage results must be below minimum coverage")
         if self.status != "sufficient" and not reasons:
             raise ValidationError("insufficient or diagnostic coverage results require reasons")
 
@@ -555,6 +563,16 @@ class PrivateAcceptanceCoverageReport:
             _id_tuple(self.unsupported_scope, "coverage_report.unsupported_scope"),
         )
         object.__setattr__(self, "failure_code", _optional_id(self.failure_code, "coverage_report.failure_code"))
+        if self.status == "diagnostic_only":
+            raise ValidationError("coverage_report.status cannot be diagnostic_only")
+        has_required_insufficient = any(
+            result.required and result.status == "insufficient_acceptance_coverage"
+            for result in results
+        )
+        if self.status == "sufficient" and has_required_insufficient:
+            raise ValidationError("sufficient coverage reports cannot include insufficient required slices")
+        if self.status == "insufficient_acceptance_coverage" and not has_required_insufficient:
+            raise ValidationError("insufficient coverage reports require an insufficient required slice")
         if (
             self.status == "insufficient_acceptance_coverage"
             and self.failure_code != "insufficient_acceptance_coverage"

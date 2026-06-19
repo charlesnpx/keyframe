@@ -9,6 +9,8 @@ from keyframe.diarization import (
     ExpectedDatasetFile,
     PrivateAcceptanceCoverageObservation,
     PrivateAcceptanceCoveragePlan,
+    PrivateAcceptanceCoverageReport,
+    PrivateAcceptanceCoverageSliceResult,
     PrivateAcceptanceCoverageSliceTarget,
     PrivateAcceptanceMetadata,
     PrivateAcceptanceSlice,
@@ -419,4 +421,87 @@ def test_private_acceptance_coverage_rejects_unknown_observation_slice_ids():
                     scored_duration_ms=1_200_000,
                 ),
             ),
+        )
+
+
+def test_private_acceptance_coverage_result_rejects_impossible_sufficient_state():
+    with pytest.raises(ValidationError, match="sufficient coverage results must meet minimum coverage"):
+        PrivateAcceptanceCoverageSliceResult(
+            slice_id="adjudicated-core",
+            status="sufficient",
+            required=True,
+            diagnostic_only=False,
+            scored_recording_count=0,
+            scored_duration_ms=0,
+            min_scored_recording_count=10,
+            min_scored_duration_ms=1_200_000,
+        )
+
+
+def test_private_acceptance_coverage_result_requires_diagnostic_flag_to_match_status():
+    with pytest.raises(ValidationError, match="coverage_result.diagnostic_only must match"):
+        PrivateAcceptanceCoverageSliceResult(
+            slice_id="diagnostic-unadjudicated",
+            status="diagnostic_only",
+            required=False,
+            diagnostic_only=False,
+            scored_recording_count=0,
+            scored_duration_ms=0,
+            min_scored_recording_count=2,
+            min_scored_duration_ms=300_000,
+            reasons=("diagnostic slice is not promoted through private acceptance protocol",),
+        )
+
+
+def test_private_acceptance_coverage_report_rejects_sufficient_status_with_required_failure():
+    failed_required_slice = PrivateAcceptanceCoverageSliceResult(
+        slice_id="adjudicated-core",
+        status="insufficient_acceptance_coverage",
+        required=True,
+        diagnostic_only=False,
+        scored_recording_count=0,
+        scored_duration_ms=0,
+        min_scored_recording_count=10,
+        min_scored_duration_ms=1_200_000,
+        reasons=("scored_recording_count below threshold",),
+    )
+
+    with pytest.raises(
+        ValidationError,
+        match="sufficient coverage reports cannot include insufficient required slices",
+    ):
+        PrivateAcceptanceCoverageReport(
+            plan_id="private-coverage-v1",
+            plan_version="2026-06-19",
+            status="sufficient",
+            slice_results=(failed_required_slice,),
+            validated_scope=("adjudicated-core",),
+            unsupported_scope=(),
+        )
+
+
+def test_private_acceptance_coverage_report_requires_required_failure_for_insufficient_status():
+    sufficient_required_slice = PrivateAcceptanceCoverageSliceResult(
+        slice_id="adjudicated-core",
+        status="sufficient",
+        required=True,
+        diagnostic_only=False,
+        scored_recording_count=10,
+        scored_duration_ms=1_200_000,
+        min_scored_recording_count=10,
+        min_scored_duration_ms=1_200_000,
+    )
+
+    with pytest.raises(
+        ValidationError,
+        match="insufficient coverage reports require an insufficient required slice",
+    ):
+        PrivateAcceptanceCoverageReport(
+            plan_id="private-coverage-v1",
+            plan_version="2026-06-19",
+            status="insufficient_acceptance_coverage",
+            slice_results=(sufficient_required_slice,),
+            validated_scope=("adjudicated-core",),
+            unsupported_scope=(),
+            failure_code="insufficient_acceptance_coverage",
         )
