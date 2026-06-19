@@ -170,6 +170,13 @@ def _case_with_support(
     )
 
 
+def _cases_for_signals():
+    return (
+        _case("rec-1", current_der=0.05, baseline_der=0.05, current_overlap_der=0.10, baseline_overlap_der=0.10),
+        _case("rec-2", current_der=0.05, baseline_der=0.05, current_overlap_der=0.10, baseline_overlap_der=0.10),
+    )
+
+
 def _recording_metrics(recording_der, *, scored_interval_ms, include_scored_interval_metric):
     metrics = {
         "diarization_error_rate": recording_der,
@@ -763,9 +770,7 @@ def test_report_constructor_rejects_metric_gate_that_conflicts_with_budget():
 def test_report_json_rejects_tampered_review_signal_calibration_rate():
     report = build_benchmark_report(
         "tampered-review-calibration-rate",
-        (
-            _case("rec-1", current_der=0.05, baseline_der=0.05, current_overlap_der=0.10, baseline_overlap_der=0.10),
-        ),
+        _cases_for_signals(),
         review_signals=_signals(),
     )
     payload = report.to_dict()
@@ -778,9 +783,7 @@ def test_report_json_rejects_tampered_review_signal_calibration_rate():
 def test_report_json_rejects_tampered_review_signal_breakdown_totals():
     report = build_benchmark_report(
         "tampered-review-calibration-breakdown",
-        (
-            _case("rec-1", current_der=0.05, baseline_der=0.05, current_overlap_der=0.10, baseline_overlap_der=0.10),
-        ),
+        _cases_for_signals(),
         review_signals=_signals(),
     )
     payload = report.to_dict()
@@ -814,9 +817,7 @@ def test_report_json_rejects_tampered_critical_span_diagnostic():
     )
     report = build_benchmark_report(
         "tampered-critical-span",
-        (
-            _case("rec-1", current_der=0.05, baseline_der=0.05, current_overlap_der=0.10, baseline_overlap_der=0.10),
-        ),
+        _cases_for_signals(),
         review_signals=_signals(),
         critical_span_policy=policy,
     )
@@ -887,9 +888,7 @@ def test_review_signal_budgets_gate_serialized_review_metric_results():
     )
     report = build_benchmark_report(
         "review-signal-gates",
-        (
-            _case("rec-1", current_der=0.05, baseline_der=0.05, current_overlap_der=0.10, baseline_overlap_der=0.10),
-        ),
+        _cases_for_signals(),
         gate_config=gate_config,
         review_signals=_signals(),
     )
@@ -908,12 +907,39 @@ def test_review_signal_budgets_gate_serialized_review_metric_results():
     assert benchmark_report_json_loads(json.dumps(report.to_dict())).to_dict() == report.to_dict()
 
 
+def test_review_signals_must_match_evaluated_cases():
+    with pytest.raises(ValidationError, match="review_signals must match evaluated benchmark cases"):
+        build_benchmark_report(
+            "mismatched-review-signal-scope",
+            (
+                _case(
+                    "rec-1",
+                    current_der=0.05,
+                    baseline_der=0.05,
+                    current_overlap_der=0.10,
+                    baseline_overlap_der=0.10,
+                ),
+            ),
+            review_signals=(
+                ReviewSignalSpan(
+                    signal_id="wrong-scope",
+                    corpus_id="ami-smoke",
+                    branch_id="other-branch",
+                    recording_id="rec-99",
+                    start_ms=0,
+                    end_ms=100,
+                    severity="minor",
+                    reference_review_required=False,
+                    predicted_review_required=False,
+                ),
+            ),
+        )
+
+
 def test_report_json_rejects_tampered_review_signal_metric_gate():
     report = build_benchmark_report(
         "tampered-review-signal-gate",
-        (
-            _case("rec-1", current_der=0.05, baseline_der=0.05, current_overlap_der=0.10, baseline_overlap_der=0.10),
-        ),
+        _cases_for_signals(),
         gate_config=BenchmarkGateConfig(
             budgets=(
                 BenchmarkRegressionBudget(
@@ -990,9 +1016,7 @@ def test_report_json_rejects_extra_review_signal_metric_result():
 def test_report_json_rejects_missing_review_signal_scope_calibrations():
     report = build_benchmark_report(
         "missing-review-signal-scopes",
-        (
-            _case("rec-1", current_der=0.05, baseline_der=0.05, current_overlap_der=0.10, baseline_overlap_der=0.10),
-        ),
+        _cases_for_signals(),
         review_signals=_signals(),
     )
     payload = report.to_dict()
@@ -1050,6 +1074,22 @@ def test_report_json_rejects_metric_result_scope_identifier_mismatch():
     payload["branch_results"][0]["branch_id"] = "different-branch"
 
     with pytest.raises(ValidationError, match="metric_result.scope_id"):
+        benchmark_report_json_loads(json.dumps(payload))
+
+
+def test_report_json_rejects_duplicate_metric_result_keys():
+    report = build_benchmark_report(
+        "duplicate-metric-result",
+        (
+            _case("rec-1", current_der=0.05, baseline_der=0.05, current_overlap_der=0.10, baseline_overlap_der=0.10),
+        ),
+    )
+    payload = report.to_dict()
+    duplicate = dict(payload["branch_results"][0])
+    duplicate["point_score"] = duplicate["point_score"] + 0.1
+    payload["branch_results"].append(duplicate)
+
+    with pytest.raises(ValidationError, match="duplicate metric result"):
         benchmark_report_json_loads(json.dumps(payload))
 
 
@@ -1118,9 +1158,7 @@ def test_report_embeds_review_signal_and_critical_span_diagnostics():
 
     report = build_benchmark_report(
         "review-diagnostics",
-        (
-            _case("rec-1", current_der=0.05, baseline_der=0.05, current_overlap_der=0.10, baseline_overlap_der=0.10),
-        ),
+        _cases_for_signals(),
         review_signals=_signals(),
         critical_span_policy=policy,
     )

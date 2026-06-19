@@ -792,6 +792,7 @@ class BenchmarkReport:
         metric_results = self.metric_results
         if not metric_results:
             raise ValidationError("benchmark_report requires at least one metric result")
+        _validate_unique_metric_results(metric_results)
         _validate_serialized_gates(self.gate_config, metric_results)
         _validate_serialized_review_signal_metric_results(
             self.review_signal_calibration,
@@ -873,6 +874,7 @@ def build_benchmark_report(
     if not isinstance(gate_config, BenchmarkGateConfig):
         raise ValidationError("gate_config must be a BenchmarkGateConfig")
     review_signals = _tuple_of(review_signals, ReviewSignalSpan, "review_signals")
+    _validate_review_signals_match_cases(cases, review_signals)
     observations = tuple(observation for case in cases for observation in _observations_from_case(case))
     if not observations:
         raise ValidationError("benchmark reports require at least one scored metric observation")
@@ -1640,6 +1642,28 @@ def _validate_metric_result_scope_identity(result: BenchmarkMetricResult) -> Non
         expected_scope_id = f"{result.corpus_id}/{result.branch_id}/{result.slice_id}"
     if result.scope_id != expected_scope_id:
         raise ValidationError("metric_result.scope_id must match its scope identifiers")
+
+
+def _validate_unique_metric_results(results: tuple[BenchmarkMetricResult, ...]) -> None:
+    seen: set[tuple[BenchmarkReportScopeType, str, str]] = set()
+    for result in results:
+        key = _metric_result_key(result)
+        if key in seen:
+            raise ValidationError(f"duplicate metric result: {result.scope_id}/{result.metric_name}")
+        seen.add(key)
+
+
+def _validate_review_signals_match_cases(
+    cases: tuple[BenchmarkEvaluationCase, ...],
+    signals: tuple[ReviewSignalSpan, ...],
+) -> None:
+    allowed = {
+        (case.corpus_id, case.branch_id, case.evaluation.recording_id)
+        for case in cases
+    }
+    for signal in signals:
+        if (signal.corpus_id, signal.branch_id, signal.recording_id) not in allowed:
+            raise ValidationError("review_signals must match evaluated benchmark cases")
 
 
 def _validate_review_signal_scope_identity(scope_calibration: ReviewSignalScopeCalibration) -> None:
