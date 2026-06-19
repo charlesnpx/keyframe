@@ -378,18 +378,16 @@ def decide_mono_mix_branch_acceptance(
 ) -> BranchAcceptanceRecord:
     """Decide whether mono-mix complexity is acceptable against an ASR-only baseline."""
 
+    complex_false_confident_rate = _probability(complex_false_confident_rate, "complex_false_confident_rate")
+    baseline_false_confident_rate = _probability(baseline_false_confident_rate, "baseline_false_confident_rate")
+    complex_review_burden_rate = _probability(complex_review_burden_rate, "complex_review_burden_rate")
+    baseline_review_burden_rate = _probability(baseline_review_burden_rate, "baseline_review_burden_rate")
     quality_delta = _finite_number(complex_quality_score, "complex_quality_score") - _finite_number(
         baseline_quality_score,
         "baseline_quality_score",
     )
-    false_confidence_delta = _finite_number(
-        complex_false_confident_rate,
-        "complex_false_confident_rate",
-    ) - _finite_number(baseline_false_confident_rate, "baseline_false_confident_rate")
-    review_burden_delta = _finite_number(complex_review_burden_rate, "complex_review_burden_rate") - _finite_number(
-        baseline_review_burden_rate,
-        "baseline_review_burden_rate",
-    )
+    false_confidence_delta = complex_false_confident_rate - baseline_false_confident_rate
+    review_burden_delta = complex_review_burden_rate - baseline_review_burden_rate
     min_quality_delta = _finite_number(min_quality_delta, "min_quality_delta")
     max_false_confidence_delta = _finite_number(max_false_confidence_delta, "max_false_confidence_delta")
     max_review_burden_delta = _finite_number(max_review_burden_delta, "max_review_burden_delta")
@@ -1260,4 +1258,11 @@ def _finite_number(value: object, field_name: str) -> float:
     result = float(value)
     if not math.isfinite(result):
         raise ValidationError(f"{field_name} must be finite")
+    return result
+
+
+def _probability(value: object, field_name: str) -> float:
+    result = _finite_number(value, field_name)
+    if result < 0.0 or result > 1.0:
+        raise ValidationError(f"{field_name} must be between 0 and 1")
     return result

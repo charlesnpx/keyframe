@@ -535,6 +535,30 @@ def test_branch_acceptance_record_requires_enforced_metric_deltas(field_name):
         BranchAcceptanceRecord(**values)
 
 
+@pytest.mark.parametrize(
+    "field_name,bad_value",
+    (
+        ("complex_false_confident_rate", 1.01),
+        ("baseline_false_confident_rate", -0.01),
+        ("complex_review_burden_rate", 1.01),
+        ("baseline_review_burden_rate", -0.01),
+    ),
+)
+def test_mono_mix_acceptance_decision_rejects_impossible_rate_inputs(field_name, bad_value):
+    values = {
+        "complex_quality_score": 0.91,
+        "baseline_quality_score": 0.82,
+        "complex_false_confident_rate": 0.08,
+        "baseline_false_confident_rate": 0.05,
+        "complex_review_burden_rate": 0.20,
+        "baseline_review_burden_rate": 0.10,
+    }
+    values[field_name] = bad_value
+
+    with pytest.raises(ValidationError, match=f"{field_name} must be between 0 and 1"):
+        decide_mono_mix_branch_acceptance(**values)
+
+
 def test_mono_mix_acceptance_decision_enforces_only_quality_false_confidence_and_review_burden():
     accepted = decide_mono_mix_branch_acceptance(
         complex_quality_score=0.91,
