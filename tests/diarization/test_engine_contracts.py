@@ -477,6 +477,30 @@ def test_whisperx_word_segments_fall_back_to_pyannote_intervals_for_speakers():
     assert [item.source_field for item in output.raw_speaker_evidence] == ["speaker", "speaker"]
 
 
+def test_whisperx_word_derived_spans_preserve_separate_speaker_turns():
+    payload = {
+        "channel_id": "mono-mix",
+        "output_id": "word-speaker-turns",
+        "segments": [
+            {
+                "words": [
+                    {"end_ms": 100, "speaker": "A", "start_ms": 0, "word": "alpha"},
+                    {"end_ms": 300, "speaker": "B", "start_ms": 200, "word": "bravo"},
+                    {"end_ms": 500, "speaker": "A", "start_ms": 400, "word": "again"},
+                ]
+            }
+        ],
+    }
+
+    output = _whisperx_adapter().normalize_raw_output(payload, artifact=_whisperx_artifact(duration_ms=600))
+
+    assert [(span.speaker_ref, span.start_ms, span.end_ms) for span in output.speaker_spans] == [
+        ("engine:mono-mix:a", 0, 100),
+        ("engine:mono-mix:b", 200, 300),
+        ("engine:mono-mix:a", 400, 500),
+    ]
+
+
 def test_whisperx_runtime_preflight_reports_missing_optional_dependencies_without_import_failure():
     status = _whisperx_adapter().runtime_preflight(
         dependency_modules={"keyframe_missing_whisperx_for_test": "whisperx-test-only"}
