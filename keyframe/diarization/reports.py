@@ -345,6 +345,7 @@ class BenchmarkMetricResult:
         object.__setattr__(self, "branch_id", _optional_id(self.branch_id, "metric_result.branch_id"))
         object.__setattr__(self, "recording_id", _optional_id(self.recording_id, "metric_result.recording_id"))
         object.__setattr__(self, "slice_id", _optional_id(self.slice_id, "metric_result.slice_id"))
+        _validate_metric_result_scope_identity(self)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -754,12 +755,16 @@ class BenchmarkReport:
         )
         if not isinstance(self.gate_config, BenchmarkGateConfig):
             raise ValidationError("benchmark_report.gate_config must be a BenchmarkGateConfig")
-        for field_name in ("corpus_results", "branch_results", "recording_results", "slice_results"):
-            object.__setattr__(
-                self,
-                field_name,
-                _tuple_of(getattr(self, field_name), BenchmarkMetricResult, f"benchmark_report.{field_name}"),
-            )
+        for field_name, scope_type in (
+            ("corpus_results", "corpus"),
+            ("branch_results", "branch"),
+            ("recording_results", "recording"),
+            ("slice_results", "slice"),
+        ):
+            results = _tuple_of(getattr(self, field_name), BenchmarkMetricResult, f"benchmark_report.{field_name}")
+            if any(result.scope_type != scope_type for result in results):
+                raise ValidationError(f"benchmark_report.{field_name} must contain only {scope_type} results")
+            object.__setattr__(self, field_name, results)
         if self.review_signal_calibration is not None and not isinstance(
             self.review_signal_calibration,
             ReviewSignalCalibration,
@@ -1608,6 +1613,35 @@ def _validate_review_signal_breakdown_totals(calibration: ReviewSignalCalibratio
             raise ValidationError(f"review_calibration.{field_name} must match severity breakdown totals")
 
 
+def _validate_metric_result_scope_identity(result: BenchmarkMetricResult) -> None:
+    if result.scope_type == "corpus":
+        if result.corpus_id is None:
+            raise ValidationError("corpus metric results require corpus_id")
+        if result.branch_id is not None or result.recording_id is not None or result.slice_id is not None:
+            raise ValidationError("corpus metric results cannot include branch, recording, or slice ids")
+        expected_scope_id = result.corpus_id
+    elif result.scope_type == "branch":
+        if result.corpus_id is None or result.branch_id is None:
+            raise ValidationError("branch metric results require corpus_id and branch_id")
+        if result.recording_id is not None or result.slice_id is not None:
+            raise ValidationError("branch metric results cannot include recording or slice ids")
+        expected_scope_id = f"{result.corpus_id}/{result.branch_id}"
+    elif result.scope_type == "recording":
+        if result.corpus_id is None or result.branch_id is None or result.recording_id is None:
+            raise ValidationError("recording metric results require corpus_id, branch_id, and recording_id")
+        if result.slice_id is not None:
+            raise ValidationError("recording metric results cannot include slice_id")
+        expected_scope_id = f"{result.corpus_id}/{result.branch_id}/{result.recording_id}"
+    else:
+        if result.corpus_id is None or result.branch_id is None or result.slice_id is None:
+            raise ValidationError("slice metric results require corpus_id, branch_id, and slice_id")
+        if result.recording_id is not None:
+            raise ValidationError("slice metric results cannot include recording_id")
+        expected_scope_id = f"{result.corpus_id}/{result.branch_id}/{result.slice_id}"
+    if result.scope_id != expected_scope_id:
+        raise ValidationError("metric_result.scope_id must match its scope identifiers")
+
+
 def _validate_review_signal_scope_identity(scope_calibration: ReviewSignalScopeCalibration) -> None:
     if scope_calibration.scope_type == "corpus":
         if scope_calibration.corpus_id is None:
@@ -1646,6 +1680,8 @@ def _validate_serialized_review_signal_metric_results(
     if calibration is None:
         if scope_calibrations:
             raise ValidationError("review_signal_scope_calibrations require review_signal_calibration")
+        if any(_is_serialized_review_signal_metric_result(result) for result in results):
+            raise ValidationError("review-signal metric results require review_signal_calibration")
         return
     if not scope_calibrations:
         raise ValidationError("review_signal_calibration requires review_signal_scope_calibrations")
@@ -1685,10 +1721,9 @@ def _validate_review_signal_scope_calibrations(
         by_scope_type.setdefault(scope_calibration.scope_type, []).append(scope_calibration)
     for scope_type in ("corpus", "branch", "recording"):
         scoped = tuple(by_scope_type.get(scope_type, ()))
-        if scoped:
-            _validate_review_signal_scope_totals(calibration, scoped, scope_type)
-    if not by_scope_type.get("corpus"):
-        raise ValidationError("review_signal_scope_calibrations require at least one corpus scope")
+        if not scoped:
+            raise ValidationError(f"review_signal_scope_calibrations require at least one {scope_type} scope")
+        _validate_review_signal_scope_totals(calibration, scoped, scope_type)
 
 
 def _validate_review_signal_scope_totals(
@@ -1704,6 +1739,16 @@ def _validate_review_signal_scope_totals(
 
 def _metric_result_key(result: BenchmarkMetricResult) -> tuple[BenchmarkReportScopeType, str, str]:
     return result.scope_type, result.scope_id, result.metric_name
+
+
+def _is_serialized_review_signal_metric_result(result: BenchmarkMetricResult) -> bool:
+    return (
+        result.scope_type in {"corpus", "branch", "recording"}
+        and (
+            result.uncertainty.basis == "review_signal_metric"
+            or result.metric_name in {"false_confident_rate", "over_flag_rate"}
+        )
+    )
 
 
 def _validate_serialized_critical_span_diagnostic(

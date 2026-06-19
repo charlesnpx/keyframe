@@ -987,6 +987,72 @@ def test_report_json_rejects_extra_review_signal_metric_result():
         benchmark_report_json_loads(json.dumps(payload))
 
 
+def test_report_json_rejects_missing_review_signal_scope_calibrations():
+    report = build_benchmark_report(
+        "missing-review-signal-scopes",
+        (
+            _case("rec-1", current_der=0.05, baseline_der=0.05, current_overlap_der=0.10, baseline_overlap_der=0.10),
+        ),
+        review_signals=_signals(),
+    )
+    payload = report.to_dict()
+    payload["review_signal_scope_calibrations"] = [
+        item for item in payload["review_signal_scope_calibrations"] if item["scope_type"] == "corpus"
+    ]
+
+    with pytest.raises(ValidationError, match="at least one branch scope"):
+        benchmark_report_json_loads(json.dumps(payload))
+
+
+def test_report_json_rejects_review_signal_metric_without_calibration():
+    report = build_benchmark_report(
+        "forged-review-metric-without-calibration",
+        (
+            _case("rec-1", current_der=0.05, baseline_der=0.05, current_overlap_der=0.10, baseline_overlap_der=0.10),
+        ),
+    )
+    payload = report.to_dict()
+    forged = dict(payload["branch_results"][0])
+    forged.update(
+        {
+            "metric_name": "false_confident_rate",
+            "point_score": 0.0,
+        }
+    )
+    payload["branch_results"].append(forged)
+
+    with pytest.raises(ValidationError, match="require review_signal_calibration"):
+        benchmark_report_json_loads(json.dumps(payload))
+
+
+def test_report_json_rejects_metric_result_in_wrong_section():
+    report = build_benchmark_report(
+        "wrong-result-section",
+        (
+            _case("rec-1", current_der=0.05, baseline_der=0.05, current_overlap_der=0.10, baseline_overlap_der=0.10),
+        ),
+    )
+    payload = report.to_dict()
+    payload["corpus_results"].append(payload["branch_results"][0])
+
+    with pytest.raises(ValidationError, match="corpus_results must contain only corpus results"):
+        benchmark_report_json_loads(json.dumps(payload))
+
+
+def test_report_json_rejects_metric_result_scope_identifier_mismatch():
+    report = build_benchmark_report(
+        "wrong-scope-identity",
+        (
+            _case("rec-1", current_der=0.05, baseline_der=0.05, current_overlap_der=0.10, baseline_overlap_der=0.10),
+        ),
+    )
+    payload = report.to_dict()
+    payload["branch_results"][0]["branch_id"] = "different-branch"
+
+    with pytest.raises(ValidationError, match="metric_result.scope_id"):
+        benchmark_report_json_loads(json.dumps(payload))
+
+
 def test_diagnostic_critical_span_policy_hook_scores_synthetic_spans():
     policy = CriticalSpanPolicyDefinition(
         policy_id="critical-span-diagnostic",
