@@ -714,6 +714,9 @@ def test_google_cumulative_streaming_finals_replace_prior_word_metadata_without_
     ]
     assert [word.text_confidence for word in output.words] == [0.96, 0.95]
     assert [word.speaker_ref for word in output.words] == ["engine:ch-1:2", "engine:ch-1:2"]
+    assert [(item.raw_speaker_id, item.speaker_ref) for item in output.raw_speaker_evidence] == [
+        ("2", "engine:ch-1:2")
+    ]
 
 
 def test_google_channel_tag_overrides_root_channel_fallback_for_multichannel_outputs():

@@ -991,13 +991,9 @@ def _google_provider_words(
             channel_id = _provider_channel_id(payload, result, artifact, context)
             start_ms, end_ms = _provider_interval_ms(value, context, offset_map)
             raw_speaker_id = _provider_speaker_id(value, context, keys=("speakerTag", "speaker_tag", "speaker"))
-            speaker_ref = _provider_speaker_ref(
-                raw_speaker_id,
-                channel_id=channel_id,
-                speaker_refs=speaker_refs,
-                raw_speaker_evidence=raw_speaker_evidence,
-                source_field="speakerTag",
-            )
+            speaker_ref = None
+            if raw_speaker_id is not None:
+                speaker_ref = _speaker_ref_for(channel_id, raw_speaker_id, speaker_refs)
             word_confidence = _first_confidence(value, ("confidence", "text_confidence"), context)
             key = (channel_id, start_ms, end_ms)
             if key not in word_rows:
@@ -1005,16 +1001,33 @@ def _google_provider_words(
             word_rows[key] = {
                 "channel_id": channel_id,
                 "end_ms": end_ms,
+                "raw_speaker_id": raw_speaker_id,
                 "speaker_confidence": _first_confidence(value, ("speaker_confidence",), context),
                 "speaker_ref": speaker_ref,
+                "speaker_source_field": _provider_speaker_source_field(
+                    value,
+                    ("speakerTag", "speaker_tag", "speaker"),
+                ),
                 "start_ms": start_ms,
                 "text": _require_text(value.get("word"), f"{context}.word"),
                 "text_confidence": word_confidence if word_confidence is not None else alternative_confidence,
             }
-    return tuple(
-        CanonicalWord(word_id=_stable_word_id(output_id, index), **word_rows[key])
-        for index, key in enumerate(word_order)
-    )
+    words: list[CanonicalWord] = []
+    for index, key in enumerate(word_order):
+        row = dict(word_rows[key])
+        raw_speaker_id = row.pop("raw_speaker_id")
+        speaker_source_field = row.pop("speaker_source_field")
+        if raw_speaker_id is not None and row["speaker_ref"] is not None:
+            raw_speaker_evidence.append(
+                RawSpeakerEvidence(
+                    raw_speaker_id=raw_speaker_id,
+                    speaker_ref=row["speaker_ref"],
+                    channel_id=row["channel_id"],
+                    source_field=speaker_source_field,
+                )
+            )
+        words.append(CanonicalWord(word_id=_stable_word_id(output_id, index), **row))
+    return tuple(words)
 
 
 def _deepgram_provider_words(
@@ -1233,6 +1246,13 @@ def _provider_speaker_id(payload: dict[str, Any], context: str, *, keys: tuple[s
         if key in payload:
             return _optional_id(str(payload.get(key)) if payload.get(key) is not None else None, f"{context}.{key}")
     return None
+
+
+def _provider_speaker_source_field(payload: dict[str, Any], keys: tuple[str, ...]) -> str:
+    for key in keys:
+        if key in payload:
+            return key
+    return keys[0]
 
 
 def _provider_confidence(value: object, field_name: str) -> float | None:
