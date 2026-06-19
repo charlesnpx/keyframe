@@ -970,6 +970,11 @@ def _google_provider_words(
             alternatives[0],
             f"hosted_provider_output.results[{result_index}].alternatives[0]",
         )
+        alternative_confidence = _first_confidence(
+            alternative,
+            ("confidence",),
+            f"hosted_provider_output.results[{result_index}].alternatives[0]",
+        )
         word_items = _sequence(
             alternative.get("words"),
             f"hosted_provider_output.results[{result_index}].alternatives[0].words",
@@ -987,6 +992,7 @@ def _google_provider_words(
                 raw_speaker_evidence=raw_speaker_evidence,
                 source_field="speakerTag",
             )
+            word_confidence = _first_confidence(value, ("confidence", "text_confidence"), context)
             words.append(
                 CanonicalWord(
                     word_id=_stable_word_id(output_id, len(words)),
@@ -995,6 +1001,7 @@ def _google_provider_words(
                     end_ms=end_ms,
                     speaker_ref=speaker_ref,
                     channel_id=channel_id,
+                    text_confidence=word_confidence if word_confidence is not None else alternative_confidence,
                     speaker_confidence=_first_confidence(value, ("speaker_confidence",), context),
                 )
             )

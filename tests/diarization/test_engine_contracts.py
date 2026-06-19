@@ -631,6 +631,7 @@ def test_google_streaming_saved_output_uses_final_word_timestamps_only():
         "google-speech-canned:word:000001",
         "google-speech-canned:word:000002",
     ]
+    assert [word.text_confidence for word in output.words] == [0.91, 0.91]
     assert [word.speaker_ref for word in output.words] == ["engine:1:1", "engine:1:2"]
     assert all(word.text != "par" for word in output.words)
 
