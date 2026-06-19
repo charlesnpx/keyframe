@@ -1027,6 +1027,7 @@ def _score_product_transcript_metrics(
             intervals,
             speaker_mapping,
             policy,
+            require_only_reference_speaker=True,
         ),
         "word_speaker_label_accuracy": _label_accuracy_by_reference_items(
             word_spans,
@@ -1066,6 +1067,8 @@ def _label_accuracy_by_reference_items(
     intervals: tuple[EvaluationInterval, ...],
     speaker_mapping: dict[str, str],
     policy: ScoringPolicyManifest,
+    *,
+    require_only_reference_speaker: bool = False,
 ) -> float:
     scoreable_reference_items = tuple(
         item
@@ -1088,6 +1091,15 @@ def _label_accuracy_by_reference_items(
             for item in candidates
             if item.speaker_ref in speaker_mapping
         }
+        if require_only_reference_speaker:
+            has_unmapped_candidate = any(item.speaker_ref not in speaker_mapping for item in candidates)
+            if (
+                candidates
+                and not has_unmapped_candidate
+                and mapped_candidate_speakers == {reference_item.speaker_ref}
+            ):
+                matched_items += 1
+            continue
         if reference_item.speaker_ref in mapped_candidate_speakers:
             matched_items += 1
     return _round_metric(matched_items / len(scoreable_reference_items))
