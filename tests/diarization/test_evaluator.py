@@ -235,6 +235,38 @@ def test_speaker_change_boundary_slice_requires_actual_speaker_change():
     assert [(item.start_ms, item.end_ms) for item in boundary.intervals] == [(250, 750)]
 
 
+def test_diagnostic_collar_excludes_boundary_shift_from_metrics():
+    recording = _recording()
+    reference_recording = replace(
+        recording,
+        speaker_spans=(
+            replace(recording.speaker_spans[0], end_ms=500, overlap=False),
+            replace(recording.speaker_spans[1], start_ms=500, end_ms=1000, overlap=False),
+        ),
+    )
+    candidate = _candidate_output(
+        reference_recording,
+        {
+            "spk-a": "engine:local:speaker-1",
+            "spk-b": "engine:local:speaker-2",
+        },
+    )
+    shifted_candidate = replace(
+        candidate,
+        speaker_spans=(
+            replace(candidate.speaker_spans[0], end_ms=600),
+            replace(candidate.speaker_spans[1], start_ms=600),
+        ),
+    )
+
+    result = evaluate_diarization_candidate(_reference_bundle(reference_recording), shifted_candidate)
+    metrics = result.recording_metrics[0].metrics
+
+    assert metrics["reference_speaker_ms"] == 500
+    assert metrics["matched_speaker_ms"] == 500
+    assert metrics["diarization_error_rate"] == 0.0
+
+
 def test_overlap_reference_scores_overlap_slice_when_reference_supports_it():
     recording = _recording("overlap.json")
     reference = _reference_bundle(recording)
@@ -246,7 +278,11 @@ def test_overlap_reference_scores_overlap_slice_when_reference_supports_it():
         },
     )
 
-    result = evaluate_diarization_candidate(reference, candidate)
+    result = evaluate_diarization_candidate(
+        reference,
+        candidate,
+        scoring_policy=replace(default_scoring_policy("diagnostic_diarization"), collar_ms=0),
+    )
     overlap_row = {row.slice_id: row for row in result.slice_metrics}["overlap:overlap"]
 
     assert overlap_row.status == "scored"

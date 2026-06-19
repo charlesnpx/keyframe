@@ -355,7 +355,8 @@ def evaluate_diarization_candidate(
 
     reference_spans = _spans_from_recording(reference.recording)
     candidate_spans = _spans_from_candidate(candidate)
-    scoring_intervals = _scoring_intervals(reference.recording, policy)
+    raw_scoring_intervals = _scoring_intervals(reference.recording, policy)
+    scoring_intervals = _apply_scoring_collar(raw_scoring_intervals, reference_spans, policy.collar_ms)
     slices = build_evaluation_slices(
         reference,
         scoring_policy=policy,
@@ -372,25 +373,33 @@ def evaluate_diarization_candidate(
         metrics=_score_metrics(reference_spans, candidate_spans, scoring_intervals, speaker_mapping, policy),
         speaker_mapping=speaker_mapping,
     )
-    slice_rows = tuple(
-        DiarizationSliceMetricRow(
-            recording_id=reference.recording.recording_id,
-            output_id=candidate.output_id,
-            policy_id=policy.policy_id,
-            slice_id=item.slice_id,
-            dimension=item.dimension,
-            value=item.value,
-            status=("scored" if item.status == "ready" else "insufficient_support"),
-            support_ms=item.support_ms,
-            minimum_support_ms=item.minimum_support_ms,
-            metrics=(
-                _score_metrics(reference_spans, candidate_spans, item.intervals, speaker_mapping, policy)
-                if item.status == "ready"
-                else {}
+    slice_rows: list[DiarizationSliceMetricRow] = []
+    for item in slices:
+        scored_intervals = _clip_intervals_to_regions(item.intervals, scoring_intervals)
+        scored_support_ms = _interval_support_ms(scored_intervals)
+        row_status: EvaluationMetricStatus = (
+            "scored"
+            if item.status == "ready" and scored_support_ms >= item.minimum_support_ms
+            else "insufficient_support"
+        )
+        slice_rows.append(
+            DiarizationSliceMetricRow(
+                recording_id=reference.recording.recording_id,
+                output_id=candidate.output_id,
+                policy_id=policy.policy_id,
+                slice_id=item.slice_id,
+                dimension=item.dimension,
+                value=item.value,
+                status=row_status,
+                support_ms=scored_support_ms,
+                minimum_support_ms=item.minimum_support_ms,
+                metrics=(
+                    _score_metrics(reference_spans, candidate_spans, scored_intervals, speaker_mapping, policy)
+                    if row_status == "scored"
+                    else {}
+                ),
             ),
         )
-        for item in slices
-    )
     return DiarizationEvaluationResult(
         recording_id=reference.recording.recording_id,
         output_id=candidate.output_id,
@@ -398,7 +407,7 @@ def evaluate_diarization_candidate(
         speaker_mapping=speaker_mapping,
         slices=slices,
         recording_metrics=(recording_row,),
-        slice_metrics=slice_rows,
+        slice_metrics=tuple(slice_rows),
         reference_artifact=reference.artifact.to_integrity_dict(),
         candidate_artifact=candidate.artifact.to_integrity_dict(),
     )
@@ -643,6 +652,22 @@ def _score_metrics(
     }
 
 
+def _apply_scoring_collar(
+    intervals: tuple[EvaluationInterval, ...],
+    reference_spans: tuple[_SpanView, ...],
+    collar_ms: int,
+) -> tuple[EvaluationInterval, ...]:
+    if collar_ms <= 0:
+        return intervals
+    collar_regions = _speaker_change_boundary_intervals(
+        reference_spans,
+        intervals,
+        collar_ms,
+        minimum_window_ms=collar_ms,
+    )
+    return _subtract_intervals(intervals, collar_regions)
+
+
 def _is_reference_overlap(active_spans: tuple[_SpanView, ...]) -> bool:
     return len({span.speaker_ref for span in active_spans}) > 1 or any(span.overlap for span in active_spans)
 
@@ -668,8 +693,10 @@ def _speaker_change_boundary_intervals(
     reference_spans: tuple[_SpanView, ...],
     scoring_intervals: tuple[EvaluationInterval, ...],
     collar_ms: int,
+    *,
+    minimum_window_ms: int = 250,
 ) -> tuple[EvaluationInterval, ...]:
-    window_ms = max(collar_ms, 250)
+    window_ms = max(collar_ms, minimum_window_ms)
     boundaries: set[tuple[int, str | None]] = set()
     channel_ids = tuple(sorted({span.channel_id for span in reference_spans}, key=lambda value: value or ""))
     for channel_id in channel_ids:
@@ -723,6 +750,36 @@ def _clip_interval_to_regions(
         channel_id = region.channel_id if region.channel_id is not None else interval.channel_id
         clipped.append(EvaluationInterval(start_ms, end_ms, channel_id))
     return tuple(clipped)
+
+
+def _subtract_intervals(
+    intervals: tuple[EvaluationInterval, ...],
+    excluded_intervals: tuple[EvaluationInterval, ...],
+) -> tuple[EvaluationInterval, ...]:
+    result: list[EvaluationInterval] = []
+    for interval in intervals:
+        remaining = [(interval.start_ms, interval.end_ms)]
+        for excluded in excluded_intervals:
+            if not _channels_match(interval.channel_id, excluded.channel_id):
+                continue
+            next_remaining: list[tuple[int, int]] = []
+            for start_ms, end_ms in remaining:
+                overlap_start = max(start_ms, excluded.start_ms)
+                overlap_end = min(end_ms, excluded.end_ms)
+                if overlap_end <= overlap_start:
+                    next_remaining.append((start_ms, end_ms))
+                    continue
+                if start_ms < overlap_start:
+                    next_remaining.append((start_ms, overlap_start))
+                if overlap_end < end_ms:
+                    next_remaining.append((overlap_end, end_ms))
+            remaining = next_remaining
+        result.extend(
+            EvaluationInterval(start_ms, end_ms, interval.channel_id)
+            for start_ms, end_ms in remaining
+            if end_ms > start_ms
+        )
+    return _normalize_intervals(tuple(result))
 
 
 def _clip_intervals_to_regions(
