@@ -395,6 +395,51 @@ def test_configured_regression_budget_without_baseline_fails_report():
     assert branch_der.scored_duration_ms == 1_000
 
 
+def test_combined_point_and_regression_budget_preserves_point_failure_without_baseline():
+    report = build_benchmark_report(
+        "combined-budget-without-baseline",
+        (
+            BenchmarkEvaluationCase(
+                corpus_id="ami-smoke",
+                branch_id="separate-tracks",
+                evaluation=_evaluation(
+                    "rec-1-current",
+                    "rec-1",
+                    recording_der=0.05,
+                    overlap_der=0.10,
+                ),
+                baseline_evaluation=None,
+                scored_duration_ms=1_000,
+                scored_words=20,
+                scored_speaker_turns=4,
+            ),
+        ),
+        gate_config=BenchmarkGateConfig(
+            budgets=(
+                BenchmarkRegressionBudget(
+                    budget_id="branch-der",
+                    metric_name="diarization_error_rate",
+                    direction="lower_is_better",
+                    max_point_score=0.04,
+                    max_regression_delta=0.01,
+                ),
+            )
+        ),
+    )
+
+    branch_der = next(
+        result
+        for result in report.branch_results
+        if result.metric_name == "diarization_error_rate"
+    )
+    assert report.status == "failed"
+    assert branch_der.gate.status == "failed"
+    assert branch_der.gate.reasons == (
+        "point score 0.05 above maximum 0.04",
+        "paired delta unavailable for regression budget",
+    )
+
+
 def test_report_requires_at_least_one_scored_metric_observation():
     with pytest.raises(ValidationError, match="at least one scored metric observation"):
         build_benchmark_report("empty-report", ())

@@ -1205,6 +1205,13 @@ def _evaluate_gate(result: BenchmarkMetricResult, gate_config: BenchmarkGateConf
     if budget.max_regression_delta is not None:
         thresholds["max_regression_delta"] = budget.max_regression_delta
         if result.paired_delta is None:
+            if reasons:
+                return RegressionGateResult(
+                    status="failed",
+                    budget_id=budget.budget_id,
+                    reasons=tuple([*reasons, "paired delta unavailable for regression budget"]),
+                    thresholds=thresholds,
+                )
             return RegressionGateResult(
                 status="unavailable",
                 budget_id=budget.budget_id,
