@@ -427,6 +427,19 @@ def test_missing_scoring_exports_are_invalid_fixture_results(tmp_path):
     assert result.issues[1].message == "missing scoring export path: uem"
 
 
+def test_invalid_scoring_export_contents_are_invalid_fixture_results(tmp_path):
+    rttm = tmp_path / "invalid.rttm"
+    uem = tmp_path / "valid.uem"
+    rttm.write_text("SPEAKER rec ch-1 0.000 0.000 <NA> <NA> spk-a <NA> <NA>\n", encoding="utf-8")
+    uem.write_text("rec ch-1 0.000 1.000\n", encoding="utf-8")
+
+    result = validate_scoring_exports(artifact_paths={"rttm": str(rttm), "uem": str(uem)})
+
+    assert result.status == "invalid_fixture"
+    assert [issue.category for issue in result.issues] == ["schema_validation"]
+    assert result.issues[0].message.startswith("invalid scoring export rttm")
+
+
 def test_sparse_slices_emit_validator_status_output_for_reports():
     recording = read_recording_json(FIXTURE_DIR / "clean_two_speaker.json")
 

@@ -37,6 +37,7 @@ from keyframe.diarization.models import (
     SpeakerSpan,
     ValidationError,
 )
+from keyframe.diarization.scoring_exports import write_rttm, write_uem
 
 
 AMI_SAMPLE_RATE_HZ = 16_000
@@ -792,6 +793,8 @@ def _write_ami_artifacts(
 ) -> dict[str, str]:
     canonical_path = Path(artifact_layout.canonical_references_dir) / f"{recording.recording_id}.canonical.json"
     reference_path = Path(artifact_layout.canonical_references_dir) / f"{recording.recording_id}.reference.json"
+    rttm_path = Path(artifact_layout.rttm_dir) / f"{recording.recording_id}.rttm"
+    uem_path = Path(artifact_layout.uem_dir) / f"{recording.recording_id}.uem"
     candidate_dir = Path(artifact_layout.candidate_bundles_dir)
     candidate_paths = {
         "separate_tracks": candidate_dir / f"{recording.recording_id}.separate_tracks.json",
@@ -802,6 +805,8 @@ def _write_ami_artifacts(
     canonical_path.parent.mkdir(parents=True, exist_ok=True)
     write_recording_json(canonical_path, recording)
     _write_json(reference_path, reference.to_evaluator_dict())
+    write_rttm(rttm_path, recording)
+    write_uem(uem_path, recording)
     for branch, path in candidate_paths.items():
         branch_name = _validate_ami_branch(branch)
         _write_json(
@@ -821,6 +826,8 @@ def _write_ami_artifacts(
             "authenticated_track_metadata"
         ].as_posix(),
         "reference_bundle": reference_path.as_posix(),
+        "rttm": rttm_path.as_posix(),
+        "uem": uem_path.as_posix(),
     }
 
 

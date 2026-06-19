@@ -18,6 +18,7 @@ from keyframe.diarization.provenance import (
     hash_audio_transform_config,
     sha256_file,
 )
+from keyframe.diarization.scoring_exports import validate_rttm_text, validate_uem_text
 
 
 FixtureValidationStatus = Literal["valid", "invalid_fixture"]
@@ -477,6 +478,21 @@ def validate_scoring_exports(
                 _issue(
                     "missing_scoring_export",
                     f"missing scoring export file: {export_name}",
+                    path=path_text,
+                )
+            )
+            continue
+        try:
+            text = Path(path_text).read_text(encoding="utf-8")
+            if export_name == "rttm":
+                validate_rttm_text(text)
+            elif export_name == "uem":
+                validate_uem_text(text)
+        except (OSError, ValidationError) as exc:
+            issues.append(
+                _issue(
+                    "schema_validation",
+                    f"invalid scoring export {export_name}: {exc}",
                     path=path_text,
                 )
             )
