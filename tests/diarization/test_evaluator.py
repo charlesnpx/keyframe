@@ -394,6 +394,52 @@ def test_speaker_change_boundary_slice_scores_inside_default_collar_window():
     assert boundary_row.metrics["diarization_error_rate"] == 0.0
 
 
+def test_boundary_slice_mapping_uses_boundary_window_when_global_collar_removes_support():
+    recording = _recording()
+    reference_recording = replace(
+        recording,
+        duration_ms=500,
+        words=(),
+        speaker_spans=(
+            SpeakerSpan(
+                span_id="span-1",
+                speaker_ref="spk-a",
+                start_ms=0,
+                end_ms=250,
+                channel_id="ch-1",
+            ),
+            SpeakerSpan(
+                span_id="span-2",
+                speaker_ref="spk-b",
+                start_ms=250,
+                end_ms=500,
+                channel_id="ch-1",
+            ),
+        ),
+        scoring_regions=(ScoringRegion("uem-1", 0, 500, channel_id="ch-1"),),
+    )
+    candidate = _candidate_output(
+        reference_recording,
+        {
+            "spk-a": "engine:local:speaker-1",
+            "spk-b": "engine:local:speaker-2",
+        },
+    )
+
+    result = evaluate_diarization_candidate(_reference_bundle(reference_recording), candidate)
+    recording_row = result.recording_metrics[0]
+    boundary_row = {row.slice_id: row for row in result.slice_metrics}["speaker_change_boundary:within_collar"]
+
+    assert recording_row.status == "insufficient_support"
+    assert result.speaker_mapping == {
+        "engine:local:speaker-1": "spk-a",
+        "engine:local:speaker-2": "spk-b",
+    }
+    assert boundary_row.status == "scored"
+    assert boundary_row.support_ms == 500
+    assert boundary_row.metrics["diarization_error_rate"] == 0.0
+
+
 def test_diagnostic_collar_excludes_single_speaker_onset_offset_shift_from_metrics():
     recording = _recording()
     reference_recording = replace(
@@ -584,6 +630,66 @@ def test_collapsed_channel_policy_rejects_mismatched_per_channel_uem_regions():
         scoring_regions=(
             ScoringRegion("uem-1", 0, 1_000, channel_id="ch-1"),
             ScoringRegion("uem-2", 500, 1_000, channel_id="ch-2"),
+        ),
+    )
+    candidate = _candidate_output(
+        multichannel,
+        {
+            "spk-a": "engine:local:speaker-1",
+            "spk-b": "engine:local:speaker-2",
+        },
+    )
+    rendered_candidate = replace(
+        candidate,
+        words=tuple(replace(word, channel_id=None) for word in candidate.words),
+        speaker_spans=tuple(replace(span, channel_id=None) for span in candidate.speaker_spans),
+    )
+    policy = replace(
+        default_scoring_policy("diagnostic_diarization"),
+        channel_mode="rendered_transcript",
+        collar_ms=0,
+    )
+
+    with pytest.raises(
+        ValidationError,
+        match="collapsed-channel scoring requires identical canonical scoring regions",
+    ):
+        evaluate_diarization_candidate(
+            _reference_bundle(multichannel),
+            rendered_candidate,
+            scoring_policy=policy,
+        )
+
+
+def test_collapsed_channel_policy_validates_mixed_shared_and_per_channel_uem_regions():
+    recording = _recording()
+    multichannel = replace(
+        recording,
+        duration_ms=1_500,
+        channels=(
+            recording.channels[0],
+            ChannelRecord("ch-2", "second"),
+        ),
+        words=(),
+        speaker_spans=(
+            SpeakerSpan(
+                span_id="span-1",
+                speaker_ref="spk-a",
+                start_ms=0,
+                end_ms=1_500,
+                channel_id="ch-1",
+            ),
+            SpeakerSpan(
+                span_id="span-2",
+                speaker_ref="spk-b",
+                start_ms=0,
+                end_ms=1_500,
+                channel_id="ch-2",
+            ),
+        ),
+        scoring_regions=(
+            ScoringRegion("uem-shared", 0, 1_000, channel_id=None),
+            ScoringRegion("uem-extra-ch-1", 1_000, 1_500, channel_id="ch-1"),
         ),
     )
     candidate = _candidate_output(

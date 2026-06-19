@@ -371,7 +371,14 @@ def evaluate_diarization_candidate(
         scoring_policy=policy,
         minimum_support_ms=minimum_slice_support_ms,
     )
-    speaker_mapping = _build_speaker_mapping(reference_spans, candidate_spans, scoring_intervals, policy)
+    boundary_mapping_intervals = tuple(
+        interval
+        for item in slices
+        if item.slice_id == "speaker_change_boundary:within_collar"
+        for interval in item.intervals
+    )
+    mapping_intervals = _normalize_intervals((*scoring_intervals, *boundary_mapping_intervals))
+    speaker_mapping = _build_speaker_mapping(reference_spans, candidate_spans, mapping_intervals, policy)
     policy_provenance = scoring_policy_report_provenance(policy)
 
     recording_metrics = _score_metrics(reference_spans, candidate_spans, scoring_intervals, speaker_mapping, policy)
@@ -506,16 +513,24 @@ def _validate_collapsible_channel_uem(
     recording: CanonicalRecording,
 ) -> None:
     channel_ids = tuple(channel.channel_id for channel in recording.channels)
-    if not channel_ids or any(interval.channel_id is None for interval in intervals):
+    if not channel_ids:
         return
 
+    shared_coverage = tuple(
+        EvaluationInterval(interval.start_ms, interval.end_ms, None)
+        for interval in intervals
+        if interval.channel_id is None
+    )
     expected: tuple[EvaluationInterval, ...] | None = None
     for channel_id in channel_ids:
         coverage = _normalize_intervals(
-            tuple(
-                EvaluationInterval(interval.start_ms, interval.end_ms, None)
-                for interval in intervals
-                if interval.channel_id == channel_id
+            (
+                *shared_coverage,
+                *(
+                    EvaluationInterval(interval.start_ms, interval.end_ms, None)
+                    for interval in intervals
+                    if interval.channel_id == channel_id
+                ),
             )
         )
         if expected is None:
