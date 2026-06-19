@@ -1,0 +1,58 @@
+{
+  "channel_id": "mono-mix",
+  "diarization": [
+    {
+      "end": 0.74,
+      "score": 0.91,
+      "speaker": "SPEAKER_00",
+      "start": 0.0
+    },
+    {
+      "end": 1.22,
+      "score": 0.86,
+      "speaker": "SPEAKER_01",
+      "start": 0.74
+    }
+  ],
+  "language": "en",
+  "output_id": "whisperx-pyannote-saved",
+  "segments": [
+    {
+      "end": 0.72,
+      "speaker": "SPEAKER_00",
+      "start": 0.0,
+      "text": "Hello there",
+      "words": [
+        {
+          "end": 0.31,
+          "score": 0.97,
+          "speaker": "SPEAKER_00",
+          "start": 0.02,
+          "word": "Hello"
+        },
+        {
+          "end": 0.68,
+          "score": 0.95,
+          "speaker": "SPEAKER_00",
+          "start": 0.36,
+          "word": "there"
+        }
+      ]
+    },
+    {
+      "end": 1.18,
+      "speaker": "SPEAKER_01",
+      "start": 0.76,
+      "text": "friend",
+      "words": [
+        {
+          "end": 1.15,
+          "score": 0.92,
+          "speaker": "SPEAKER_01",
+          "start": 0.82,
+          "word": "friend"
+        }
+      ]
+    }
+  ]
+}
