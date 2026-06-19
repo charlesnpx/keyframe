@@ -5,14 +5,18 @@ import pytest
 from keyframe.diarization import (
     BenchmarkEvaluationCase,
     BenchmarkGateConfig,
+    BenchmarkMetricResult,
     BenchmarkRegressionBudget,
+    BenchmarkReport,
     CriticalSpanPolicyDefinition,
     DiarizationEvaluationResult,
     DiarizationRecordingMetricRow,
     DiarizationSliceMetricRow,
     EvaluationInterval,
     EvaluationSliceDefinition,
+    RegressionGateResult,
     ReviewSignalSpan,
+    UncertaintyInterval,
     benchmark_report_json_dumps,
     benchmark_report_json_loads,
     benchmark_report_to_markdown,
@@ -643,6 +647,50 @@ def test_report_json_rejects_serialized_gate_that_conflicts_with_budget():
         benchmark_report_json_loads(json.dumps(payload))
 
 
+def test_report_constructor_rejects_metric_gate_that_conflicts_with_budget():
+    gate_config = BenchmarkGateConfig(
+        budgets=(
+            BenchmarkRegressionBudget(
+                budget_id="der-budget",
+                metric_name="diarization_error_rate",
+                direction="lower_is_better",
+                max_regression_delta=0.01,
+            ),
+        )
+    )
+    forged_result = BenchmarkMetricResult(
+        scope_type="corpus",
+        scope_id="ami-smoke",
+        corpus_id="ami-smoke",
+        metric_name="diarization_error_rate",
+        point_score=0.15,
+        baseline_score=0.10,
+        paired_delta=0.05,
+        sample_count=1,
+        scored_duration_ms=1_000,
+        scored_words=10,
+        scored_speaker_turns=2,
+        gate=RegressionGateResult(
+            status="passed",
+            budget_id="der-budget",
+            thresholds={"max_regression_delta": 0.01},
+        ),
+        uncertainty=UncertaintyInterval(
+            status="unavailable",
+            basis="paired_delta",
+            reason="requires at least two paired samples",
+        ),
+    )
+
+    with pytest.raises(ValidationError, match="metric_result gate does not match regression budget"):
+        BenchmarkReport(
+            report_id="forged-gate",
+            status="passed",
+            gate_config=gate_config,
+            corpus_results=(forged_result,),
+        )
+
+
 def test_report_json_rejects_tampered_review_signal_calibration_rate():
     report = build_benchmark_report(
         "tampered-review-calibration-rate",
@@ -781,6 +829,22 @@ def test_diagnostic_critical_span_policy_hook_scores_synthetic_spans():
     assert score.recall == 0.5
     assert passing_score.status == "passed"
     assert passing_score.recall == 1.0
+
+
+def test_review_signal_labels_reject_bare_strings():
+    with pytest.raises(ValidationError, match="review_signal.labels"):
+        ReviewSignalSpan(
+            signal_id="string-labels",
+            corpus_id="ami-smoke",
+            branch_id="separate-tracks",
+            recording_id="rec-1",
+            start_ms=0,
+            end_ms=100,
+            severity="serious",
+            reference_review_required=True,
+            predicted_review_required=True,
+            labels="critical",
+        )
 
 
 def test_report_embeds_review_signal_and_critical_span_diagnostics():

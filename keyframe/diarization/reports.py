@@ -724,6 +724,7 @@ class BenchmarkReport:
         metric_results = self.metric_results
         if not metric_results:
             raise ValidationError("benchmark_report requires at least one metric result")
+        _validate_serialized_gates(self.gate_config, metric_results)
         has_failure = _has_failed_gate(metric_results, self.critical_span_diagnostic)
         if self.status == "passed" and has_failure:
             raise ValidationError("passed benchmark reports cannot include failed gates")
@@ -1783,6 +1784,8 @@ def _tuple_of(values: object, item_type: type[Any], field_name: str) -> tuple[An
 
 
 def _tuple_of_text(values: object, field_name: str) -> tuple[str, ...]:
+    if isinstance(values, (str, bytes)):
+        raise ValidationError(f"{field_name} must be an iterable of strings")
     try:
         items = tuple(values)  # type: ignore[arg-type]
     except TypeError as exc:
