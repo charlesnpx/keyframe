@@ -954,7 +954,8 @@ def _google_provider_words(
     raw_speaker_evidence: list[RawSpeakerEvidence],
 ) -> tuple[CanonicalWord, ...]:
     results = _sequence(payload.get("results"), "hosted_provider_output.results")
-    words: list[CanonicalWord] = []
+    word_rows: dict[tuple[str, int, int], dict[str, Any]] = {}
+    word_order: list[tuple[str, int, int]] = []
     for result_index, result_item in enumerate(results):
         result = _validate_metadata(result_item, f"hosted_provider_output.results[{result_index}]")
         event_status = _provider_event_status(result)
@@ -993,19 +994,22 @@ def _google_provider_words(
                 source_field="speakerTag",
             )
             word_confidence = _first_confidence(value, ("confidence", "text_confidence"), context)
-            words.append(
-                CanonicalWord(
-                    word_id=_stable_word_id(output_id, len(words)),
-                    text=_require_text(value.get("word"), f"{context}.word"),
-                    start_ms=start_ms,
-                    end_ms=end_ms,
-                    speaker_ref=speaker_ref,
-                    channel_id=channel_id,
-                    text_confidence=word_confidence if word_confidence is not None else alternative_confidence,
-                    speaker_confidence=_first_confidence(value, ("speaker_confidence",), context),
-                )
-            )
-    return tuple(words)
+            key = (channel_id, start_ms, end_ms)
+            if key not in word_rows:
+                word_order.append(key)
+            word_rows[key] = {
+                "channel_id": channel_id,
+                "end_ms": end_ms,
+                "speaker_confidence": _first_confidence(value, ("speaker_confidence",), context),
+                "speaker_ref": speaker_ref,
+                "start_ms": start_ms,
+                "text": _require_text(value.get("word"), f"{context}.word"),
+                "text_confidence": word_confidence if word_confidence is not None else alternative_confidence,
+            }
+    return tuple(
+        CanonicalWord(word_id=_stable_word_id(output_id, index), **word_rows[key])
+        for index, key in enumerate(word_order)
+    )
 
 
 def _deepgram_provider_words(

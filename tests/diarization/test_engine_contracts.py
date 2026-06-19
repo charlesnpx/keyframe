@@ -640,6 +640,49 @@ def test_google_streaming_saved_output_uses_final_word_timestamps_only():
     assert all(word.text != "par" for word in output.words)
 
 
+def test_google_cumulative_streaming_finals_replace_prior_word_metadata_without_duplicates():
+    payload = _payload("google_speech_provider.json")
+    payload.pop("channel_id")
+    payload["results"].append(
+        {
+            "alternatives": [
+                {
+                    "confidence": 0.97,
+                    "transcript": "hello there",
+                    "words": [
+                        {
+                            "confidence": 0.96,
+                            "endTime": "0.30s",
+                            "speakerTag": 2,
+                            "startTime": "0.00s",
+                            "word": "hello",
+                        },
+                        {
+                            "confidence": 0.95,
+                            "endTime": "0.66s",
+                            "speakerTag": 2,
+                            "startTime": "0.35s",
+                            "word": "there",
+                        },
+                    ],
+                }
+            ],
+            "channelTag": 1,
+            "isFinal": True,
+        }
+    )
+
+    output = _hosted_adapter("google_speech").normalize_raw_output(payload, artifact=_provider_artifact())
+
+    assert [word.text for word in output.words] == ["hello", "there"]
+    assert [word.word_id for word in output.words] == [
+        "google-speech-canned:word:000001",
+        "google-speech-canned:word:000002",
+    ]
+    assert [word.text_confidence for word in output.words] == [0.96, 0.95]
+    assert [word.speaker_ref for word in output.words] == ["engine:ch-1:2", "engine:ch-1:2"]
+
+
 def test_deepgram_saved_output_keeps_same_speaker_ids_channel_local():
     output = _hosted_adapter("deepgram").normalize_raw_output(
         _payload("deepgram_provider.json"),
