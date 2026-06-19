@@ -84,6 +84,10 @@ def _candidate_recording(recording, candidate):
     )
 
 
+def _scoring_policy(kind="diagnostic_diarization", **changes):
+    return replace(default_scoring_policy(kind), **changes)
+
+
 def _many_speaker_recording(speaker_count=17):
     recording = _recording()
     speaker_refs = tuple(f"spk-{index:02d}" for index in range(speaker_count))
@@ -115,7 +119,7 @@ def test_perfect_anonymous_diarizer_scores_with_permutation_invariant_labels():
             "spk-b": "engine:local:speaker-1",
         },
     )
-    policy = replace(default_scoring_policy("diagnostic_diarization"), collar_ms=0)
+    policy = _scoring_policy(collar_ms=0)
 
     result = evaluate_diarization_candidate(
         reference,
@@ -128,14 +132,11 @@ def test_perfect_anonymous_diarizer_scores_with_permutation_invariant_labels():
         "engine:local:speaker-1": "spk-b",
         "engine:local:speaker-2": "spk-a",
     }
-    assert set(policy.metric_set).issubset(metrics)
-    assert metrics["speaker_label_accuracy"] == 1.0
-    assert metrics["speaker_label_error_rate"] == 0.0
+    assert set(metrics) == set(policy.metric_set)
     assert metrics["diarization_error_rate"] == 0.0
     assert metrics["speaker_error_rate"] == 0.0
     assert metrics["false_alarm_rate"] == 0.0
     assert metrics["miss_rate"] == 0.0
-    assert metrics["matched_speaker_ms"] == 750
 
 
 def test_candidate_from_different_recording_is_rejected_even_with_same_duration():
@@ -230,8 +231,7 @@ def test_per_channel_multichannel_scoring_requires_candidate_channel_attribution
             "spk-b": "engine:local:speaker-2",
         },
     )
-    policy = replace(
-        default_scoring_policy("diagnostic_diarization"),
+    policy = _scoring_policy(
         channel_mode="per_channel",
         collar_ms=0,
     )
@@ -265,7 +265,7 @@ def test_large_speaker_assignment_fails_closed_instead_of_using_greedy_mapping()
         evaluate_diarization_candidate(
             _reference_bundle(recording),
             candidate,
-            scoring_policy=replace(default_scoring_policy("diagnostic_diarization"), collar_ms=0),
+            scoring_policy=_scoring_policy(collar_ms=0),
         )
 
 
@@ -279,10 +279,14 @@ def test_large_recordings_only_count_scoreable_reference_speakers_for_exact_mapp
         {speaker.speaker_ref: f"engine:{speaker.speaker_ref}" for speaker in recording.speakers},
     )
 
+    policy = _scoring_policy(
+        collar_ms=0,
+        metric_set=("reference_speaker_count", "candidate_speaker_count", "mapped_candidate_speaker_count"),
+    )
     result = evaluate_diarization_candidate(
         _reference_bundle(recording),
         candidate,
-        scoring_policy=replace(default_scoring_policy("diagnostic_diarization"), collar_ms=0),
+        scoring_policy=policy,
     )
     metrics = result.recording_metrics[0].metrics
 
@@ -301,8 +305,7 @@ def test_unknown_policy_metric_fails_closed():
             "spk-b": "engine:local:speaker-2",
         },
     )
-    policy = replace(
-        default_scoring_policy("diagnostic_diarization"),
+    policy = _scoring_policy(
         collar_ms=0,
         metric_set=("not_implemented",),
     )
@@ -383,7 +386,14 @@ def test_diagnostic_collar_excludes_boundary_shift_from_metrics():
         ),
     )
 
-    result = evaluate_diarization_candidate(_reference_bundle(reference_recording), shifted_candidate)
+    policy = _scoring_policy(
+        metric_set=("reference_speaker_ms", "matched_speaker_ms", "diarization_error_rate"),
+    )
+    result = evaluate_diarization_candidate(
+        _reference_bundle(reference_recording),
+        shifted_candidate,
+        scoring_policy=policy,
+    )
     metrics = result.recording_metrics[0].metrics
 
     assert metrics["reference_speaker_ms"] == 400
@@ -410,7 +420,12 @@ def test_speaker_change_boundary_slice_scores_inside_default_collar_window():
         },
     )
 
-    result = evaluate_diarization_candidate(_reference_bundle(reference_recording), candidate)
+    policy = _scoring_policy(metric_set=("reference_speaker_ms", "diarization_error_rate"))
+    result = evaluate_diarization_candidate(
+        _reference_bundle(reference_recording),
+        candidate,
+        scoring_policy=policy,
+    )
     boundary_row = {row.slice_id: row for row in result.slice_metrics}["speaker_change_boundary:within_collar"]
 
     assert boundary_row.status == "scored"
@@ -491,7 +506,14 @@ def test_diagnostic_collar_excludes_single_speaker_onset_offset_shift_from_metri
         ),
     )
 
-    result = evaluate_diarization_candidate(_reference_bundle(reference_recording), shifted_candidate)
+    policy = _scoring_policy(
+        metric_set=("reference_speaker_ms", "matched_speaker_ms", "diarization_error_rate"),
+    )
+    result = evaluate_diarization_candidate(
+        _reference_bundle(reference_recording),
+        shifted_candidate,
+        scoring_policy=policy,
+    )
     metrics = result.recording_metrics[0].metrics
 
     assert metrics["reference_speaker_ms"] == 900
@@ -524,7 +546,14 @@ def test_diagnostic_collar_excludes_uem_edge_onset_offset_shift_from_metrics():
         ),
     )
 
-    result = evaluate_diarization_candidate(_reference_bundle(reference_recording), shifted_candidate)
+    policy = _scoring_policy(
+        metric_set=("reference_speaker_ms", "matched_speaker_ms", "diarization_error_rate"),
+    )
+    result = evaluate_diarization_candidate(
+        _reference_bundle(reference_recording),
+        shifted_candidate,
+        scoring_policy=policy,
+    )
     metrics = result.recording_metrics[0].metrics
 
     assert metrics["reference_speaker_ms"] == 500
@@ -602,14 +631,20 @@ def test_rendered_transcript_policy_collapses_physical_channels_for_scoring():
         speaker_spans=tuple(replace(span, channel_id=None) for span in candidate.speaker_spans),
     )
 
+    policy = _scoring_policy(
+        channel_mode="rendered_transcript",
+        collar_ms=0,
+        metric_set=(
+            "reference_speaker_ms",
+            "hypothesis_speaker_ms",
+            "false_alarm_speaker_ms",
+            "diarization_error_rate",
+        ),
+    )
     result = evaluate_diarization_candidate(
         _reference_bundle(multichannel),
         rendered_candidate,
-        scoring_policy=replace(
-            default_scoring_policy("diagnostic_diarization"),
-            channel_mode="rendered_transcript",
-            collar_ms=0,
-        ),
+        scoring_policy=policy,
     )
     metrics = result.recording_metrics[0].metrics
     rows_by_slice = {row.slice_id: row for row in result.slice_metrics}
@@ -669,8 +704,7 @@ def test_collapsed_channel_policy_rejects_mismatched_per_channel_uem_regions():
         words=tuple(replace(word, channel_id=None) for word in candidate.words),
         speaker_spans=tuple(replace(span, channel_id=None) for span in candidate.speaker_spans),
     )
-    policy = replace(
-        default_scoring_policy("diagnostic_diarization"),
+    policy = _scoring_policy(
         channel_mode="rendered_transcript",
         collar_ms=0,
     )
@@ -729,8 +763,7 @@ def test_collapsed_channel_policy_validates_mixed_shared_and_per_channel_uem_reg
         words=tuple(replace(word, channel_id=None) for word in candidate.words),
         speaker_spans=tuple(replace(span, channel_id=None) for span in candidate.speaker_spans),
     )
-    policy = replace(
-        default_scoring_policy("diagnostic_diarization"),
+    policy = _scoring_policy(
         channel_mode="rendered_transcript",
         collar_ms=0,
     )
@@ -778,10 +811,14 @@ def test_slice_metrics_count_only_speakers_inside_the_slice():
         },
     )
 
+    policy = _scoring_policy(
+        collar_ms=0,
+        metric_set=("reference_speaker_count", "candidate_speaker_count", "mapped_candidate_speaker_count"),
+    )
     result = evaluate_diarization_candidate(
         _reference_bundle(reference_recording),
         candidate,
-        scoring_policy=replace(default_scoring_policy("diagnostic_diarization"), collar_ms=0),
+        scoring_policy=policy,
     )
     rows_by_slice = {row.slice_id: row for row in result.slice_metrics}
     recording_metrics = result.recording_metrics[0].metrics
@@ -809,10 +846,11 @@ def test_overlap_reference_scores_overlap_slice_when_reference_supports_it():
         },
     )
 
+    policy = _scoring_policy(collar_ms=0, metric_set=("speaker_label_accuracy",))
     result = evaluate_diarization_candidate(
         reference,
         candidate,
-        scoring_policy=replace(default_scoring_policy("diagnostic_diarization"), collar_ms=0),
+        scoring_policy=policy,
     )
     overlap_row = {row.slice_id: row for row in result.slice_metrics}["overlap:overlap"]
 
@@ -853,10 +891,7 @@ def test_product_policy_excludes_single_speaker_regions_flagged_as_overlap():
     overlap_row = {row.slice_id: row for row in result.slice_metrics}["overlap:overlap"]
 
     assert result.speaker_mapping == {"engine:local:speaker-1": "spk-b"}
-    assert set(policy.metric_set).issubset(metrics)
-    assert metrics["reference_speaker_ms"] == 400
-    assert metrics["matched_speaker_ms"] == 400
-    assert metrics["speaker_label_accuracy"] == 1.0
+    assert set(metrics) == set(policy.metric_set)
     assert metrics["word_speaker_label_accuracy"] == 1.0
     assert metrics["turn_speaker_label_accuracy"] == 1.0
     assert metrics["speaker_count_error"] == 0
@@ -881,7 +916,7 @@ def test_speaker_mapping_stays_in_score_artifact_not_candidate_or_rendered_trans
     result = evaluate_diarization_candidate(
         reference,
         candidate,
-        scoring_policy=replace(default_scoring_policy("diagnostic_diarization"), collar_ms=0),
+        scoring_policy=_scoring_policy(collar_ms=0),
     )
 
     assert result.to_dict()["speaker_mapping"] == {

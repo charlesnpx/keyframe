@@ -381,7 +381,7 @@ def evaluate_diarization_candidate(
     speaker_mapping = _build_speaker_mapping(reference_spans, candidate_spans, mapping_intervals, policy)
     policy_provenance = scoring_policy_report_provenance(policy)
 
-    recording_metrics = _score_policy_metrics(
+    recording_internal_metrics = _score_metrics(
         reference_spans,
         candidate_spans,
         scoring_intervals,
@@ -389,14 +389,14 @@ def evaluate_diarization_candidate(
         policy,
     )
     recording_status: EvaluationMetricStatus = (
-        "scored" if recording_metrics["scored_interval_ms"] > 0 else "insufficient_support"
+        "scored" if recording_internal_metrics["scored_interval_ms"] > 0 else "insufficient_support"
     )
     recording_row = DiarizationRecordingMetricRow(
         recording_id=reference.recording.recording_id,
         output_id=candidate.output_id,
         policy_id=policy.policy_id,
         status=recording_status,
-        metrics=recording_metrics if recording_status == "scored" else {},
+        metrics=_policy_metric_payload(recording_internal_metrics, policy) if recording_status == "scored" else {},
         speaker_mapping=speaker_mapping,
     )
     slice_rows: list[DiarizationSliceMetricRow] = []
@@ -413,6 +413,11 @@ def evaluate_diarization_candidate(
             if item.status == "ready" and scored_support_ms >= item.minimum_support_ms
             else "insufficient_support"
         )
+        slice_internal_metrics = (
+            _score_metrics(reference_spans, candidate_spans, scored_intervals, speaker_mapping, policy)
+            if row_status == "scored"
+            else {}
+        )
         slice_rows.append(
             DiarizationSliceMetricRow(
                 recording_id=reference.recording.recording_id,
@@ -424,11 +429,7 @@ def evaluate_diarization_candidate(
                 status=row_status,
                 support_ms=scored_support_ms,
                 minimum_support_ms=item.minimum_support_ms,
-                metrics=(
-                    _score_policy_metrics(reference_spans, candidate_spans, scored_intervals, speaker_mapping, policy)
-                    if row_status == "scored"
-                    else {}
-                ),
+                metrics=_policy_metric_payload(slice_internal_metrics, policy) if row_status == "scored" else {},
             ),
         )
     return DiarizationEvaluationResult(
@@ -761,14 +762,8 @@ def _score_metrics(
     }
 
 
-def _score_policy_metrics(
-    reference_spans: tuple[_SpanView, ...],
-    candidate_spans: tuple[_SpanView, ...],
-    intervals: tuple[EvaluationInterval, ...],
-    speaker_mapping: dict[str, str],
-    policy: ScoringPolicyManifest,
-) -> dict[str, Any]:
-    metrics = _score_metrics(reference_spans, candidate_spans, intervals, speaker_mapping, policy)
+def _policy_metric_payload(metrics: dict[str, Any], policy: ScoringPolicyManifest) -> dict[str, Any]:
+    metrics = dict(metrics)
     reference_speaker_ms = metrics["reference_speaker_ms"]
     metrics["speaker_error_rate"] = metrics["speaker_label_error_rate"]
     metrics["miss_rate"] = (
@@ -788,7 +783,7 @@ def _score_policy_metrics(
     missing = tuple(metric for metric in policy.metric_set if metric not in metrics)
     if missing:
         raise ValidationError(f"central evaluator does not implement policy metrics: {', '.join(missing)}")
-    return metrics
+    return {metric: metrics[metric] for metric in policy.metric_set}
 
 
 def _apply_scoring_collar(
