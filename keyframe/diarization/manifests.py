@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -22,6 +23,11 @@ DatasetRole = Literal[
 DatasetAccessMode = Literal["public_direct", "public_manual", "auth_required", "local_only", "forbidden"]
 RedistributionMode = Literal["allowed", "restricted", "forbidden"]
 ExpectedFileRole = Literal["audio", "annotation", "metadata", "manifest", "split", "other"]
+ScoringPolicyKind = Literal["diagnostic_diarization", "product_transcript"]
+ScoringChannelMode = Literal["per_channel", "mono_mix", "rendered_transcript"]
+ScoringSpeakerCountMode = Literal["known", "estimated", "session_local"]
+ScoringTextNormalization = Literal["none", "casefold_punctuation"]
+ScoringUemRegions = Literal["canonical_scoring_regions", "full_recording"]
 
 ALLOWED_DATASET_ROLES = frozenset(
     {
@@ -44,8 +50,14 @@ ALLOWED_DATASET_ACCESS_MODES = frozenset(
 )
 ALLOWED_REDISTRIBUTION_MODES = frozenset({"allowed", "restricted", "forbidden"})
 ALLOWED_EXPECTED_FILE_ROLES = frozenset({"audio", "annotation", "metadata", "manifest", "split", "other"})
+ALLOWED_SCORING_POLICY_KINDS = frozenset({"diagnostic_diarization", "product_transcript"})
+ALLOWED_SCORING_CHANNEL_MODES = frozenset({"per_channel", "mono_mix", "rendered_transcript"})
+ALLOWED_SCORING_SPEAKER_COUNT_MODES = frozenset({"known", "estimated", "session_local"})
+ALLOWED_SCORING_TEXT_NORMALIZATION = frozenset({"none", "casefold_punctuation"})
+ALLOWED_SCORING_UEM_REGIONS = frozenset({"canonical_scoring_regions", "full_recording"})
 _BENCHMARK_DEFAULT_FULL_ROLES = frozenset({"smoke_ci", "public_dev", "public_holdout", "adversarial"})
 _HEX_DIGITS = frozenset("0123456789abcdef")
+_DEFAULT_POLICY_FIXTURE_DIR = Path(__file__).parent / "scoring_policies"
 
 
 @dataclass(frozen=True)
@@ -109,18 +121,91 @@ class ScoringPolicyManifest:
     policy_id: str
     version: str
     description: str
+    policy_kind: ScoringPolicyKind = "diagnostic_diarization"
+    evaluator_version: str = "dscore-compatible-v1"
     collar_ms: int = 250
-    ignore_overlap: bool = False
+    score_overlap: bool | None = None
+    uem_regions: ScoringUemRegions = "canonical_scoring_regions"
+    channel_mode: ScoringChannelMode = "per_channel"
+    speaker_count_mode: ScoringSpeakerCountMode = "known"
+    text_normalization: ScoringTextNormalization = "none"
+    ignored_tokens: tuple[str, ...] = ()
+    metric_set: tuple[str, ...] = ("diarization_error_rate",)
+    ignore_overlap: bool | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "policy_id", _require_id(self.policy_id, "scoring_policy.policy_id"))
         object.__setattr__(self, "version", _require_id(self.version, "scoring_policy.version"))
         object.__setattr__(self, "description", _require_text(self.description, "scoring_policy.description"))
+        object.__setattr__(
+            self,
+            "policy_kind",
+            _validate_choice(self.policy_kind, ALLOWED_SCORING_POLICY_KINDS, "scoring_policy.policy_kind"),
+        )
+        object.__setattr__(
+            self,
+            "evaluator_version",
+            _require_id(self.evaluator_version, "scoring_policy.evaluator_version"),
+        )
         object.__setattr__(self, "collar_ms", _non_negative_int(self.collar_ms, "scoring_policy.collar_ms"))
-        object.__setattr__(self, "ignore_overlap", _require_bool(self.ignore_overlap, "scoring_policy.ignore_overlap"))
+        score_overlap = _coerce_score_overlap(self.score_overlap, self.ignore_overlap)
+        object.__setattr__(self, "score_overlap", score_overlap)
+        object.__setattr__(self, "ignore_overlap", not score_overlap)
+        object.__setattr__(
+            self,
+            "uem_regions",
+            _validate_choice(self.uem_regions, ALLOWED_SCORING_UEM_REGIONS, "scoring_policy.uem_regions"),
+        )
+        object.__setattr__(
+            self,
+            "channel_mode",
+            _validate_choice(self.channel_mode, ALLOWED_SCORING_CHANNEL_MODES, "scoring_policy.channel_mode"),
+        )
+        object.__setattr__(
+            self,
+            "speaker_count_mode",
+            _validate_choice(
+                self.speaker_count_mode,
+                ALLOWED_SCORING_SPEAKER_COUNT_MODES,
+                "scoring_policy.speaker_count_mode",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "text_normalization",
+            _validate_choice(
+                self.text_normalization,
+                ALLOWED_SCORING_TEXT_NORMALIZATION,
+                "scoring_policy.text_normalization",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "ignored_tokens",
+            tuple(_require_text(token, "scoring_policy.ignored_tokens") for token in _sequence(self.ignored_tokens)),
+        )
+        object.__setattr__(
+            self,
+            "metric_set",
+            _unique_tuple_of_ids(_sequence(self.metric_set), "scoring_policy.metric_set"),
+        )
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return {
+            "channel_mode": self.channel_mode,
+            "collar_ms": self.collar_ms,
+            "description": self.description,
+            "evaluator_version": self.evaluator_version,
+            "ignored_tokens": list(self.ignored_tokens),
+            "metric_set": list(self.metric_set),
+            "policy_id": self.policy_id,
+            "policy_kind": self.policy_kind,
+            "score_overlap": self.score_overlap,
+            "speaker_count_mode": self.speaker_count_mode,
+            "text_normalization": self.text_normalization,
+            "uem_regions": self.uem_regions,
+            "version": self.version,
+        }
 
 
 @dataclass(frozen=True)
@@ -271,6 +356,66 @@ def dataset_manifest_to_dict(manifest: DatasetManifest) -> dict[str, Any]:
     return manifest.to_dict()
 
 
+def scoring_policy_from_dict(payload: dict[str, Any]) -> ScoringPolicyManifest:
+    return _scoring_policy_from_dict(payload)
+
+
+def scoring_policy_to_dict(policy: ScoringPolicyManifest) -> dict[str, Any]:
+    if not isinstance(policy, ScoringPolicyManifest):
+        raise ValidationError("policy must be a ScoringPolicyManifest")
+    return policy.to_dict()
+
+
+def scoring_policy_json_dumps(policy: ScoringPolicyManifest) -> str:
+    return json.dumps(scoring_policy_to_dict(policy), ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+
+
+def scoring_policy_json_loads(text: str) -> ScoringPolicyManifest:
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValidationError(f"scoring policy JSON is invalid: {exc.msg}") from exc
+    return scoring_policy_from_dict(payload)
+
+
+def read_scoring_policy_json(path: str | Path) -> ScoringPolicyManifest:
+    return scoring_policy_json_loads(Path(path).read_text(encoding="utf-8"))
+
+
+def scoring_policy_hash(policy: ScoringPolicyManifest) -> str:
+    payload = json.dumps(scoring_policy_to_dict(policy), ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def scoring_policy_report_provenance(policy: ScoringPolicyManifest | dict[str, Any]) -> dict[str, str]:
+    if isinstance(policy, dict):
+        policy = scoring_policy_from_dict(policy)
+    if not isinstance(policy, ScoringPolicyManifest):
+        raise ValidationError("policy must be a ScoringPolicyManifest")
+    return {
+        "evaluator_version": policy.evaluator_version,
+        "policy_hash": scoring_policy_hash(policy),
+        "policy_id": policy.policy_id,
+        "policy_kind": policy.policy_kind,
+        "scoring_policy_version": policy.version,
+    }
+
+
+def default_scoring_policy_manifests() -> tuple[ScoringPolicyManifest, ...]:
+    return (
+        read_scoring_policy_json(_DEFAULT_POLICY_FIXTURE_DIR / "diagnostic_diarization_v1.json"),
+        read_scoring_policy_json(_DEFAULT_POLICY_FIXTURE_DIR / "product_transcript_v1.json"),
+    )
+
+
+def default_scoring_policy(policy_kind: ScoringPolicyKind) -> ScoringPolicyManifest:
+    policy_kind = _validate_choice(policy_kind, ALLOWED_SCORING_POLICY_KINDS, "policy_kind")
+    for policy in default_scoring_policy_manifests():
+        if policy.policy_kind == policy_kind:
+            return policy
+    raise ValidationError(f"default scoring policy is not available: {policy_kind}")
+
+
 def dataset_manifest_from_dict(payload: dict[str, Any]) -> DatasetManifest:
     data = _require_mapping(payload, "dataset_manifest")
     _reject_unknown_fields(
@@ -388,15 +533,39 @@ def _scoring_policy_from_dict(payload: object) -> ScoringPolicyManifest:
     data = _require_mapping(payload, "scoring_policy")
     _reject_unknown_fields(
         data,
-        {"collar_ms", "description", "ignore_overlap", "policy_id", "version"},
+        {
+            "channel_mode",
+            "collar_ms",
+            "description",
+            "evaluator_version",
+            "ignored_tokens",
+            "ignore_overlap",
+            "metric_set",
+            "policy_id",
+            "policy_kind",
+            "score_overlap",
+            "speaker_count_mode",
+            "text_normalization",
+            "uem_regions",
+            "version",
+        },
         "scoring_policy",
     )
     return ScoringPolicyManifest(
         policy_id=_required(data, "policy_id", "scoring_policy"),
         version=_required(data, "version", "scoring_policy"),
         description=_required(data, "description", "scoring_policy"),
+        policy_kind=data.get("policy_kind", "diagnostic_diarization"),
+        evaluator_version=data.get("evaluator_version", "dscore-compatible-v1"),
         collar_ms=data.get("collar_ms", 250),
-        ignore_overlap=data.get("ignore_overlap", False),
+        score_overlap=data.get("score_overlap"),
+        ignore_overlap=data.get("ignore_overlap"),
+        uem_regions=data.get("uem_regions", "canonical_scoring_regions"),
+        channel_mode=data.get("channel_mode", "per_channel"),
+        speaker_count_mode=data.get("speaker_count_mode", "known"),
+        text_normalization=data.get("text_normalization", "none"),
+        ignored_tokens=tuple(_sequence(data.get("ignored_tokens", ()))),
+        metric_set=tuple(_sequence(data.get("metric_set", ("diarization_error_rate",)))),
     )
 
 
@@ -477,6 +646,17 @@ def _require_bool(value: object, field_name: str) -> bool:
     return value
 
 
+def _coerce_score_overlap(score_overlap: object, ignore_overlap: object) -> bool:
+    if score_overlap is None and ignore_overlap is None:
+        return True
+    if score_overlap is None:
+        return not _require_bool(ignore_overlap, "scoring_policy.ignore_overlap")
+    score_overlap = _require_bool(score_overlap, "scoring_policy.score_overlap")
+    if ignore_overlap is not None and score_overlap == _require_bool(ignore_overlap, "scoring_policy.ignore_overlap"):
+        raise ValidationError("scoring_policy.score_overlap conflicts with ignore_overlap")
+    return score_overlap
+
+
 def _non_negative_int(value: object, field_name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValidationError(f"{field_name} must be an integer")
@@ -546,6 +726,20 @@ def _as_tuple_of_policies(values: object) -> tuple[ScoringPolicyManifest, ...]:
         if not isinstance(item, ScoringPolicyManifest):
             raise ValidationError(f"dataset_manifest.scoring_policies[{index}] must be a ScoringPolicyManifest")
     return items
+
+
+def _unique_tuple_of_ids(values: object, field_name: str) -> tuple[str, ...]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        value = _require_id(value, field_name)
+        if value in seen:
+            raise ValidationError(f"{field_name} contains duplicate value: {value}")
+        seen.add(value)
+        result.append(value)
+    if not result:
+        raise ValidationError(f"{field_name} is required")
+    return tuple(result)
 
 
 def _ensure_unique(values: tuple[str, ...], field_name: str) -> frozenset[str]:

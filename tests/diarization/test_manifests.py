@@ -7,6 +7,7 @@ import pytest
 from keyframe.diarization import (
     ALLOWED_DATASET_ACCESS_MODES,
     ALLOWED_DATASET_ROLES,
+    ALLOWED_SCORING_POLICY_KINDS,
     DATASET_MANIFEST_SCHEMA_VERSION,
     DatasetAccess,
     DatasetManifest,
@@ -17,9 +18,16 @@ from keyframe.diarization import (
     dataset_manifest_from_dict,
     dataset_manifest_json_dumps,
     dataset_manifest_json_loads,
+    default_scoring_policy,
+    default_scoring_policy_manifests,
     manifest_allows_default_ci_download,
     manifest_allows_default_full_download,
     read_dataset_manifest_json,
+    scoring_policy_from_dict,
+    scoring_policy_hash,
+    scoring_policy_json_dumps,
+    scoring_policy_json_loads,
+    scoring_policy_report_provenance,
     write_dataset_manifest_json,
 )
 
@@ -51,6 +59,7 @@ def test_dataset_roles_and_access_modes_cover_planned_scope():
         "local_only",
         "forbidden",
     }
+    assert ALLOWED_SCORING_POLICY_KINDS == {"diagnostic_diarization", "product_transcript"}
 
 
 def test_packaged_ami_manifest_loads_and_rewrites_byte_stable_json():
@@ -70,6 +79,26 @@ def test_packaged_ami_manifest_loads_and_rewrites_byte_stable_json():
         "ami-public-dev",
         "ami-public-holdout",
     ]
+    assert manifest.scoring_policies[0].to_dict() == {
+        "channel_mode": "per_channel",
+        "collar_ms": 250,
+        "description": "Initial diarization policy for AMI smoke/dev/holdout validation.",
+        "evaluator_version": "dscore-compatible-v1",
+        "ignored_tokens": [],
+        "metric_set": [
+            "diarization_error_rate",
+            "speaker_error_rate",
+            "false_alarm_rate",
+            "miss_rate",
+        ],
+        "policy_id": "ami-diarization-v1",
+        "policy_kind": "diagnostic_diarization",
+        "score_overlap": True,
+        "speaker_count_mode": "known",
+        "text_normalization": "none",
+        "uem_regions": "canonical_scoring_regions",
+        "version": "1",
+    }
     assert dataset_manifest_json_dumps(manifest) == path.read_text(encoding="utf-8")
 
 
@@ -199,6 +228,85 @@ def test_manifest_dataclass_validation_accepts_smoke_ci_public_direct_case():
 
     assert manifest.default_ci_downloadable is True
     assert manifest.default_full_downloadable is True
+
+
+def test_default_scoring_policy_fixtures_represent_diagnostic_and_product_modes():
+    policies = default_scoring_policy_manifests()
+    by_kind = {policy.policy_kind: policy for policy in policies}
+
+    assert set(by_kind) == {"diagnostic_diarization", "product_transcript"}
+    assert by_kind["diagnostic_diarization"].policy_id == "diagnostic-diarization-v1"
+    assert by_kind["diagnostic_diarization"].collar_ms == 250
+    assert by_kind["diagnostic_diarization"].score_overlap is True
+    assert by_kind["diagnostic_diarization"].uem_regions == "canonical_scoring_regions"
+    assert by_kind["diagnostic_diarization"].channel_mode == "per_channel"
+    assert by_kind["diagnostic_diarization"].speaker_count_mode == "known"
+    assert by_kind["diagnostic_diarization"].text_normalization == "none"
+    assert by_kind["diagnostic_diarization"].evaluator_version == "dscore-compatible-v1"
+    assert "diarization_error_rate" in by_kind["diagnostic_diarization"].metric_set
+    assert by_kind["product_transcript"].policy_id == "product-transcript-v1"
+    assert by_kind["product_transcript"].collar_ms == 0
+    assert by_kind["product_transcript"].score_overlap is False
+    assert by_kind["product_transcript"].channel_mode == "rendered_transcript"
+    assert by_kind["product_transcript"].speaker_count_mode == "session_local"
+    assert by_kind["product_transcript"].text_normalization == "casefold_punctuation"
+    assert by_kind["product_transcript"].ignored_tokens == ("<unk>", "[inaudible]", "[noise]")
+    assert default_scoring_policy("product_transcript") == by_kind["product_transcript"]
+
+
+def test_scoring_policy_json_round_trip_is_stable_and_hashable():
+    policy = default_scoring_policy("diagnostic_diarization")
+    text = scoring_policy_json_dumps(policy)
+
+    assert scoring_policy_json_loads(text).to_dict() == policy.to_dict()
+    assert len(scoring_policy_hash(policy)) == 64
+    assert '"version": "1"' in text
+    assert "ignore_overlap" not in text
+
+
+def test_scoring_policy_accepts_legacy_ignore_overlap_alias_without_serializing_it():
+    policy = ScoringPolicyManifest(
+        policy_id="legacy-policy",
+        version="1",
+        description="Legacy policy",
+        ignore_overlap=True,
+    )
+
+    assert policy.score_overlap is False
+    assert policy.ignore_overlap is True
+    assert policy.to_dict()["score_overlap"] is False
+    assert "ignore_overlap" not in policy.to_dict()
+
+
+def test_scoring_policy_rejects_unversioned_and_conflicting_overlap_policy():
+    payload = default_scoring_policy("diagnostic_diarization").to_dict()
+    payload.pop("version")
+
+    with pytest.raises(ValidationError, match="scoring_policy.version is required"):
+        scoring_policy_from_dict(payload)
+    with pytest.raises(ValidationError, match="conflicts"):
+        ScoringPolicyManifest(
+            policy_id="conflict",
+            version="1",
+            description="Conflict",
+            score_overlap=True,
+            ignore_overlap=True,
+        )
+
+
+def test_scoring_policy_report_provenance_requires_version_and_changes_with_version():
+    policy = default_scoring_policy("diagnostic_diarization")
+    changed = scoring_policy_from_dict({**policy.to_dict(), "version": "2"})
+
+    first = scoring_policy_report_provenance(policy)
+    second = scoring_policy_report_provenance(changed)
+
+    assert first["scoring_policy_version"] == "1"
+    assert second["scoring_policy_version"] == "2"
+    assert first["policy_id"] == second["policy_id"]
+    assert first["policy_hash"] != second["policy_hash"]
+    with pytest.raises(ValidationError, match="scoring_policy.version is required"):
+        scoring_policy_report_provenance({key: value for key, value in policy.to_dict().items() if key != "version"})
 
 
 @pytest.mark.parametrize(

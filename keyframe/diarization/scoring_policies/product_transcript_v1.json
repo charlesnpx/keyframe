@@ -1,0 +1,23 @@
+{
+  "channel_mode": "rendered_transcript",
+  "collar_ms": 0,
+  "description": "Default product transcript scoring policy for rendered session-local labels and transcript text.",
+  "evaluator_version": "keyframe-product-transcript-v1",
+  "ignored_tokens": [
+    "<unk>",
+    "[inaudible]",
+    "[noise]"
+  ],
+  "metric_set": [
+    "word_speaker_label_accuracy",
+    "turn_speaker_label_accuracy",
+    "speaker_count_error"
+  ],
+  "policy_id": "product-transcript-v1",
+  "policy_kind": "product_transcript",
+  "score_overlap": false,
+  "speaker_count_mode": "session_local",
+  "text_normalization": "casefold_punctuation",
+  "uem_regions": "canonical_scoring_regions",
+  "version": "1"
+}
