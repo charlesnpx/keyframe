@@ -107,9 +107,17 @@ class AMISplitPlan:
         object.__setattr__(
             self,
             "tuned_on_splits",
-            _unique_tuple_of_ids(self.tuned_on_splits, "ami_split.tuned_on_splits"),
+            _unique_tuple_of_ids(
+                self.tuned_on_splits,
+                "ami_split.tuned_on_splits",
+                duplicate_kind="split",
+            ),
         )
-        evaluated_on_splits = _unique_tuple_of_ids(self.evaluated_on_splits, "ami_split.evaluated_on_splits")
+        evaluated_on_splits = _unique_tuple_of_ids(
+            self.evaluated_on_splits,
+            "ami_split.evaluated_on_splits",
+            duplicate_kind="split",
+        )
         if not evaluated_on_splits:
             raise ValidationError("ami_split.evaluated_on_splits is required")
         object.__setattr__(self, "evaluated_on_splits", evaluated_on_splits)
@@ -717,7 +725,11 @@ def build_ami_slice_metadata(
     recording_ids: tuple[str, ...],
     minimum_support: int,
 ) -> AMISliceMetadata:
-    recording_ids = _tuple_of_ids(recording_ids, "ami_slice.recording_ids")
+    recording_ids = _unique_tuple_of_ids(
+        recording_ids,
+        "ami_slice.recording_ids",
+        duplicate_kind="recording",
+    )
     minimum_support = _require_positive_int(minimum_support, "ami_slice.minimum_support")
     support_count = len(recording_ids)
     if support_count < minimum_support:
@@ -1187,12 +1199,12 @@ def _tuple_of_ids(values: object, field_name: str) -> tuple[str, ...]:
     return tuple(_require_id(value, field_name) for value in _sequence(values, field_name))
 
 
-def _unique_tuple_of_ids(values: object, field_name: str) -> tuple[str, ...]:
+def _unique_tuple_of_ids(values: object, field_name: str, *, duplicate_kind: str = "id") -> tuple[str, ...]:
     result = _tuple_of_ids(values, field_name)
     seen: set[str] = set()
     for value in result:
         if value in seen:
-            raise ValidationError(f"{field_name} contains duplicate split: {value}")
+            raise ValidationError(f"{field_name} contains duplicate {duplicate_kind}: {value}")
         seen.add(value)
     return result
 

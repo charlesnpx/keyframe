@@ -291,3 +291,12 @@ def test_ami_sparse_slice_metadata_marks_insufficient_support_instead_of_droppin
     }
     assert supported.status == "ready"
     assert supported.reason is None
+
+
+def test_ami_sparse_slice_metadata_rejects_duplicate_recording_support():
+    with pytest.raises(ValidationError, match="recording_ids contains duplicate recording"):
+        build_ami_slice_metadata(
+            "overlap-heavy",
+            recording_ids=("ES2002a", "ES2002a"),
+            minimum_support=2,
+        )
