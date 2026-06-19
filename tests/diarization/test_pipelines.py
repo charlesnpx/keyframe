@@ -35,7 +35,7 @@ FORBIDDEN_SAFE_PAYLOAD_KEYS = {
 }
 
 
-def _recording():
+def _recording(channel_ids=("left", "right"), channel_names=("Alex", "Blair")):
     return CanonicalRecording(
         recording_id="rec-two-track",
         original_audio_id="original-local-rec-two-track",
@@ -44,20 +44,26 @@ def _recording():
         transform_chain_id="identity",
         duration_ms=1_200,
         sample_rate_hz=16_000,
-        channels=(ChannelRecord("left", name="Alex"), ChannelRecord("right", name="Blair")),
+        channels=tuple(
+            ChannelRecord(channel_id, name=channel_names[index])
+            for index, channel_id in enumerate(channel_ids)
+        ),
     )
 
 
-def _bundle(mode):
+def _bundle(mode, channel_ids=("left", "right"), channel_names=("Alex", "Blair")):
     return build_candidate_bundle(
-        ReferenceBundle.from_recording(_recording(), artifact_id=f"reference-{mode}"),
+        ReferenceBundle.from_recording(
+            _recording(channel_ids=channel_ids, channel_names=channel_names),
+            artifact_id=f"reference-{mode}",
+        ),
         bundle_id=f"candidate-{mode}",
         mode=mode,
     )
 
 
-def _track_output(channel_id, output_id, words):
-    recording = _recording()
+def _track_output(channel_id, output_id, words, *, channel_ids=("left", "right")):
+    recording = _recording(channel_ids=channel_ids)
     spans = _spans_for_words(channel_id, output_id, words)
     return NormalizedEngineOutput(
         output_id=output_id,
@@ -139,6 +145,24 @@ def _branch_outputs():
     )
 
 
+def _colliding_channel_outputs():
+    channel_ids = ("left:1", "left/1")
+    return (
+        _track_output(
+            "left:1",
+            "left-colon-output",
+            (("colon-first", 100, 180, "raw-speaker-1", None),),
+            channel_ids=channel_ids,
+        ),
+        _track_output(
+            "left/1",
+            "left-slash-output",
+            (("slash-first", 200, 280, "raw-speaker-1", None),),
+            channel_ids=channel_ids,
+        ),
+    )
+
+
 def _walk_keys(value):
     if isinstance(value, dict):
         for key, item in value.items():
@@ -192,6 +216,36 @@ def test_same_raw_speaker_id_on_different_tracks_remains_channel_local():
     }
     assert len(set(speaker_refs_by_channel.values())) == 2
     assert result.output.raw_speaker_evidence == ()
+
+
+def test_sanitized_channel_ids_cannot_collapse_channel_local_speakers():
+    channel_ids = ("left:1", "left/1")
+    result = run_separate_track_branch(
+        _bundle("product_realistic", channel_ids=channel_ids),
+        _colliding_channel_outputs(),
+    )
+
+    speaker_refs_by_channel = {word.channel_id: word.speaker_ref for word in result.output.words}
+
+    assert speaker_refs_by_channel == {
+        "left:1": "separate_tracks:left%3A1:speaker_1",
+        "left/1": "separate_tracks:left%2F1:speaker_1",
+    }
+    assert len(set(speaker_refs_by_channel.values())) == 2
+
+
+def test_duplicate_per_track_outputs_are_rejected():
+    duplicate_left = (
+        *_branch_outputs(),
+        _track_output(
+            "left",
+            "second-left-output",
+            (("duplicate-left", 700, 780, "raw-speaker-2", None),),
+        ),
+    )
+
+    with pytest.raises(ValidationError, match="duplicate per-track output for channel: left"):
+        run_separate_track_branch(_bundle("product_realistic"), duplicate_left)
 
 
 def test_authenticated_track_metadata_branch_renders_permitted_track_labels():

@@ -12,6 +12,7 @@ import math
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import quote
 
 from keyframe.diarization.adapters import (
     BenchmarkExecutionMode,
@@ -28,6 +29,7 @@ from keyframe.diarization.engines import (
     NormalizedEngineOutput,
 )
 from keyframe.diarization.evaluator import DiarizationEvaluationResult
+from keyframe.diarization.manifests import DatasetManifest
 from keyframe.diarization.models import (
     CanonicalRecording,
     CanonicalWord,
@@ -45,7 +47,6 @@ from keyframe.diarization.rendering import (
     render_transcript,
 )
 from keyframe.diarization.reports import BenchmarkEvaluationCase
-from keyframe.diarization.manifests import DatasetManifest
 
 
 PipelineBranchId = Literal["separate_tracks", "authenticated_track_metadata"]
@@ -423,6 +424,8 @@ def _validate_track_engine_outputs(
         channel_id = _single_output_channel(output)
         if channel_id not in candidate_channel_ids:
             raise ValidationError(f"engine_outputs[{index}] channel_id is not candidate-visible: {channel_id}")
+        if channel_id in covered_channels:
+            raise ValidationError(f"engine_outputs contains duplicate per-track output for channel: {channel_id}")
         covered_channels.add(channel_id)
         timeline = output.artifact.timeline
         if first_timeline is None:
@@ -651,10 +654,7 @@ def _stable_span_id(output_id: str, index: int) -> str:
 
 
 def _sanitize_ref_part(value: str) -> str:
-    result = []
-    for char in value.strip().lower():
-        result.append(char if char.isalnum() else "-")
-    return "".join(result).strip("-") or "unknown"
+    return quote(value.strip(), safe="") or "unknown"
 
 
 def _reject_forbidden_pipeline_fields(payload: object, path: str) -> None:
