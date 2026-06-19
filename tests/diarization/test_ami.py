@@ -310,3 +310,12 @@ def test_ami_sparse_slice_metadata_rejects_duplicate_recording_support():
             minimum_support=2,
             recording_ids=("ES2002a", "ES2002a"),
         )
+
+    with pytest.raises(ValidationError, match="support_count must match recording_ids"):
+        AMISliceMetadata(
+            slice_id="overlap-heavy",
+            status="ready",
+            support_count=2,
+            minimum_support=2,
+            recording_ids=("ES2002a",),
+        )

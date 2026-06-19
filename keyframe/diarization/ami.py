@@ -154,15 +154,14 @@ class AMISliceMetadata:
             "minimum_support",
             _require_positive_int(self.minimum_support, "ami_slice.minimum_support"),
         )
-        object.__setattr__(
-            self,
-            "recording_ids",
-            _unique_tuple_of_ids(
-                self.recording_ids,
-                "ami_slice.recording_ids",
-                duplicate_kind="recording",
-            ),
+        recording_ids = _unique_tuple_of_ids(
+            self.recording_ids,
+            "ami_slice.recording_ids",
+            duplicate_kind="recording",
         )
+        object.__setattr__(self, "recording_ids", recording_ids)
+        if self.support_count != len(recording_ids):
+            raise ValidationError("ami_slice.support_count must match recording_ids")
         object.__setattr__(self, "reason", _optional_text(self.reason, "ami_slice.reason"))
         if self.status == "ready" and self.support_count < self.minimum_support:
             raise ValidationError("ready AMI slices must meet minimum support")
