@@ -184,10 +184,10 @@ def _colliding_channel_outputs():
     )
 
 
-def _mono_mix_bundle():
+def _mono_mix_bundle(bundle_id="candidate-mono-mix"):
     recording = _recording()
     return CandidateBundle(
-        bundle_id="candidate-mono-mix",
+        bundle_id=bundle_id,
         mode="product_realistic",
         audio={
             "channel_count": 1,
@@ -467,7 +467,14 @@ def test_mono_mix_branch_renders_asr_words_with_diarization_spans_overlap_and_un
     assert result.output.artifact.timeline.channel_ids == ("mono-mix",)
     assert result.output.artifact.timeline.transform_chain_id == "identity-mono-mix"
     assert [word.text for word in result.output.words] == ["hello", "there", "together"]
-    assert [word.speaker_ref for word in result.output.words] == [None, None, None]
+    assert [word.speaker_ref for word in result.output.words] == [
+        "mono_mix:mono-mix:speaker_1",
+        "mono_mix:mono-mix:speaker_1",
+        "mono_mix:mono-mix:speaker_2",
+    ]
+    assert all(word.display_label is None for word in result.output.words)
+    assert [word.speaker_ref for word in result.recording.words] == [word.speaker_ref for word in result.output.words]
+    assert all(word.display_label is not None for word in result.recording.words)
     assert [span.speaker_ref for span in result.output.speaker_spans] == [
         "mono_mix:mono-mix:speaker_1",
         "mono_mix:mono-mix:speaker_2",
@@ -652,3 +659,64 @@ def test_mono_mix_branch_report_compares_complex_branch_and_asr_only_baseline():
     assert payload["complex_transcript"]["turn_count"] == 2
     assert payload["baseline_transcript"]["state"] == "speaker_attribution_unavailable"
     assert FORBIDDEN_SAFE_PAYLOAD_KEYS.isdisjoint(set(_walk_keys(payload["complex_branch"])))
+
+
+def test_mono_mix_branch_report_rejects_inverted_complex_and_baseline_results():
+    bundle = _mono_mix_bundle()
+    complex_result = run_mono_mix_branch(
+        bundle,
+        asr_output=_mono_mix_asr_output(),
+        diarization_output=_mono_mix_diarization_output(),
+        output_id="mono-complex",
+    )
+    baseline = build_asr_only_degraded_baseline(
+        bundle,
+        asr_output=_mono_mix_asr_output(),
+        output_id="mono-baseline",
+    )
+    acceptance = decide_mono_mix_branch_acceptance(
+        complex_quality_score=0.90,
+        baseline_quality_score=0.80,
+        complex_false_confident_rate=0.05,
+        baseline_false_confident_rate=0.05,
+        complex_review_burden_rate=0.10,
+        baseline_review_burden_rate=0.20,
+        min_quality_delta=0.01,
+    )
+
+    with pytest.raises(ValidationError, match="complex_branch must be the non-baseline mono_mix result"):
+        build_mono_mix_branch_report(
+            complex_branch=baseline,
+            simple_baseline=complex_result,
+            acceptance=acceptance,
+        )
+
+
+def test_mono_mix_branch_report_rejects_unrelated_candidate_bundles():
+    complex_result = run_mono_mix_branch(
+        _mono_mix_bundle("candidate-mono-mix-a"),
+        asr_output=_mono_mix_asr_output(),
+        diarization_output=_mono_mix_diarization_output(),
+        output_id="mono-complex-a",
+    )
+    unrelated_baseline = build_asr_only_degraded_baseline(
+        _mono_mix_bundle("candidate-mono-mix-b"),
+        asr_output=_mono_mix_asr_output(),
+        output_id="mono-baseline-b",
+    )
+    acceptance = decide_mono_mix_branch_acceptance(
+        complex_quality_score=0.90,
+        baseline_quality_score=0.80,
+        complex_false_confident_rate=0.05,
+        baseline_false_confident_rate=0.05,
+        complex_review_burden_rate=0.10,
+        baseline_review_burden_rate=0.20,
+        min_quality_delta=0.01,
+    )
+
+    with pytest.raises(ValidationError, match="branches must use the same candidate bundle"):
+        build_mono_mix_branch_report(
+            complex_branch=complex_result,
+            simple_baseline=unrelated_baseline,
+            acceptance=acceptance,
+        )

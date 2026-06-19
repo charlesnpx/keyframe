@@ -20,6 +20,7 @@ from keyframe.diarization.adapters import (
     DatasetCacheConfig,
     create_benchmark_run_record,
 )
+from keyframe.diarization.attribution import apply_session_local_attribution
 from keyframe.diarization.bundles import (
     CandidateBundle,
     validate_candidate_bundle_payload,
@@ -235,6 +236,14 @@ class MonoMixBranchReport:
             raise ValidationError("mono_mix_report.simple_baseline must be a BranchPipelineResult")
         if self.complex_branch.branch_id != "mono_mix" or self.simple_baseline.branch_id != "mono_mix":
             raise ValidationError("mono_mix_report requires mono_mix branch results")
+        if self.complex_branch.candidate_bundle_id != self.simple_baseline.candidate_bundle_id:
+            raise ValidationError("mono_mix_report branches must use the same candidate bundle")
+        if self.complex_branch.metadata.get("baseline") is not False:
+            raise ValidationError("mono_mix_report.complex_branch must be the non-baseline mono_mix result")
+        if self.simple_baseline.metadata.get("baseline") is not True:
+            raise ValidationError("mono_mix_report.simple_baseline must be the degraded baseline")
+        if self.simple_baseline.metadata.get("baseline_kind") != "asr_only_degraded_transcript":
+            raise ValidationError("mono_mix_report.simple_baseline must be the ASR-only degraded baseline")
         if not isinstance(self.acceptance, BranchAcceptanceRecord):
             raise ValidationError("mono_mix_report.acceptance must be a BranchAcceptanceRecord")
         if self.acceptance.branch_id != "mono_mix":
@@ -243,6 +252,10 @@ class MonoMixBranchReport:
             raise ValidationError("mono_mix_report.complex_transcript must be a RenderedTranscript")
         if not isinstance(self.baseline_transcript, RenderedTranscript):
             raise ValidationError("mono_mix_report.baseline_transcript must be a RenderedTranscript")
+        if self.complex_transcript.recording_id != self.complex_branch.recording.recording_id:
+            raise ValidationError("mono_mix_report.complex_transcript must match complex_branch")
+        if self.baseline_transcript.recording_id != self.simple_baseline.recording.recording_id:
+            raise ValidationError("mono_mix_report.baseline_transcript must match simple_baseline")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -286,9 +299,13 @@ def run_mono_mix_branch(
     validate_pipeline_branch_candidate_inputs(branch_id, candidate_bundle)
     _validate_mono_mix_engine_outputs(candidate_bundle, asr_output=asr_output, diarization_output=diarization_output)
     result_output_id = _require_id(output_id or f"{candidate_bundle.bundle_id}:mono_mix", "pipeline.output_id")
-    words = _mono_mix_asr_words(result_output_id, asr_output)
+    asr_words = _mono_mix_asr_words(result_output_id, asr_output)
     spans, speaker_refs = _mono_mix_diarization_spans(result_output_id, diarization_output)
     artifact = _branch_output_artifact(result_output_id, candidate_bundle, (asr_output, diarization_output))
+    recording = apply_session_local_attribution(
+        _mono_mix_recording(result_output_id, artifact, asr_words, spans, speaker_refs)
+    )
+    words = tuple(replace(word, display_label=None) for word in recording.words)
     output = NormalizedEngineOutput(
         output_id=result_output_id,
         output_kind="word_spans",
@@ -298,7 +315,6 @@ def run_mono_mix_branch(
         speaker_spans=spans,
         raw_speaker_evidence=(),
     )
-    recording = _mono_mix_recording(result_output_id, artifact, words, spans, speaker_refs)
     return BranchPipelineResult(
         branch_id=branch_id,
         candidate_bundle_id=candidate_bundle.bundle_id,
