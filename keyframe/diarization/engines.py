@@ -419,9 +419,9 @@ def _chunk_start_ms(
     value = word_payload.get("chunk_start_ms", segment_payload.get("chunk_start_ms"))
     if value is not None:
         return _require_non_negative_int(value, f"{field_name}.chunk_start_ms")
-    if offset_map is not None:
+    if offset_map is not None and offset_map.source_time_basis == "chunk_relative_ms":
         return 0
-    raise ValidationError("chunk_relative_ms requires chunk_start_ms or transform_offset_map")
+    raise ValidationError("chunk_relative_ms requires chunk_start_ms or a chunk-relative transform_offset_map")
 
 
 def _frame_rate(word_payload: dict[str, Any], segment_payload: dict[str, Any], field_name: str) -> float:

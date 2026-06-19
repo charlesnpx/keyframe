@@ -218,6 +218,19 @@ def test_chunk_relative_time_basis_requires_validated_offset():
         _adapter().normalize_raw_output(payload, artifact=_artifact())
 
 
+def test_chunk_relative_time_basis_rejects_canonical_offset_map_without_chunk_offset():
+    payload = _payload("chunk_relative.json")
+    payload["segments"][0].pop("chunk_start_ms")
+
+    with pytest.raises(ValidationError, match="chunk_relative_ms requires"):
+        _adapter().normalize_raw_output(
+            payload,
+            artifact=_artifact(),
+            source_artifact=_vad_trimmed_source(),
+            transform_offset_map=_plus_100_offset_map(),
+        )
+
+
 def test_transform_offset_map_requires_source_artifact():
     with pytest.raises(ValidationError, match="transform_offset_map requires source_artifact"):
         _adapter().normalize_raw_output(
