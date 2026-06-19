@@ -271,10 +271,6 @@ def test_ami_split_plan_rejects_holdout_tuning_and_run_record_identifies_frozen_
         cache=DatasetCacheConfig(cache_root=str(FIXTURE_ROOT)),
         tuned_on_splits=("ami-public-dev",),
         evaluated_on_splits=("ami-public-holdout",),
-        derived_artifacts={
-            "rttm": "exports/rttm/ami-public-holdout.rttm",
-            "uem": "exports/uem/ami-public-holdout.uem",
-        },
     )
     identifiers = ami_run_record_identifiers(record)
 
@@ -282,10 +278,8 @@ def test_ami_split_plan_rejects_holdout_tuning_and_run_record_identifies_frozen_
     assert record.split_id == "ami-public-holdout"
     assert record.tuned_split_ids == ("ami-public-dev",)
     assert record.evaluated_split_ids == ("ami-public-holdout",)
-    assert record.derived_artifacts == {
-        "rttm": "exports/rttm/ami-public-holdout.rttm",
-        "uem": "exports/uem/ami-public-holdout.uem",
-    }
+    assert record.derived_artifacts["rttm"].endswith("/exports/rttm/ami-public-holdout.rttm")
+    assert record.derived_artifacts["uem"].endswith("/exports/uem/ami-public-holdout.uem")
     assert identifiers == {
         "branch": "separate_tracks",
         "dataset_id": "ami",

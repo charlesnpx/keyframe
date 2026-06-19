@@ -116,6 +116,19 @@ def test_score_rttm_pair_fails_below_threshold_for_degraded_hypothesis():
     assert result.missed_speech_ms > 0
 
 
+def test_score_rttm_pair_clips_rows_to_uem_instead_of_rejecting_crossing_rows():
+    reference = "SPEAKER rec ch-1 0.000 1.000 <NA> <NA> spk-a <NA> <NA>\n"
+    uem = "rec ch-1 0.250 0.750\n"
+
+    result = score_rttm_pair(reference, reference, uem, threshold=0.999999)
+
+    assert result.passed is True
+    assert result.score == 1.0
+    assert result.reference_speech_ms == 500
+    assert result.hypothesis_speech_ms == 500
+    assert result.matched_speech_ms == 500
+
+
 def test_writers_create_rttm_and_uem_artifacts(tmp_path):
     recording = _recording()
     rttm_path = tmp_path / "exports" / "rttm" / "fixture.rttm"

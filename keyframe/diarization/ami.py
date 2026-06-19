@@ -17,6 +17,7 @@ from keyframe.diarization.adapters import (
     DatasetExportResult,
     DatasetPreparationPlan,
     DatasetValidationResult,
+    build_artifact_layout,
     create_benchmark_run_record,
     plan_dataset_preparation,
 )
@@ -688,6 +689,11 @@ def create_ami_benchmark_run_record(
         tuned_on_splits=tuned_on_splits,
         evaluated_on_splits=evaluated_on_splits,
     )
+    run_artifacts = _ami_run_record_derived_artifacts(
+        artifact_root=artifact_root,
+        split_id=split_id,
+        overrides=derived_artifacts,
+    )
     return create_benchmark_run_record(
         run_id=run_id,
         manifest=manifest,
@@ -697,8 +703,25 @@ def create_ami_benchmark_run_record(
         cache=cache,
         tuned_split_ids=plan.tuned_on_splits,
         evaluated_split_ids=plan.evaluated_on_splits,
-        derived_artifacts=derived_artifacts,
+        derived_artifacts=run_artifacts,
     )
+
+
+def _ami_run_record_derived_artifacts(
+    *,
+    artifact_root: str | Path,
+    split_id: str,
+    overrides: dict[str, str] | None = None,
+) -> dict[str, str]:
+    split_id = _require_id(split_id, "split_id")
+    layout = build_artifact_layout(artifact_root)
+    artifacts = {
+        "rttm": (Path(layout.rttm_dir) / f"{split_id}.rttm").as_posix(),
+        "uem": (Path(layout.uem_dir) / f"{split_id}.uem").as_posix(),
+    }
+    if overrides is not None:
+        artifacts.update(overrides)
+    return artifacts
 
 
 def ami_dataset_snapshot_id(snapshot: DatasetManifest | dict[str, Any]) -> str:

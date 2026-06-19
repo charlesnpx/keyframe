@@ -246,10 +246,9 @@ def score_rttm_pair(
     """Score two strict RTTM exports by exact speaker-span agreement inside UEM regions."""
 
     threshold = _validate_threshold(threshold)
-    reference_rows = validate_rttm_text(reference_rttm)
-    hypothesis_rows = validate_rttm_text(hypothesis_rttm)
     uem_rows = validate_uem_text(uem)
-    _validate_rows_within_uem(reference_rows + hypothesis_rows, uem_rows)
+    reference_rows = _clip_rows_to_uem(validate_rttm_text(reference_rttm), uem_rows)
+    hypothesis_rows = _clip_rows_to_uem(validate_rttm_text(hypothesis_rttm), uem_rows)
 
     reference_counter = Counter(_row_key(row) for row in reference_rows)
     hypothesis_counter = Counter(_row_key(row) for row in hypothesis_rows)
@@ -295,16 +294,31 @@ def _row_key(row: RttmRow) -> tuple[str, str, int, int, int, str]:
     return (row.recording_id, row.channel_id, row.start_ms, row.end_ms, row.duration_ms, row.speaker_ref)
 
 
-def _validate_rows_within_uem(rows: tuple[RttmRow, ...], uem_rows: tuple[UemRow, ...]) -> None:
+def _clip_rows_to_uem(rows: tuple[RttmRow, ...], uem_rows: tuple[UemRow, ...]) -> tuple[RttmRow, ...]:
+    clipped: list[RttmRow] = []
     for row in rows:
-        if not any(
-            uem_row.recording_id == row.recording_id
-            and uem_row.channel_id == row.channel_id
-            and uem_row.start_ms <= row.start_ms
-            and row.end_ms <= uem_row.end_ms
-            for uem_row in uem_rows
-        ):
-            raise ValidationError("RTTM row is outside UEM scoring regions")
+        for uem_row in uem_rows:
+            if uem_row.recording_id != row.recording_id or uem_row.channel_id != row.channel_id:
+                continue
+            start_ms = max(row.start_ms, uem_row.start_ms)
+            end_ms = min(row.end_ms, uem_row.end_ms)
+            if end_ms <= start_ms:
+                continue
+            clipped.append(
+                RttmRow(
+                    recording_id=row.recording_id,
+                    channel_id=row.channel_id,
+                    start_ms=start_ms,
+                    duration_ms=end_ms - start_ms,
+                    speaker_ref=row.speaker_ref,
+                )
+            )
+    return tuple(
+        sorted(
+            clipped,
+            key=lambda item: (item.recording_id, item.channel_id, item.start_ms, item.end_ms, item.speaker_ref),
+        )
+    )
 
 
 def _format_seconds(milliseconds: int) -> str:
