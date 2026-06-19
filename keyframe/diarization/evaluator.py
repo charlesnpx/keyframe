@@ -303,11 +303,17 @@ def build_evaluation_slices(
 
     turn_duration_intervals = {
         "short": _clip_intervals_to_regions(
-            _turn_duration_intervals(reference_spans, scoring_intervals, short=True),
+            _policy_slice_intervals(
+                _turn_duration_intervals(reference_spans, scoring_intervals, short=True),
+                policy,
+            ),
             scoreable_atoms,
         ),
         "long": _clip_intervals_to_regions(
-            _turn_duration_intervals(reference_spans, scoring_intervals, short=False),
+            _policy_slice_intervals(
+                _turn_duration_intervals(reference_spans, scoring_intervals, short=False),
+                policy,
+            ),
             scoreable_atoms,
         ),
     }
@@ -322,7 +328,10 @@ def build_evaluation_slices(
             "speaker_change_boundary",
             "within_collar",
             _clip_intervals_to_regions(
-                _speaker_change_boundary_intervals(reference_spans, scoring_intervals, policy.collar_ms),
+                _policy_slice_intervals(
+                    _speaker_change_boundary_intervals(reference_spans, scoring_intervals, policy.collar_ms),
+                    policy,
+                ),
                 scoreable_atoms,
             ),
             minimum_support_ms,
@@ -536,6 +545,17 @@ def _policy_scoreable_reference_atoms(
         atom
         for atom in atoms
         if not _is_reference_overlap(_active_spans(reference_spans, atom))
+    )
+
+
+def _policy_slice_intervals(
+    intervals: tuple[EvaluationInterval, ...],
+    policy: ScoringPolicyManifest,
+) -> tuple[EvaluationInterval, ...]:
+    if policy.channel_mode not in {"mono_mix", "rendered_transcript"}:
+        return intervals
+    return _normalize_intervals(
+        tuple(EvaluationInterval(interval.start_ms, interval.end_ms, None) for interval in intervals)
     )
 
 

@@ -350,6 +350,23 @@ def test_rendered_transcript_policy_collapses_physical_channels_for_scoring():
             recording.channels[0],
             ChannelRecord("ch-2", "second"),
         ),
+        words=(),
+        speaker_spans=(
+            SpeakerSpan(
+                span_id="span-1",
+                speaker_ref="spk-a",
+                start_ms=0,
+                end_ms=500,
+                channel_id="ch-1",
+            ),
+            SpeakerSpan(
+                span_id="span-2",
+                speaker_ref="spk-b",
+                start_ms=0,
+                end_ms=500,
+                channel_id="ch-2",
+            ),
+        ),
         scoring_regions=(
             ScoringRegion("uem-1", 0, 1_000, channel_id="ch-1"),
             ScoringRegion("uem-2", 0, 1_000, channel_id="ch-2"),
@@ -371,14 +388,22 @@ def test_rendered_transcript_policy_collapses_physical_channels_for_scoring():
     result = evaluate_diarization_candidate(
         _reference_bundle(multichannel),
         rendered_candidate,
-        scoring_policy=default_scoring_policy("product_transcript"),
+        scoring_policy=replace(
+            default_scoring_policy("diagnostic_diarization"),
+            channel_mode="rendered_transcript",
+            collar_ms=0,
+        ),
     )
     metrics = result.recording_metrics[0].metrics
+    short_turn_metrics = {row.slice_id: row for row in result.slice_metrics}["turn_duration:short"].metrics
 
-    assert metrics["reference_speaker_ms"] == 750
-    assert metrics["hypothesis_speaker_ms"] == 750
+    assert metrics["reference_speaker_ms"] == 1000
+    assert metrics["hypothesis_speaker_ms"] == 1000
     assert metrics["false_alarm_speaker_ms"] == 0
     assert metrics["diarization_error_rate"] == 0.0
+    assert short_turn_metrics["reference_speaker_ms"] == 1000
+    assert short_turn_metrics["hypothesis_speaker_ms"] == 1000
+    assert short_turn_metrics["false_alarm_speaker_ms"] == 0
 
 
 def test_overlap_reference_scores_overlap_slice_when_reference_supports_it():
