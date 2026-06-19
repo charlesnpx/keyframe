@@ -965,6 +965,11 @@ def _score_product_transcript_metrics(
         policy,
         reference_items=word_spans,
     )
+    candidate_count_spans = _product_scoreable_items(
+        _spans_from_words(candidate_score_words),
+        intervals,
+        policy,
+    )
     turn_spans = _product_scoreable_items(_word_turn_spans(reference_score_words), intervals, policy)
     candidate_turn_spans = _product_scoreable_items(
         _word_turn_spans(candidate_score_words),
@@ -974,7 +979,7 @@ def _score_product_transcript_metrics(
     )
     return {
         "speaker_count_error": abs(
-            len({span.speaker_ref for span in candidate_word_spans})
+            len({span.speaker_ref for span in candidate_count_spans})
             - len({span.speaker_ref for span in word_spans})
         ),
         "turn_speaker_label_accuracy": _label_accuracy_by_reference_items(
