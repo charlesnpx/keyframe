@@ -235,6 +235,23 @@ def test_benchmark_run_record_captures_snapshot_layout_cache_and_splits(tmp_path
     assert payload["no_network"] is True
 
 
+def test_dry_run_run_record_is_no_network(tmp_path):
+    manifest = _ami_manifest()
+
+    record = create_benchmark_run_record(
+        run_id="run-001",
+        manifest=manifest,
+        split_id="ami-public-dev",
+        branch="feature/diarization-benchmark-platform",
+        artifact_root=tmp_path / "artifacts",
+        cache=DatasetCacheConfig(cache_root=str(tmp_path / "cache")),
+        execution_mode="dry_run",
+    )
+
+    assert record.execution_mode == "dry_run"
+    assert record.no_network is True
+
+
 def test_benchmark_run_record_json_round_trip_is_stable(tmp_path):
     manifest = _ami_manifest()
     record = create_benchmark_run_record(
@@ -338,6 +355,25 @@ def test_direct_run_record_constructor_applies_non_redistributable_cache_policy(
             tuned_split_ids=(),
             evaluated_split_ids=("private-split",),
             execution_mode="full_benchmark",
+            no_network=False,
+        )
+
+
+def test_direct_run_record_constructor_rejects_dry_run_with_network(tmp_path):
+    manifest = _ami_manifest()
+
+    with pytest.raises(ValidationError, match="no-network run records must set no_network"):
+        BenchmarkRunRecord(
+            run_id="run-001",
+            dataset_id=manifest.dataset_id,
+            dataset_snapshot=manifest.to_dict(),
+            split_id="ami-public-dev",
+            branch="feature/diarization-benchmark-platform",
+            artifact_layout=build_artifact_layout(tmp_path / "artifacts"),
+            cache_root=str(tmp_path / "cache"),
+            tuned_split_ids=(),
+            evaluated_split_ids=("ami-public-dev",),
+            execution_mode="dry_run",
             no_network=False,
         )
 

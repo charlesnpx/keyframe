@@ -236,8 +236,8 @@ class BenchmarkRunRecord:
         _validate_manifest_split_ids(self.evaluated_split_ids, manifest_split_ids, "run_record.evaluated_split_ids")
         if self.split_id not in self.evaluated_split_ids:
             raise ValidationError("run_record.split_id must be included in evaluated_split_ids")
-        if self.execution_mode == "default_no_network" and not self.no_network:
-            raise ValidationError("default_no_network run records must set no_network")
+        if self.execution_mode in {"default_no_network", "dry_run"} and not self.no_network:
+            raise ValidationError("no-network run records must set no_network")
         ensure_adapter_cache_policy(
             dataset_snapshot,
             DatasetCacheConfig(cache_root=self.cache_root),
@@ -382,7 +382,7 @@ def create_benchmark_run_record(
         tuned_split_ids=tuned_split_ids,
         evaluated_split_ids=evaluated_split_ids,
         execution_mode=execution_mode,
-        no_network=execution_mode == "default_no_network",
+        no_network=execution_mode in {"default_no_network", "dry_run"},
         derived_artifacts={} if derived_artifacts is None else derived_artifacts,
     )
 
