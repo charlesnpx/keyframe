@@ -803,9 +803,19 @@ def build_benchmark_report(
     branch_results = _metric_results_for_scope(observations, "branch", gate_config)
     recording_results = _metric_results_for_scope(observations, "recording", gate_config)
     slice_results = _metric_results_for_scope(observations, "slice", gate_config)
+    review_calibration = calibrate_review_signals(review_signals) if review_signals else None
+    review_metric_results = _review_signal_metric_results(review_signals, gate_config) if review_calibration else ()
+    corpus_results = _sort_metric_results(
+        corpus_results + tuple(result for result in review_metric_results if result.scope_type == "corpus")
+    )
+    branch_results = _sort_metric_results(
+        branch_results + tuple(result for result in review_metric_results if result.scope_type == "branch")
+    )
+    recording_results = _sort_metric_results(
+        recording_results + tuple(result for result in review_metric_results if result.scope_type == "recording")
+    )
     all_results = corpus_results + branch_results + recording_results + slice_results
     _validate_all_budgets_matched(gate_config, all_results)
-    review_calibration = calibrate_review_signals(review_signals) if review_signals else None
     critical_score = (
         score_diagnostic_critical_spans(review_signals, critical_span_policy)
         if critical_span_policy is not None
@@ -1143,7 +1153,91 @@ def _metric_results_for_scope(
         _metric_result_from_observations(scope_type, key, tuple(items), gate_config)
         for key, items in grouped.items()
     ]
+    return _sort_metric_results(tuple(results))
+
+
+def _sort_metric_results(results: tuple[BenchmarkMetricResult, ...]) -> tuple[BenchmarkMetricResult, ...]:
     return tuple(sorted(results, key=lambda item: (item.scope_type, item.scope_id, item.metric_name)))
+
+
+def _review_signal_metric_results(
+    signals: tuple[ReviewSignalSpan, ...],
+    gate_config: BenchmarkGateConfig,
+) -> tuple[BenchmarkMetricResult, ...]:
+    groups: dict[tuple[BenchmarkReportScopeType, tuple[str, ...]], list[ReviewSignalSpan]] = {}
+    for signal in signals:
+        groups.setdefault(("corpus", (signal.corpus_id,)), []).append(signal)
+        groups.setdefault(("branch", (signal.corpus_id, signal.branch_id)), []).append(signal)
+        groups.setdefault(("recording", (signal.corpus_id, signal.branch_id, signal.recording_id)), []).append(signal)
+
+    results: list[BenchmarkMetricResult] = []
+    for (scope_type, key), grouped_signals in groups.items():
+        calibration = calibrate_review_signals(tuple(grouped_signals))
+        scope_id, corpus_id, branch_id, recording_id = _review_signal_scope_fields(scope_type, key)
+        scored_duration_ms = sum(signal.end_ms - signal.start_ms for signal in grouped_signals)
+        for metric_name, point_score in _review_signal_metric_values(calibration):
+            result_without_gate = BenchmarkMetricResult(
+                scope_type=scope_type,
+                scope_id=scope_id,
+                metric_name=metric_name,
+                point_score=point_score,
+                sample_count=calibration.total,
+                scored_duration_ms=scored_duration_ms,
+                scored_words=0,
+                scored_speaker_turns=0,
+                gate=RegressionGateResult(status="unavailable", reasons=("gate not evaluated",)),
+                uncertainty=UncertaintyInterval(
+                    status="unavailable",
+                    basis="review_signal_metric",
+                    reason="review-signal metrics do not have paired samples",
+                ),
+                corpus_id=corpus_id,
+                branch_id=branch_id,
+                recording_id=recording_id,
+            )
+            results.append(
+                BenchmarkMetricResult(
+                    scope_type=result_without_gate.scope_type,
+                    scope_id=result_without_gate.scope_id,
+                    metric_name=result_without_gate.metric_name,
+                    point_score=result_without_gate.point_score,
+                    sample_count=result_without_gate.sample_count,
+                    scored_duration_ms=result_without_gate.scored_duration_ms,
+                    scored_words=result_without_gate.scored_words,
+                    scored_speaker_turns=result_without_gate.scored_speaker_turns,
+                    gate=_evaluate_gate(result_without_gate, gate_config),
+                    uncertainty=result_without_gate.uncertainty,
+                    corpus_id=result_without_gate.corpus_id,
+                    branch_id=result_without_gate.branch_id,
+                    recording_id=result_without_gate.recording_id,
+                )
+            )
+    return _sort_metric_results(tuple(results))
+
+
+def _review_signal_scope_fields(
+    scope_type: BenchmarkReportScopeType,
+    key: tuple[str, ...],
+) -> tuple[str, str, str | None, str | None]:
+    if scope_type == "corpus":
+        (corpus_id,) = key
+        return corpus_id, corpus_id, None, None
+    if scope_type == "branch":
+        corpus_id, branch_id = key
+        return f"{corpus_id}/{branch_id}", corpus_id, branch_id, None
+    if scope_type == "recording":
+        corpus_id, branch_id, recording_id = key
+        return f"{corpus_id}/{branch_id}/{recording_id}", corpus_id, branch_id, recording_id
+    raise ValidationError(f"review-signal scope is not supported: {scope_type}")
+
+
+def _review_signal_metric_values(calibration: ReviewSignalCalibration) -> tuple[tuple[str, float], ...]:
+    metric_names = ("precision", "recall", "false_confident_rate", "over_flag_rate", "coverage")
+    return tuple(
+        (metric_name, value)
+        for metric_name in metric_names
+        if (value := getattr(calibration, metric_name)) is not None
+    )
 
 
 def _metric_result_from_observations(

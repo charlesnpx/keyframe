@@ -793,6 +793,88 @@ def test_review_signal_calibration_reports_serious_and_minor_breakdowns():
     assert calibration.minor.true_negative == 1
 
 
+def test_review_signal_budgets_gate_serialized_review_metric_results():
+    gate_config = BenchmarkGateConfig(
+        budgets=(
+            BenchmarkRegressionBudget(
+                budget_id="false-confident-budget",
+                metric_name="false_confident_rate",
+                budget_kind="false_confidence",
+                direction="lower_is_better",
+                max_point_score=0.25,
+                scope_type="branch",
+                scope_id="ami-smoke/separate-tracks",
+            ),
+            BenchmarkRegressionBudget(
+                budget_id="review-burden-budget",
+                metric_name="over_flag_rate",
+                budget_kind="human_review_burden",
+                direction="lower_is_better",
+                max_point_score=0.75,
+                scope_type="branch",
+                scope_id="ami-smoke/separate-tracks",
+            ),
+        )
+    )
+    report = build_benchmark_report(
+        "review-signal-gates",
+        (
+            _case("rec-1", current_der=0.05, baseline_der=0.05, current_overlap_der=0.10, baseline_overlap_der=0.10),
+        ),
+        gate_config=gate_config,
+        review_signals=_signals(),
+    )
+
+    false_confident = next(result for result in report.branch_results if result.metric_name == "false_confident_rate")
+    over_flag = next(result for result in report.branch_results if result.metric_name == "over_flag_rate")
+
+    assert report.status == "failed"
+    assert false_confident.point_score == 0.5
+    assert false_confident.gate.status == "failed"
+    assert false_confident.gate.budget_id == "false-confident-budget"
+    assert over_flag.point_score == 0.5
+    assert over_flag.gate.status == "passed"
+    assert over_flag.gate.budget_id == "review-burden-budget"
+    assert benchmark_report_json_loads(json.dumps(report.to_dict())).to_dict() == report.to_dict()
+
+
+def test_report_json_rejects_tampered_review_signal_metric_gate():
+    report = build_benchmark_report(
+        "tampered-review-signal-gate",
+        (
+            _case("rec-1", current_der=0.05, baseline_der=0.05, current_overlap_der=0.10, baseline_overlap_der=0.10),
+        ),
+        gate_config=BenchmarkGateConfig(
+            budgets=(
+                BenchmarkRegressionBudget(
+                    budget_id="false-confident-budget",
+                    metric_name="false_confident_rate",
+                    budget_kind="false_confidence",
+                    direction="lower_is_better",
+                    max_point_score=0.25,
+                    scope_type="branch",
+                    scope_id="ami-smoke/separate-tracks",
+                ),
+            )
+        ),
+        review_signals=_signals(),
+    )
+    payload = report.to_dict()
+    payload["status"] = "passed"
+    for result in payload["branch_results"]:
+        if result["metric_name"] == "false_confident_rate":
+            result["gate"] = {
+                "budget_id": "false-confident-budget",
+                "reasons": [],
+                "status": "passed",
+                "thresholds": {"max_point_score": 0.25},
+            }
+            break
+
+    with pytest.raises(ValidationError, match="metric_result gate does not match regression budget"):
+        benchmark_report_json_loads(json.dumps(payload))
+
+
 def test_diagnostic_critical_span_policy_hook_scores_synthetic_spans():
     policy = CriticalSpanPolicyDefinition(
         policy_id="critical-span-diagnostic",
