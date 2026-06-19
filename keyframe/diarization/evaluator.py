@@ -395,8 +395,14 @@ def evaluate_diarization_candidate(
         speaker_mapping,
         policy,
     )
+    recording_has_support = _has_metric_support(
+        reference.recording.words,
+        scoring_intervals,
+        policy,
+        recording_internal_metrics,
+    )
     recording_status: EvaluationMetricStatus = (
-        "scored" if recording_internal_metrics["scored_interval_ms"] > 0 else "insufficient_support"
+        "scored" if recording_has_support else "insufficient_support"
     )
     recording_row = DiarizationRecordingMetricRow(
         recording_id=reference.recording.recording_id,
@@ -426,15 +432,30 @@ def evaluate_diarization_candidate(
         )
         scored_intervals = _clip_intervals_to_regions(item.intervals, slice_scoring_intervals)
         scored_support_ms = _interval_support_ms(scored_intervals)
+        slice_internal_metrics = _score_metrics(
+            reference_spans,
+            candidate_spans,
+            scored_intervals,
+            speaker_mapping,
+            policy,
+        )
+        slice_has_support = _has_metric_support(
+            reference.recording.words,
+            scored_intervals,
+            policy,
+            slice_internal_metrics,
+        )
         row_status: EvaluationMetricStatus = (
             "scored"
-            if item.status == "ready" and scored_support_ms >= item.minimum_support_ms
+            if item.status == "ready"
+            and scored_support_ms >= item.minimum_support_ms
+            and slice_has_support
             else "insufficient_support"
         )
-        slice_internal_metrics = (
-            _score_metrics(reference_spans, candidate_spans, scored_intervals, speaker_mapping, policy)
+        row_support_ms = (
+            scored_support_ms
             if row_status == "scored"
-            else {}
+            else min(scored_support_ms, item.minimum_support_ms - 1)
         )
         slice_rows.append(
             DiarizationSliceMetricRow(
@@ -445,7 +466,7 @@ def evaluate_diarization_candidate(
                 dimension=item.dimension,
                 value=item.value,
                 status=row_status,
-                support_ms=scored_support_ms,
+                support_ms=row_support_ms,
                 minimum_support_ms=item.minimum_support_ms,
                 metrics=(
                     _policy_metric_payload(
@@ -909,6 +930,23 @@ def _policy_metric_payload(
     if missing:
         raise ValidationError(f"central evaluator does not implement policy metrics: {', '.join(missing)}")
     return {metric: metrics[metric] for metric in policy.metric_set}
+
+
+def _has_metric_support(
+    reference_words: tuple[CanonicalWord, ...],
+    intervals: tuple[EvaluationInterval, ...],
+    policy: ScoringPolicyManifest,
+    internal_metrics: dict[str, Any],
+) -> bool:
+    if policy.policy_kind != "product_transcript":
+        return internal_metrics["scored_interval_ms"] > 0
+    return bool(
+        _product_scoreable_items(
+            _spans_from_words(_scoreable_words(reference_words, policy)),
+            intervals,
+            policy,
+        )
+    )
 
 
 def _score_product_transcript_metrics(

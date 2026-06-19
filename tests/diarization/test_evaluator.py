@@ -1227,6 +1227,53 @@ def test_product_overlap_filtering_uses_collapsed_rendered_transcript_channels()
     assert metrics["turn_speaker_label_accuracy"] == 1.0
 
 
+def test_product_rows_need_scoreable_reference_words_not_just_span_support():
+    recording = _recording()
+    reference_recording = replace(
+        recording,
+        duration_ms=1_000,
+        speakers=(recording.speakers[0],),
+        speaker_spans=(
+            replace(
+                recording.speaker_spans[0],
+                speaker_ref="spk-a",
+                start_ms=0,
+                end_ms=500,
+                channel_id="ch-1",
+                overlap=False,
+            ),
+        ),
+        words=(
+            replace(
+                recording.words[0],
+                word_id="w-ignored",
+                text="[noise]",
+                speaker_ref="spk-a",
+                start_ms=0,
+                end_ms=500,
+                channel_id="ch-1",
+                overlap=False,
+            ),
+        ),
+        scoring_regions=(ScoringRegion("uem-1", 0, 1_000, channel_id="ch-1"),),
+    )
+    candidate = _candidate_output(reference_recording, {"spk-a": "engine:word:speaker-1"})
+
+    result = evaluate_diarization_candidate(
+        _reference_bundle(reference_recording),
+        candidate,
+        scoring_policy=default_scoring_policy("product_transcript"),
+    )
+    row_by_slice = {row.slice_id: row for row in result.slice_metrics}
+    non_overlap_row = row_by_slice["overlap:non_overlap"]
+
+    assert result.recording_metrics[0].status == "insufficient_support"
+    assert result.recording_metrics[0].metrics == {}
+    assert non_overlap_row.support_ms == 0
+    assert non_overlap_row.status == "insufficient_support"
+    assert non_overlap_row.metrics == {}
+
+
 def test_speaker_mapping_stays_in_score_artifact_not_candidate_or_rendered_transcript():
     recording = _recording()
     reference = _reference_bundle(recording)
