@@ -1143,9 +1143,10 @@ def _provider_channel_id(
     value = payload.get("channel_id")
     if value is not None:
         return _require_id(str(value), f"{context}.channel_id")
-    if "channelTag" in payload:
-        index = _provider_channel_ordinal(payload.get("channelTag"), f"{context}.channelTag") - 1
-        return _artifact_channel_id(artifact, index, f"{context}.channelTag")
+    for key in ("channelTag", "channel_tag"):
+        if key in payload:
+            index = _provider_channel_ordinal(payload.get(key), f"{context}.{key}") - 1
+            return _artifact_channel_id(artifact, index, f"{context}.{key}")
     if "channel_label" in payload:
         return _aws_channel_label_to_artifact_channel(payload.get("channel_label"), artifact, context)
     if provider_channel_index is not None:

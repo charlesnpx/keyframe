@@ -653,6 +653,26 @@ def test_google_snake_case_streaming_partials_are_not_treated_as_final():
     assert all(word.text != "par" for word in output.words)
 
 
+def test_google_snake_case_channel_tags_map_to_canonical_channels():
+    payload = _payload("google_speech_provider.json")
+    payload["channel_id"] = "left"
+    for result in payload["results"]:
+        result["channel_tag"] = 2
+        result.pop("channelTag")
+        result["is_final"] = result.pop("isFinal")
+        for alternative in result["alternatives"]:
+            for word in alternative["words"]:
+                word["speaker_tag"] = word.pop("speakerTag")
+
+    output = _hosted_adapter("google_speech").normalize_raw_output(
+        payload,
+        artifact=_provider_artifact(channel_ids=("left", "right")),
+    )
+
+    assert [word.channel_id for word in output.words] == ["right", "right"]
+    assert [word.speaker_ref for word in output.words] == ["engine:right:1", "engine:right:2"]
+
+
 def test_google_cumulative_streaming_finals_replace_prior_word_metadata_without_duplicates():
     payload = _payload("google_speech_provider.json")
     payload.pop("channel_id")
