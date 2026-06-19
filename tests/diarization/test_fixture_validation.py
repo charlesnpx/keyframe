@@ -116,6 +116,19 @@ def test_unflagged_cross_speaker_span_overlap_is_invalid_when_policy_ignores_ove
     assert [issue.category for issue in result.issues] == ["unsupported_overlap"]
 
 
+def test_unflagged_cross_speaker_span_overlap_emits_overlap_slice_metadata():
+    payload = _payload("clean_two_speaker.json")
+    payload["speaker_spans"][0]["end_ms"] = 600
+    payload["speaker_spans"][1]["start_ms"] = 300
+
+    result = validate_canonical_reference_payload(payload, scoring_policy=_scoring_policy(ignore_overlap=False))
+    overlap_slices = [item for item in result.slice_metadata if item.dimension == "overlap_ratio"]
+
+    assert result.status == "valid"
+    assert overlap_slices[0].value != "none"
+    assert overlap_slices[0].metrics["overlap_ratio"] > 0
+
+
 def test_invalid_negative_interval_returns_invalid_fixture_not_exception():
     payload = _payload("clean_two_speaker.json")
     payload["words"][0]["start_ms"] = -1
@@ -213,6 +226,15 @@ def test_fixture_gate_allows_mono_mix_when_enabled_for_multichannel_reference():
 
     assert wrong_mono_id.status == "invalid_fixture"
     assert wrong_mono_id.issues[0].category == "audio_metadata_mismatch"
+
+    payload["channels"] = [{"channel_id": "mono-mix"}]
+    payload["runtime_hints"]["channel_ids"] = ["mono-mix"]
+    payload["runtime_hints"]["timeline"]["channel_ids"] = ["mono-mix"]
+    payload["runtime_hints"]["timeline"]["transform_chain_id"] = "identity"
+    stale_transform = validate_fixture_gate(candidate_payloads=((payload, recording),), allow_mono_mix=True)
+
+    assert stale_transform.status == "invalid_fixture"
+    assert stale_transform.issues[0].category == "audio_metadata_mismatch"
 
 
 def test_fixture_gate_aggregates_slice_support_across_canonical_payloads():
