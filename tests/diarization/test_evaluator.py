@@ -362,8 +362,8 @@ def test_rendered_transcript_policy_collapses_physical_channels_for_scoring():
             SpeakerSpan(
                 span_id="span-2",
                 speaker_ref="spk-b",
-                start_ms=0,
-                end_ms=500,
+                start_ms=500,
+                end_ms=1_000,
                 channel_id="ch-2",
             ),
         ),
@@ -395,12 +395,16 @@ def test_rendered_transcript_policy_collapses_physical_channels_for_scoring():
         ),
     )
     metrics = result.recording_metrics[0].metrics
-    short_turn_metrics = {row.slice_id: row for row in result.slice_metrics}["turn_duration:short"].metrics
+    rows_by_slice = {row.slice_id: row for row in result.slice_metrics}
+    short_turn_metrics = rows_by_slice["turn_duration:short"].metrics
+    boundary_row = rows_by_slice["speaker_change_boundary:within_collar"]
 
     assert metrics["reference_speaker_ms"] == 1000
     assert metrics["hypothesis_speaker_ms"] == 1000
     assert metrics["false_alarm_speaker_ms"] == 0
     assert metrics["diarization_error_rate"] == 0.0
+    assert boundary_row.status == "scored"
+    assert boundary_row.support_ms == 500
     assert short_turn_metrics["reference_speaker_ms"] == 1000
     assert short_turn_metrics["hypothesis_speaker_ms"] == 1000
     assert short_turn_metrics["false_alarm_speaker_ms"] == 0

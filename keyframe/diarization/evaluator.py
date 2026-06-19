@@ -741,7 +741,7 @@ def _speaker_change_boundary_intervals(
 ) -> tuple[EvaluationInterval, ...]:
     window_ms = max(collar_ms, 250)
     boundaries: set[tuple[int, str | None]] = set()
-    channel_ids = tuple(sorted({span.channel_id for span in reference_spans}, key=lambda value: value or ""))
+    channel_ids = tuple(sorted({region.channel_id for region in scoring_intervals}, key=lambda value: value or ""))
     for channel_id in channel_ids:
         points = tuple(
             sorted(
