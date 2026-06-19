@@ -1711,12 +1711,20 @@ def _validate_serialized_review_signal_metric_results(
         raise ValidationError("review_signal_calibration requires review_signal_scope_calibrations")
     _validate_review_signal_scope_calibrations(calibration, scope_calibrations)
     expected = _review_signal_metric_results(scope_calibrations, gate_config)
+    evaluated_scopes = {
+        (result.scope_type, result.scope_id)
+        for result in results
+        if result.scope_type in {"corpus", "branch", "recording"}
+        and not _is_serialized_review_signal_metric_result(result)
+    }
+    for scope_calibration in scope_calibrations:
+        if (scope_calibration.scope_type, scope_calibration.scope_id) not in evaluated_scopes:
+            raise ValidationError("review_signal_scope_calibrations must match evaluated metric scopes")
     expected_by_key = {_metric_result_key(result): result.to_dict() for result in expected}
     actual_review_signal_results = tuple(
         result
         for result in results
-        if result.scope_type in {"corpus", "branch", "recording"}
-        and result.metric_name in _REVIEW_SIGNAL_METRIC_NAMES
+        if _is_serialized_review_signal_metric_result(result)
     )
     actual_by_key: dict[tuple[BenchmarkReportScopeType, str, str], dict[str, Any]] = {}
     for result in actual_review_signal_results:
@@ -1767,11 +1775,8 @@ def _metric_result_key(result: BenchmarkMetricResult) -> tuple[BenchmarkReportSc
 
 def _is_serialized_review_signal_metric_result(result: BenchmarkMetricResult) -> bool:
     return (
-        result.scope_type in {"corpus", "branch", "recording"}
-        and (
-            result.uncertainty.basis == "review_signal_metric"
-            or result.metric_name in {"false_confident_rate", "over_flag_rate"}
-        )
+        result.uncertainty.basis == "review_signal_metric"
+        or result.metric_name in {"false_confident_rate", "over_flag_rate"}
     )
 
 

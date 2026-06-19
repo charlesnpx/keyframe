@@ -1013,6 +1013,31 @@ def test_report_json_rejects_extra_review_signal_metric_result():
         benchmark_report_json_loads(json.dumps(payload))
 
 
+def test_report_json_rejects_review_signal_scope_not_backed_by_evaluated_metrics():
+    report = build_benchmark_report(
+        "moved-review-signal-scope",
+        _cases_for_signals(),
+        review_signals=_signals(),
+    )
+    payload = report.to_dict()
+    for scope_calibration in payload["review_signal_scope_calibrations"]:
+        if scope_calibration["scope_type"] == "recording" and scope_calibration["recording_id"] == "rec-2":
+            scope_calibration["recording_id"] = "rec-99"
+            scope_calibration["scope_id"] = "ami-smoke/separate-tracks/rec-99"
+            break
+    for result in payload["recording_results"]:
+        if result["recording_id"] == "rec-2" and result["metric_name"] in {
+            "coverage",
+            "false_confident_rate",
+            "over_flag_rate",
+        }:
+            result["recording_id"] = "rec-99"
+            result["scope_id"] = "ami-smoke/separate-tracks/rec-99"
+
+    with pytest.raises(ValidationError, match="review_signal_scope_calibrations must match evaluated metric scopes"):
+        benchmark_report_json_loads(json.dumps(payload))
+
+
 def test_report_json_rejects_missing_review_signal_scope_calibrations():
     report = build_benchmark_report(
         "missing-review-signal-scopes",
@@ -1044,6 +1069,41 @@ def test_report_json_rejects_review_signal_metric_without_calibration():
         }
     )
     payload["branch_results"].append(forged)
+
+    with pytest.raises(ValidationError, match="require review_signal_calibration"):
+        benchmark_report_json_loads(json.dumps(payload))
+
+
+def test_report_json_rejects_slice_review_signal_metric_without_calibration():
+    report = build_benchmark_report(
+        "forged-slice-review-metric-without-calibration",
+        (
+            _case("rec-1", current_der=0.05, baseline_der=0.05, current_overlap_der=0.10, baseline_overlap_der=0.10),
+        ),
+    )
+    payload = report.to_dict()
+    forged = dict(payload["slice_results"][0])
+    forged.update(
+        {
+            "gate": {
+                "budget_id": None,
+                "reasons": ["no regression budget configured"],
+                "status": "unavailable",
+                "thresholds": {},
+            },
+            "metric_name": "false_confident_rate",
+            "point_score": 0.0,
+            "uncertainty": {
+                "basis": "review_signal_metric",
+                "confidence_level": 0.95,
+                "lower": None,
+                "reason": "review-signal metrics do not have paired samples",
+                "status": "unavailable",
+                "upper": None,
+            },
+        }
+    )
+    payload["slice_results"].append(forged)
 
     with pytest.raises(ValidationError, match="require review_signal_calibration"):
         benchmark_report_json_loads(json.dumps(payload))
