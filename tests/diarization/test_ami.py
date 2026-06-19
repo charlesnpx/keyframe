@@ -8,6 +8,7 @@ from keyframe.diarization import (
     AMIAdapter,
     AMIBenchmarkBranchConfig,
     AMIRecordingSource,
+    AMISliceMetadata,
     AMISplitPlan,
     AMISpeakerSegment,
     AMIWordAnnotation,
@@ -299,4 +300,13 @@ def test_ami_sparse_slice_metadata_rejects_duplicate_recording_support():
             "overlap-heavy",
             recording_ids=("ES2002a", "ES2002a"),
             minimum_support=2,
+        )
+
+    with pytest.raises(ValidationError, match="recording_ids contains duplicate recording"):
+        AMISliceMetadata(
+            slice_id="overlap-heavy",
+            status="ready",
+            support_count=2,
+            minimum_support=2,
+            recording_ids=("ES2002a", "ES2002a"),
         )
