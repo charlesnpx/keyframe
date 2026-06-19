@@ -1,15 +1,30 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from keyframe.diarization import (
+    AMI_BENCHMARK_BRANCHES,
     AMIAdapter,
+    AMIBenchmarkBranchConfig,
     AMIRecordingSource,
+    AMISliceMetadata,
+    AMISplitPlan,
     AMISpeakerSegment,
     AMIWordAnnotation,
     DatasetCacheConfig,
+    ValidationError,
+    ami_dataset_snapshot_id,
+    ami_run_record_identifiers,
+    build_ami_candidate_bundle,
+    build_ami_candidate_bundles,
     build_ami_reference_bundle,
+    build_ami_slice_metadata,
+    build_ami_split_plan,
     build_artifact_layout,
     build_candidate_bundle,
+    create_ami_benchmark_run_record,
+    read_dataset_manifest_json,
     normalize_ami_recording,
     read_ami_channels_xml,
     read_ami_segments_xml,
@@ -20,6 +35,7 @@ from keyframe.diarization import (
 
 
 FIXTURE_ROOT = Path("tests/diarization/fixtures/ami_minimal")
+MANIFEST_PATH = Path("keyframe/diarization/dataset_manifests/ami.json")
 SOURCE_IDS = ("AMI-P1", "AMI-P2")
 
 
@@ -124,6 +140,10 @@ def test_ami_adapter_validates_local_cache_and_exports_reference_and_candidate_a
         {"channel_id": "ihm-P1", "track_name": "Headset microphone 1"},
         {"channel_id": "ihm-P2", "track_name": "Headset microphone 2"},
     ]
+    mono_payload = json.loads(Path(results[0].artifact_paths["mono_mix_candidate_bundle"]).read_text(encoding="utf-8"))
+    validate_candidate_bundle_payload(mono_payload)
+    assert mono_payload["audio"]["channel_count"] == 1
+    assert mono_payload["channels"] == [{"channel_id": "mono-mix"}]
 
 
 def test_ami_source_speaker_ids_are_reference_only_not_candidate_or_rendered_product_output():
@@ -152,3 +172,150 @@ def test_ami_source_speaker_ids_are_reference_only_not_candidate_or_rendered_pro
     assert "track_name" not in product_payload["channels"][0]
     assert authenticated_payload["channels"][0]["track_name"] == "Headset microphone 1"
     assert rendered_payload["turns"][0]["label"] == "person_1"
+
+
+def test_ami_branch_modes_expose_only_permitted_candidate_inputs():
+    recording = normalize_ami_recording(_recording_source())
+    reference = build_ami_reference_bundle(recording)
+
+    bundles = build_ami_candidate_bundles(reference)
+
+    assert tuple(bundles) == AMI_BENCHMARK_BRANCHES
+    separate_payload = bundles["separate_tracks"].to_dict()
+    mono_payload = bundles["mono_mix"].to_dict()
+    authenticated_payload = build_ami_candidate_bundle(
+        reference,
+        branch="authenticated_track_metadata",
+        bundle_id="authenticated",
+    ).to_dict()
+
+    assert separate_payload["channels"] == [{"channel_id": "ihm-P1"}, {"channel_id": "ihm-P2"}]
+    assert "track_name" not in separate_payload["channels"][0]
+    assert mono_payload["channels"] == [{"channel_id": "mono-mix"}]
+    assert mono_payload["runtime_hints"]["channel_ids"] == ["mono-mix"]
+    assert authenticated_payload["channels"] == [
+        {"channel_id": "ihm-P1", "track_name": "Headset microphone 1"},
+        {"channel_id": "ihm-P2", "track_name": "Headset microphone 2"},
+    ]
+    for payload in (separate_payload, mono_payload, authenticated_payload):
+        validate_candidate_bundle_payload(payload)
+        for source_id in SOURCE_IDS:
+            assert source_id not in _payload_text(payload)
+
+
+def test_ami_branch_config_rejects_impossible_direct_construction():
+    with pytest.raises(ValidationError, match="separate_tracks branch must expose separate tracks"):
+        AMIBenchmarkBranchConfig(
+            branch="separate_tracks",
+            exposes_separate_tracks=False,
+            exposes_track_metadata=False,
+            mixes_to_mono=False,
+        )
+
+    with pytest.raises(ValidationError, match="mono_mix branch cannot expose separate tracks"):
+        AMIBenchmarkBranchConfig(
+            branch="mono_mix",
+            exposes_separate_tracks=True,
+            exposes_track_metadata=False,
+            mixes_to_mono=True,
+        )
+
+
+def test_ami_split_plan_rejects_duplicate_split_ids():
+    with pytest.raises(ValidationError, match="tuned_on_splits contains duplicate split"):
+        AMISplitPlan(
+            branch="separate_tracks",
+            tuned_on_splits=("ami-public-dev", "ami-public-dev"),
+            evaluated_on_splits=("ami-public-holdout",),
+        )
+
+    with pytest.raises(ValidationError, match="evaluated_on_splits contains duplicate split"):
+        AMISplitPlan(
+            branch="separate_tracks",
+            tuned_on_splits=("ami-public-dev",),
+            evaluated_on_splits=("ami-public-holdout", "ami-public-holdout"),
+        )
+
+
+def test_ami_split_plan_rejects_holdout_tuning_and_run_record_identifies_frozen_splits(tmp_path):
+    manifest = read_dataset_manifest_json(MANIFEST_PATH)
+
+    with pytest.raises(ValidationError, match="public holdout splits cannot be marked"):
+        build_ami_split_plan(
+            manifest,
+            branch="separate_tracks",
+            tuned_on_splits=("ami-public-holdout",),
+            evaluated_on_splits=("ami-public-holdout",),
+        )
+
+    record = create_ami_benchmark_run_record(
+        run_id="ami-run-001",
+        manifest=manifest,
+        split_id="ami-public-holdout",
+        branch="separate_tracks",
+        artifact_root=tmp_path / "artifacts",
+        cache=DatasetCacheConfig(cache_root=str(FIXTURE_ROOT)),
+        tuned_on_splits=("ami-public-dev",),
+        evaluated_on_splits=("ami-public-holdout",),
+    )
+    identifiers = ami_run_record_identifiers(record)
+
+    assert record.branch == "separate_tracks"
+    assert record.split_id == "ami-public-holdout"
+    assert record.tuned_split_ids == ("ami-public-dev",)
+    assert record.evaluated_split_ids == ("ami-public-holdout",)
+    assert identifiers == {
+        "branch": "separate_tracks",
+        "dataset_id": "ami",
+        "dataset_snapshot_id": ami_dataset_snapshot_id(manifest),
+        "evaluated_on_splits": ["ami-public-holdout"],
+        "split_id": "ami-public-holdout",
+        "tuned_on_splits": ["ami-public-dev"],
+    }
+
+
+def test_ami_sparse_slice_metadata_marks_insufficient_support_instead_of_dropping_slice():
+    sparse = build_ami_slice_metadata("overlap-heavy", recording_ids=("ES2002a",), minimum_support=2)
+    supported = build_ami_slice_metadata(
+        "overlap-heavy",
+        recording_ids=("ES2002a", "ES2002b"),
+        minimum_support=2,
+    )
+
+    assert sparse.to_dict() == {
+        "minimum_support": 2,
+        "reason": "requires at least 2 recordings",
+        "recording_ids": ["ES2002a"],
+        "slice_id": "overlap-heavy",
+        "status": "insufficient_support",
+        "support_count": 1,
+    }
+    assert supported.status == "ready"
+    assert supported.reason is None
+
+
+def test_ami_sparse_slice_metadata_rejects_duplicate_recording_support():
+    with pytest.raises(ValidationError, match="recording_ids contains duplicate recording"):
+        build_ami_slice_metadata(
+            "overlap-heavy",
+            recording_ids=("ES2002a", "ES2002a"),
+            minimum_support=2,
+        )
+
+    with pytest.raises(ValidationError, match="recording_ids contains duplicate recording"):
+        AMISliceMetadata(
+            slice_id="overlap-heavy",
+            status="ready",
+            support_count=2,
+            minimum_support=2,
+            recording_ids=("ES2002a", "ES2002a"),
+        )
+
+    with pytest.raises(ValidationError, match="support_count must match recording_ids"):
+        AMISliceMetadata(
+            slice_id="overlap-heavy",
+            status="ready",
+            support_count=2,
+            minimum_support=2,
+            recording_ids=("ES2002a",),
+        )

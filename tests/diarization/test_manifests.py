@@ -65,7 +65,11 @@ def test_packaged_ami_manifest_loads_and_rewrites_byte_stable_json():
     assert manifest.access.redistribution == "allowed"
     assert manifest.license_url == "https://groups.inf.ed.ac.uk/ami/corpus/license.shtml"
     assert manifest.attribution.startswith("AMI Meeting Corpus")
-    assert [split.split_id for split in manifest.splits] == ["ami-public-dev", "ami-public-holdout"]
+    assert [split.split_id for split in manifest.splits] == [
+        "ami-smoke-ci",
+        "ami-public-dev",
+        "ami-public-holdout",
+    ]
     assert dataset_manifest_json_dumps(manifest) == path.read_text(encoding="utf-8")
 
 

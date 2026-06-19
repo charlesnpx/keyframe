@@ -2,22 +2,25 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from keyframe.diarization.adapters import (
     BenchmarkArtifactLayout,
+    BenchmarkRunRecord,
     DatasetCacheConfig,
     DatasetExportResult,
     DatasetPreparationPlan,
     DatasetValidationResult,
+    create_benchmark_run_record,
     plan_dataset_preparation,
 )
-from keyframe.diarization.bundles import ReferenceBundle, build_candidate_bundle
+from keyframe.diarization.bundles import CandidateBundle, ReferenceBundle, build_candidate_bundle
 from keyframe.diarization.io import write_recording_json
 from keyframe.diarization.manifests import (
     DatasetManifest,
@@ -40,6 +43,140 @@ AMI_SAMPLE_RATE_HZ = 16_000
 _DEFAULT_MANIFEST_PATH = Path(__file__).parent / "dataset_manifests" / "ami.json"
 _WORD_TAGS = frozenset({"w", "word"})
 _SEGMENT_TAGS = frozenset({"segment", "seg", "turn", "speakerturn"})
+AMI_BENCHMARK_BRANCHES = ("separate_tracks", "mono_mix", "authenticated_track_metadata")
+AMIBenchmarkBranch = Literal["separate_tracks", "mono_mix", "authenticated_track_metadata"]
+AMISliceStatus = Literal["ready", "insufficient_support"]
+_AMI_BENCHMARK_BRANCHES = frozenset(AMI_BENCHMARK_BRANCHES)
+_AMI_HOLDOUT_ROLES = frozenset({"public_holdout"})
+
+
+@dataclass(frozen=True)
+class AMIBenchmarkBranchConfig:
+    """Candidate input policy for one AMI benchmark branch."""
+
+    branch: AMIBenchmarkBranch
+    exposes_separate_tracks: bool
+    exposes_track_metadata: bool
+    mixes_to_mono: bool
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "branch", _validate_ami_branch(self.branch))
+        object.__setattr__(
+            self,
+            "exposes_separate_tracks",
+            _require_bool(self.exposes_separate_tracks, "ami_branch.exposes_separate_tracks"),
+        )
+        object.__setattr__(
+            self,
+            "exposes_track_metadata",
+            _require_bool(self.exposes_track_metadata, "ami_branch.exposes_track_metadata"),
+        )
+        object.__setattr__(self, "mixes_to_mono", _require_bool(self.mixes_to_mono, "ami_branch.mixes_to_mono"))
+        if self.branch == "mono_mix" and self.exposes_separate_tracks:
+            raise ValidationError("mono_mix branch cannot expose separate tracks")
+        if self.branch in {"separate_tracks", "authenticated_track_metadata"} and not self.exposes_separate_tracks:
+            raise ValidationError(f"{self.branch} branch must expose separate tracks")
+        if self.branch == "mono_mix" and not self.mixes_to_mono:
+            raise ValidationError("ami mono_mix branch must mix to mono")
+        if self.branch != "mono_mix" and self.mixes_to_mono:
+            raise ValidationError("only the ami mono_mix branch can mix to mono")
+        if self.branch == "authenticated_track_metadata" and not self.exposes_track_metadata:
+            raise ValidationError("authenticated_track_metadata branch must expose track metadata")
+        if self.exposes_track_metadata and self.branch != "authenticated_track_metadata":
+            raise ValidationError("only authenticated_track_metadata can expose track metadata")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "branch": self.branch,
+            "exposes_separate_tracks": self.exposes_separate_tracks,
+            "exposes_track_metadata": self.exposes_track_metadata,
+            "mixes_to_mono": self.mixes_to_mono,
+        }
+
+
+@dataclass(frozen=True)
+class AMISplitPlan:
+    """Frozen AMI split declaration for a benchmark run."""
+
+    branch: AMIBenchmarkBranch
+    tuned_on_splits: tuple[str, ...]
+    evaluated_on_splits: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "branch", _validate_ami_branch(self.branch))
+        object.__setattr__(
+            self,
+            "tuned_on_splits",
+            _unique_tuple_of_ids(
+                self.tuned_on_splits,
+                "ami_split.tuned_on_splits",
+                duplicate_kind="split",
+            ),
+        )
+        evaluated_on_splits = _unique_tuple_of_ids(
+            self.evaluated_on_splits,
+            "ami_split.evaluated_on_splits",
+            duplicate_kind="split",
+        )
+        if not evaluated_on_splits:
+            raise ValidationError("ami_split.evaluated_on_splits is required")
+        object.__setattr__(self, "evaluated_on_splits", evaluated_on_splits)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "branch": self.branch,
+            "evaluated_on_splits": list(self.evaluated_on_splits),
+            "tuned_on_splits": list(self.tuned_on_splits),
+        }
+
+
+@dataclass(frozen=True)
+class AMISliceMetadata:
+    """Validation metadata for a report slice, including sparse slice status."""
+
+    slice_id: str
+    status: AMISliceStatus
+    support_count: int
+    minimum_support: int
+    recording_ids: tuple[str, ...] = ()
+    reason: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "slice_id", _require_id(self.slice_id, "ami_slice.slice_id"))
+        object.__setattr__(self, "status", _validate_slice_status(self.status))
+        object.__setattr__(
+            self,
+            "support_count",
+            _require_non_negative_int(self.support_count, "ami_slice.support_count"),
+        )
+        object.__setattr__(
+            self,
+            "minimum_support",
+            _require_positive_int(self.minimum_support, "ami_slice.minimum_support"),
+        )
+        recording_ids = _unique_tuple_of_ids(
+            self.recording_ids,
+            "ami_slice.recording_ids",
+            duplicate_kind="recording",
+        )
+        object.__setattr__(self, "recording_ids", recording_ids)
+        if self.support_count != len(recording_ids):
+            raise ValidationError("ami_slice.support_count must match recording_ids")
+        object.__setattr__(self, "reason", _optional_text(self.reason, "ami_slice.reason"))
+        if self.status == "ready" and self.support_count < self.minimum_support:
+            raise ValidationError("ready AMI slices must meet minimum support")
+        if self.status == "insufficient_support" and self.support_count >= self.minimum_support:
+            raise ValidationError("insufficient_support AMI slices must be below minimum support")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "minimum_support": self.minimum_support,
+            "reason": self.reason,
+            "recording_ids": list(self.recording_ids),
+            "slice_id": self.slice_id,
+            "status": self.status,
+            "support_count": self.support_count,
+        }
 
 
 @dataclass(frozen=True)
@@ -465,6 +602,188 @@ def build_ami_reference_bundle(
     )
 
 
+def ami_benchmark_branch_config(branch: AMIBenchmarkBranch) -> AMIBenchmarkBranchConfig:
+    branch = _validate_ami_branch(branch)
+    return AMIBenchmarkBranchConfig(
+        branch=branch,
+        exposes_separate_tracks=branch in {"separate_tracks", "authenticated_track_metadata"},
+        exposes_track_metadata=branch == "authenticated_track_metadata",
+        mixes_to_mono=branch == "mono_mix",
+    )
+
+
+def build_ami_candidate_bundle(
+    reference: ReferenceBundle,
+    *,
+    branch: AMIBenchmarkBranch,
+    bundle_id: str | None = None,
+) -> CandidateBundle:
+    if not isinstance(reference, ReferenceBundle):
+        raise ValidationError("reference must be a ReferenceBundle")
+    branch_config = ami_benchmark_branch_config(branch)
+    bundle_id = bundle_id or f"{reference.recording.recording_id}-{branch_config.branch}"
+    if branch_config.branch == "separate_tracks":
+        return build_candidate_bundle(reference, bundle_id=bundle_id, mode="product_realistic")
+    if branch_config.branch == "authenticated_track_metadata":
+        return build_candidate_bundle(reference, bundle_id=bundle_id, mode="authenticated_track_metadata")
+    return _build_mono_mix_candidate_bundle(reference, bundle_id=bundle_id)
+
+
+def build_ami_candidate_bundles(
+    reference: ReferenceBundle,
+    *,
+    branches: tuple[AMIBenchmarkBranch, ...] = AMI_BENCHMARK_BRANCHES,
+) -> dict[str, CandidateBundle]:
+    return {
+        branch: build_ami_candidate_bundle(
+            reference,
+            branch=branch,
+            bundle_id=f"{reference.recording.recording_id}-{branch}",
+        )
+        for branch in branches
+    }
+
+
+def build_ami_split_plan(
+    manifest: DatasetManifest,
+    *,
+    branch: AMIBenchmarkBranch,
+    tuned_on_splits: tuple[str, ...] = (),
+    evaluated_on_splits: tuple[str, ...],
+) -> AMISplitPlan:
+    if not isinstance(manifest, DatasetManifest):
+        raise ValidationError("manifest must be a DatasetManifest")
+    plan = AMISplitPlan(
+        branch=branch,
+        tuned_on_splits=tuned_on_splits,
+        evaluated_on_splits=evaluated_on_splits,
+    )
+    split_by_id = {split.split_id: split for split in manifest.splits}
+    for split_id in plan.tuned_on_splits + plan.evaluated_on_splits:
+        if split_id not in split_by_id:
+            raise ValidationError(f"AMI split plan references unknown split: {split_id}")
+    for split_id in plan.tuned_on_splits:
+        if split_by_id[split_id].role in _AMI_HOLDOUT_ROLES:
+            raise ValidationError("AMI public holdout splits cannot be marked as tuned_on_splits")
+    return plan
+
+
+def create_ami_benchmark_run_record(
+    *,
+    run_id: str,
+    manifest: DatasetManifest,
+    split_id: str,
+    branch: AMIBenchmarkBranch,
+    artifact_root: str | Path,
+    cache: DatasetCacheConfig,
+    tuned_on_splits: tuple[str, ...] = (),
+    evaluated_on_splits: tuple[str, ...] = (),
+    derived_artifacts: dict[str, str] | None = None,
+) -> BenchmarkRunRecord:
+    evaluated_on_splits = evaluated_on_splits or (split_id,)
+    plan = build_ami_split_plan(
+        manifest,
+        branch=branch,
+        tuned_on_splits=tuned_on_splits,
+        evaluated_on_splits=evaluated_on_splits,
+    )
+    return create_benchmark_run_record(
+        run_id=run_id,
+        manifest=manifest,
+        split_id=split_id,
+        branch=plan.branch,
+        artifact_root=artifact_root,
+        cache=cache,
+        tuned_split_ids=plan.tuned_on_splits,
+        evaluated_split_ids=plan.evaluated_on_splits,
+        derived_artifacts=derived_artifacts,
+    )
+
+
+def ami_dataset_snapshot_id(snapshot: DatasetManifest | dict[str, Any]) -> str:
+    if isinstance(snapshot, DatasetManifest):
+        dataset_id = snapshot.dataset_id
+        payload_data = snapshot.to_dict()
+    elif isinstance(snapshot, dict):
+        dataset_id = _require_id(snapshot.get("dataset_id"), "dataset_snapshot.dataset_id")
+        payload_data = snapshot
+    else:
+        raise ValidationError("snapshot must be a DatasetManifest or dataset snapshot object")
+    payload = json.dumps(payload_data, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return f"{dataset_id}:{hashlib.sha256(payload.encode('utf-8')).hexdigest()}"
+
+
+def ami_run_record_identifiers(record: BenchmarkRunRecord) -> dict[str, Any]:
+    if not isinstance(record, BenchmarkRunRecord):
+        raise ValidationError("record must be a BenchmarkRunRecord")
+    return {
+        "branch": record.branch,
+        "dataset_id": record.dataset_id,
+        "dataset_snapshot_id": ami_dataset_snapshot_id(record.dataset_snapshot),
+        "evaluated_on_splits": list(record.evaluated_split_ids),
+        "split_id": record.split_id,
+        "tuned_on_splits": list(record.tuned_split_ids),
+    }
+
+
+def build_ami_slice_metadata(
+    slice_id: str,
+    *,
+    recording_ids: tuple[str, ...],
+    minimum_support: int,
+) -> AMISliceMetadata:
+    recording_ids = _unique_tuple_of_ids(
+        recording_ids,
+        "ami_slice.recording_ids",
+        duplicate_kind="recording",
+    )
+    minimum_support = _require_positive_int(minimum_support, "ami_slice.minimum_support")
+    support_count = len(recording_ids)
+    if support_count < minimum_support:
+        return AMISliceMetadata(
+            slice_id=slice_id,
+            status="insufficient_support",
+            support_count=support_count,
+            minimum_support=minimum_support,
+            recording_ids=recording_ids,
+            reason=f"requires at least {minimum_support} recordings",
+        )
+    return AMISliceMetadata(
+        slice_id=slice_id,
+        status="ready",
+        support_count=support_count,
+        minimum_support=minimum_support,
+        recording_ids=recording_ids,
+    )
+
+
+def _build_mono_mix_candidate_bundle(reference: ReferenceBundle, *, bundle_id: str) -> CandidateBundle:
+    timeline = reference.artifact.timeline
+    return CandidateBundle(
+        bundle_id=bundle_id,
+        mode="product_realistic",
+        audio={
+            "channel_count": 1,
+            "duration_ms": timeline.duration_ms,
+            "sample_rate_hz": timeline.sample_rate_hz,
+            "time_basis": timeline.time_basis,
+        },
+        channels=({"channel_id": "mono-mix"},),
+        runtime_hints={
+            "channel_ids": ["mono-mix"],
+            "mode_supports_speaker_identity": False,
+            "timeline": {
+                "channel_ids": ["mono-mix"],
+                "duration_ms": timeline.duration_ms,
+                "sample_rate_hz": timeline.sample_rate_hz,
+                "time_basis": timeline.time_basis,
+                "timeline_id": timeline.timeline_id,
+                "transform_chain_id": f"{timeline.transform_chain_id}-mono-mix",
+            },
+        },
+    )
+
+
 def _write_ami_artifacts(
     split_id: str,
     recording: CanonicalRecording,
@@ -473,36 +792,34 @@ def _write_ami_artifacts(
 ) -> dict[str, str]:
     canonical_path = Path(artifact_layout.canonical_references_dir) / f"{recording.recording_id}.canonical.json"
     reference_path = Path(artifact_layout.canonical_references_dir) / f"{recording.recording_id}.reference.json"
-    product_candidate_path = (
-        Path(artifact_layout.candidate_bundles_dir) / f"{recording.recording_id}.product_realistic.json"
-    )
-    authenticated_candidate_path = (
-        Path(artifact_layout.candidate_bundles_dir) / f"{recording.recording_id}.authenticated_track_metadata.json"
-    )
+    candidate_dir = Path(artifact_layout.candidate_bundles_dir)
+    candidate_paths = {
+        "separate_tracks": candidate_dir / f"{recording.recording_id}.separate_tracks.json",
+        "mono_mix": candidate_dir / f"{recording.recording_id}.mono_mix.json",
+        "authenticated_track_metadata": candidate_dir / f"{recording.recording_id}.authenticated_track_metadata.json",
+    }
 
     canonical_path.parent.mkdir(parents=True, exist_ok=True)
     write_recording_json(canonical_path, recording)
     _write_json(reference_path, reference.to_evaluator_dict())
-    _write_json(
-        product_candidate_path,
-        build_candidate_bundle(
-            reference,
-            bundle_id=f"{split_id}-{recording.recording_id}-product-realistic",
-            mode="product_realistic",
-        ).to_dict(),
-    )
-    _write_json(
-        authenticated_candidate_path,
-        build_candidate_bundle(
-            reference,
-            bundle_id=f"{split_id}-{recording.recording_id}-authenticated-track-metadata",
-            mode="authenticated_track_metadata",
-        ).to_dict(),
-    )
+    for branch, path in candidate_paths.items():
+        branch_name = _validate_ami_branch(branch)
+        _write_json(
+            path,
+            build_ami_candidate_bundle(
+                reference,
+                branch=branch_name,
+                bundle_id=f"{split_id}-{recording.recording_id}-{branch}",
+            ).to_dict(),
+        )
     return {
-        "authenticated_track_metadata_candidate_bundle": authenticated_candidate_path.as_posix(),
         "canonical_reference": canonical_path.as_posix(),
-        "candidate_bundle": product_candidate_path.as_posix(),
+        "candidate_bundle": candidate_paths["separate_tracks"].as_posix(),
+        "separate_tracks_candidate_bundle": candidate_paths["separate_tracks"].as_posix(),
+        "mono_mix_candidate_bundle": candidate_paths["mono_mix"].as_posix(),
+        "authenticated_track_metadata_candidate_bundle": candidate_paths[
+            "authenticated_track_metadata"
+        ].as_posix(),
         "reference_bundle": reference_path.as_posix(),
     }
 
@@ -871,6 +1188,40 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _validate_ami_branch(value: object) -> AMIBenchmarkBranch:
+    value = _require_id(value, "ami_branch.branch")
+    if value not in _AMI_BENCHMARK_BRANCHES:
+        raise ValidationError(f"AMI benchmark branch is not supported: {value}")
+    return value  # type: ignore[return-value]
+
+
+def _validate_slice_status(value: object) -> AMISliceStatus:
+    value = _require_id(value, "ami_slice.status")
+    if value not in {"ready", "insufficient_support"}:
+        raise ValidationError(f"AMI slice status is not supported: {value}")
+    return value  # type: ignore[return-value]
+
+
+def _tuple_of_ids(values: object, field_name: str) -> tuple[str, ...]:
+    return tuple(_require_id(value, field_name) for value in _sequence(values, field_name))
+
+
+def _unique_tuple_of_ids(values: object, field_name: str, *, duplicate_kind: str = "id") -> tuple[str, ...]:
+    result = _tuple_of_ids(values, field_name)
+    seen: set[str] = set()
+    for value in result:
+        if value in seen:
+            raise ValidationError(f"{field_name} contains duplicate {duplicate_kind}: {value}")
+        seen.add(value)
+    return result
+
+
+def _sequence(value: object, field_name: str) -> tuple[Any, ...]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        raise ValidationError(f"{field_name} must be an array")
+    return tuple(value)
+
+
 def _require_id(value: object, field_name: str) -> str:
     if value is None:
         raise ValidationError(f"{field_name} is required")
@@ -901,6 +1252,12 @@ def _optional_text(value: object, field_name: str) -> str | None:
     if value is None:
         return None
     return _require_text(value, field_name)
+
+
+def _require_bool(value: object, field_name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValidationError(f"{field_name} must be a boolean")
+    return value
 
 
 def _require_non_negative_int(value: object, field_name: str) -> int:
