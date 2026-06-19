@@ -367,21 +367,23 @@ def _canonical_word_interval(
     if time_basis == "canonical_ms":
         start_ms = int(start)
         end_ms = int(end)
-        if offset_map is not None:
-            return offset_map.convert_source_ms(start_ms), offset_map.convert_source_ms(end_ms)
-        return start_ms, end_ms
-    if time_basis == "chunk_relative_ms":
+    elif time_basis == "chunk_relative_ms":
         chunk_start_ms = _chunk_start_ms(word_payload, segment_payload, offset_map, field_name)
-        return int(start + chunk_start_ms), int(end + chunk_start_ms)
-    if time_basis == "sample_index":
-        return (
-            round(start * 1000 / artifact.timeline.sample_rate_hz),
-            round(end * 1000 / artifact.timeline.sample_rate_hz),
-        )
-    if time_basis == "frame_index":
+        start_ms = int(start + chunk_start_ms)
+        end_ms = int(end + chunk_start_ms)
+    elif time_basis == "sample_index":
+        start_ms = round(start * 1000 / artifact.timeline.sample_rate_hz)
+        end_ms = round(end * 1000 / artifact.timeline.sample_rate_hz)
+    elif time_basis == "frame_index":
         frame_rate = _frame_rate(word_payload, segment_payload, field_name)
-        return (round(start * 1000 / frame_rate), round(end * 1000 / frame_rate))
-    raise ValidationError(f"raw_engine_output time_basis is not supported: {time_basis}")
+        start_ms = round(start * 1000 / frame_rate)
+        end_ms = round(end * 1000 / frame_rate)
+    else:
+        raise ValidationError(f"raw_engine_output time_basis is not supported: {time_basis}")
+
+    if offset_map is not None:
+        return offset_map.convert_source_ms(start_ms), offset_map.convert_source_ms(end_ms)
+    return start_ms, end_ms
 
 
 def _raw_time_basis(
@@ -413,7 +415,7 @@ def _chunk_start_ms(
     if value is not None:
         return _require_non_negative_int(value, f"{field_name}.chunk_start_ms")
     if offset_map is not None:
-        return offset_map.convert_source_ms(0)
+        return 0
     raise ValidationError("chunk_relative_ms requires chunk_start_ms or transform_offset_map")
 
 

@@ -69,6 +69,27 @@ def _adapter():
     )
 
 
+def _vad_trimmed_source(duration_ms=900):
+    return _artifact_with_timeline(
+        timeline_id="vad-trimmed",
+        transform_chain_id="vad-trim",
+        duration_ms=duration_ms,
+    )
+
+
+def _plus_100_offset_map(source_end_ms=900, target_end_ms=1000):
+    return TimelineOffsetMap(
+        offset_map_id="vad-trim-to-canonical",
+        source_timeline_id="vad-trimmed",
+        target_timeline_id="candidate-timeline",
+        source_transform_chain_id="vad-trim",
+        target_transform_chain_id="identity",
+        source_time_basis="canonical_ms",
+        target_time_basis="canonical_ms",
+        segments=(OffsetMapSegment(0, source_end_ms, 100, target_end_ms),),
+    )
+
+
 def test_canned_json_adapter_satisfies_engine_protocol():
     assert isinstance(_adapter(), DiarizationEngineAdapter)
 
@@ -197,10 +218,83 @@ def test_chunk_relative_time_basis_requires_validated_offset():
         _adapter().normalize_raw_output(payload, artifact=_artifact())
 
 
+def test_chunk_relative_time_basis_applies_transform_offset_map_after_chunk_offset():
+    payload = {
+        "output_id": "chunk-relative-offset-map",
+        "segments": [
+            {
+                "channel_id": "ch-1",
+                "chunk_start_ms": 350,
+                "speaker_id": "speaker-a",
+                "time_basis": "chunk_relative_ms",
+                "words": [
+                    {
+                        "end_ms": 200,
+                        "start_ms": 100,
+                        "text": "shifted",
+                        "text_confidence": 0.98,
+                    }
+                ],
+            }
+        ],
+    }
+
+    output = _adapter().normalize_raw_output(
+        payload,
+        artifact=_artifact(),
+        source_artifact=_vad_trimmed_source(),
+        transform_offset_map=_plus_100_offset_map(),
+    )
+
+    assert [(word.start_ms, word.end_ms) for word in output.words] == [(550, 650)]
+    assert [(span.start_ms, span.end_ms) for span in output.speaker_spans] == [(550, 650)]
+
+
+def test_sample_index_time_basis_applies_transform_offset_map_after_conversion():
+    payload = {
+        "output_id": "sample-index-offset-map",
+        "segments": [
+            {
+                "channel_id": "ch-1",
+                "speaker_id": "speaker-a",
+                "time_basis": "sample_index",
+                "words": [
+                    {
+                        "end": 3200,
+                        "start": 1600,
+                        "text": "samples",
+                        "text_confidence": 0.98,
+                    }
+                ],
+            }
+        ],
+    }
+
+    output = _adapter().normalize_raw_output(
+        payload,
+        artifact=_artifact(),
+        source_artifact=_vad_trimmed_source(),
+        transform_offset_map=_plus_100_offset_map(),
+    )
+
+    assert [(word.start_ms, word.end_ms) for word in output.words] == [(200, 300)]
+
+
 def test_resampled_frame_index_time_basis_converts_to_canonical_ms():
     output = _adapter().normalize_raw_output(_payload("frame_index.json"), artifact=_artifact())
 
     assert [(word.start_ms, word.end_ms) for word in output.words] == [(1000, 2000)]
+
+
+def test_frame_index_time_basis_applies_transform_offset_map_after_conversion():
+    output = _adapter().normalize_raw_output(
+        _payload("frame_index.json"),
+        artifact=_artifact_with_timeline(duration_ms=2200),
+        source_artifact=_vad_trimmed_source(duration_ms=2000),
+        transform_offset_map=_plus_100_offset_map(source_end_ms=2000, target_end_ms=2100),
+    )
+
+    assert [(word.start_ms, word.end_ms) for word in output.words] == [(1100, 2100)]
 
 
 def test_streaming_partial_final_outputs_use_stable_events_without_duplicate_words():
@@ -222,11 +316,7 @@ def test_duplicate_chunks_do_not_duplicate_words():
 
 
 def test_timeline_mismatch_rejects_without_valid_offset_map():
-    source = _artifact_with_timeline(
-        timeline_id="vad-trimmed",
-        transform_chain_id="vad-trim",
-        duration_ms=900,
-    )
+    source = _vad_trimmed_source()
     target = _artifact()
 
     with pytest.raises(ValidationError, match="duration_ms conflicts"):
@@ -238,28 +328,14 @@ def test_timeline_mismatch_rejects_without_valid_offset_map():
 
 
 def test_timeline_mismatch_accepts_valid_transform_offset_map():
-    source = _artifact_with_timeline(
-        timeline_id="vad-trimmed",
-        transform_chain_id="vad-trim",
-        duration_ms=900,
-    )
+    source = _vad_trimmed_source()
     target = _artifact()
-    offset_map = TimelineOffsetMap(
-        offset_map_id="vad-trim-to-canonical",
-        source_timeline_id="vad-trimmed",
-        target_timeline_id="candidate-timeline",
-        source_transform_chain_id="vad-trim",
-        target_transform_chain_id="identity",
-        source_time_basis="canonical_ms",
-        target_time_basis="canonical_ms",
-        segments=(OffsetMapSegment(0, 900, 100, 1000),),
-    )
 
     output = _adapter().normalize_raw_output(
         _payload("vad_trimmed_source.json"),
         artifact=target,
         source_artifact=source,
-        transform_offset_map=offset_map,
+        transform_offset_map=_plus_100_offset_map(),
     )
 
     assert output.words[0].text == "hello"
