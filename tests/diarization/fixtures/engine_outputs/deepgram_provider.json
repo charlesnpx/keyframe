@@ -17,13 +17,13 @@
                 "confidence": 0.97,
                 "end": 0.25,
                 "speaker": 0,
+                "speaker_confidence": 0.88,
                 "start": 0.00,
                 "word": "left"
               }
             ]
           }
-        ],
-        "channel_id": "left"
+        ]
       },
       {
         "alternatives": [
@@ -34,13 +34,13 @@
                 "confidence": 0.95,
                 "end": 0.72,
                 "speaker": 0,
+                "speaker_confidence": 0.82,
                 "start": 0.42,
                 "word": "answer"
               }
             ]
           }
-        ],
-        "channel_id": "right"
+        ]
       }
     ]
   }

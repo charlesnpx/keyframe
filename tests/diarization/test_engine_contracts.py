@@ -620,19 +620,23 @@ def test_aws_transcribe_saved_output_normalizes_to_canonical_provider_artifact()
 
 
 def test_google_streaming_saved_output_uses_final_word_timestamps_only():
+    payload = _payload("google_speech_provider.json")
+    payload.pop("channel_id")
+
     output = _hosted_adapter("google_speech").normalize_raw_output(
-        _payload("google_speech_provider.json"),
-        artifact=_provider_artifact(channel_ids=("1",)),
+        payload,
+        artifact=_provider_artifact(),
     )
 
     assert output.output_id == "google-speech-canned"
     assert [word.text for word in output.words] == ["hello", "there"]
+    assert [word.channel_id for word in output.words] == ["ch-1", "ch-1"]
     assert [word.word_id for word in output.words] == [
         "google-speech-canned:word:000001",
         "google-speech-canned:word:000002",
     ]
     assert [word.text_confidence for word in output.words] == [0.91, 0.91]
-    assert [word.speaker_ref for word in output.words] == ["engine:1:1", "engine:1:2"]
+    assert [word.speaker_ref for word in output.words] == ["engine:ch-1:1", "engine:ch-1:2"]
     assert all(word.text != "par" for word in output.words)
 
 
@@ -645,7 +649,26 @@ def test_deepgram_saved_output_keeps_same_speaker_ids_channel_local():
     assert [word.text for word in output.words] == ["left", "answer"]
     assert [word.channel_id for word in output.words] == ["left", "right"]
     assert [word.speaker_ref for word in output.words] == ["engine:left:0", "engine:right:0"]
+    assert [word.speaker_confidence for word in output.words] == [0.88, 0.82]
     assert len({word.speaker_ref for word in output.words}) == 2
+
+
+def test_aws_channel_labels_map_to_canonical_artifact_channels():
+    payload = _payload("aws_transcribe_provider.json")
+    payload.pop("channel_id")
+    for item in payload["results"]["items"]:
+        item.pop("channel_id", None)
+        if item.get("type") == "pronunciation":
+            item["channel_label"] = "ch_0"
+
+    output = _hosted_adapter("aws_transcribe").normalize_raw_output(payload, artifact=_provider_artifact())
+
+    assert [word.channel_id for word in output.words] == ["ch-1", "ch-1", "ch-1"]
+    assert [word.speaker_ref for word in output.words] == [
+        "engine:ch-1:spk-0",
+        "engine:ch-1:spk-0",
+        "engine:ch-1:spk-1",
+    ]
 
 
 def test_hosted_provider_governance_is_attached_to_engine_config_without_live_call_state():

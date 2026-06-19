@@ -1027,6 +1027,7 @@ def _deepgram_provider_words(
             channel,
             artifact,
             f"hosted_provider_output.results.channels[{channel_index}]",
+            provider_channel_index=channel_index,
         )
         alternatives = _sequence(
             channel.get("alternatives"),
@@ -1063,6 +1064,7 @@ def _deepgram_provider_words(
                     speaker_ref=speaker_ref,
                     channel_id=channel_id,
                     text_confidence=_first_confidence(value, ("confidence",), context),
+                    speaker_confidence=_first_confidence(value, ("speaker_confidence",), context),
                 )
             )
     return tuple(words)
@@ -1091,13 +1093,54 @@ def _provider_channel_id(
     payload: dict[str, Any],
     artifact: NormalizedArtifactProvenance,
     context: str,
+    *,
+    provider_channel_index: int | None = None,
 ) -> str:
-    value = payload.get("channel_id", payload.get("channelTag", root_payload.get("channel_id")))
+    value = payload.get("channel_id", root_payload.get("channel_id"))
     if value is not None:
         return _require_id(str(value), f"{context}.channel_id")
+    if "channelTag" in payload:
+        index = _provider_channel_ordinal(payload.get("channelTag"), f"{context}.channelTag") - 1
+        return _artifact_channel_id(artifact, index, f"{context}.channelTag")
+    if "channel_label" in payload:
+        return _aws_channel_label_to_artifact_channel(payload.get("channel_label"), artifact, context)
+    if provider_channel_index is not None:
+        return _artifact_channel_id(artifact, provider_channel_index, context)
     if len(artifact.timeline.channel_ids) == 1:
         return artifact.timeline.channel_ids[0]
     raise ValidationError(f"{context}.channel_id is required for multi-channel artifacts")
+
+
+def _provider_channel_ordinal(value: object, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValidationError(f"{field_name} must be an integer")
+    if value <= 0:
+        raise ValidationError(f"{field_name} must be greater than 0")
+    return value
+
+
+def _artifact_channel_id(artifact: NormalizedArtifactProvenance, index: int, field_name: str) -> str:
+    if index < 0 or index >= len(artifact.timeline.channel_ids):
+        raise ValidationError(f"{field_name} does not map to an artifact channel")
+    return artifact.timeline.channel_ids[index]
+
+
+def _aws_channel_label_to_artifact_channel(
+    value: object,
+    artifact: NormalizedArtifactProvenance,
+    context: str,
+) -> str:
+    label = _require_id(str(value) if value is not None else None, f"{context}.channel_label")
+    if label in artifact.timeline.channel_ids:
+        return label
+    if label.startswith("ch_"):
+        suffix = label.removeprefix("ch_")
+        try:
+            index = int(suffix)
+        except ValueError as exc:
+            raise ValidationError(f"{context}.channel_label does not map to an artifact channel") from exc
+        return _artifact_channel_id(artifact, index, f"{context}.channel_label")
+    raise ValidationError(f"{context}.channel_label does not map to an artifact channel")
 
 
 def _provider_interval_ms(
