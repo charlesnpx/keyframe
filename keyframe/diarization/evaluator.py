@@ -625,8 +625,17 @@ def _build_speaker_mapping_for_policy(
     policy: ScoringPolicyManifest,
 ) -> dict[str, str]:
     if policy.policy_kind == "product_transcript":
-        reference_word_spans = _spans_from_words(_scoreable_words(recording.words, policy))
-        candidate_word_spans = _spans_from_words(_scoreable_words(candidate.words, policy))
+        reference_word_spans = _product_scoreable_items(
+            _spans_from_words(_scoreable_words(recording.words, policy)),
+            scoring_intervals,
+            policy,
+        )
+        candidate_word_spans = _product_scoreable_items(
+            _spans_from_words(_scoreable_words(candidate.words, policy)),
+            scoring_intervals,
+            policy,
+            reference_items=reference_word_spans,
+        )
         return _build_item_speaker_mapping(reference_word_spans, candidate_word_spans, scoring_intervals, policy)
     return _build_speaker_mapping(reference_spans, candidate_spans, scoring_intervals, policy)
 
@@ -640,18 +649,13 @@ def _build_item_speaker_mapping(
     weights: dict[tuple[str, str], int] = {}
     scoreable_reference_speakers: set[str] = set()
     for reference_item in reference_items:
-        if not _item_is_scoreable(reference_item, scoring_intervals):
+        if not _item_is_scoreable(reference_item, scoring_intervals, policy):
             continue
-        if not policy.score_overlap and _item_is_reference_overlap(reference_item, reference_items):
+        if not policy.score_overlap and _item_is_reference_overlap(reference_item, reference_items, policy):
             continue
         scoreable_reference_speakers.add(reference_item.speaker_ref)
         for candidate_item in candidate_items:
-            if not _channels_match(candidate_item.channel_id, reference_item.channel_id):
-                continue
-            if min(candidate_item.end_ms, reference_item.end_ms) <= max(
-                candidate_item.start_ms,
-                reference_item.start_ms,
-            ):
+            if not _items_overlap_in_intervals(candidate_item, reference_item, scoring_intervals, policy):
                 continue
             key = (candidate_item.speaker_ref, reference_item.speaker_ref)
             weights[key] = weights.get(key, 0) + 1
@@ -916,10 +920,20 @@ def _score_product_transcript_metrics(
 ) -> dict[str, Any]:
     reference_score_words = _scoreable_words(reference_words, policy)
     candidate_score_words = _scoreable_words(candidate_words, policy)
-    word_spans = _spans_from_words(reference_score_words)
-    candidate_word_spans = _spans_from_words(candidate_score_words)
-    turn_spans = _word_turn_spans(reference_score_words)
-    candidate_turn_spans = _word_turn_spans(candidate_score_words)
+    word_spans = _product_scoreable_items(_spans_from_words(reference_score_words), intervals, policy)
+    candidate_word_spans = _product_scoreable_items(
+        _spans_from_words(candidate_score_words),
+        intervals,
+        policy,
+        reference_items=word_spans,
+    )
+    turn_spans = _product_scoreable_items(_word_turn_spans(reference_score_words), intervals, policy)
+    candidate_turn_spans = _product_scoreable_items(
+        _word_turn_spans(candidate_score_words),
+        intervals,
+        policy,
+        reference_items=turn_spans,
+    )
     return {
         "speaker_count_error": abs(
             len({span.speaker_ref for span in candidate_word_spans})
@@ -952,8 +966,8 @@ def _label_accuracy_by_reference_items(
     scoreable_reference_items = tuple(
         item
         for item in reference_items
-        if _item_is_scoreable(item, intervals)
-        and (policy.score_overlap or not _item_is_reference_overlap(item, reference_items))
+        if _item_is_scoreable(item, intervals, policy)
+        and (policy.score_overlap or not _item_is_reference_overlap(item, reference_items, policy))
     )
     if not scoreable_reference_items:
         return 1.0 if not candidate_items else 0.0
@@ -963,8 +977,7 @@ def _label_accuracy_by_reference_items(
         candidates = tuple(
             item
             for item in candidate_items
-            if _channels_match(item.channel_id, reference_item.channel_id)
-            and min(item.end_ms, reference_item.end_ms) > max(item.start_ms, reference_item.start_ms)
+            if _items_overlap_in_intervals(item, reference_item, intervals, policy)
         )
         mapped_candidate_speakers = {
             speaker_mapping[item.speaker_ref]
@@ -976,23 +989,80 @@ def _label_accuracy_by_reference_items(
     return _round_metric(matched_items / len(scoreable_reference_items))
 
 
-def _item_is_scoreable(item: _SpanView, intervals: tuple[EvaluationInterval, ...]) -> bool:
+def _product_scoreable_items(
+    items: tuple[_SpanView, ...],
+    intervals: tuple[EvaluationInterval, ...],
+    policy: ScoringPolicyManifest,
+    *,
+    reference_items: tuple[_SpanView, ...] | None = None,
+) -> tuple[_SpanView, ...]:
+    result = []
+    for item in items:
+        if not _item_is_scoreable(item, intervals, policy):
+            continue
+        if reference_items is None and not policy.score_overlap and _item_is_reference_overlap(item, items, policy):
+            continue
+        if reference_items is not None and not any(
+            _items_overlap_in_intervals(item, reference_item, intervals, policy)
+            for reference_item in reference_items
+        ):
+            continue
+        result.append(item)
+    return tuple(result)
+
+
+def _items_overlap_in_intervals(
+    candidate_item: _SpanView,
+    reference_item: _SpanView,
+    intervals: tuple[EvaluationInterval, ...],
+    policy: ScoringPolicyManifest,
+) -> bool:
+    candidate_channel = _policy_channel_id(candidate_item.channel_id, policy)
+    reference_channel = _policy_channel_id(reference_item.channel_id, policy)
+    if not _channels_match(candidate_channel, reference_channel):
+        return False
     return any(
-        _channels_match(item.channel_id, interval.channel_id)
+        _channels_match(candidate_channel, _policy_channel_id(interval.channel_id, policy))
+        and _channels_match(reference_channel, _policy_channel_id(interval.channel_id, policy))
+        and min(candidate_item.end_ms, reference_item.end_ms, interval.end_ms)
+        > max(candidate_item.start_ms, reference_item.start_ms, interval.start_ms)
+        for interval in intervals
+    )
+
+
+def _item_is_scoreable(
+    item: _SpanView,
+    intervals: tuple[EvaluationInterval, ...],
+    policy: ScoringPolicyManifest,
+) -> bool:
+    item_channel = _policy_channel_id(item.channel_id, policy)
+    return any(
+        _channels_match(item_channel, _policy_channel_id(interval.channel_id, policy))
         and min(item.end_ms, interval.end_ms) > max(item.start_ms, interval.start_ms)
         for interval in intervals
     )
 
 
-def _item_is_reference_overlap(item: _SpanView, reference_items: tuple[_SpanView, ...]) -> bool:
+def _item_is_reference_overlap(
+    item: _SpanView,
+    reference_items: tuple[_SpanView, ...],
+    policy: ScoringPolicyManifest,
+) -> bool:
     if item.overlap:
         return True
+    item_channel = _policy_channel_id(item.channel_id, policy)
     return any(
         other is not item
-        and _channels_match(other.channel_id, item.channel_id)
+        and _channels_match(_policy_channel_id(other.channel_id, policy), item_channel)
         and min(other.end_ms, item.end_ms) > max(other.start_ms, item.start_ms)
         for other in reference_items
     )
+
+
+def _policy_channel_id(channel_id: str | None, policy: ScoringPolicyManifest) -> str | None:
+    if policy.channel_mode in {"mono_mix", "rendered_transcript"}:
+        return None
+    return channel_id
 
 
 def _scoreable_words(words: tuple[CanonicalWord, ...], policy: ScoringPolicyManifest) -> tuple[CanonicalWord, ...]:

@@ -1073,6 +1073,160 @@ def test_product_word_accuracy_counts_words_not_word_duration():
     assert metrics["turn_speaker_label_accuracy"] == 0.5
 
 
+def test_product_speaker_count_ignores_words_outside_scoring_regions():
+    recording = _recording()
+    reference_recording = replace(
+        recording,
+        duration_ms=2_000,
+        speaker_spans=(),
+        speakers=(
+            recording.speakers[0],
+            recording.speakers[1],
+        ),
+        words=(
+            replace(
+                recording.words[0],
+                word_id="w-in",
+                speaker_ref="spk-a",
+                start_ms=0,
+                end_ms=300,
+                channel_id="ch-1",
+            ),
+            replace(
+                recording.words[1],
+                word_id="w-out",
+                speaker_ref="spk-b",
+                start_ms=1_200,
+                end_ms=1_500,
+                channel_id="ch-1",
+            ),
+        ),
+        scoring_regions=(ScoringRegion("uem-1", 0, 1_000, channel_id="ch-1"),),
+    )
+    candidate = _candidate_output(
+        reference_recording,
+        {
+            "spk-a": "engine:word:speaker-1",
+            "spk-b": "engine:word:speaker-2",
+        },
+    )
+
+    result = evaluate_diarization_candidate(
+        _reference_bundle(reference_recording),
+        candidate,
+        scoring_policy=default_scoring_policy("product_transcript"),
+    )
+    metrics = result.recording_metrics[0].metrics
+
+    assert metrics["speaker_count_error"] == 0
+    assert metrics["word_speaker_label_accuracy"] == 1.0
+
+
+def test_product_word_accuracy_requires_candidate_overlap_inside_uem():
+    recording = _recording()
+    reference_recording = replace(
+        recording,
+        duration_ms=1_000,
+        speaker_spans=(),
+        speakers=(recording.speakers[0],),
+        words=(
+            replace(
+                recording.words[0],
+                word_id="w-ref",
+                speaker_ref="spk-a",
+                start_ms=0,
+                end_ms=1_000,
+                channel_id="ch-1",
+            ),
+        ),
+        scoring_regions=(ScoringRegion("uem-1", 500, 1_000, channel_id="ch-1"),),
+    )
+    candidate = _candidate_output(reference_recording, {"spk-a": "engine:word:speaker-1"})
+    outside_uem_candidate = replace(
+        candidate,
+        words=(
+            replace(
+                candidate.words[0],
+                start_ms=0,
+                end_ms=400,
+            ),
+        ),
+    )
+
+    result = evaluate_diarization_candidate(
+        _reference_bundle(reference_recording),
+        outside_uem_candidate,
+        scoring_policy=default_scoring_policy("product_transcript"),
+    )
+    metrics = result.recording_metrics[0].metrics
+
+    assert result.speaker_mapping == {}
+    assert metrics["word_speaker_label_accuracy"] == 0.0
+    assert metrics["turn_speaker_label_accuracy"] == 0.0
+
+
+def test_product_overlap_filtering_uses_collapsed_rendered_transcript_channels():
+    recording = _recording()
+    reference_recording = replace(
+        recording,
+        duration_ms=1_000,
+        channels=(
+            recording.channels[0],
+            ChannelRecord("ch-2", "second"),
+        ),
+        speaker_spans=(),
+        words=(
+            replace(
+                recording.words[0],
+                word_id="w-overlap-1",
+                speaker_ref="spk-a",
+                start_ms=0,
+                end_ms=300,
+                channel_id="ch-1",
+            ),
+            replace(
+                recording.words[1],
+                word_id="w-overlap-2",
+                speaker_ref="spk-b",
+                start_ms=0,
+                end_ms=300,
+                channel_id="ch-2",
+            ),
+            replace(
+                recording.words[0],
+                word_id="w-score",
+                speaker_ref="spk-a",
+                start_ms=500,
+                end_ms=800,
+                channel_id="ch-1",
+            ),
+        ),
+        scoring_regions=(
+            ScoringRegion("uem-1", 0, 1_000, channel_id="ch-1"),
+            ScoringRegion("uem-2", 0, 1_000, channel_id="ch-2"),
+        ),
+    )
+    candidate = _candidate_output(
+        reference_recording,
+        {
+            "spk-a": "engine:word:speaker-1",
+            "spk-b": "engine:word:wrong-speaker",
+        },
+    )
+
+    result = evaluate_diarization_candidate(
+        _reference_bundle(reference_recording),
+        candidate,
+        scoring_policy=default_scoring_policy("product_transcript"),
+    )
+    metrics = result.recording_metrics[0].metrics
+
+    assert result.speaker_mapping == {"engine:word:speaker-1": "spk-a"}
+    assert metrics["speaker_count_error"] == 0
+    assert metrics["word_speaker_label_accuracy"] == 1.0
+    assert metrics["turn_speaker_label_accuracy"] == 1.0
+
+
 def test_speaker_mapping_stays_in_score_artifact_not_candidate_or_rendered_transcript():
     recording = _recording()
     reference = _reference_bundle(recording)
