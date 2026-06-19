@@ -139,6 +139,37 @@ def test_perfect_anonymous_diarizer_scores_with_permutation_invariant_labels():
     assert metrics["miss_rate"] == 0.0
 
 
+def test_speaker_substitutions_count_once_in_der():
+    recording = _recording()
+    candidate = _candidate_output(
+        recording,
+        {
+            "spk-a": "engine:local:merged",
+            "spk-b": "engine:local:merged",
+        },
+    )
+    policy = _scoring_policy(
+        collar_ms=0,
+        metric_set=(
+            "diarization_error_rate",
+            "speaker_error_rate",
+            "miss_rate",
+            "false_alarm_rate",
+            "speaker_error_ms",
+        ),
+    )
+
+    result = evaluate_diarization_candidate(_reference_bundle(recording), candidate, scoring_policy=policy)
+    metrics = result.recording_metrics[0].metrics
+
+    assert result.speaker_mapping == {"engine:local:merged": "spk-b"}
+    assert metrics["speaker_error_ms"] == 350
+    assert metrics["diarization_error_rate"] == 0.466667
+    assert metrics["speaker_error_rate"] == 0.466667
+    assert metrics["miss_rate"] == 0.0
+    assert metrics["false_alarm_rate"] == 0.0
+
+
 def test_candidate_from_different_recording_is_rejected_even_with_same_duration():
     recording = _recording()
     other_recording = replace(
@@ -898,6 +929,43 @@ def test_product_policy_excludes_single_speaker_regions_flagged_as_overlap():
     assert overlap_row.status == "insufficient_support"
     assert overlap_row.support_ms == 0
     assert overlap_row.metrics == {}
+
+
+def test_product_transcript_metrics_use_words_not_coarse_candidate_spans():
+    recording = _recording()
+    reference = _reference_bundle(recording)
+    candidate = _candidate_output(
+        recording,
+        {
+            "spk-a": "engine:word:speaker-1",
+            "spk-b": "engine:word:speaker-2",
+        },
+    )
+    coarse_span_candidate = replace(
+        candidate,
+        speaker_spans=(
+            SpeakerSpan(
+                span_id="candidate-coarse-span",
+                speaker_ref="engine:coarse:single-speaker",
+                start_ms=0,
+                end_ms=1_000,
+                channel_id=None,
+            ),
+        ),
+    )
+    policy = default_scoring_policy("product_transcript")
+
+    result = evaluate_diarization_candidate(reference, coarse_span_candidate, scoring_policy=policy)
+    metrics = result.recording_metrics[0].metrics
+
+    assert set(metrics) == set(policy.metric_set)
+    assert result.speaker_mapping == {
+        "engine:word:speaker-1": "spk-a",
+        "engine:word:speaker-2": "spk-b",
+    }
+    assert metrics["word_speaker_label_accuracy"] == 1.0
+    assert metrics["turn_speaker_label_accuracy"] == 1.0
+    assert metrics["speaker_count_error"] == 0
 
 
 def test_speaker_mapping_stays_in_score_artifact_not_candidate_or_rendered_transcript():

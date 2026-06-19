@@ -371,6 +371,13 @@ def evaluate_diarization_candidate(
         scoring_policy=policy,
         minimum_support_ms=minimum_slice_support_ms,
     )
+    mapping_reference_spans, mapping_candidate_spans = _mapping_spans(
+        reference.recording,
+        candidate,
+        reference_spans,
+        candidate_spans,
+        policy,
+    )
     boundary_mapping_intervals = tuple(
         interval
         for item in slices
@@ -378,7 +385,7 @@ def evaluate_diarization_candidate(
         for interval in item.intervals
     )
     mapping_intervals = _normalize_intervals((*scoring_intervals, *boundary_mapping_intervals))
-    speaker_mapping = _build_speaker_mapping(reference_spans, candidate_spans, mapping_intervals, policy)
+    speaker_mapping = _build_speaker_mapping(mapping_reference_spans, mapping_candidate_spans, mapping_intervals, policy)
     policy_provenance = scoring_policy_report_provenance(policy)
 
     recording_internal_metrics = _score_metrics(
@@ -396,7 +403,18 @@ def evaluate_diarization_candidate(
         output_id=candidate.output_id,
         policy_id=policy.policy_id,
         status=recording_status,
-        metrics=_policy_metric_payload(recording_internal_metrics, policy) if recording_status == "scored" else {},
+        metrics=(
+            _policy_metric_payload(
+                recording_internal_metrics,
+                policy,
+                reference_words=reference.recording.words,
+                candidate_words=candidate.words,
+                intervals=scoring_intervals,
+                speaker_mapping=speaker_mapping,
+            )
+            if recording_status == "scored"
+            else {}
+        ),
         speaker_mapping=speaker_mapping,
     )
     slice_rows: list[DiarizationSliceMetricRow] = []
@@ -429,7 +447,18 @@ def evaluate_diarization_candidate(
                 status=row_status,
                 support_ms=scored_support_ms,
                 minimum_support_ms=item.minimum_support_ms,
-                metrics=_policy_metric_payload(slice_internal_metrics, policy) if row_status == "scored" else {},
+                metrics=(
+                    _policy_metric_payload(
+                        slice_internal_metrics,
+                        policy,
+                        reference_words=reference.recording.words,
+                        candidate_words=candidate.words,
+                        intervals=scored_intervals,
+                        speaker_mapping=speaker_mapping,
+                    )
+                    if row_status == "scored"
+                    else {}
+                ),
             ),
         )
     return DiarizationEvaluationResult(
@@ -575,6 +604,20 @@ def _spans_from_words(words: tuple[CanonicalWord, ...]) -> tuple[_SpanView, ...]
     return tuple(spans)
 
 
+def _mapping_spans(
+    recording: CanonicalRecording,
+    candidate: NormalizedEngineOutput,
+    reference_spans: tuple[_SpanView, ...],
+    candidate_spans: tuple[_SpanView, ...],
+    policy: ScoringPolicyManifest,
+) -> tuple[tuple[_SpanView, ...], tuple[_SpanView, ...]]:
+    if policy.policy_kind == "product_transcript":
+        reference_word_spans = _spans_from_words(_scoreable_words(recording.words, policy))
+        candidate_word_spans = _spans_from_words(_scoreable_words(candidate.words, policy))
+        return reference_word_spans, candidate_word_spans
+    return reference_spans, candidate_spans
+
+
 def _atomic_intervals(
     scoring_intervals: tuple[EvaluationInterval, ...],
     *span_groups: tuple[_SpanView, ...],
@@ -712,6 +755,9 @@ def _score_metrics(
     reference_speaker_ms = 0
     hypothesis_speaker_ms = 0
     matched_speaker_ms = 0
+    speaker_error_ms = 0
+    missed_speaker_ms = 0
+    false_alarm_speaker_ms = 0
     scored_interval_ms = 0
     reference_speakers_scored: set[str] = set()
     candidate_speakers_scored: set[str] = set()
@@ -733,19 +779,23 @@ def _score_metrics(
             candidate_ref for candidate_ref in active_candidate if candidate_ref in speaker_mapping
         )
         duration_ms = atom.duration_ms
+        reference_count = len(active_reference)
+        hypothesis_count = len(active_candidate)
+        matched_count = len(active_reference.intersection(mapped_candidate))
         scored_interval_ms += duration_ms
-        reference_speaker_ms += duration_ms * len(active_reference)
-        hypothesis_speaker_ms += duration_ms * len(active_candidate)
-        matched_speaker_ms += duration_ms * len(active_reference.intersection(mapped_candidate))
+        reference_speaker_ms += duration_ms * reference_count
+        hypothesis_speaker_ms += duration_ms * hypothesis_count
+        matched_speaker_ms += duration_ms * matched_count
+        speaker_error_ms += duration_ms * max(0, min(reference_count, hypothesis_count) - matched_count)
+        missed_speaker_ms += duration_ms * max(0, reference_count - hypothesis_count)
+        false_alarm_speaker_ms += duration_ms * max(0, hypothesis_count - reference_count)
 
-    missed_speaker_ms = max(0, reference_speaker_ms - matched_speaker_ms)
-    false_alarm_speaker_ms = max(0, hypothesis_speaker_ms - matched_speaker_ms)
     if reference_speaker_ms == 0:
         speaker_label_accuracy = 1.0 if hypothesis_speaker_ms == 0 else 0.0
         diarization_error_rate = 0.0 if hypothesis_speaker_ms == 0 else 1.0
     else:
         speaker_label_accuracy = matched_speaker_ms / reference_speaker_ms
-        diarization_error_rate = (missed_speaker_ms + false_alarm_speaker_ms) / reference_speaker_ms
+        diarization_error_rate = (missed_speaker_ms + false_alarm_speaker_ms + speaker_error_ms) / reference_speaker_ms
     return {
         "candidate_speaker_count": len(candidate_speakers_scored),
         "diarization_error_rate": _round_metric(diarization_error_rate),
@@ -757,15 +807,28 @@ def _score_metrics(
         "reference_speaker_count": len(reference_speakers_scored),
         "reference_speaker_ms": reference_speaker_ms,
         "scored_interval_ms": scored_interval_ms,
+        "speaker_error_ms": speaker_error_ms,
         "speaker_label_accuracy": _round_metric(speaker_label_accuracy),
         "speaker_label_error_rate": _round_metric(1.0 - speaker_label_accuracy),
     }
 
 
-def _policy_metric_payload(metrics: dict[str, Any], policy: ScoringPolicyManifest) -> dict[str, Any]:
+def _policy_metric_payload(
+    metrics: dict[str, Any],
+    policy: ScoringPolicyManifest,
+    *,
+    reference_words: tuple[CanonicalWord, ...],
+    candidate_words: tuple[CanonicalWord, ...],
+    intervals: tuple[EvaluationInterval, ...],
+    speaker_mapping: dict[str, str],
+) -> dict[str, Any]:
     metrics = dict(metrics)
     reference_speaker_ms = metrics["reference_speaker_ms"]
-    metrics["speaker_error_rate"] = metrics["speaker_label_error_rate"]
+    metrics["speaker_error_rate"] = (
+        _round_metric(metrics["speaker_error_ms"] / reference_speaker_ms)
+        if reference_speaker_ms
+        else 0.0
+    )
     metrics["miss_rate"] = (
         _round_metric(metrics["missed_speaker_ms"] / reference_speaker_ms)
         if reference_speaker_ms
@@ -779,11 +842,110 @@ def _policy_metric_payload(metrics: dict[str, Any], policy: ScoringPolicyManifes
     metrics["word_speaker_label_accuracy"] = metrics["speaker_label_accuracy"]
     metrics["turn_speaker_label_accuracy"] = metrics["speaker_label_accuracy"]
     metrics["speaker_count_error"] = abs(metrics["candidate_speaker_count"] - metrics["reference_speaker_count"])
+    if policy.policy_kind == "product_transcript":
+        metrics.update(
+            _score_product_transcript_metrics(
+                reference_words,
+                candidate_words,
+                intervals,
+                speaker_mapping,
+                policy,
+            )
+        )
 
     missing = tuple(metric for metric in policy.metric_set if metric not in metrics)
     if missing:
         raise ValidationError(f"central evaluator does not implement policy metrics: {', '.join(missing)}")
     return {metric: metrics[metric] for metric in policy.metric_set}
+
+
+def _score_product_transcript_metrics(
+    reference_words: tuple[CanonicalWord, ...],
+    candidate_words: tuple[CanonicalWord, ...],
+    intervals: tuple[EvaluationInterval, ...],
+    speaker_mapping: dict[str, str],
+    policy: ScoringPolicyManifest,
+) -> dict[str, Any]:
+    reference_score_words = _scoreable_words(reference_words, policy)
+    candidate_score_words = _scoreable_words(candidate_words, policy)
+    word_metrics = _score_metrics(
+        _spans_from_words(reference_score_words),
+        _spans_from_words(candidate_score_words),
+        intervals,
+        speaker_mapping,
+        policy,
+    )
+    turn_metrics = _score_metrics(
+        _word_turn_spans(reference_score_words),
+        _word_turn_spans(candidate_score_words),
+        intervals,
+        speaker_mapping,
+        policy,
+    )
+    return {
+        "speaker_count_error": abs(word_metrics["candidate_speaker_count"] - word_metrics["reference_speaker_count"]),
+        "turn_speaker_label_accuracy": turn_metrics["speaker_label_accuracy"],
+        "word_speaker_label_accuracy": word_metrics["speaker_label_accuracy"],
+    }
+
+
+def _scoreable_words(words: tuple[CanonicalWord, ...], policy: ScoringPolicyManifest) -> tuple[CanonicalWord, ...]:
+    ignored_tokens = {_normalized_metric_text(token, policy) for token in policy.ignored_tokens}
+    return tuple(
+        word
+        for word in words
+        if word.speaker_ref is not None
+        and _normalized_metric_text(word.text, policy) not in ignored_tokens
+    )
+
+
+def _word_turn_spans(words: tuple[CanonicalWord, ...]) -> tuple[_SpanView, ...]:
+    ordered_words = tuple(word for _, word in sorted(enumerate(words), key=lambda item: (item[1].start_ms, item[0])))
+    turns: list[_SpanView] = []
+    current: list[CanonicalWord] = []
+    current_end_ms = 0
+    for word in ordered_words:
+        if current and _starts_new_word_turn(current[-1], word, current_end_ms):
+            turns.append(_span_from_word_turn(current))
+            current = []
+            current_end_ms = 0
+        current.append(word)
+        current_end_ms = max(current_end_ms, word.end_ms)
+    if current:
+        turns.append(_span_from_word_turn(current))
+    return tuple(turns)
+
+
+def _starts_new_word_turn(previous: CanonicalWord, current: CanonicalWord, current_turn_end_ms: int) -> bool:
+    if previous.speaker_ref != current.speaker_ref:
+        return True
+    if previous.channel_id != current.channel_id:
+        return True
+    if previous.overlap != current.overlap:
+        return True
+    if current.start_ms - current_turn_end_ms > 900:
+        return True
+    return previous.text.rstrip().endswith((".", "?", "!"))
+
+
+def _span_from_word_turn(words: list[CanonicalWord]) -> _SpanView:
+    first = words[0]
+    if first.speaker_ref is None:
+        raise ValidationError("product transcript turn words require speaker_ref")
+    return _SpanView(
+        first.speaker_ref,
+        first.start_ms,
+        max(word.end_ms for word in words),
+        first.channel_id,
+        first.overlap,
+    )
+
+
+def _normalized_metric_text(text: str, policy: ScoringPolicyManifest) -> str:
+    text = text.strip()
+    if policy.text_normalization != "casefold_punctuation":
+        return text
+    return "".join(character for character in text.casefold() if character.isalnum() or character.isspace()).strip()
 
 
 def _apply_scoring_collar(
