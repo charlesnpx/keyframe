@@ -36,11 +36,11 @@ class RenderedWord:
     start_ms: int
     end_ms: int
     label: str | None
-    display_label: DisplayLabel | None = None
     channel_id: str | None = None
     speaker_confidence: float | None = None
     uncertain: bool = False
     overlap: bool = False
+    display_label: DisplayLabel | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -56,10 +56,10 @@ class RenderedTurn:
     label: str | None
     word_ids: tuple[str, ...]
     text: str
-    display_label: DisplayLabel | None = None
     channel_id: str | None = None
     uncertain: bool = False
     overlap: bool = False
+    display_label: DisplayLabel | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
