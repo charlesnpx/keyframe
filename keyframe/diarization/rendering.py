@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import asdict, dataclass, replace
 from typing import Any, Literal
 
 from keyframe.diarization.attribution import apply_session_local_attribution
-from keyframe.diarization.models import CanonicalRecording, CanonicalWord, DisplayLabel, SpeakerRecord, ValidationError
+from keyframe.diarization.models import (
+    CanonicalRecording,
+    CanonicalWord,
+    DisplayLabel,
+    LabelSource,
+    SpeakerRecord,
+    ValidationError,
+)
 
 
 OverlayOperationType = Literal[
@@ -32,6 +40,7 @@ class RenderedWord:
     speaker_confidence: float | None = None
     uncertain: bool = False
     overlap: bool = False
+    display_label: DisplayLabel | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -50,6 +59,7 @@ class RenderedTurn:
     channel_id: str | None = None
     uncertain: bool = False
     overlap: bool = False
+    display_label: DisplayLabel | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -73,6 +83,14 @@ class RenderedTranscript:
             "turns": [turn.to_dict() for turn in self.turns],
             "words": [word.to_dict() for word in self.words],
         }
+
+
+def rendered_transcript_json_dumps(transcript: RenderedTranscript) -> str:
+    """Serialize rendered transcript JSON with byte-stable formatting."""
+
+    if not isinstance(transcript, RenderedTranscript):
+        raise ValidationError("transcript must be a RenderedTranscript")
+    return json.dumps(transcript.to_dict(), ensure_ascii=False, indent=2, sort_keys=True) + "\n"
 
 
 @dataclass(frozen=True)
@@ -142,6 +160,7 @@ def render_transcript(
     recording: CanonicalRecording,
     *,
     overlays: tuple[TranscriptOverlay, ...] = (),
+    label_source: LabelSource = "diarization_cluster",
     max_gap_ms: int = 900,
     split_after_punctuation: bool = True,
 ) -> RenderedTranscript:
@@ -152,7 +171,7 @@ def render_transcript(
     if max_gap_ms < 0:
         raise ValidationError("max_gap_ms must be >= 0")
 
-    attributed = apply_session_local_attribution(recording)
+    attributed = apply_session_local_attribution(recording, label_source=label_source)
     ordered_overlays = _ordered_overlays(overlays)
     overlay_result = _apply_overlays(attributed, ordered_overlays)
     indexed_words = tuple(enumerate(overlay_result.recording.words))
@@ -364,6 +383,7 @@ def _render_turn(index: int, words: list[CanonicalWord], uncertain_word_ids: fro
         label=_word_label(words[0]),
         word_ids=tuple(word.word_id for word in words),
         text=_join_words(words),
+        display_label=_word_display_label(words[0]),
         channel_id=words[0].channel_id,
         uncertain=any(word.word_id in uncertain_word_ids or word.speaker_confidence is None for word in words),
         overlap=any(word.overlap for word in words),
@@ -377,6 +397,7 @@ def _render_word(word: CanonicalWord, uncertain_word_ids: frozenset[str]) -> Ren
         start_ms=word.start_ms,
         end_ms=word.end_ms,
         label=_word_label(word),
+        display_label=_word_display_label(word),
         channel_id=word.channel_id,
         speaker_confidence=word.speaker_confidence,
         uncertain=word.word_id in uncertain_word_ids or word.speaker_confidence is None,
@@ -396,6 +417,10 @@ def _join_words(words: list[CanonicalWord]) -> str:
 
 def _word_label(word: CanonicalWord) -> str | None:
     return None if word.display_label is None else word.display_label.label
+
+
+def _word_display_label(word: CanonicalWord) -> DisplayLabel | None:
+    return word.display_label
 
 
 def _display_label(label: str, source: str) -> DisplayLabel:

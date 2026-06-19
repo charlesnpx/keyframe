@@ -1,0 +1,84 @@
+{
+  "applied_overlay_ids": [],
+  "recording_id": "fixture-overlap",
+  "turns": [
+    {
+      "channel_id": "ch-1",
+      "display_label": {
+        "confidence": null,
+        "label": "person_1",
+        "scope": "recording",
+        "source": "diarization_cluster",
+        "source_ref": null
+      },
+      "end_ms": 400,
+      "label": "person_1",
+      "overlap": true,
+      "start_ms": 100,
+      "text": "yes",
+      "turn_id": "turn_1",
+      "uncertain": false,
+      "word_ids": [
+        "w-1"
+      ]
+    },
+    {
+      "channel_id": "ch-1",
+      "display_label": {
+        "confidence": null,
+        "label": "person_2",
+        "scope": "recording",
+        "source": "diarization_cluster",
+        "source_ref": null
+      },
+      "end_ms": 550,
+      "label": "person_2",
+      "overlap": true,
+      "start_ms": 250,
+      "text": "right",
+      "turn_id": "turn_2",
+      "uncertain": false,
+      "word_ids": [
+        "w-2"
+      ]
+    }
+  ],
+  "words": [
+    {
+      "channel_id": "ch-1",
+      "display_label": {
+        "confidence": null,
+        "label": "person_1",
+        "scope": "recording",
+        "source": "diarization_cluster",
+        "source_ref": null
+      },
+      "end_ms": 400,
+      "label": "person_1",
+      "overlap": true,
+      "speaker_confidence": 0.8,
+      "start_ms": 100,
+      "text": "yes",
+      "uncertain": false,
+      "word_id": "w-1"
+    },
+    {
+      "channel_id": "ch-1",
+      "display_label": {
+        "confidence": null,
+        "label": "person_2",
+        "scope": "recording",
+        "source": "diarization_cluster",
+        "source_ref": null
+      },
+      "end_ms": 550,
+      "label": "person_2",
+      "overlap": true,
+      "speaker_confidence": 0.82,
+      "start_ms": 250,
+      "text": "right",
+      "uncertain": false,
+      "word_id": "w-2"
+    }
+  ]
+}

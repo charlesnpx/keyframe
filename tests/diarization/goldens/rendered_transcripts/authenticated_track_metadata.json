@@ -1,0 +1,84 @@
+{
+  "applied_overlay_ids": [],
+  "recording_id": "fixture-authenticated-track-metadata",
+  "turns": [
+    {
+      "channel_id": "ch-agent",
+      "display_label": {
+        "confidence": null,
+        "label": "person_1",
+        "scope": "recording",
+        "source": "channel_metadata",
+        "source_ref": null
+      },
+      "end_ms": 220,
+      "label": "person_1",
+      "overlap": false,
+      "start_ms": 0,
+      "text": "agent",
+      "turn_id": "turn_1",
+      "uncertain": false,
+      "word_ids": [
+        "w-agent"
+      ]
+    },
+    {
+      "channel_id": "ch-customer",
+      "display_label": {
+        "confidence": null,
+        "label": "person_2",
+        "scope": "recording",
+        "source": "channel_metadata",
+        "source_ref": null
+      },
+      "end_ms": 620,
+      "label": "person_2",
+      "overlap": false,
+      "start_ms": 320,
+      "text": "customer",
+      "turn_id": "turn_2",
+      "uncertain": false,
+      "word_ids": [
+        "w-customer"
+      ]
+    }
+  ],
+  "words": [
+    {
+      "channel_id": "ch-agent",
+      "display_label": {
+        "confidence": null,
+        "label": "person_1",
+        "scope": "recording",
+        "source": "channel_metadata",
+        "source_ref": null
+      },
+      "end_ms": 220,
+      "label": "person_1",
+      "overlap": false,
+      "speaker_confidence": 1.0,
+      "start_ms": 0,
+      "text": "agent",
+      "uncertain": false,
+      "word_id": "w-agent"
+    },
+    {
+      "channel_id": "ch-customer",
+      "display_label": {
+        "confidence": null,
+        "label": "person_2",
+        "scope": "recording",
+        "source": "channel_metadata",
+        "source_ref": null
+      },
+      "end_ms": 620,
+      "label": "person_2",
+      "overlap": false,
+      "speaker_confidence": 1.0,
+      "start_ms": 320,
+      "text": "customer",
+      "uncertain": false,
+      "word_id": "w-customer"
+    }
+  ]
+}

@@ -1,0 +1,34 @@
+{
+  "applied_overlay_ids": [],
+  "recording_id": "fixture-missing-speaker",
+  "turns": [
+    {
+      "channel_id": "ch-1",
+      "display_label": null,
+      "end_ms": 500,
+      "label": null,
+      "overlap": false,
+      "start_ms": 100,
+      "text": "unattributed",
+      "turn_id": "turn_1",
+      "uncertain": true,
+      "word_ids": [
+        "w-1"
+      ]
+    }
+  ],
+  "words": [
+    {
+      "channel_id": "ch-1",
+      "display_label": null,
+      "end_ms": 500,
+      "label": null,
+      "overlap": false,
+      "speaker_confidence": null,
+      "start_ms": 100,
+      "text": "unattributed",
+      "uncertain": true,
+      "word_id": "w-1"
+    }
+  ]
+}

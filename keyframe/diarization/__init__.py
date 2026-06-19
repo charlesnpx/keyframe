@@ -57,6 +57,7 @@ from keyframe.diarization.rendering import (
     RenameLabelOverlay,
     SplitSpeakerOverlay,
     TranscriptOverlay,
+    rendered_transcript_json_dumps,
     render_transcript,
 )
 
@@ -104,6 +105,7 @@ __all__ = [
     "read_recordings_jsonl",
     "recording_from_dict",
     "recording_to_dict",
+    "rendered_transcript_json_dumps",
     "render_transcript",
     "validate_schema_version",
     "validate_candidate_bundle_payload",
