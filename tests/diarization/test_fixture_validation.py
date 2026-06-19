@@ -5,12 +5,16 @@ from dataclasses import replace
 from pathlib import Path
 
 from keyframe.diarization import (
+    AudioChannelMapping,
+    AudioTransformCacheCheck,
+    AudioTransformConfig,
     ChannelRecord,
     DatasetAccess,
     DatasetManifest,
     DatasetSplitManifest,
     ExpectedDatasetFile,
     ScoringPolicyManifest,
+    build_audio_transform_manifest,
     build_candidate_bundle_from_recording,
     build_fixture_slice_metadata,
     merge_fixture_validation_results,
@@ -18,8 +22,10 @@ from keyframe.diarization import (
     validate_candidate_bundle_against_reference,
     validate_canonical_reference_payload,
     validate_fixture_gate,
+    validate_audio_transform_cache,
     validate_manifest_expected_files,
     validate_scoring_exports,
+    sha256_bytes,
 )
 
 
@@ -60,6 +66,33 @@ def _manifest_for_files(expected_files):
     )
 
 
+def _audio_transform_config(*, source_channel_id="ch-1"):
+    return AudioTransformConfig(
+        tool_name="ffmpeg",
+        tool_version="6.1",
+        normalized_command=("ffmpeg", "-i", "original.wav", "-ar", "16000", "canonical.wav"),
+        channel_mapping=(
+            AudioChannelMapping(
+                output_channel_id="ch-1",
+                source_channel_ids=(source_channel_id,),
+            ),
+        ),
+        gain_policy="preserve",
+        downmix_policy="none",
+    )
+
+
+def _audio_transform_manifest(config=None):
+    return build_audio_transform_manifest(
+        branch_id="separate_tracks",
+        original_audio_id="original-audio-local",
+        canonical_audio_id="canonical-audio-local",
+        original_audio_sha256=sha256_bytes(b"original"),
+        canonical_audio_sha256=sha256_bytes(b"canonical"),
+        config=config or _audio_transform_config(),
+    )
+
+
 def test_manifest_expected_file_validation_reports_missing_and_checksum_mismatch(tmp_path):
     actual = tmp_path / "actual.txt"
     actual.write_text("actual", encoding="utf-8")
@@ -82,6 +115,59 @@ def test_manifest_expected_file_validation_reports_missing_and_checksum_mismatch
     assert result.status == "invalid_fixture"
     assert [issue.category for issue in result.issues] == ["checksum_mismatch", "missing_file"]
     assert result.checked_files == (str(actual), str(tmp_path / "missing.txt"))
+
+
+def test_audio_transform_cache_validation_reports_hash_and_config_mismatch(tmp_path):
+    original = tmp_path / "original.fake"
+    canonical = tmp_path / "canonical.fake"
+    original.write_bytes(b"original")
+    canonical.write_bytes(b"canonical")
+    manifest = _audio_transform_manifest()
+
+    valid = validate_audio_transform_cache(
+        manifest,
+        original_audio_path=original,
+        canonical_audio_path=canonical,
+        expected_config=_audio_transform_config(),
+    )
+
+    canonical.write_bytes(b"stale canonical")
+    invalid = validate_audio_transform_cache(
+        manifest,
+        original_audio_path=original,
+        canonical_audio_path=canonical,
+        expected_config=_audio_transform_config(source_channel_id="ch-2"),
+    )
+
+    assert valid.status == "valid"
+    assert valid.checked_files == (original.as_posix(), canonical.as_posix())
+    assert invalid.status == "invalid_fixture"
+    assert [issue.category for issue in invalid.issues] == [
+        "transform_config_mismatch",
+        "checksum_mismatch",
+    ]
+
+
+def test_fixture_gate_includes_audio_transform_cache_checks(tmp_path):
+    original = tmp_path / "original.fake"
+    canonical = tmp_path / "canonical.fake"
+    original.write_bytes(b"original")
+    canonical.write_bytes(b"canonical")
+    manifest = _audio_transform_manifest()
+
+    result = validate_fixture_gate(
+        audio_transform_caches=(
+            AudioTransformCacheCheck(
+                manifest=manifest,
+                original_audio_path=original,
+                canonical_audio_path=canonical,
+                expected_config=_audio_transform_config(),
+            ),
+        )
+    )
+
+    assert result.status == "valid"
+    assert result.checked_files == (original.as_posix(), canonical.as_posix())
 
 
 def test_valid_overlap_is_allowed_when_scoring_policy_includes_overlap():
