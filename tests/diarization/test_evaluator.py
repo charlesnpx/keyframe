@@ -115,21 +115,27 @@ def test_perfect_anonymous_diarizer_scores_with_permutation_invariant_labels():
             "spk-b": "engine:local:speaker-1",
         },
     )
+    policy = replace(default_scoring_policy("diagnostic_diarization"), collar_ms=0)
 
     result = evaluate_diarization_candidate(
         reference,
         candidate,
-        scoring_policy=replace(default_scoring_policy("diagnostic_diarization"), collar_ms=0),
+        scoring_policy=policy,
     )
+    metrics = result.recording_metrics[0].metrics
 
     assert result.speaker_mapping == {
         "engine:local:speaker-1": "spk-b",
         "engine:local:speaker-2": "spk-a",
     }
-    assert result.recording_metrics[0].metrics["speaker_label_accuracy"] == 1.0
-    assert result.recording_metrics[0].metrics["speaker_label_error_rate"] == 0.0
-    assert result.recording_metrics[0].metrics["diarization_error_rate"] == 0.0
-    assert result.recording_metrics[0].metrics["matched_speaker_ms"] == 750
+    assert set(policy.metric_set).issubset(metrics)
+    assert metrics["speaker_label_accuracy"] == 1.0
+    assert metrics["speaker_label_error_rate"] == 0.0
+    assert metrics["diarization_error_rate"] == 0.0
+    assert metrics["speaker_error_rate"] == 0.0
+    assert metrics["false_alarm_rate"] == 0.0
+    assert metrics["miss_rate"] == 0.0
+    assert metrics["matched_speaker_ms"] == 750
 
 
 def test_candidate_from_different_recording_is_rejected_even_with_same_duration():
@@ -284,6 +290,25 @@ def test_large_recordings_only_count_scoreable_reference_speakers_for_exact_mapp
     assert metrics["reference_speaker_count"] == 1
     assert metrics["candidate_speaker_count"] == 1
     assert metrics["mapped_candidate_speaker_count"] == 1
+
+
+def test_unknown_policy_metric_fails_closed():
+    recording = _recording()
+    candidate = _candidate_output(
+        recording,
+        {
+            "spk-a": "engine:local:speaker-1",
+            "spk-b": "engine:local:speaker-2",
+        },
+    )
+    policy = replace(
+        default_scoring_policy("diagnostic_diarization"),
+        collar_ms=0,
+        metric_set=("not_implemented",),
+    )
+
+    with pytest.raises(ValidationError, match="central evaluator does not implement policy metrics"):
+        evaluate_diarization_candidate(_reference_bundle(recording), candidate, scoring_policy=policy)
 
 
 def test_reference_derived_slices_include_required_dimensions_and_sparse_statuses():
@@ -818,18 +843,23 @@ def test_product_policy_excludes_single_speaker_regions_flagged_as_overlap():
         },
     )
 
+    policy = default_scoring_policy("product_transcript")
     result = evaluate_diarization_candidate(
         reference,
         candidate,
-        scoring_policy=default_scoring_policy("product_transcript"),
+        scoring_policy=policy,
     )
     metrics = result.recording_metrics[0].metrics
     overlap_row = {row.slice_id: row for row in result.slice_metrics}["overlap:overlap"]
 
     assert result.speaker_mapping == {"engine:local:speaker-1": "spk-b"}
+    assert set(policy.metric_set).issubset(metrics)
     assert metrics["reference_speaker_ms"] == 400
     assert metrics["matched_speaker_ms"] == 400
     assert metrics["speaker_label_accuracy"] == 1.0
+    assert metrics["word_speaker_label_accuracy"] == 1.0
+    assert metrics["turn_speaker_label_accuracy"] == 1.0
+    assert metrics["speaker_count_error"] == 0
     assert overlap_row.status == "insufficient_support"
     assert overlap_row.support_ms == 0
     assert overlap_row.metrics == {}

@@ -381,7 +381,13 @@ def evaluate_diarization_candidate(
     speaker_mapping = _build_speaker_mapping(reference_spans, candidate_spans, mapping_intervals, policy)
     policy_provenance = scoring_policy_report_provenance(policy)
 
-    recording_metrics = _score_metrics(reference_spans, candidate_spans, scoring_intervals, speaker_mapping, policy)
+    recording_metrics = _score_policy_metrics(
+        reference_spans,
+        candidate_spans,
+        scoring_intervals,
+        speaker_mapping,
+        policy,
+    )
     recording_status: EvaluationMetricStatus = (
         "scored" if recording_metrics["scored_interval_ms"] > 0 else "insufficient_support"
     )
@@ -419,7 +425,7 @@ def evaluate_diarization_candidate(
                 support_ms=scored_support_ms,
                 minimum_support_ms=item.minimum_support_ms,
                 metrics=(
-                    _score_metrics(reference_spans, candidate_spans, scored_intervals, speaker_mapping, policy)
+                    _score_policy_metrics(reference_spans, candidate_spans, scored_intervals, speaker_mapping, policy)
                     if row_status == "scored"
                     else {}
                 ),
@@ -753,6 +759,36 @@ def _score_metrics(
         "speaker_label_accuracy": _round_metric(speaker_label_accuracy),
         "speaker_label_error_rate": _round_metric(1.0 - speaker_label_accuracy),
     }
+
+
+def _score_policy_metrics(
+    reference_spans: tuple[_SpanView, ...],
+    candidate_spans: tuple[_SpanView, ...],
+    intervals: tuple[EvaluationInterval, ...],
+    speaker_mapping: dict[str, str],
+    policy: ScoringPolicyManifest,
+) -> dict[str, Any]:
+    metrics = _score_metrics(reference_spans, candidate_spans, intervals, speaker_mapping, policy)
+    reference_speaker_ms = metrics["reference_speaker_ms"]
+    metrics["speaker_error_rate"] = metrics["speaker_label_error_rate"]
+    metrics["miss_rate"] = (
+        _round_metric(metrics["missed_speaker_ms"] / reference_speaker_ms)
+        if reference_speaker_ms
+        else 0.0
+    )
+    metrics["false_alarm_rate"] = (
+        _round_metric(metrics["false_alarm_speaker_ms"] / reference_speaker_ms)
+        if reference_speaker_ms
+        else (0.0 if metrics["false_alarm_speaker_ms"] == 0 else 1.0)
+    )
+    metrics["word_speaker_label_accuracy"] = metrics["speaker_label_accuracy"]
+    metrics["turn_speaker_label_accuracy"] = metrics["speaker_label_accuracy"]
+    metrics["speaker_count_error"] = abs(metrics["candidate_speaker_count"] - metrics["reference_speaker_count"])
+
+    missing = tuple(metric for metric in policy.metric_set if metric not in metrics)
+    if missing:
+        raise ValidationError(f"central evaluator does not implement policy metrics: {', '.join(missing)}")
+    return metrics
 
 
 def _apply_scoring_collar(
