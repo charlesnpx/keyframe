@@ -229,6 +229,7 @@ class BenchmarkEvaluationCase:
     branch_id: str
     evaluation: DiarizationEvaluationResult
     baseline_evaluation: DiarizationEvaluationResult | None = None
+    scored_duration_ms: int = 0
     scored_words: int = 0
     scored_speaker_turns: int = 0
     slice_scored_words: Mapping[str, int] | None = None
@@ -244,6 +245,11 @@ class BenchmarkEvaluationCase:
             DiarizationEvaluationResult,
         ):
             raise ValidationError("benchmark_case.baseline_evaluation must be a DiarizationEvaluationResult")
+        object.__setattr__(
+            self,
+            "scored_duration_ms",
+            _non_negative_int(self.scored_duration_ms, "benchmark_case.scored_duration_ms"),
+        )
         object.__setattr__(self, "scored_words", _non_negative_int(self.scored_words, "benchmark_case.scored_words"))
         object.__setattr__(
             self,
@@ -991,7 +997,6 @@ def _observations_from_recording_row(
     row: DiarizationRecordingMetricRow,
     baseline_metrics: Mapping[str, Any],
 ) -> tuple[_MetricObservation, ...]:
-    scored_duration_ms = _metric_int(row.metrics, "scored_interval_ms")
     return tuple(
         _MetricObservation(
             corpus_id=case.corpus_id,
@@ -1000,7 +1005,7 @@ def _observations_from_recording_row(
             metric_name=metric_name,
             point_score=point_score,
             baseline_score=_optional_metric_number(baseline_metrics, metric_name),
-            scored_duration_ms=scored_duration_ms,
+            scored_duration_ms=case.scored_duration_ms,
             scored_words=case.scored_words,
             scored_speaker_turns=case.scored_speaker_turns,
             source_scope="recording",
@@ -1318,7 +1323,7 @@ def _has_failed_gate(
         for result in results
     ):
         return True
-    return critical_score is not None and critical_score.status == "failed"
+    return critical_score is not None and critical_score.status != "passed"
 
 
 def _markdown_metric_table(title: str, results: tuple[BenchmarkMetricResult, ...]) -> list[str]:
@@ -1493,13 +1498,6 @@ def _optional_metric_number(metrics: Mapping[str, Any], metric_name: str) -> flo
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         return None
     return _finite_number(value, f"baseline_metric.{metric_name}")
-
-
-def _metric_int(metrics: Mapping[str, Any], metric_name: str) -> int:
-    value = metrics.get(metric_name, 0)
-    if not isinstance(value, int) or isinstance(value, bool):
-        return 0
-    return _non_negative_int(value, f"metric.{metric_name}")
 
 
 def _mean(values: tuple[float, ...]) -> float:

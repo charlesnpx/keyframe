@@ -1,5 +1,4 @@
 import json
-from pathlib import Path
 
 import pytest
 
@@ -35,6 +34,7 @@ def _evaluation(
     overlap_der,
     boundary_accuracy=0.95,
     scored_interval_ms=1_000,
+    include_scored_interval_metric=True,
 ):
     slices = (
         EvaluationSliceDefinition(
@@ -62,11 +62,11 @@ def _evaluation(
             output_id=output_id,
             policy_id="diagnostic-diarization-v1",
             status="scored",
-            metrics={
-                "diarization_error_rate": recording_der,
-                "speaker_label_accuracy": 1.0 - recording_der,
-                "scored_interval_ms": scored_interval_ms,
-            },
+            metrics=_recording_metrics(
+                recording_der,
+                scored_interval_ms=scored_interval_ms,
+                include_scored_interval_metric=include_scored_interval_metric,
+            ),
             speaker_mapping={},
         ),
     )
@@ -142,6 +142,7 @@ def _case_with_support(
             recording_der=current_der,
             overlap_der=current_overlap_der,
             scored_interval_ms=scored_interval_ms,
+            include_scored_interval_metric=False,
         ),
         baseline_evaluation=_evaluation(
             f"{recording_id}-baseline",
@@ -149,7 +150,9 @@ def _case_with_support(
             recording_der=baseline_der,
             overlap_der=baseline_overlap_der,
             scored_interval_ms=scored_interval_ms,
+            include_scored_interval_metric=False,
         ),
+        scored_duration_ms=scored_interval_ms,
         scored_words=20,
         scored_speaker_turns=4,
         slice_scored_words={
@@ -161,6 +164,16 @@ def _case_with_support(
             "speaker_change_boundary:within_collar": 1,
         },
     )
+
+
+def _recording_metrics(recording_der, *, scored_interval_ms, include_scored_interval_metric):
+    metrics = {
+        "diarization_error_rate": recording_der,
+        "speaker_label_accuracy": 1.0 - recording_der,
+    }
+    if include_scored_interval_metric:
+        metrics["scored_interval_ms"] = scored_interval_ms
+    return metrics
 
 
 def _signals():
@@ -354,6 +367,7 @@ def test_configured_regression_budget_without_baseline_fails_report():
                     overlap_der=0.10,
                 ),
                 baseline_evaluation=None,
+                scored_duration_ms=1_000,
                 scored_words=20,
                 scored_speaker_turns=4,
             ),
@@ -378,6 +392,7 @@ def test_configured_regression_budget_without_baseline_fails_report():
     assert report.status == "failed"
     assert branch_der.gate.status == "unavailable"
     assert branch_der.gate.budget_id == "branch-der"
+    assert branch_der.scored_duration_ms == 1_000
 
 
 def test_report_json_round_trip_and_markdown_emitters(tmp_path):
@@ -499,3 +514,38 @@ def test_report_embeds_review_signal_and_critical_span_diagnostics():
     assert report.critical_span_diagnostic is not None
     assert report.critical_span_diagnostic.status == "passed"
     assert "Critical Span Diagnostic" in benchmark_report_to_markdown(report)
+
+
+def test_report_fails_when_configured_critical_span_policy_has_no_diagnostic_support():
+    policy = CriticalSpanPolicyDefinition(
+        policy_id="critical-span-diagnostic",
+        version="v1",
+        description="Synthetic diagnostic hook for serious review spans.",
+        critical_severities=("serious",),
+        minimum_recall=1.0,
+    )
+
+    report = build_benchmark_report(
+        "unsupported-critical-spans",
+        (
+            _case("rec-1", current_der=0.05, baseline_der=0.05, current_overlap_der=0.10, baseline_overlap_der=0.10),
+        ),
+        review_signals=(
+            ReviewSignalSpan(
+                signal_id="minor-only",
+                corpus_id="ami-smoke",
+                branch_id="separate-tracks",
+                recording_id="rec-1",
+                start_ms=0,
+                end_ms=100,
+                severity="minor",
+                reference_review_required=True,
+                predicted_review_required=True,
+            ),
+        ),
+        critical_span_policy=policy,
+    )
+
+    assert report.status == "failed"
+    assert report.critical_span_diagnostic is not None
+    assert report.critical_span_diagnostic.status == "unavailable"
