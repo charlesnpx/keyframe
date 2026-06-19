@@ -395,6 +395,68 @@ def test_configured_regression_budget_without_baseline_fails_report():
     assert branch_der.scored_duration_ms == 1_000
 
 
+def test_report_requires_at_least_one_scored_metric_observation():
+    with pytest.raises(ValidationError, match="at least one scored metric observation"):
+        build_benchmark_report("empty-report", ())
+
+
+def test_configured_regression_budget_must_match_a_metric_result():
+    with pytest.raises(ValidationError, match="regression budgets did not match"):
+        build_benchmark_report(
+            "unmatched-budget",
+            (
+                _case(
+                    "rec-1",
+                    current_der=0.05,
+                    baseline_der=0.05,
+                    current_overlap_der=0.10,
+                    baseline_overlap_der=0.10,
+                ),
+            ),
+            gate_config=BenchmarkGateConfig(
+                budgets=(
+                    BenchmarkRegressionBudget(
+                        budget_id="missing-metric",
+                        metric_name="false_confident_rate",
+                        budget_kind="false_confidence",
+                        min_point_score=0.9,
+                    ),
+                )
+            ),
+        )
+
+
+def test_paired_baseline_must_match_recording_and_scoring_policy():
+    current = _evaluation("rec-1-current", "rec-1", recording_der=0.05, overlap_der=0.10)
+    different_recording = _evaluation("rec-2-baseline", "rec-2", recording_der=0.05, overlap_der=0.10)
+    different_policy = DiarizationEvaluationResult(
+        recording_id="rec-1",
+        output_id="rec-1-baseline",
+        scoring_policy={"policy_id": "product-transcript-v1", "version": "1"},
+        speaker_mapping={},
+        slices=current.slices,
+        recording_metrics=current.recording_metrics,
+        slice_metrics=current.slice_metrics,
+        reference_artifact=current.reference_artifact,
+        candidate_artifact=current.candidate_artifact,
+    )
+
+    with pytest.raises(ValidationError, match="recording_id must match"):
+        BenchmarkEvaluationCase(
+            corpus_id="ami-smoke",
+            branch_id="separate-tracks",
+            evaluation=current,
+            baseline_evaluation=different_recording,
+        )
+    with pytest.raises(ValidationError, match="scoring_policy must match"):
+        BenchmarkEvaluationCase(
+            corpus_id="ami-smoke",
+            branch_id="separate-tracks",
+            evaluation=current,
+            baseline_evaluation=different_policy,
+        )
+
+
 def test_report_json_round_trip_and_markdown_emitters(tmp_path):
     report = build_benchmark_report(
         "emitters",

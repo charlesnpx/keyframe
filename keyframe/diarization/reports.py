@@ -240,11 +240,13 @@ class BenchmarkEvaluationCase:
         object.__setattr__(self, "branch_id", _require_id(self.branch_id, "benchmark_case.branch_id"))
         if not isinstance(self.evaluation, DiarizationEvaluationResult):
             raise ValidationError("benchmark_case.evaluation must be a DiarizationEvaluationResult")
-        if self.baseline_evaluation is not None and not isinstance(
-            self.baseline_evaluation,
-            DiarizationEvaluationResult,
-        ):
-            raise ValidationError("benchmark_case.baseline_evaluation must be a DiarizationEvaluationResult")
+        if self.baseline_evaluation is not None:
+            if not isinstance(self.baseline_evaluation, DiarizationEvaluationResult):
+                raise ValidationError("benchmark_case.baseline_evaluation must be a DiarizationEvaluationResult")
+            if self.baseline_evaluation.recording_id != self.evaluation.recording_id:
+                raise ValidationError("benchmark_case.baseline_evaluation recording_id must match evaluation")
+            if self.baseline_evaluation.scoring_policy != self.evaluation.scoring_policy:
+                raise ValidationError("benchmark_case.baseline_evaluation scoring_policy must match evaluation")
         object.__setattr__(
             self,
             "scored_duration_ms",
@@ -743,10 +745,14 @@ def build_benchmark_report(
         raise ValidationError("gate_config must be a BenchmarkGateConfig")
     review_signals = _tuple_of(review_signals, ReviewSignalSpan, "review_signals")
     observations = tuple(observation for case in cases for observation in _observations_from_case(case))
+    if not observations:
+        raise ValidationError("benchmark reports require at least one scored metric observation")
     corpus_results = _metric_results_for_scope(observations, "corpus", gate_config)
     branch_results = _metric_results_for_scope(observations, "branch", gate_config)
     recording_results = _metric_results_for_scope(observations, "recording", gate_config)
     slice_results = _metric_results_for_scope(observations, "slice", gate_config)
+    all_results = corpus_results + branch_results + recording_results + slice_results
+    _validate_all_budgets_matched(gate_config, all_results)
     review_calibration = calibrate_review_signals(review_signals) if review_signals else None
     critical_score = (
         score_diagnostic_critical_spans(review_signals, critical_span_policy)
@@ -754,7 +760,7 @@ def build_benchmark_report(
         else None
     )
     status: BenchmarkReportStatus = "failed" if _has_failed_gate(
-        corpus_results + branch_results + recording_results + slice_results,
+        all_results,
         critical_score,
     ) else "passed"
     return BenchmarkReport(
@@ -1231,6 +1237,23 @@ def _matching_budget(
             if value is not None
         ),
     )
+
+
+def _validate_all_budgets_matched(
+    gate_config: BenchmarkGateConfig,
+    results: tuple[BenchmarkMetricResult, ...],
+) -> None:
+    matched_budget_ids = {
+        result.gate.budget_id
+        for result in results
+        if result.gate.budget_id is not None
+    }
+    unmatched_budget_ids = {budget.budget_id for budget in gate_config.budgets} - matched_budget_ids
+    if unmatched_budget_ids:
+        raise ValidationError(
+            "regression budgets did not match any metric result: "
+            + ", ".join(sorted(unmatched_budget_ids))
+        )
 
 
 def _uncertainty_interval(values: tuple[float, ...], *, basis: str) -> UncertaintyInterval:
