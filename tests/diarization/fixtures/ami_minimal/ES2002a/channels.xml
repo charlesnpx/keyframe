@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<channels recording_id="ES2002a">
+  <channel id="ihm-P1" name="Headset microphone 1" source_speaker_id="AMI-P1" />
+  <channel id="ihm-P2" name="Headset microphone 2" source_speaker_id="AMI-P2" />
+</channels>
