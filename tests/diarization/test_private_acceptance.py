@@ -406,3 +406,17 @@ def test_required_coverage_targets_must_be_promoted_through_private_acceptance_p
                 targets=(_coverage_target("diagnostic-unadjudicated"),),
             )
         )
+
+
+def test_private_acceptance_coverage_rejects_unknown_observation_slice_ids():
+    with pytest.raises(ValidationError, match="coverage observation references unknown slice_id: stale-slice"):
+        evaluate_private_acceptance_coverage(
+            _metadata(coverage_plan=_coverage_plan()),
+            (
+                PrivateAcceptanceCoverageObservation(
+                    slice_id="stale-slice",
+                    scored_recording_count=10,
+                    scored_duration_ms=1_200_000,
+                ),
+            ),
+        )

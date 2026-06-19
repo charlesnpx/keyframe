@@ -682,8 +682,11 @@ def evaluate_private_acceptance_coverage(
         raise ValidationError("metadata.coverage_plan is required")
     plan = metadata.coverage_plan
     observations = _tuple_of(observations, PrivateAcceptanceCoverageObservation, "coverage_observations")
+    target_ids = {target.slice_id for target in plan.targets}
     observed_by_slice: dict[str, PrivateAcceptanceCoverageObservation] = {}
     for observation in observations:
+        if observation.slice_id not in target_ids:
+            raise ValidationError(f"coverage observation references unknown slice_id: {observation.slice_id}")
         if observation.slice_id in observed_by_slice:
             raise ValidationError(f"duplicate coverage observation slice_id: {observation.slice_id}")
         observed_by_slice[observation.slice_id] = observation
