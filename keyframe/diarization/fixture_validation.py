@@ -281,6 +281,7 @@ def validate_candidate_bundle_against_reference(
     issues: list[FixtureValidationIssue] = []
     audio = payload["audio"]
     channels = payload["channels"]
+    timeline = payload["runtime_hints"]["timeline"]
     if audio["duration_ms"] != recording.duration_ms:
         issues.append(
             _issue(
@@ -302,6 +303,14 @@ def validate_candidate_bundle_against_reference(
             _issue(
                 "audio_metadata_mismatch",
                 "candidate audio time_basis does not match canonical reference",
+                recording_id=recording.recording_id,
+            )
+        )
+    if timeline["timeline_id"] != recording.timeline_id:
+        issues.append(
+            _issue(
+                "audio_metadata_mismatch",
+                "candidate audio timeline_id does not match canonical reference",
                 recording_id=recording.recording_id,
             )
         )

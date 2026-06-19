@@ -153,11 +153,16 @@ def test_candidate_validation_reports_redaction_and_audio_metadata_failures():
     drift_payload["runtime_hints"]["timeline"]["channel_ids"][0] = "wrong-channel"
     channel_drift = validate_candidate_bundle_against_reference(drift_payload, recording)
 
+    timeline_payload = copy.deepcopy(payload)
+    timeline_payload["runtime_hints"]["timeline"]["timeline_id"] = "wrong-timeline"
+    timeline_drift = validate_candidate_bundle_against_reference(timeline_payload, recording)
+
     assert leaked.status == "invalid_fixture"
     assert leaked.issues[0].category == "reference_leakage"
     assert mismatch.issues[0].category == "audio_metadata_mismatch"
     assert channel_mismatch.issues[0].category == "audio_metadata_mismatch"
     assert channel_drift.issues[0].category == "audio_metadata_mismatch"
+    assert timeline_drift.issues[0].category == "audio_metadata_mismatch"
 
 
 def test_fixture_gate_allows_mono_mix_when_enabled_for_multichannel_reference():
