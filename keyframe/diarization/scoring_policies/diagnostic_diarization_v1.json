@@ -1,0 +1,20 @@
+{
+  "channel_mode": "per_channel",
+  "collar_ms": 250,
+  "description": "Default diagnostic diarization scoring policy for benchmark reference and hypothesis RTTM comparisons.",
+  "evaluator_version": "dscore-compatible-v1",
+  "ignored_tokens": [],
+  "metric_set": [
+    "diarization_error_rate",
+    "speaker_error_rate",
+    "false_alarm_rate",
+    "miss_rate"
+  ],
+  "policy_id": "diagnostic-diarization-v1",
+  "policy_kind": "diagnostic_diarization",
+  "score_overlap": true,
+  "speaker_count_mode": "known",
+  "text_normalization": "none",
+  "uem_regions": "canonical_scoring_regions",
+  "version": "1"
+}
