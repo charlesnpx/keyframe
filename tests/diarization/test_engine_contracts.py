@@ -256,10 +256,12 @@ def test_timeline_mismatch_accepts_valid_transform_offset_map():
     )
 
     output = _adapter().normalize_raw_output(
-        _payload("clean_provider.json"),
+        _payload("vad_trimmed_source.json"),
         artifact=target,
         source_artifact=source,
         transform_offset_map=offset_map,
     )
 
     assert output.words[0].text == "hello"
+    assert [(word.start_ms, word.end_ms) for word in output.words] == [(100, 400), (450, 750)]
+    assert [(span.start_ms, span.end_ms) for span in output.speaker_spans] == [(100, 750)]

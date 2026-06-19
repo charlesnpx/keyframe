@@ -365,7 +365,11 @@ def _canonical_word_interval(
     if end <= start:
         raise ValidationError("raw_engine_output word end must be greater than start")
     if time_basis == "canonical_ms":
-        return int(start), int(end)
+        start_ms = int(start)
+        end_ms = int(end)
+        if offset_map is not None:
+            return offset_map.convert_source_ms(start_ms), offset_map.convert_source_ms(end_ms)
+        return start_ms, end_ms
     if time_basis == "chunk_relative_ms":
         chunk_start_ms = _chunk_start_ms(word_payload, segment_payload, offset_map, field_name)
         return int(start + chunk_start_ms), int(end + chunk_start_ms)
