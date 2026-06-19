@@ -1,3 +1,4 @@
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -302,3 +303,37 @@ def test_run_record_creation_rejects_split_lists_outside_manifest(tmp_path, fiel
             cache=DatasetCacheConfig(cache_root=str(tmp_path / "cache")),
             **kwargs,
         )
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda payload: payload.update({"dataset_id": "different-dataset"}),
+            "dataset_id must match dataset_snapshot.dataset_id",
+        ),
+        (
+            lambda payload: payload.update({"evaluated_split_ids": ["ami-public-dev", "not-in-manifest"]}),
+            "run_record.evaluated_split_ids contains unknown split",
+        ),
+        (
+            lambda payload: payload.update({"tuned_split_ids": ["not-in-manifest"]}),
+            "run_record.tuned_split_ids contains unknown split",
+        ),
+    ],
+)
+def test_run_record_loader_rejects_snapshot_and_split_tampering(tmp_path, mutate, message):
+    manifest = _ami_manifest()
+    record = create_benchmark_run_record(
+        run_id="run-001",
+        manifest=manifest,
+        split_id="ami-public-dev",
+        branch="feature/diarization-benchmark-platform",
+        artifact_root=tmp_path / "artifacts",
+        cache=DatasetCacheConfig(cache_root=str(tmp_path / "cache")),
+    )
+    payload = record.to_dict()
+    mutate(payload)
+
+    with pytest.raises(ValidationError, match=message):
+        benchmark_run_record_json_loads(json.dumps(payload))

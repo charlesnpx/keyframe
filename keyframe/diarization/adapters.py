@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from keyframe.diarization.bundles import ReferenceBundle
-from keyframe.diarization.manifests import DatasetManifest, DatasetSplitManifest
+from keyframe.diarization.manifests import DatasetManifest, DatasetSplitManifest, dataset_manifest_from_dict
 from keyframe.diarization.models import CanonicalRecording, ValidationError
 
 
@@ -411,17 +411,29 @@ def benchmark_run_record_from_dict(payload: dict[str, Any]) -> BenchmarkRunRecor
         },
         "run_record",
     )
+    dataset_snapshot = dataset_manifest_from_dict(_required(data, "dataset_snapshot", "run_record"))
+    dataset_id = _required(data, "dataset_id", "run_record")
+    if dataset_id != dataset_snapshot.dataset_id:
+        raise ValidationError("run_record.dataset_id must match dataset_snapshot.dataset_id")
+    split_id = _required(data, "split_id", "run_record")
+    manifest_split_ids = frozenset(split.split_id for split in dataset_snapshot.splits)
+    if split_id not in manifest_split_ids:
+        raise ValidationError(f"run_record.split_id is unknown: {split_id}")
+    tuned_split_ids = tuple(_sequence(data.get("tuned_split_ids", ())))
+    evaluated_split_ids = tuple(_sequence(_required(data, "evaluated_split_ids", "run_record")))
+    _validate_manifest_split_ids(tuned_split_ids, manifest_split_ids, "run_record.tuned_split_ids")
+    _validate_manifest_split_ids(evaluated_split_ids, manifest_split_ids, "run_record.evaluated_split_ids")
     return BenchmarkRunRecord(
         schema_version=_required(data, "schema_version", "run_record"),
         run_id=_required(data, "run_id", "run_record"),
-        dataset_id=_required(data, "dataset_id", "run_record"),
-        dataset_snapshot=_required(data, "dataset_snapshot", "run_record"),
-        split_id=_required(data, "split_id", "run_record"),
+        dataset_id=dataset_id,
+        dataset_snapshot=dataset_snapshot.to_dict(),
+        split_id=split_id,
         branch=_required(data, "branch", "run_record"),
         artifact_layout=_artifact_layout_from_dict(_required(data, "artifact_layout", "run_record")),
         cache_root=data.get("cache_root"),
-        tuned_split_ids=tuple(_sequence(data.get("tuned_split_ids", ()))),
-        evaluated_split_ids=tuple(_sequence(_required(data, "evaluated_split_ids", "run_record"))),
+        tuned_split_ids=tuned_split_ids,
+        evaluated_split_ids=evaluated_split_ids,
         execution_mode=_required(data, "execution_mode", "run_record"),
         no_network=_required(data, "no_network", "run_record"),
         derived_artifacts=data.get("derived_artifacts", {}),
