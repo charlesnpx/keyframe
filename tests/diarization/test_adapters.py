@@ -135,6 +135,14 @@ def test_default_preparation_rejects_network_and_download_policy(tmp_path):
     with pytest.raises(ValidationError, match="downloads require an explicit allow_download"):
         plan_dataset_preparation(manifest, no_download_cache, download=True)
 
+    download_cache = DatasetCacheConfig(
+        cache_root=str(tmp_path / "cache"),
+        allow_download=True,
+        allow_network=True,
+    )
+    with pytest.raises(ValidationError, match="downloads require public_direct access"):
+        plan_dataset_preparation(manifest, download_cache, download=True)
+
 
 def test_explicit_download_plan_requires_public_direct_manifest_and_policy(tmp_path):
     manifest = DatasetManifest(
@@ -271,4 +279,26 @@ def test_run_record_validation_rejects_unknown_split_and_inconsistent_evaluated_
             evaluated_split_ids=("ami-public-holdout",),
             execution_mode="default_no_network",
             no_network=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "kwargs"),
+    [
+        ("run_record.tuned_split_ids", {"tuned_split_ids": ("missing-split",)}),
+        ("run_record.evaluated_split_ids", {"evaluated_split_ids": ("missing-split",)}),
+    ],
+)
+def test_run_record_creation_rejects_split_lists_outside_manifest(tmp_path, field_name, kwargs):
+    manifest = _ami_manifest()
+
+    with pytest.raises(ValidationError, match=f"{field_name} contains unknown split"):
+        create_benchmark_run_record(
+            run_id="run-001",
+            manifest=manifest,
+            split_id="ami-public-dev",
+            branch="feature/diarization-benchmark-platform",
+            artifact_root=tmp_path / "artifacts",
+            cache=DatasetCacheConfig(cache_root=str(tmp_path / "cache")),
+            **kwargs,
         )

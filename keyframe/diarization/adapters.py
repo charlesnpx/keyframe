@@ -321,8 +321,8 @@ def plan_dataset_preparation(
     ensure_adapter_cache_policy(manifest, cache, execution_mode=execution_mode)
     if download and not cache.allow_download:
         raise ValidationError("dataset downloads require an explicit allow_download cache policy")
-    if download and manifest.access.mode in {"auth_required", "local_only", "forbidden"}:
-        raise ValidationError("this dataset access mode cannot be downloaded automatically")
+    if download and manifest.access.mode != "public_direct":
+        raise ValidationError("dataset downloads require public_direct access")
     split_ids = tuple(split.split_id for split in manifest.splits)
     actions = ["validate_manifest"]
     if cache.cache_root is not None:
@@ -353,10 +353,13 @@ def create_benchmark_run_record(
     derived_artifacts: dict[str, str] | None = None,
 ) -> BenchmarkRunRecord:
     ensure_adapter_cache_policy(manifest, cache, execution_mode=execution_mode)
-    if not any(split.split_id == split_id for split in manifest.splits):
+    manifest_split_ids = frozenset(split.split_id for split in manifest.splits)
+    if split_id not in manifest_split_ids:
         raise ValidationError(f"run_record.split_id is unknown: {split_id}")
     if not evaluated_split_ids:
         evaluated_split_ids = (split_id,)
+    _validate_manifest_split_ids(tuned_split_ids, manifest_split_ids, "run_record.tuned_split_ids")
+    _validate_manifest_split_ids(evaluated_split_ids, manifest_split_ids, "run_record.evaluated_split_ids")
     return BenchmarkRunRecord(
         run_id=run_id,
         dataset_id=manifest.dataset_id,
@@ -474,6 +477,13 @@ def _validate_execution_mode(value: object) -> BenchmarkExecutionMode:
     if value not in _ALLOWED_EXECUTION_MODES:
         raise ValidationError(f"execution_mode is not supported: {value}")
     return value  # type: ignore[return-value]
+
+
+def _validate_manifest_split_ids(values: tuple[str, ...], manifest_split_ids: frozenset[str], field_name: str) -> None:
+    for value in values:
+        value = _require_id(value, field_name)
+        if value not in manifest_split_ids:
+            raise ValidationError(f"{field_name} contains unknown split: {value}")
 
 
 def _optional_local_path(value: object, field_name: str) -> str | None:
