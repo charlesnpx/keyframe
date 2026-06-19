@@ -410,6 +410,65 @@ def test_rendered_transcript_policy_collapses_physical_channels_for_scoring():
     assert short_turn_metrics["false_alarm_speaker_ms"] == 0
 
 
+def test_collapsed_channel_policy_rejects_mismatched_per_channel_uem_regions():
+    recording = _recording()
+    multichannel = replace(
+        recording,
+        channels=(
+            recording.channels[0],
+            ChannelRecord("ch-2", "second"),
+        ),
+        words=(),
+        speaker_spans=(
+            SpeakerSpan(
+                span_id="span-1",
+                speaker_ref="spk-a",
+                start_ms=0,
+                end_ms=500,
+                channel_id="ch-1",
+            ),
+            SpeakerSpan(
+                span_id="span-2",
+                speaker_ref="spk-b",
+                start_ms=500,
+                end_ms=1_000,
+                channel_id="ch-2",
+            ),
+        ),
+        scoring_regions=(
+            ScoringRegion("uem-1", 0, 1_000, channel_id="ch-1"),
+            ScoringRegion("uem-2", 500, 1_000, channel_id="ch-2"),
+        ),
+    )
+    candidate = _candidate_output(
+        multichannel,
+        {
+            "spk-a": "engine:local:speaker-1",
+            "spk-b": "engine:local:speaker-2",
+        },
+    )
+    rendered_candidate = replace(
+        candidate,
+        words=tuple(replace(word, channel_id=None) for word in candidate.words),
+        speaker_spans=tuple(replace(span, channel_id=None) for span in candidate.speaker_spans),
+    )
+    policy = replace(
+        default_scoring_policy("diagnostic_diarization"),
+        channel_mode="rendered_transcript",
+        collar_ms=0,
+    )
+
+    with pytest.raises(
+        ValidationError,
+        match="collapsed-channel scoring requires identical canonical scoring regions",
+    ):
+        evaluate_diarization_candidate(
+            _reference_bundle(multichannel),
+            rendered_candidate,
+            scoring_policy=policy,
+        )
+
+
 def test_overlap_reference_scores_overlap_slice_when_reference_supports_it():
     recording = _recording("overlap.json")
     reference = _reference_bundle(recording)

@@ -459,10 +459,15 @@ def _validate_candidate_timeline(recording: CanonicalRecording, candidate: Norma
 def _scoring_intervals(recording: CanonicalRecording, policy: ScoringPolicyManifest) -> tuple[EvaluationInterval, ...]:
     collapse_channels = policy.channel_mode in {"mono_mix", "rendered_transcript"}
     if policy.uem_regions == "canonical_scoring_regions" and recording.scoring_regions:
-        intervals = tuple(
-            EvaluationInterval(region.start_ms, region.end_ms, None if collapse_channels else region.channel_id)
+        source_intervals = tuple(
+            EvaluationInterval(region.start_ms, region.end_ms, region.channel_id)
             for region in recording.scoring_regions
         )
+        if collapse_channels:
+            _validate_collapsible_channel_uem(source_intervals, recording)
+            intervals = tuple(EvaluationInterval(item.start_ms, item.end_ms, None) for item in source_intervals)
+        else:
+            intervals = source_intervals
     else:
         channel_ids: tuple[str | None, ...] = (
             (None,)
@@ -471,6 +476,31 @@ def _scoring_intervals(recording: CanonicalRecording, policy: ScoringPolicyManif
         )
         intervals = tuple(EvaluationInterval(0, recording.duration_ms, channel_id) for channel_id in channel_ids)
     return _normalize_intervals(intervals)
+
+
+def _validate_collapsible_channel_uem(
+    intervals: tuple[EvaluationInterval, ...],
+    recording: CanonicalRecording,
+) -> None:
+    channel_ids = tuple(channel.channel_id for channel in recording.channels)
+    if not channel_ids or any(interval.channel_id is None for interval in intervals):
+        return
+
+    expected: tuple[EvaluationInterval, ...] | None = None
+    for channel_id in channel_ids:
+        coverage = _normalize_intervals(
+            tuple(
+                EvaluationInterval(interval.start_ms, interval.end_ms, None)
+                for interval in intervals
+                if interval.channel_id == channel_id
+            )
+        )
+        if expected is None:
+            expected = coverage
+        elif coverage != expected:
+            raise ValidationError(
+                "collapsed-channel scoring requires identical canonical scoring regions per channel"
+            )
 
 
 def _spans_from_recording(recording: CanonicalRecording) -> tuple[_SpanView, ...]:
