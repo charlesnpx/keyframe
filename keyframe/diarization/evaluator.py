@@ -411,9 +411,8 @@ def _reference_recording(reference: ReferenceBundle | CanonicalRecording) -> Can
 
 
 def _validate_candidate_timeline(recording: CanonicalRecording, candidate: NormalizedEngineOutput) -> None:
+    candidate.artifact.timeline.assert_consistent_with_recording(recording)
     timeline = candidate.artifact.timeline
-    if timeline.duration_ms != recording.duration_ms:
-        raise ValidationError("candidate timeline duration_ms conflicts with reference recording")
     if timeline.time_basis != "canonical_ms" or recording.time_basis != "canonical_ms":
         raise ValidationError("central evaluator requires canonical_ms timelines")
     for span in candidate.speaker_spans:
@@ -505,6 +504,11 @@ def _build_speaker_mapping(
 ) -> dict[str, str]:
     reference_speakers = tuple(sorted({span.speaker_ref for span in reference_spans}))
     candidate_speakers = tuple(sorted({span.speaker_ref for span in candidate_spans}))
+    if len(reference_speakers) > _MAX_EXACT_ASSIGNMENT_REFERENCES:
+        raise ValidationError(
+            "speaker assignment requires exact maximum-weight matching; "
+            "too many reference speakers for the bounded exact matcher"
+        )
     weights: dict[tuple[str, str], int] = {}
     for atom in _atomic_intervals(scoring_intervals, reference_spans, candidate_spans):
         active_reference_spans = _active_spans(reference_spans, atom)
@@ -516,8 +520,6 @@ def _build_speaker_mapping(
         for candidate_ref in active_candidate:
             for reference_ref in active_reference:
                 weights[(candidate_ref, reference_ref)] = weights.get((candidate_ref, reference_ref), 0) + duration_ms
-    if len(reference_speakers) > _MAX_EXACT_ASSIGNMENT_REFERENCES:
-        return _greedy_speaker_mapping(candidate_speakers, reference_speakers, weights)
     return _exact_speaker_mapping(candidate_speakers, reference_speakers, weights)
 
 
@@ -547,31 +549,6 @@ def _exact_speaker_mapping(
         states = next_states
     best = max(states.values(), key=lambda item: (item[0], len(item[1]), tuple(reversed(item[1]))))
     return dict(best[1])
-
-
-def _greedy_speaker_mapping(
-    candidate_speakers: tuple[str, ...],
-    reference_speakers: tuple[str, ...],
-    weights: dict[tuple[str, str], int],
-) -> dict[str, str]:
-    unused_candidates = set(candidate_speakers)
-    unused_references = set(reference_speakers)
-    mapping: dict[str, str] = {}
-    pairs = sorted(
-        (
-            (weight, candidate_ref, reference_ref)
-            for (candidate_ref, reference_ref), weight in weights.items()
-            if weight > 0
-        ),
-        key=lambda item: (-item[0], item[1], item[2]),
-    )
-    for _, candidate_ref, reference_ref in pairs:
-        if candidate_ref not in unused_candidates or reference_ref not in unused_references:
-            continue
-        mapping[candidate_ref] = reference_ref
-        unused_candidates.remove(candidate_ref)
-        unused_references.remove(reference_ref)
-    return mapping
 
 
 def _assignment_is_better(

@@ -2,6 +2,8 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 from keyframe.diarization import (
     EngineConfigMetadata,
     NormalizedArtifactProvenance,
@@ -15,6 +17,7 @@ from keyframe.diarization import (
     evaluate_diarization_candidate,
     read_recording_json,
     render_transcript,
+    ValidationError,
 )
 
 
@@ -79,6 +82,27 @@ def _candidate_recording(recording, candidate):
     )
 
 
+def _many_speaker_recording(speaker_count=17):
+    recording = _recording()
+    speaker_refs = tuple(f"spk-{index:02d}" for index in range(speaker_count))
+    return replace(
+        recording,
+        duration_ms=2_000,
+        speakers=tuple(SpeakerRecord(speaker_ref) for speaker_ref in speaker_refs),
+        words=(),
+        speaker_spans=tuple(
+            SpeakerSpan(
+                span_id=f"span-{index:02d}",
+                speaker_ref=speaker_ref,
+                start_ms=index * 100,
+                end_ms=index * 100 + 50,
+                channel_id="ch-1",
+            )
+            for index, speaker_ref in enumerate(speaker_refs)
+        ),
+    )
+
+
 def test_perfect_anonymous_diarizer_scores_with_permutation_invariant_labels():
     recording = _recording()
     reference = _reference_bundle(recording)
@@ -100,6 +124,38 @@ def test_perfect_anonymous_diarizer_scores_with_permutation_invariant_labels():
     assert result.recording_metrics[0].metrics["speaker_label_error_rate"] == 0.0
     assert result.recording_metrics[0].metrics["diarization_error_rate"] == 0.0
     assert result.recording_metrics[0].metrics["matched_speaker_ms"] == 750
+
+
+def test_candidate_from_different_recording_is_rejected_even_with_same_duration():
+    recording = _recording()
+    other_recording = replace(
+        recording,
+        recording_id="different-recording",
+        original_audio_id="different-original",
+        canonical_audio_id="different-canonical",
+        timeline_id="different-timeline",
+    )
+    candidate = _candidate_output(
+        other_recording,
+        {
+            "spk-a": "engine:local:speaker-2",
+            "spk-b": "engine:local:speaker-1",
+        },
+    )
+
+    with pytest.raises(ValidationError, match="conflicts"):
+        evaluate_diarization_candidate(_reference_bundle(recording), candidate)
+
+
+def test_large_speaker_assignment_fails_closed_instead_of_using_greedy_mapping():
+    recording = _many_speaker_recording()
+    candidate = _candidate_output(
+        recording,
+        {speaker.speaker_ref: f"engine:{speaker.speaker_ref}" for speaker in recording.speakers},
+    )
+
+    with pytest.raises(ValidationError, match="bounded exact matcher"):
+        evaluate_diarization_candidate(_reference_bundle(recording), candidate)
 
 
 def test_reference_derived_slices_include_required_dimensions_and_sparse_statuses():
