@@ -1,0 +1,11 @@
+{
+  "dataset_id": "ami",
+  "notes": [
+    "Smoke CI split descriptor for the tiny checked-in AMI-shaped fixture.",
+    "Full AMI corpus media and annotations remain manually acquired for controlled jobs."
+  ],
+  "recording_ids": [
+    "ES2002a"
+  ],
+  "split_id": "ami-smoke-ci"
+}

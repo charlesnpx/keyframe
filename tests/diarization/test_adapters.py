@@ -88,7 +88,11 @@ def test_fake_adapter_lifecycle_hooks_keep_scoring_centralized(tmp_path):
     layout = build_artifact_layout(tmp_path / "artifacts")
 
     assert isinstance(adapter, DatasetAdapter)
-    assert [split.split_id for split in adapter.describe_splits()] == ["ami-public-dev", "ami-public-holdout"]
+    assert [split.split_id for split in adapter.describe_splits()] == [
+        "ami-smoke-ci",
+        "ami-public-dev",
+        "ami-public-holdout",
+    ]
 
     plan = adapter.prepare(cache)
     validation = adapter.validate_source("ami-public-dev", cache)
@@ -118,7 +122,7 @@ def test_default_preparation_is_no_network_and_no_download(tmp_path):
         "dataset_id": "ami",
         "download_required": False,
         "network_required": False,
-        "split_ids": ["ami-public-dev", "ami-public-holdout"],
+        "split_ids": ["ami-smoke-ci", "ami-public-dev", "ami-public-holdout"],
     }
 
 

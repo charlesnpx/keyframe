@@ -10,6 +10,13 @@
   "dataset_id": "ami",
   "expected_files": [
     {
+      "checksum_sha256": "34e8830f948e6b4be5bf91dc634ca7a943a0b034dfecacb6deb73fd4b2acc7f8",
+      "file_role": "split",
+      "path": "keyframe/diarization/dataset_manifests/ami_smoke_split.json",
+      "size_bytes": 281,
+      "source_url": "https://github.com/charlesnpx/keyframe"
+    },
+    {
       "checksum_sha256": "3de421b49a168ab7867a08fd043b4e6cabc9d42ca515d31541e10df7a506872b",
       "file_role": "split",
       "path": "keyframe/diarization/dataset_manifests/ami_public_dev_split.json",
@@ -28,14 +35,15 @@
   "name": "AMI Meeting Corpus",
   "notes": [
     "First concrete diarization benchmark manifest.",
-    "Manifest records split descriptors committed with the package; raw corpus media remains manually acquired."
+    "Manifest records split descriptors committed with the package; raw corpus media remains manually acquired.",
+    "ami-smoke-ci is backed by a tiny redistributable AMI-shaped fixture for CI parser coverage."
   ],
   "role": "public_dev",
   "schema_version": 1,
   "scoring_policies": [
     {
       "collar_ms": 250,
-      "description": "Initial diarization policy for AMI manifest smoke/dev validation.",
+      "description": "Initial diarization policy for AMI smoke/dev/holdout validation.",
       "ignore_overlap": false,
       "policy_id": "ami-diarization-v1",
       "version": "1"
@@ -43,6 +51,17 @@
   ],
   "source_url": "https://groups.inf.ed.ac.uk/ami/corpus/",
   "splits": [
+    {
+      "expected_file_paths": [
+        "keyframe/diarization/dataset_manifests/ami_smoke_split.json"
+      ],
+      "recording_ids": [
+        "ES2002a"
+      ],
+      "role": "smoke_ci",
+      "scoring_policy_id": "ami-diarization-v1",
+      "split_id": "ami-smoke-ci"
+    },
     {
       "expected_file_paths": [
         "keyframe/diarization/dataset_manifests/ami_public_dev_split.json"
