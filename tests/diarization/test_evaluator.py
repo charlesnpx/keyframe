@@ -114,7 +114,11 @@ def test_perfect_anonymous_diarizer_scores_with_permutation_invariant_labels():
         },
     )
 
-    result = evaluate_diarization_candidate(reference, candidate)
+    result = evaluate_diarization_candidate(
+        reference,
+        candidate,
+        scoring_policy=replace(default_scoring_policy("diagnostic_diarization"), collar_ms=0),
+    )
 
     assert result.speaker_mapping == {
         "engine:local:speaker-1": "spk-b",
@@ -267,6 +271,40 @@ def test_diagnostic_collar_excludes_boundary_shift_from_metrics():
     assert metrics["diarization_error_rate"] == 0.0
 
 
+def test_diagnostic_collar_excludes_single_speaker_onset_offset_shift_from_metrics():
+    recording = _recording()
+    reference_recording = replace(
+        recording,
+        duration_ms=2_000,
+        speakers=(recording.speakers[0],),
+        words=(),
+        speaker_spans=(
+            SpeakerSpan(
+                span_id="span-1",
+                speaker_ref="spk-a",
+                start_ms=300,
+                end_ms=1_700,
+                channel_id="ch-1",
+            ),
+        ),
+        scoring_regions=(replace(recording.scoring_regions[0], end_ms=2_000),),
+    )
+    candidate = _candidate_output(reference_recording, {"spk-a": "engine:local:speaker-1"})
+    shifted_candidate = replace(
+        candidate,
+        speaker_spans=(
+            replace(candidate.speaker_spans[0], start_ms=400, end_ms=1_600),
+        ),
+    )
+
+    result = evaluate_diarization_candidate(_reference_bundle(reference_recording), shifted_candidate)
+    metrics = result.recording_metrics[0].metrics
+
+    assert metrics["reference_speaker_ms"] == 900
+    assert metrics["matched_speaker_ms"] == 900
+    assert metrics["diarization_error_rate"] == 0.0
+
+
 def test_overlap_reference_scores_overlap_slice_when_reference_supports_it():
     recording = _recording("overlap.json")
     reference = _reference_bundle(recording)
@@ -342,7 +380,11 @@ def test_speaker_mapping_stays_in_score_artifact_not_candidate_or_rendered_trans
     candidate_bundle = build_candidate_bundle(reference, bundle_id="candidate-fixture")
     candidate_payload_before = candidate.to_dict()
 
-    result = evaluate_diarization_candidate(reference, candidate)
+    result = evaluate_diarization_candidate(
+        reference,
+        candidate,
+        scoring_policy=replace(default_scoring_policy("diagnostic_diarization"), collar_ms=0),
+    )
 
     assert result.to_dict()["speaker_mapping"] == {
         "engine:local:speaker-1": "spk-b",

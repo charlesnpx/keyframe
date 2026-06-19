@@ -659,13 +659,31 @@ def _apply_scoring_collar(
 ) -> tuple[EvaluationInterval, ...]:
     if collar_ms <= 0:
         return intervals
-    collar_regions = _speaker_change_boundary_intervals(
-        reference_spans,
-        intervals,
-        collar_ms,
-        minimum_window_ms=collar_ms,
-    )
+    collar_regions = _reference_boundary_intervals(reference_spans, intervals, collar_ms)
     return _subtract_intervals(intervals, collar_regions)
+
+
+def _reference_boundary_intervals(
+    reference_spans: tuple[_SpanView, ...],
+    scoring_intervals: tuple[EvaluationInterval, ...],
+    collar_ms: int,
+) -> tuple[EvaluationInterval, ...]:
+    boundaries = {
+        (point, span.channel_id)
+        for span in reference_spans
+        for point in (span.start_ms, span.end_ms)
+        if any(
+            region.start_ms < point < region.end_ms and _channels_match(span.channel_id, region.channel_id)
+            for region in scoring_intervals
+        )
+    }
+    return _clip_intervals_to_regions(
+        tuple(
+            EvaluationInterval(max(0, point - collar_ms), point + collar_ms, channel_id)
+            for point, channel_id in sorted(boundaries, key=lambda item: (item[0], item[1] or ""))
+        ),
+        scoring_intervals,
+    )
 
 
 def _is_reference_overlap(active_spans: tuple[_SpanView, ...]) -> bool:
@@ -693,10 +711,8 @@ def _speaker_change_boundary_intervals(
     reference_spans: tuple[_SpanView, ...],
     scoring_intervals: tuple[EvaluationInterval, ...],
     collar_ms: int,
-    *,
-    minimum_window_ms: int = 250,
 ) -> tuple[EvaluationInterval, ...]:
-    window_ms = max(collar_ms, minimum_window_ms)
+    window_ms = max(collar_ms, 250)
     boundaries: set[tuple[int, str | None]] = set()
     channel_ids = tuple(sorted({span.channel_id for span in reference_spans}, key=lambda value: value or ""))
     for channel_id in channel_ids:
