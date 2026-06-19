@@ -944,41 +944,41 @@ def _spans_from_words(output_id: str, words: tuple[CanonicalWord, ...]) -> tuple
     spans: list[SpeakerSpan] = []
     words_by_channel: dict[str | None, list[CanonicalWord]] = {}
     for word in words:
-        if word.speaker_ref is not None:
-            words_by_channel.setdefault(word.channel_id, []).append(word)
+        words_by_channel.setdefault(word.channel_id, []).append(word)
 
     for channel_id, channel_words in words_by_channel.items():
         active_speaker: str | None = None
         active_start_ms: int | None = None
         active_end_ms: int | None = None
-        for word in sorted(channel_words, key=lambda item: (item.start_ms, item.end_ms)):
-            if word.speaker_ref != active_speaker:
-                if active_speaker is not None and active_start_ms is not None and active_end_ms is not None:
-                    spans.append(
-                        SpeakerSpan(
-                            span_id=_stable_span_id(output_id, len(spans)),
-                            speaker_ref=active_speaker,
-                            start_ms=active_start_ms,
-                            end_ms=active_end_ms,
-                            channel_id=channel_id,
-                        )
+
+        def flush_active_span() -> None:
+            if active_speaker is not None and active_start_ms is not None and active_end_ms is not None:
+                spans.append(
+                    SpeakerSpan(
+                        span_id=_stable_span_id(output_id, len(spans)),
+                        speaker_ref=active_speaker,
+                        start_ms=active_start_ms,
+                        end_ms=active_end_ms,
+                        channel_id=channel_id,
                     )
+                )
+
+        for word in sorted(channel_words, key=lambda item: (item.start_ms, item.end_ms)):
+            if word.speaker_ref is None:
+                flush_active_span()
+                active_speaker = None
+                active_start_ms = None
+                active_end_ms = None
+                continue
+            if word.speaker_ref != active_speaker:
+                flush_active_span()
                 active_speaker = word.speaker_ref
                 active_start_ms = word.start_ms
                 active_end_ms = word.end_ms
             else:
                 active_end_ms = max(active_end_ms or word.end_ms, word.end_ms)
 
-        if active_speaker is not None and active_start_ms is not None and active_end_ms is not None:
-            spans.append(
-                SpeakerSpan(
-                    span_id=_stable_span_id(output_id, len(spans)),
-                    speaker_ref=active_speaker,
-                    start_ms=active_start_ms,
-                    end_ms=active_end_ms,
-                    channel_id=channel_id,
-                )
-            )
+        flush_active_span()
     return tuple(spans)
 
 
