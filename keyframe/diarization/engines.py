@@ -16,10 +16,12 @@ from keyframe.diarization.provenance import NormalizedArtifactProvenance, Timeli
 EngineOutputKind = Literal["word_spans"]
 EngineContractStatus = Literal["valid", "invalid"]
 EngineRuntimeSupportStatus = Literal["available", "unsupported"]
+HostedProviderKind = Literal["aws_transcribe", "google_speech", "deepgram"]
 
 _ALLOWED_OUTPUT_KINDS = frozenset({"word_spans"})
 _ALLOWED_STATUSES = frozenset({"valid", "invalid"})
 _ALLOWED_RUNTIME_SUPPORT_STATUSES = frozenset({"available", "unsupported"})
+_ALLOWED_HOSTED_PROVIDERS = frozenset({"aws_transcribe", "google_speech", "deepgram"})
 _DEFAULT_WHISPERX_DEPENDENCIES = {
     "pyannote.audio": "pyannote.audio",
     "whisperx": "whisperx",
@@ -116,6 +118,71 @@ class ModelArtifactGovernance:
             payload["checkpoint"] = self.checkpoint
         if self.registry_source is not None:
             payload["registry_source"] = self.registry_source
+        return payload
+
+
+@dataclass(frozen=True)
+class HostedProviderGovernance:
+    """Governance metadata for saved hosted provider outputs."""
+
+    provider: HostedProviderKind
+    region: str | None = None
+    model_version: str | None = None
+    version_pinning: str | None = None
+    retention_policy: str | None = None
+    raw_json_export: str | None = None
+    terms_constraints: tuple[str, ...] = ()
+    parameters: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        provider = _require_id(self.provider, "hosted_governance.provider")
+        if provider not in _ALLOWED_HOSTED_PROVIDERS:
+            raise ValidationError(f"hosted_governance.provider is not supported: {provider}")
+        object.__setattr__(self, "provider", provider)
+        object.__setattr__(self, "region", _optional_text(self.region, "hosted_governance.region"))
+        object.__setattr__(
+            self,
+            "model_version",
+            _optional_text(self.model_version, "hosted_governance.model_version"),
+        )
+        object.__setattr__(
+            self,
+            "version_pinning",
+            _optional_text(self.version_pinning, "hosted_governance.version_pinning"),
+        )
+        object.__setattr__(
+            self,
+            "retention_policy",
+            _optional_text(self.retention_policy, "hosted_governance.retention_policy"),
+        )
+        object.__setattr__(
+            self,
+            "raw_json_export",
+            _optional_text(self.raw_json_export, "hosted_governance.raw_json_export"),
+        )
+        object.__setattr__(
+            self,
+            "terms_constraints",
+            _tuple_of_text(self.terms_constraints, "hosted_governance.terms_constraints"),
+        )
+        object.__setattr__(self, "parameters", _validate_metadata(self.parameters, "hosted_governance.parameters"))
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = {
+            "parameters": dict(self.parameters),
+            "provider": self.provider,
+            "terms_constraints": list(self.terms_constraints),
+        }
+        if self.region is not None:
+            payload["region"] = self.region
+        if self.model_version is not None:
+            payload["model_version"] = self.model_version
+        if self.version_pinning is not None:
+            payload["version_pinning"] = self.version_pinning
+        if self.retention_policy is not None:
+            payload["retention_policy"] = self.retention_policy
+        if self.raw_json_export is not None:
+            payload["raw_json_export"] = self.raw_json_export
         return payload
 
 
@@ -602,6 +669,106 @@ class SelfHostedWhisperXPyannoteAdapter:
         return EngineContractValidation("invalid" if errors else "valid", errors=tuple(errors))
 
 
+class HostedProviderJsonAdapter:
+    """Provider-neutral adapter for saved AWS, Google, and Deepgram-style JSON outputs."""
+
+    def __init__(self, governance: HostedProviderGovernance, *, config_id: str | None = None) -> None:
+        if not isinstance(governance, HostedProviderGovernance):
+            raise ValidationError("governance must be a HostedProviderGovernance")
+        self._governance = governance
+        self.adapter_id = f"hosted-provider-{governance.provider}"
+        self._config = EngineConfigMetadata(
+            adapter_id=self.adapter_id,
+            provider=governance.provider,
+            model_name=f"{governance.provider}-hosted-transcription",
+            model_version=governance.model_version,
+            config_id=config_id,
+            parameters={"hosted_provider_governance": governance.to_dict()},
+        )
+
+    def describe_config(self) -> EngineConfigMetadata:
+        return self._config
+
+    def normalize_raw_output(
+        self,
+        raw_output: dict[str, Any],
+        *,
+        artifact: NormalizedArtifactProvenance,
+        source_artifact: NormalizedArtifactProvenance | None = None,
+        transform_offset_map: TimelineOffsetMap | None = None,
+    ) -> NormalizedEngineOutput:
+        if not isinstance(artifact, NormalizedArtifactProvenance):
+            raise ValidationError("artifact must be a NormalizedArtifactProvenance")
+        active_offset_map = None
+        if transform_offset_map is not None and source_artifact is None:
+            raise ValidationError("transform_offset_map requires source_artifact")
+        if source_artifact is not None:
+            merge_validation = validate_timeline_merge(source_artifact, artifact, offset_map=transform_offset_map)
+            if merge_validation.offset_map_id is not None:
+                active_offset_map = transform_offset_map
+        payload = _validate_metadata(raw_output, "hosted_provider_output")
+        output_id = _optional_id(payload.get("output_id"), "hosted_provider_output.output_id") or (
+            f"{artifact.artifact_id}:{self._governance.provider}"
+        )
+        speaker_refs: dict[tuple[str | None, str], str] = {}
+        raw_speaker_evidence: list[RawSpeakerEvidence] = []
+        if self._governance.provider == "aws_transcribe":
+            words = _aws_provider_words(
+                payload,
+                output_id=output_id,
+                artifact=artifact,
+                offset_map=active_offset_map,
+                speaker_refs=speaker_refs,
+                raw_speaker_evidence=raw_speaker_evidence,
+            )
+        elif self._governance.provider == "google_speech":
+            words = _google_provider_words(
+                payload,
+                output_id=output_id,
+                artifact=artifact,
+                offset_map=active_offset_map,
+                speaker_refs=speaker_refs,
+                raw_speaker_evidence=raw_speaker_evidence,
+            )
+        elif self._governance.provider == "deepgram":
+            words = _deepgram_provider_words(
+                payload,
+                output_id=output_id,
+                artifact=artifact,
+                offset_map=active_offset_map,
+                speaker_refs=speaker_refs,
+                raw_speaker_evidence=raw_speaker_evidence,
+            )
+        else:
+            raise ValidationError(f"hosted provider is not supported: {self._governance.provider}")
+
+        output = NormalizedEngineOutput(
+            output_id=output_id,
+            output_kind="word_spans",
+            artifact=artifact,
+            config=self.describe_config(),
+            words=words,
+            speaker_spans=_spans_from_words(output_id, words),
+            raw_speaker_evidence=_dedupe_evidence(tuple(raw_speaker_evidence)),
+        )
+        validation = self.validate_contract(output)
+        if not validation.valid:
+            raise ValidationError("; ".join(validation.errors))
+        return output
+
+    def validate_contract(self, output: NormalizedEngineOutput) -> EngineContractValidation:
+        if not isinstance(output, NormalizedEngineOutput):
+            raise ValidationError("output must be a NormalizedEngineOutput")
+        errors: list[str] = []
+        if not output.words:
+            errors.append("hosted provider output must include word-level timestamps")
+        if not any(word.speaker_ref is not None for word in output.words):
+            errors.append("hosted provider output must include speaker metadata")
+        if output.words and not any(word.channel_id is not None for word in output.words):
+            errors.append("hosted provider output must preserve channel evidence")
+        return EngineContractValidation("invalid" if errors else "valid", errors=tuple(errors))
+
+
 def _speaker_ref_for(
     channel_id: str | None,
     raw_speaker_id: str,
@@ -733,6 +900,400 @@ def _dedupe_evidence(values: tuple[RawSpeakerEvidence, ...]) -> tuple[RawSpeaker
         seen.add(key)
         result.append(value)
     return tuple(result)
+
+
+def _aws_provider_words(
+    payload: dict[str, Any],
+    *,
+    output_id: str,
+    artifact: NormalizedArtifactProvenance,
+    offset_map: TimelineOffsetMap | None,
+    speaker_refs: dict[tuple[str | None, str], str],
+    raw_speaker_evidence: list[RawSpeakerEvidence],
+) -> tuple[CanonicalWord, ...]:
+    results = _validate_metadata(payload.get("results"), "hosted_provider_output.results")
+    items = _sequence(results.get("items"), "hosted_provider_output.results.items")
+    speaker_labels = _aws_speaker_labels_by_interval(results, offset_map=offset_map)
+    words: list[CanonicalWord] = []
+    for index, item in enumerate(items):
+        context = f"hosted_provider_output.results.items[{index}]"
+        value = _validate_metadata(item, context)
+        if value.get("type", "pronunciation") != "pronunciation":
+            continue
+        channel_id = _provider_channel_id(payload, value, artifact, context)
+        start_ms, end_ms = _provider_interval_ms(value, context, offset_map)
+        text = _aws_word_text(value, context)
+        raw_speaker_id = _provider_speaker_id(
+            value,
+            context,
+            keys=("speaker_label", "speaker", "speaker_id"),
+        ) or speaker_labels.get((start_ms, end_ms))
+        speaker_ref = _provider_speaker_ref(
+            raw_speaker_id,
+            channel_id=channel_id,
+            speaker_refs=speaker_refs,
+            raw_speaker_evidence=raw_speaker_evidence,
+            source_field="speaker_label",
+        )
+        words.append(
+            CanonicalWord(
+                word_id=_stable_word_id(output_id, len(words)),
+                text=text,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                speaker_ref=speaker_ref,
+                channel_id=channel_id,
+                text_confidence=_aws_word_confidence(value, context),
+            )
+        )
+    return tuple(words)
+
+
+def _google_provider_words(
+    payload: dict[str, Any],
+    *,
+    output_id: str,
+    artifact: NormalizedArtifactProvenance,
+    offset_map: TimelineOffsetMap | None,
+    speaker_refs: dict[tuple[str | None, str], str],
+    raw_speaker_evidence: list[RawSpeakerEvidence],
+) -> tuple[CanonicalWord, ...]:
+    results = _sequence(payload.get("results"), "hosted_provider_output.results")
+    word_rows: dict[tuple[str, int, int], dict[str, Any]] = {}
+    word_order: list[tuple[str, int, int]] = []
+    for result_index, result_item in enumerate(results):
+        result = _validate_metadata(result_item, f"hosted_provider_output.results[{result_index}]")
+        event_status = _provider_event_status(result)
+        if event_status == "partial":
+            continue
+        alternatives = _sequence(
+            result.get("alternatives"),
+            f"hosted_provider_output.results[{result_index}].alternatives",
+        )
+        if not alternatives:
+            raise ValidationError("hosted_provider_output.results[].alternatives is required")
+        alternative = _validate_metadata(
+            alternatives[0],
+            f"hosted_provider_output.results[{result_index}].alternatives[0]",
+        )
+        alternative_confidence = _first_confidence(
+            alternative,
+            ("confidence",),
+            f"hosted_provider_output.results[{result_index}].alternatives[0]",
+        )
+        word_items = _sequence(
+            alternative.get("words"),
+            f"hosted_provider_output.results[{result_index}].alternatives[0].words",
+        )
+        for word_index, item in enumerate(word_items):
+            context = f"hosted_provider_output.results[{result_index}].alternatives[0].words[{word_index}]"
+            value = _validate_metadata(item, context)
+            channel_id = _provider_channel_id(payload, result, artifact, context)
+            start_ms, end_ms = _provider_interval_ms(value, context, offset_map)
+            raw_speaker_id = _provider_speaker_id(value, context, keys=("speakerTag", "speaker_tag", "speaker"))
+            speaker_ref = None
+            if raw_speaker_id is not None:
+                speaker_ref = _speaker_ref_for(channel_id, raw_speaker_id, speaker_refs)
+            word_confidence = _first_confidence(value, ("confidence", "text_confidence"), context)
+            key = (channel_id, start_ms, end_ms)
+            if key not in word_rows:
+                word_order.append(key)
+            word_rows[key] = {
+                "channel_id": channel_id,
+                "end_ms": end_ms,
+                "raw_speaker_id": raw_speaker_id,
+                "speaker_confidence": _first_confidence(value, ("speaker_confidence",), context),
+                "speaker_ref": speaker_ref,
+                "speaker_source_field": _provider_speaker_source_field(
+                    value,
+                    ("speakerTag", "speaker_tag", "speaker"),
+                ),
+                "start_ms": start_ms,
+                "text": _require_text(value.get("word"), f"{context}.word"),
+                "text_confidence": word_confidence if word_confidence is not None else alternative_confidence,
+            }
+    words: list[CanonicalWord] = []
+    for index, key in enumerate(word_order):
+        row = dict(word_rows[key])
+        raw_speaker_id = row.pop("raw_speaker_id")
+        speaker_source_field = row.pop("speaker_source_field")
+        if raw_speaker_id is not None and row["speaker_ref"] is not None:
+            raw_speaker_evidence.append(
+                RawSpeakerEvidence(
+                    raw_speaker_id=raw_speaker_id,
+                    speaker_ref=row["speaker_ref"],
+                    channel_id=row["channel_id"],
+                    source_field=speaker_source_field,
+                )
+            )
+        words.append(CanonicalWord(word_id=_stable_word_id(output_id, index), **row))
+    return tuple(words)
+
+
+def _deepgram_provider_words(
+    payload: dict[str, Any],
+    *,
+    output_id: str,
+    artifact: NormalizedArtifactProvenance,
+    offset_map: TimelineOffsetMap | None,
+    speaker_refs: dict[tuple[str | None, str], str],
+    raw_speaker_evidence: list[RawSpeakerEvidence],
+) -> tuple[CanonicalWord, ...]:
+    results = _validate_metadata(payload.get("results"), "hosted_provider_output.results")
+    channels = _sequence(results.get("channels"), "hosted_provider_output.results.channels")
+    words: list[CanonicalWord] = []
+    for channel_index, channel_item in enumerate(channels):
+        channel = _validate_metadata(channel_item, f"hosted_provider_output.results.channels[{channel_index}]")
+        channel_id = _provider_channel_id(
+            payload,
+            channel,
+            artifact,
+            f"hosted_provider_output.results.channels[{channel_index}]",
+            provider_channel_index=channel_index,
+        )
+        alternatives = _sequence(
+            channel.get("alternatives"),
+            f"hosted_provider_output.results.channels[{channel_index}].alternatives",
+        )
+        if not alternatives:
+            raise ValidationError("hosted_provider_output.results.channels[].alternatives is required")
+        alternative = _validate_metadata(
+            alternatives[0],
+            f"hosted_provider_output.results.channels[{channel_index}].alternatives[0]",
+        )
+        word_items = _sequence(
+            alternative.get("words"),
+            f"hosted_provider_output.results.channels[{channel_index}].alternatives[0].words",
+        )
+        for word_index, item in enumerate(word_items):
+            context = f"hosted_provider_output.results.channels[{channel_index}].alternatives[0].words[{word_index}]"
+            value = _validate_metadata(item, context)
+            start_ms, end_ms = _provider_interval_ms(value, context, offset_map)
+            raw_speaker_id = _provider_speaker_id(value, context, keys=("speaker", "speaker_id"))
+            speaker_ref = _provider_speaker_ref(
+                raw_speaker_id,
+                channel_id=channel_id,
+                speaker_refs=speaker_refs,
+                raw_speaker_evidence=raw_speaker_evidence,
+                source_field="speaker",
+            )
+            words.append(
+                CanonicalWord(
+                    word_id=_stable_word_id(output_id, len(words)),
+                    text=_require_text(value.get("word"), f"{context}.word"),
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                    speaker_ref=speaker_ref,
+                    channel_id=channel_id,
+                    text_confidence=_first_confidence(value, ("confidence",), context),
+                    speaker_confidence=_first_confidence(value, ("speaker_confidence",), context),
+                )
+            )
+    return tuple(words)
+
+
+def _aws_word_text(payload: dict[str, Any], context: str) -> str:
+    return _require_text(_aws_word_alternative(payload, context).get("content"), f"{context}.alternatives[0].content")
+
+
+def _aws_word_confidence(payload: dict[str, Any], context: str) -> float | None:
+    alternative = _aws_word_alternative(payload, context)
+    if "confidence" not in alternative:
+        return None
+    return _provider_confidence(alternative.get("confidence"), f"{context}.alternatives[0].confidence")
+
+
+def _aws_word_alternative(payload: dict[str, Any], context: str) -> dict[str, Any]:
+    alternatives = _sequence(payload.get("alternatives"), f"{context}.alternatives")
+    if not alternatives:
+        raise ValidationError(f"{context}.alternatives is required")
+    return _validate_metadata(alternatives[0], f"{context}.alternatives[0]")
+
+
+def _aws_speaker_labels_by_interval(
+    results: dict[str, Any],
+    *,
+    offset_map: TimelineOffsetMap | None,
+) -> dict[tuple[int, int], str]:
+    value = results.get("speaker_labels")
+    if value is None:
+        return {}
+    speaker_labels = _validate_metadata(value, "hosted_provider_output.results.speaker_labels")
+    labels: dict[tuple[int, int], str] = {}
+    segments = _sequence(
+        speaker_labels.get("segments", ()),
+        "hosted_provider_output.results.speaker_labels.segments",
+    )
+    for segment_index, segment_item in enumerate(segments):
+        segment = _validate_metadata(
+            segment_item,
+            f"hosted_provider_output.results.speaker_labels.segments[{segment_index}]",
+        )
+        items = _sequence(
+            segment.get("items", ()),
+            f"hosted_provider_output.results.speaker_labels.segments[{segment_index}].items",
+        )
+        for item_index, item in enumerate(items):
+            context = (
+                "hosted_provider_output.results.speaker_labels"
+                f".segments[{segment_index}].items[{item_index}]"
+            )
+            payload = _validate_metadata(item, context)
+            start_ms, end_ms = _provider_interval_ms(payload, context, offset_map)
+            speaker_label = _require_id(payload.get("speaker_label"), f"{context}.speaker_label")
+            labels[(start_ms, end_ms)] = speaker_label
+    return labels
+
+
+def _provider_channel_id(
+    root_payload: dict[str, Any],
+    payload: dict[str, Any],
+    artifact: NormalizedArtifactProvenance,
+    context: str,
+    *,
+    provider_channel_index: int | None = None,
+) -> str:
+    value = payload.get("channel_id")
+    if value is not None:
+        return _require_id(str(value), f"{context}.channel_id")
+    for key in ("channelTag", "channel_tag"):
+        if key in payload:
+            index = _provider_channel_ordinal(payload.get(key), f"{context}.{key}") - 1
+            return _artifact_channel_id(artifact, index, f"{context}.{key}")
+    if "channel_label" in payload:
+        return _aws_channel_label_to_artifact_channel(payload.get("channel_label"), artifact, context)
+    if provider_channel_index is not None:
+        return _artifact_channel_id(artifact, provider_channel_index, context)
+    value = root_payload.get("channel_id")
+    if value is not None:
+        return _require_id(str(value), "hosted_provider_output.channel_id")
+    if len(artifact.timeline.channel_ids) == 1:
+        return artifact.timeline.channel_ids[0]
+    raise ValidationError(f"{context}.channel_id is required for multi-channel artifacts")
+
+
+def _provider_channel_ordinal(value: object, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValidationError(f"{field_name} must be an integer")
+    if value <= 0:
+        raise ValidationError(f"{field_name} must be greater than 0")
+    return value
+
+
+def _artifact_channel_id(artifact: NormalizedArtifactProvenance, index: int, field_name: str) -> str:
+    if index < 0 or index >= len(artifact.timeline.channel_ids):
+        raise ValidationError(f"{field_name} does not map to an artifact channel")
+    return artifact.timeline.channel_ids[index]
+
+
+def _aws_channel_label_to_artifact_channel(
+    value: object,
+    artifact: NormalizedArtifactProvenance,
+    context: str,
+) -> str:
+    label = _require_id(str(value) if value is not None else None, f"{context}.channel_label")
+    if label in artifact.timeline.channel_ids:
+        return label
+    if label.startswith("ch_"):
+        suffix = label.removeprefix("ch_")
+        try:
+            index = int(suffix)
+        except ValueError as exc:
+            raise ValidationError(f"{context}.channel_label does not map to an artifact channel") from exc
+        return _artifact_channel_id(artifact, index, f"{context}.channel_label")
+    raise ValidationError(f"{context}.channel_label does not map to an artifact channel")
+
+
+def _provider_interval_ms(
+    payload: dict[str, Any],
+    context: str,
+    offset_map: TimelineOffsetMap | None,
+) -> tuple[int, int]:
+    start_ms = _provider_timestamp_ms(payload, ("start_ms", "startTime", "start_time", "start"), context)
+    end_ms = _provider_timestamp_ms(payload, ("end_ms", "endTime", "end_time", "end"), context)
+    if end_ms <= start_ms:
+        raise ValidationError(f"{context}.end must be greater than start")
+    if offset_map is not None:
+        return offset_map.convert_source_ms(start_ms), offset_map.convert_source_ms(end_ms)
+    return start_ms, end_ms
+
+
+def _provider_timestamp_ms(payload: dict[str, Any], keys: tuple[str, ...], context: str) -> int:
+    for key in keys:
+        if key in payload:
+            value = payload.get(key)
+            if key.endswith("_ms"):
+                return _non_negative_time_ms(value, f"{context}.{key}", multiplier=1.0)
+            return _hosted_time_to_ms(value, f"{context}.{key}")
+    raise ValidationError(f"{context}.{keys[-1]} is required")
+
+
+def _hosted_time_to_ms(value: object, field_name: str) -> int:
+    if isinstance(value, str):
+        value = value.strip()
+        if value.endswith("s"):
+            value = value[:-1]
+        try:
+            parsed = float(value)
+        except ValueError as exc:
+            raise ValidationError(f"{field_name} must be a number") from exc
+        return _non_negative_time_ms(parsed, field_name, multiplier=1000.0)
+    return _non_negative_time_ms(value, field_name, multiplier=1000.0)
+
+
+def _provider_speaker_id(payload: dict[str, Any], context: str, *, keys: tuple[str, ...]) -> str | None:
+    for key in keys:
+        if key in payload:
+            return _optional_id(str(payload.get(key)) if payload.get(key) is not None else None, f"{context}.{key}")
+    return None
+
+
+def _provider_speaker_source_field(payload: dict[str, Any], keys: tuple[str, ...]) -> str:
+    for key in keys:
+        if key in payload:
+            return key
+    return keys[0]
+
+
+def _provider_confidence(value: object, field_name: str) -> float | None:
+    if isinstance(value, str):
+        try:
+            value = float(value)
+        except ValueError as exc:
+            raise ValidationError(f"{field_name} must be a number") from exc
+    return _optional_confidence(value, field_name)
+
+
+def _provider_speaker_ref(
+    raw_speaker_id: str | None,
+    *,
+    channel_id: str,
+    speaker_refs: dict[tuple[str | None, str], str],
+    raw_speaker_evidence: list[RawSpeakerEvidence],
+    source_field: str,
+) -> str | None:
+    if raw_speaker_id is None:
+        return None
+    speaker_ref = _speaker_ref_for(channel_id, raw_speaker_id, speaker_refs)
+    raw_speaker_evidence.append(
+        RawSpeakerEvidence(
+            raw_speaker_id=raw_speaker_id,
+            speaker_ref=speaker_ref,
+            channel_id=channel_id,
+            source_field=source_field,
+        )
+    )
+    return speaker_ref
+
+
+def _provider_event_status(payload: dict[str, Any]) -> str:
+    if "isFinal" in payload:
+        is_final = _require_bool(payload.get("isFinal"), "hosted_provider_output.result.isFinal")
+        return "final" if is_final else "partial"
+    if "is_final" in payload:
+        is_final = _require_bool(payload.get("is_final"), "hosted_provider_output.result.is_final")
+        return "final" if is_final else "partial"
+    return _event_status(payload)
 
 
 def _whisper_diarization_rows(

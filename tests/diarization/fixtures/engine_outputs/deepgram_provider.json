@@ -1,0 +1,47 @@
+{
+  "metadata": {
+    "model_info": {
+      "name": "nova-3",
+      "version": "2026-06"
+    }
+  },
+  "output_id": "deepgram-canned",
+  "results": {
+    "channels": [
+      {
+        "alternatives": [
+          {
+            "transcript": "left right",
+            "words": [
+              {
+                "confidence": 0.97,
+                "end": 0.25,
+                "speaker": 0,
+                "speaker_confidence": 0.88,
+                "start": 0.00,
+                "word": "left"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "alternatives": [
+          {
+            "transcript": "answer",
+            "words": [
+              {
+                "confidence": 0.95,
+                "end": 0.72,
+                "speaker": 0,
+                "speaker_confidence": 0.82,
+                "start": 0.42,
+                "word": "answer"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

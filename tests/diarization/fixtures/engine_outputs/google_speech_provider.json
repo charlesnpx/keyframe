@@ -1,0 +1,47 @@
+{
+  "channel_id": "ch-1",
+  "output_id": "google-speech-canned",
+  "results": [
+    {
+      "alternatives": [
+        {
+          "transcript": "partial",
+          "words": [
+            {
+              "endTime": "0.20s",
+              "speakerTag": 1,
+              "startTime": "0.00s",
+              "word": "par"
+            }
+          ]
+        }
+      ],
+      "channelTag": 1,
+      "isFinal": false
+    },
+    {
+      "alternatives": [
+        {
+          "confidence": 0.91,
+          "transcript": "hello there",
+          "words": [
+            {
+              "endTime": "0.30s",
+              "speakerTag": 1,
+              "startTime": "0.00s",
+              "word": "hello"
+            },
+            {
+              "endTime": "0.66s",
+              "speakerTag": 2,
+              "startTime": "0.35s",
+              "word": "there"
+            }
+          ]
+        }
+      ],
+      "channelTag": 1,
+      "isFinal": true
+    }
+  ]
+}

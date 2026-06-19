@@ -1,0 +1,56 @@
+{
+  "channel_id": "ch-1",
+  "jobName": "aws-canned-job",
+  "output_id": "aws-transcribe-canned",
+  "results": {
+    "items": [
+      {
+        "alternatives": [
+          {
+            "confidence": "0.98",
+            "content": "hello"
+          }
+        ],
+        "channel_id": "ch-1",
+        "end_time": "0.30",
+        "speaker_label": "spk_0",
+        "start_time": "0.00",
+        "type": "pronunciation"
+      },
+      {
+        "alternatives": [
+          {
+            "confidence": "0.96",
+            "content": "there"
+          }
+        ],
+        "channel_id": "ch-1",
+        "end_time": "0.64",
+        "speaker_label": "spk_0",
+        "start_time": "0.34",
+        "type": "pronunciation"
+      },
+      {
+        "alternatives": [
+          {
+            "content": ","
+          }
+        ],
+        "type": "punctuation"
+      },
+      {
+        "alternatives": [
+          {
+            "confidence": "0.94",
+            "content": "friend"
+          }
+        ],
+        "channel_id": "ch-1",
+        "end_time": "1.08",
+        "speaker_label": "spk_1",
+        "start_time": "0.80",
+        "type": "pronunciation"
+      }
+    ]
+  }
+}
