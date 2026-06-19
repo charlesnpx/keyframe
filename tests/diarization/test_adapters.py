@@ -181,6 +181,18 @@ def test_explicit_download_plan_requires_public_direct_manifest_and_policy(tmp_p
     assert plan.actions == ("validate_manifest", "validate_cache", "download")
 
 
+def test_preparation_plan_rejects_download_without_network():
+    with pytest.raises(ValidationError, match="network_required is required"):
+        DatasetPreparationPlan(
+            dataset_id="smoke-fixture",
+            split_ids=("smoke",),
+            cache_root=None,
+            network_required=False,
+            download_required=True,
+            actions=("download",),
+        )
+
+
 def test_full_benchmark_mode_requires_cache_for_non_redistributable_data(tmp_path):
     manifest = read_dataset_manifest_json(MANIFEST_DIR / "callhome_placeholder.json")
 
@@ -472,4 +484,22 @@ def test_run_record_loader_rejects_snapshot_and_split_tampering(tmp_path, mutate
     mutate(payload)
 
     with pytest.raises(ValidationError, match=message):
+        benchmark_run_record_json_loads(json.dumps(payload))
+
+
+@pytest.mark.parametrize("field_name", ["tuned_split_ids", "cache_root", "derived_artifacts"])
+def test_run_record_loader_requires_all_serialized_audit_fields(tmp_path, field_name):
+    manifest = _ami_manifest()
+    record = create_benchmark_run_record(
+        run_id="run-001",
+        manifest=manifest,
+        split_id="ami-public-dev",
+        branch="feature/diarization-benchmark-platform",
+        artifact_root=tmp_path / "artifacts",
+        cache=DatasetCacheConfig(cache_root=str(tmp_path / "cache")),
+    )
+    payload = record.to_dict()
+    payload.pop(field_name)
+
+    with pytest.raises(ValidationError, match=f"run_record.{field_name} is required"):
         benchmark_run_record_json_loads(json.dumps(payload))

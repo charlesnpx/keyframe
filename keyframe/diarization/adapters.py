@@ -85,6 +85,8 @@ class DatasetPreparationPlan:
             "download_required",
             _require_bool(self.download_required, "preparation_plan.download_required"),
         )
+        if self.download_required and not self.network_required:
+            raise ValidationError("preparation_plan.network_required is required when download_required is true")
         object.__setattr__(self, "actions", _tuple_of_text(self.actions, "preparation_plan.actions"))
 
     def to_dict(self) -> dict[str, Any]:
@@ -425,7 +427,7 @@ def benchmark_run_record_from_dict(payload: dict[str, Any]) -> BenchmarkRunRecor
     dataset_snapshot = dataset_manifest_from_dict(_required(data, "dataset_snapshot", "run_record"))
     dataset_id = _required(data, "dataset_id", "run_record")
     split_id = _required(data, "split_id", "run_record")
-    tuned_split_ids = tuple(_sequence(data.get("tuned_split_ids", ())))
+    tuned_split_ids = tuple(_sequence(_required(data, "tuned_split_ids", "run_record")))
     evaluated_split_ids = tuple(_sequence(_required(data, "evaluated_split_ids", "run_record")))
     return BenchmarkRunRecord(
         schema_version=_required(data, "schema_version", "run_record"),
@@ -435,12 +437,12 @@ def benchmark_run_record_from_dict(payload: dict[str, Any]) -> BenchmarkRunRecor
         split_id=split_id,
         branch=_required(data, "branch", "run_record"),
         artifact_layout=_artifact_layout_from_dict(_required(data, "artifact_layout", "run_record")),
-        cache_root=data.get("cache_root"),
+        cache_root=_required(data, "cache_root", "run_record"),
         tuned_split_ids=tuned_split_ids,
         evaluated_split_ids=evaluated_split_ids,
         execution_mode=_required(data, "execution_mode", "run_record"),
         no_network=_required(data, "no_network", "run_record"),
-        derived_artifacts=data.get("derived_artifacts", {}),
+        derived_artifacts=_required(data, "derived_artifacts", "run_record"),
     )
 
 
