@@ -3,7 +3,10 @@ import math
 import pytest
 
 from keyframe.diarization import (
+    AudioChannelMapping,
     AudioTimelineProvenance,
+    AudioTransformConfig,
+    AudioTransformManifest,
     NormalizedArtifactProvenance,
     OffsetMapSegment,
     TimelineOffsetMap,
@@ -11,7 +14,13 @@ from keyframe.diarization import (
     TransformStep,
     ValidationError,
     boundary_shift_degrades_scoring,
+    build_audio_transform_manifest,
+    build_mono_mix_transform_manifest,
+    hash_audio_transform_config,
+    normalize_transform_command,
     read_recording_json,
+    sha256_bytes,
+    sha256_file,
     validate_timeline_merge,
 )
 
@@ -49,6 +58,33 @@ def _assert_no_local_audio_identity(payload):
     elif isinstance(payload, list):
         for value in payload:
             _assert_no_local_audio_identity(value)
+
+
+def _assert_no_audio_hashes(payload):
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            assert "sha256" not in key
+            assert key != "transform_config_hash"
+            _assert_no_audio_hashes(value)
+    elif isinstance(payload, list):
+        for value in payload:
+            _assert_no_audio_hashes(value)
+
+
+def _transform_config(*, source_channel_ids=("ch-1",), output_channel_id="ch-1", command=None):
+    return AudioTransformConfig(
+        tool_name="ffmpeg",
+        tool_version="6.1",
+        normalized_command=command or ["ffmpeg", "-i", "input.wav", "-ar", "16000", "canonical.wav"],
+        channel_mapping=(
+            AudioChannelMapping(
+                output_channel_id=output_channel_id,
+                source_channel_ids=tuple(source_channel_ids),
+            ),
+        ),
+        gain_policy="preserve",
+        downmix_policy="none",
+    )
 
 
 def test_recording_provenance_includes_required_normalized_artifact_fields():
@@ -89,6 +125,112 @@ def test_audio_identity_and_hash_stay_out_of_rendered_and_monitoring_metadata():
     _assert_no_local_audio_identity(artifact.to_monitoring_metadata())
     _assert_no_local_audio_identity(artifact.to_cross_session_linking_metadata())
     assert "timeline_id" not in artifact.to_cross_session_linking_metadata()["timeline"]
+
+
+def test_transform_command_normalization_and_config_hash_are_stable():
+    spaced = _transform_config(command="ffmpeg   -i 'input file.wav'   -ar 16000 canonical.wav")
+    tokenized = _transform_config(command=("ffmpeg", "-i", "input file.wav", "-ar", "16000", "canonical.wav"))
+    remapped = _transform_config(source_channel_ids=("ch-2",), command=tokenized.normalized_command)
+
+    assert normalize_transform_command(spaced.normalized_command) == tokenized.normalized_command
+    assert hash_audio_transform_config(spaced) == hash_audio_transform_config(tokenized)
+    assert hash_audio_transform_config(remapped) != hash_audio_transform_config(tokenized)
+
+
+def test_audio_transform_manifest_records_integrity_only_transform_details():
+    config = _transform_config()
+    manifest = build_audio_transform_manifest(
+        branch_id="separate_tracks",
+        original_audio_id="original-audio-local",
+        canonical_audio_id="canonical-audio-local",
+        original_audio_sha256=sha256_bytes(b"original"),
+        canonical_audio_sha256=sha256_bytes(b"canonical"),
+        config=config,
+    )
+    timeline = _timeline(
+        local_audio_sha256=manifest.canonical_audio_sha256,
+        transform_manifest=manifest,
+    )
+    artifact = _artifact("fixture", timeline)
+
+    integrity = artifact.to_integrity_dict()
+    assert integrity["timeline"]["transform_manifest"]["transform_config_hash"] == config.config_hash
+    assert integrity["timeline"]["transform_manifest"]["config"]["tool_name"] == "ffmpeg"
+    assert integrity["timeline"]["transform_manifest"]["config"]["channel_mapping"][0]["source_channel_ids"] == ["ch-1"]
+
+    rendered = artifact.to_rendered_transcript_metadata()
+    monitoring = artifact.to_monitoring_metadata()
+    assert "transform_manifest" not in rendered["timeline"]
+    _assert_no_audio_hashes(rendered)
+    _assert_no_audio_hashes(monitoring)
+
+
+def test_audio_transform_manifest_rejects_forged_transform_id():
+    config = _transform_config()
+
+    with pytest.raises(ValidationError, match="transform_id does not match content address"):
+        AudioTransformManifest(
+            transform_id="audio-transform:separate_tracks:forged",
+            branch_id="separate_tracks",
+            original_audio_id="original-audio-local",
+            canonical_audio_id="canonical-audio-local",
+            original_audio_sha256=sha256_bytes(b"original"),
+            canonical_audio_sha256=sha256_bytes(b"canonical"),
+            transform_config_hash=config.config_hash,
+            config=config,
+        )
+
+
+def test_sha256_file_hashes_file_content(tmp_path):
+    path = tmp_path / "audio.fake"
+    path.write_bytes(b"canonical audio bytes")
+
+    assert sha256_file(path) == sha256_bytes(b"canonical audio bytes")
+
+
+def test_mono_mix_transform_manifest_is_reproducible_and_branch_specific():
+    common = {
+        "original_audio_id": "original-audio-local",
+        "canonical_audio_id": "canonical-audio-local",
+        "original_audio_sha256": sha256_bytes(b"original"),
+        "canonical_audio_sha256": sha256_bytes(b"canonical-mono"),
+        "source_channel_ids": ("ihm-P1", "ihm-P2"),
+        "tool_name": "ffmpeg",
+        "tool_version": "6.1",
+        "command": ("ffmpeg", "-i", "input.wav", "-ac", "1", "mono.wav"),
+    }
+
+    first = build_mono_mix_transform_manifest(branch_id="mono_mix", **common)
+    second = build_mono_mix_transform_manifest(branch_id="mono_mix", **common)
+    alternate_branch = build_mono_mix_transform_manifest(branch_id="diagnostic_mono_mix", **common)
+
+    assert first.transform_id == second.transform_id
+    assert first.transform_id != alternate_branch.transform_id
+    assert first.transform_config_hash == alternate_branch.transform_config_hash
+    assert first.config.downmix_policy == "mono_mix"
+    assert first.config.channel_mapping[0].output_channel_id == "mono-mix"
+    assert first.config.channel_mapping[0].source_channel_ids == ("ihm-P1", "ihm-P2")
+
+
+def test_transform_manifest_must_match_timeline_audio_identity_and_hash():
+    manifest = build_audio_transform_manifest(
+        branch_id="separate_tracks",
+        original_audio_id="original-audio-local",
+        canonical_audio_id="canonical-audio-local",
+        original_audio_sha256=sha256_bytes(b"original"),
+        canonical_audio_sha256=sha256_bytes(b"canonical"),
+        config=_transform_config(),
+    )
+
+    with pytest.raises(ValidationError, match="canonical_audio_sha256 conflicts"):
+        _timeline(local_audio_sha256=sha256_bytes(b"other"), transform_manifest=manifest)
+
+    with pytest.raises(ValidationError, match="channel mapping conflicts"):
+        _timeline(
+            channel_ids=("other-channel",),
+            local_audio_sha256=manifest.canonical_audio_sha256,
+            transform_manifest=manifest,
+        )
 
 
 def test_compatible_timeline_merge_is_direct():

@@ -12,6 +12,12 @@ from keyframe.diarization.bundles import validate_candidate_bundle_payload
 from keyframe.diarization.io import recording_from_dict
 from keyframe.diarization.manifests import DatasetManifest, ScoringPolicyManifest
 from keyframe.diarization.models import CanonicalRecording, ValidationError
+from keyframe.diarization.provenance import (
+    AudioTransformConfig,
+    AudioTransformManifest,
+    hash_audio_transform_config,
+    sha256_file,
+)
 
 
 FixtureValidationStatus = Literal["valid", "invalid_fixture"]
@@ -23,6 +29,7 @@ FixtureIssueCategory = Literal[
     "missing_scoring_export",
     "reference_leakage",
     "schema_validation",
+    "transform_config_mismatch",
     "unsupported_overlap",
     "unresolved_speaker",
 ]
@@ -37,6 +44,7 @@ _ISSUE_CATEGORIES = frozenset(
         "missing_scoring_export",
         "reference_leakage",
         "schema_validation",
+        "transform_config_mismatch",
         "unsupported_overlap",
         "unresolved_speaker",
     }
@@ -161,6 +169,40 @@ class FixtureValidationResult:
         }
 
 
+@dataclass(frozen=True)
+class AudioTransformCacheCheck:
+    """Fixture-gate input for validating cached canonical audio transform artifacts."""
+
+    manifest: AudioTransformManifest
+    canonical_audio_path: str | Path | None = None
+    original_audio_path: str | Path | None = None
+    expected_config: AudioTransformConfig | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.manifest, AudioTransformManifest):
+            raise ValidationError("audio_transform_cache.manifest must be an AudioTransformManifest")
+        object.__setattr__(
+            self,
+            "canonical_audio_path",
+            _optional_path_text(self.canonical_audio_path, "audio_transform_cache.canonical_audio_path"),
+        )
+        object.__setattr__(
+            self,
+            "original_audio_path",
+            _optional_path_text(self.original_audio_path, "audio_transform_cache.original_audio_path"),
+        )
+        if self.expected_config is not None and not isinstance(self.expected_config, AudioTransformConfig):
+            raise ValidationError("audio_transform_cache.expected_config must be an AudioTransformConfig")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "canonical_audio_path": self.canonical_audio_path,
+            "expected_config": None if self.expected_config is None else self.expected_config.to_dict(),
+            "manifest": self.manifest.to_dict(),
+            "original_audio_path": self.original_audio_path,
+        }
+
+
 def validate_manifest_expected_files(
     manifest: DatasetManifest,
     *,
@@ -203,6 +245,50 @@ def validate_manifest_expected_files(
                     path=path_text,
                 )
             )
+    return _result(issues, checked_files=tuple(checked_files))
+
+
+def validate_audio_transform_cache(
+    manifest: AudioTransformManifest,
+    *,
+    canonical_audio_path: str | Path | None = None,
+    original_audio_path: str | Path | None = None,
+    expected_config: AudioTransformConfig | None = None,
+) -> FixtureValidationResult:
+    """Validate content-addressed audio transform cache bytes and config hash."""
+
+    if not isinstance(manifest, AudioTransformManifest):
+        raise ValidationError("manifest must be an AudioTransformManifest")
+    if expected_config is not None and not isinstance(expected_config, AudioTransformConfig):
+        raise ValidationError("expected_config must be an AudioTransformConfig")
+
+    issues: list[FixtureValidationIssue] = []
+    checked_files: list[str] = []
+    if expected_config is not None and hash_audio_transform_config(expected_config) != manifest.transform_config_hash:
+        issues.append(
+            _issue(
+                "transform_config_mismatch",
+                "audio transform config hash does not match cached manifest",
+            )
+        )
+    if original_audio_path is not None:
+        checked_files.append(
+            _validate_audio_cache_file(
+                original_audio_path,
+                expected_sha256=manifest.original_audio_sha256,
+                label="original audio",
+                issues=issues,
+            )
+        )
+    if canonical_audio_path is not None:
+        checked_files.append(
+            _validate_audio_cache_file(
+                canonical_audio_path,
+                expected_sha256=manifest.canonical_audio_sha256,
+                label="canonical audio",
+                issues=issues,
+            )
+        )
     return _result(issues, checked_files=tuple(checked_files))
 
 
@@ -405,6 +491,7 @@ def validate_fixture_gate(
     candidate_payloads: tuple[tuple[dict[str, Any], CanonicalRecording], ...] = (),
     scoring_policy: ScoringPolicyManifest | None = None,
     artifact_paths: dict[str, str] | None = None,
+    audio_transform_caches: tuple[AudioTransformCacheCheck, ...] = (),
     minimum_slice_support: int = 1,
     allow_mono_mix: bool = False,
 ) -> FixtureValidationResult:
@@ -455,6 +542,19 @@ def validate_fixture_gate(
         )
     if artifact_paths is not None:
         results.append(validate_scoring_exports(artifact_paths=artifact_paths))
+    for cache_check in _tuple_of(
+        audio_transform_caches,
+        AudioTransformCacheCheck,
+        "audio_transform_caches",
+    ):
+        results.append(
+            validate_audio_transform_cache(
+                cache_check.manifest,
+                canonical_audio_path=cache_check.canonical_audio_path,
+                original_audio_path=cache_check.original_audio_path,
+                expected_config=cache_check.expected_config,
+            )
+        )
     return merge_fixture_validation_results(*results)
 
 
@@ -708,6 +808,24 @@ def _result(
     )
 
 
+def _validate_audio_cache_file(
+    path: str | Path,
+    *,
+    expected_sha256: str,
+    label: str,
+    issues: list[FixtureValidationIssue],
+) -> str:
+    path = Path(path)
+    path_text = path.as_posix()
+    if not path.is_file():
+        issues.append(_issue("missing_file", f"missing cached {label} file", path=path_text))
+        return path_text
+    actual_sha256 = sha256_file(path)
+    if actual_sha256 != expected_sha256:
+        issues.append(_issue("checksum_mismatch", f"cached {label} sha256 mismatch", path=path_text))
+    return path_text
+
+
 def _validate_string_map(value: object, field_name: str) -> dict[str, str]:
     if not isinstance(value, dict):
         raise ValidationError(f"{field_name} must be an object")
@@ -825,6 +943,14 @@ def _require_text(value: object, field_name: str) -> str:
 def _optional_text(value: object, field_name: str) -> str | None:
     if value is None:
         return None
+    return _require_text(value, field_name)
+
+
+def _optional_path_text(value: object, field_name: str) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, Path):
+        return value.as_posix()
     return _require_text(value, field_name)
 
 
