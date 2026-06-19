@@ -649,7 +649,7 @@ class BenchmarkReport:
         object.__setattr__(
             self,
             "schema_version",
-            _positive_int(self.schema_version, "benchmark_report.schema_version"),
+            _validate_report_schema_version(self.schema_version),
         )
         if not isinstance(self.gate_config, BenchmarkGateConfig):
             raise ValidationError("benchmark_report.gate_config must be a BenchmarkGateConfig")
@@ -1083,15 +1083,24 @@ def _metric_result_from_observations(
     observations: tuple[_MetricObservation, ...],
     gate_config: BenchmarkGateConfig,
 ) -> BenchmarkMetricResult:
-    point_score = _mean(tuple(item.point_score for item in observations))
-    baseline_values = tuple(item.baseline_score for item in observations if item.baseline_score is not None)
+    weighted_scores = tuple((item.point_score, _observation_weight(item)) for item in observations)
+    point_score = _weighted_mean(weighted_scores)
+    weighted_baseline_scores = tuple(
+        (item.baseline_score, _observation_weight(item))
+        for item in observations
+        if item.baseline_score is not None
+    )
+    baseline_score = (
+        _weighted_mean(weighted_baseline_scores)
+        if len(weighted_baseline_scores) == len(observations)
+        else None
+    )
+    paired_delta = point_score - baseline_score if baseline_score is not None else None
     paired_deltas = tuple(
         item.point_score - item.baseline_score
         for item in observations
         if item.baseline_score is not None
     )
-    baseline_score = _mean(baseline_values) if len(baseline_values) == len(observations) else None
-    paired_delta = _mean(paired_deltas) if len(paired_deltas) == len(observations) else None
     metric_name = observations[0].metric_name
     scope_id, corpus_id, branch_id, recording_id, slice_id = _scope_fields(scope_type, key)
     result_without_gate = BenchmarkMetricResult(
@@ -1304,7 +1313,10 @@ def _has_failed_gate(
     results: tuple[BenchmarkMetricResult, ...],
     critical_score: CriticalSpanDiagnosticScore | None,
 ) -> bool:
-    if any(result.gate.status == "failed" for result in results):
+    if any(
+        result.gate.status == "failed" or (result.gate.budget_id is not None and result.gate.status == "unavailable")
+        for result in results
+    ):
         return True
     return critical_score is not None and critical_score.status == "failed"
 
@@ -1496,6 +1508,25 @@ def _mean(values: tuple[float, ...]) -> float:
     return sum(values) / len(values)
 
 
+def _weighted_mean(values: tuple[tuple[float, int], ...]) -> float:
+    if not values:
+        raise ValidationError("cannot average an empty metric series")
+    total_weight = sum(weight for _value, weight in values)
+    if total_weight <= 0:
+        return _mean(tuple(value for value, _weight in values))
+    return sum(value * weight for value, weight in values) / total_weight
+
+
+def _observation_weight(observation: _MetricObservation) -> int:
+    if observation.scored_duration_ms > 0:
+        return observation.scored_duration_ms
+    if observation.scored_words > 0:
+        return observation.scored_words
+    if observation.scored_speaker_turns > 0:
+        return observation.scored_speaker_turns
+    return 1
+
+
 def _rate(numerator: int, denominator: int) -> float | None:
     if denominator == 0:
         return None
@@ -1515,6 +1546,13 @@ def _required(data: Mapping[str, Any], key: str, context: str) -> Any:
     if key not in data:
         raise ValidationError(f"{context}.{key} is required")
     return data[key]
+
+
+def _validate_report_schema_version(value: object) -> int:
+    version = _positive_int(value, "benchmark_report.schema_version")
+    if version != BENCHMARK_REPORT_SCHEMA_VERSION:
+        raise ValidationError(f"benchmark_report.schema_version is not supported: {version}")
+    return version
 
 
 def _sequence(value: object) -> tuple[Any, ...]:

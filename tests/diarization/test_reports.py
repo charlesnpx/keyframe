@@ -1,4 +1,7 @@
+import json
 from pathlib import Path
+
+import pytest
 
 from keyframe.diarization import (
     BenchmarkEvaluationCase,
@@ -21,6 +24,7 @@ from keyframe.diarization import (
     write_benchmark_report_json,
     write_benchmark_report_markdown,
 )
+from keyframe.diarization.models import ValidationError
 
 
 def _evaluation(
@@ -111,6 +115,24 @@ def _evaluation(
 
 
 def _case(recording_id, *, current_der, baseline_der, current_overlap_der, baseline_overlap_der):
+    return _case_with_support(
+        recording_id,
+        current_der=current_der,
+        baseline_der=baseline_der,
+        current_overlap_der=current_overlap_der,
+        baseline_overlap_der=baseline_overlap_der,
+    )
+
+
+def _case_with_support(
+    recording_id,
+    *,
+    current_der,
+    baseline_der,
+    current_overlap_der,
+    baseline_overlap_der,
+    scored_interval_ms=1_000,
+):
     return BenchmarkEvaluationCase(
         corpus_id="ami-smoke",
         branch_id="separate-tracks",
@@ -119,12 +141,14 @@ def _case(recording_id, *, current_der, baseline_der, current_overlap_der, basel
             recording_id,
             recording_der=current_der,
             overlap_der=current_overlap_der,
+            scored_interval_ms=scored_interval_ms,
         ),
         baseline_evaluation=_evaluation(
             f"{recording_id}-baseline",
             recording_id,
             recording_der=baseline_der,
             overlap_der=baseline_overlap_der,
+            scored_interval_ms=scored_interval_ms,
         ),
         scored_words=20,
         scored_speaker_turns=4,
@@ -239,6 +263,39 @@ def test_benchmark_report_includes_required_scopes_and_metric_fields():
     assert branch_der.gate.status == "passed"
 
 
+def test_aggregate_metrics_are_weighted_by_scored_support():
+    report = build_benchmark_report(
+        "weighted-aggregate",
+        (
+            _case_with_support(
+                "short-bad",
+                current_der=1.0,
+                baseline_der=0.0,
+                current_overlap_der=0.0,
+                baseline_overlap_der=0.0,
+                scored_interval_ms=100,
+            ),
+            _case_with_support(
+                "long-good",
+                current_der=0.0,
+                baseline_der=0.0,
+                current_overlap_der=0.0,
+                baseline_overlap_der=0.0,
+                scored_interval_ms=900,
+            ),
+        ),
+    )
+
+    branch_der = next(
+        result
+        for result in report.branch_results
+        if result.metric_name == "diarization_error_rate"
+    )
+    assert branch_der.point_score == 0.1
+    assert branch_der.paired_delta == 0.1
+    assert branch_der.scored_duration_ms == 1_000
+
+
 def test_slice_specific_regression_budget_can_pass_and_fail():
     pass_report = build_benchmark_report(
         "slice-pass",
@@ -283,6 +340,46 @@ def test_slice_specific_regression_budget_can_pass_and_fail():
     assert "paired delta" in fail_overlap.gate.reasons[0]
 
 
+def test_configured_regression_budget_without_baseline_fails_report():
+    report = build_benchmark_report(
+        "missing-baseline",
+        (
+            BenchmarkEvaluationCase(
+                corpus_id="ami-smoke",
+                branch_id="separate-tracks",
+                evaluation=_evaluation(
+                    "rec-1-current",
+                    "rec-1",
+                    recording_der=0.05,
+                    overlap_der=0.10,
+                ),
+                baseline_evaluation=None,
+                scored_words=20,
+                scored_speaker_turns=4,
+            ),
+        ),
+        gate_config=BenchmarkGateConfig(
+            budgets=(
+                BenchmarkRegressionBudget(
+                    budget_id="branch-der",
+                    metric_name="diarization_error_rate",
+                    direction="lower_is_better",
+                    max_regression_delta=0.01,
+                ),
+            )
+        ),
+    )
+
+    branch_der = next(
+        result
+        for result in report.branch_results
+        if result.metric_name == "diarization_error_rate"
+    )
+    assert report.status == "failed"
+    assert branch_der.gate.status == "unavailable"
+    assert branch_der.gate.budget_id == "branch-der"
+
+
 def test_report_json_round_trip_and_markdown_emitters(tmp_path):
     report = build_benchmark_report(
         "emitters",
@@ -306,6 +403,20 @@ def test_report_json_round_trip_and_markdown_emitters(tmp_path):
     assert "## Corpus Results" in markdown
     assert "## Slice Results" in markdown
     assert markdown_path.read_text(encoding="utf-8") == markdown
+
+
+def test_report_json_rejects_unsupported_schema_versions():
+    report = build_benchmark_report(
+        "unsupported-schema",
+        (
+            _case("rec-1", current_der=0.05, baseline_der=0.05, current_overlap_der=0.10, baseline_overlap_der=0.10),
+        ),
+    )
+    payload = report.to_dict()
+    payload["schema_version"] = 999
+
+    with pytest.raises(ValidationError, match="schema_version is not supported"):
+        benchmark_report_json_loads(json.dumps(payload))
 
 
 def test_review_signal_calibration_reports_serious_and_minor_breakdowns():
