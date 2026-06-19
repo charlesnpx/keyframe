@@ -226,6 +226,20 @@ def test_public_split_constructor_rejects_string_sequence_fields(kwargs, message
         DatasetSplitManifest(**kwargs)
 
 
+@pytest.mark.parametrize("path", ["/tmp/audio.wav", "../secret.wav", "C:/secret.wav", "..\\secret.wav"])
+def test_manifest_paths_are_portable_relative_paths(path):
+    with pytest.raises(ValidationError, match="relative path inside the dataset root|forward slashes"):
+        ExpectedDatasetFile(path=path, checksum_sha256="0" * 64, file_role="audio")
+
+    with pytest.raises(ValidationError, match="relative path inside the dataset root|forward slashes"):
+        DatasetSplitManifest(
+            split_id="bad-path",
+            role="smoke_ci",
+            expected_file_paths=(path,),
+            scoring_policy_id="smoke-policy",
+        )
+
+
 def test_public_manifest_constructor_rejects_string_notes():
     with pytest.raises(ValidationError, match="sequence fields must be arrays"):
         DatasetManifest(

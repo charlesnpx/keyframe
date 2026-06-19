@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Literal
 
 from keyframe.diarization.models import ValidationError
@@ -428,8 +428,11 @@ def _validate_sha256(value: object, field_name: str) -> str:
 
 def _validate_relative_path(value: object, field_name: str) -> str:
     value = _require_id(value, field_name)
-    path = Path(value)
-    if path.is_absolute() or ".." in path.parts:
+    if "\\" in value:
+        raise ValidationError(f"{field_name} must use forward slashes")
+    posix_path = PurePosixPath(value)
+    windows_path = PureWindowsPath(value)
+    if posix_path.is_absolute() or windows_path.is_absolute() or ".." in posix_path.parts:
         raise ValidationError(f"{field_name} must be a relative path inside the dataset root")
     return value
 
