@@ -92,6 +92,10 @@ def test_expected_file_checksums_match_committed_manifest_files():
             lambda payload: payload["expected_files"][0].pop("checksum_sha256"),
             "expected_file.checksum_sha256 is required",
         ),
+        (
+            lambda payload: payload["expected_files"][0].update({"checksum_sha256": "A" * 64}),
+            "expected_file.checksum must be a lowercase sha256 hex digest",
+        ),
     ],
 )
 def test_benchmarked_manifest_requires_license_attribution_files_checksums_and_splits(mutate, message):
@@ -191,6 +195,71 @@ def test_manifest_dataclass_validation_accepts_smoke_ci_public_direct_case():
 
     assert manifest.default_ci_downloadable is True
     assert manifest.default_full_downloadable is True
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        (
+            {
+                "split_id": "bad-split",
+                "role": "smoke_ci",
+                "expected_file_paths": "fixtures/smoke.json",
+                "scoring_policy_id": "smoke-policy",
+            },
+            "sequence fields must be arrays",
+        ),
+        (
+            {
+                "split_id": "bad-split",
+                "role": "smoke_ci",
+                "expected_file_paths": ("fixtures/smoke.json",),
+                "scoring_policy_id": "smoke-policy",
+                "recording_ids": "recording-1",
+            },
+            "sequence fields must be arrays",
+        ),
+    ],
+)
+def test_public_split_constructor_rejects_string_sequence_fields(kwargs, message):
+    with pytest.raises(ValidationError, match=message):
+        DatasetSplitManifest(**kwargs)
+
+
+def test_public_manifest_constructor_rejects_string_notes():
+    with pytest.raises(ValidationError, match="sequence fields must be arrays"):
+        DatasetManifest(
+            dataset_id="smoke-fixture",
+            name="Smoke Fixture",
+            role="smoke_ci",
+            access=DatasetAccess(mode="public_direct", redistribution="allowed", url="https://example.com/smoke.zip"),
+            license_url="https://example.com/license",
+            attribution="Synthetic smoke fixture",
+            expected_files=(
+                ExpectedDatasetFile(
+                    path="fixtures/smoke.json",
+                    checksum_sha256="0" * 64,
+                    file_role="manifest",
+                    size_bytes=0,
+                ),
+            ),
+            splits=(
+                DatasetSplitManifest(
+                    split_id="smoke",
+                    role="smoke_ci",
+                    expected_file_paths=("fixtures/smoke.json",),
+                    scoring_policy_id="smoke-policy",
+                ),
+            ),
+            scoring_policies=(
+                ScoringPolicyManifest(
+                    policy_id="smoke-policy",
+                    version="1",
+                    description="Smoke policy",
+                ),
+            ),
+            notes="one note",
+        )
 
 
 def test_diarization_manifests_do_not_add_yaml_dependency():

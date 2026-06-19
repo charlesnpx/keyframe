@@ -137,7 +137,8 @@ class DatasetSplitManifest:
         object.__setattr__(self, "split_id", _require_id(self.split_id, "dataset_split.split_id"))
         object.__setattr__(self, "role", _validate_role(self.role, "dataset_split.role"))
         paths = tuple(
-            _validate_relative_path(path, "dataset_split.expected_file_paths") for path in self.expected_file_paths
+            _validate_relative_path(path, "dataset_split.expected_file_paths")
+            for path in _sequence(self.expected_file_paths)
         )
         if not paths:
             raise ValidationError("dataset_split.expected_file_paths is required")
@@ -150,7 +151,10 @@ class DatasetSplitManifest:
         object.__setattr__(
             self,
             "recording_ids",
-            tuple(_require_id(recording_id, "dataset_split.recording_ids") for recording_id in self.recording_ids),
+            tuple(
+                _require_id(recording_id, "dataset_split.recording_ids")
+                for recording_id in _sequence(self.recording_ids)
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -192,7 +196,7 @@ class DatasetManifest:
         object.__setattr__(
             self,
             "notes",
-            tuple(_require_text(note, "dataset_manifest.notes") for note in self.notes),
+            tuple(_require_text(note, "dataset_manifest.notes") for note in _sequence(self.notes)),
         )
         object.__setattr__(self, "expected_files", _as_tuple_of_files(self.expected_files))
         object.__setattr__(self, "splits", _as_tuple_of_splits(self.splits))
@@ -416,7 +420,7 @@ def _validate_choice(value: object, choices: frozenset[str], field_name: str) ->
 
 
 def _validate_sha256(value: object, field_name: str) -> str:
-    value = _require_id(value, field_name).lower()
+    value = _require_id(value, field_name)
     if len(value) != 64 or any(character not in _HEX_DIGITS for character in value):
         raise ValidationError(f"{field_name} must be a lowercase sha256 hex digest")
     return value
