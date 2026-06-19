@@ -1,0 +1,33 @@
+{
+  "output_id": "speaker-id-collision",
+  "segments": [
+    {
+      "channel_id": "ch-1",
+      "speaker_confidence": 0.9,
+      "speaker_id": "S 1",
+      "words": [
+        {
+          "end_ms": 300,
+          "speaker_confidence": 0.9,
+          "start_ms": 0,
+          "text": "first",
+          "text_confidence": 0.95
+        }
+      ]
+    },
+    {
+      "channel_id": "ch-1",
+      "speaker_confidence": 0.88,
+      "speaker_id": "S-1",
+      "words": [
+        {
+          "end_ms": 700,
+          "speaker_confidence": 0.88,
+          "start_ms": 400,
+          "text": "second",
+          "text_confidence": 0.94
+        }
+      ]
+    }
+  ]
+}

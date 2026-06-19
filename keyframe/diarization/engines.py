@@ -312,7 +312,14 @@ def _speaker_ref_for(
     if key not in speaker_refs:
         channel_part = "no_channel" if channel_id is None else _sanitize_ref_part(channel_id)
         speaker_part = _sanitize_ref_part(raw_speaker_id)
-        speaker_refs[key] = f"engine:{channel_part}:{speaker_part}"
+        base_ref = f"engine:{channel_part}:{speaker_part}"
+        speaker_ref = base_ref
+        suffix = 2
+        used_refs = set(speaker_refs.values())
+        while speaker_ref in used_refs:
+            speaker_ref = f"{base_ref}-{suffix}"
+            suffix += 1
+        speaker_refs[key] = speaker_ref
     return speaker_refs[key]
 
 

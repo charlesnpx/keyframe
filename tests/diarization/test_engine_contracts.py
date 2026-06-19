@@ -114,6 +114,17 @@ def test_same_raw_speaker_id_on_different_channels_remains_channel_local():
     assert all(word.display_label is None for word in output.words)
 
 
+def test_distinct_raw_speaker_ids_do_not_collapse_after_sanitizing():
+    output = _adapter().normalize_raw_output(_payload("speaker_id_collision.json"), artifact=_artifact())
+
+    assert [word.speaker_ref for word in output.words] == ["engine:ch-1:s-1", "engine:ch-1:s-1-2"]
+    assert [item.raw_speaker_id for item in output.raw_speaker_evidence] == ["S 1", "S-1"]
+    assert [item.speaker_ref for item in output.raw_speaker_evidence] == [
+        "engine:ch-1:s-1",
+        "engine:ch-1:s-1-2",
+    ]
+
+
 def test_missing_confidence_is_preserved_as_null():
     output = _adapter().normalize_raw_output(_payload("missing_confidence.json"), artifact=_artifact())
 
