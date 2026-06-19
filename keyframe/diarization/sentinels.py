@@ -270,6 +270,8 @@ def _sentinel_failures(baseline_id: SentinelBaselineId, metrics: dict[str, Any])
             failures.append("bad_text_perfect_speaker must preserve speaker attribution")
         return tuple(failures)
     if baseline_id == "bad_turn_builder":
+        if metrics.get("word_speaker_label_accuracy") != 1.0:
+            failures.append("bad_turn_builder must preserve word speaker attribution")
         if metrics.get("turn_speaker_label_accuracy", 1.0) >= 1.0:
             failures.append("bad_turn_builder must degrade turn_speaker_label_accuracy")
         return tuple(failures)
@@ -333,8 +335,10 @@ def _baseline_words(
             speaker_ref = _channel_speaker_ref(word.channel_id, channel_refs)
         elif baseline_id == "timestamp_shifted":
             start_ms, end_ms = _shift_interval(start_ms, end_ms, duration_ms)
-        elif baseline_id in {"perfect_text_wrong_speaker", "bad_turn_builder"}:
+        elif baseline_id == "perfect_text_wrong_speaker":
             speaker_ref = collapsed_ref if word.speaker_ref is not None else None
+        elif baseline_id == "bad_turn_builder":
+            speaker_ref = _mapped_speaker_ref(word.speaker_ref, speaker_map)
         elif baseline_id == "bad_text_perfect_speaker":
             text = f"sentinel-bad-text-{index + 1}"
         result.append(
@@ -345,6 +349,21 @@ def _baseline_words(
                 start_ms=start_ms,
                 end_ms=end_ms,
                 speaker_ref=speaker_ref,
+                display_label=None,
+            )
+        )
+    if baseline_id == "bad_turn_builder" and result:
+        first_start = min(word.start_ms for word in result)
+        last_end = max(word.end_ms for word in result)
+        template = result[0]
+        result.append(
+            replace(
+                template,
+                word_id=f"sentinel-baseline:{baseline_id}:word:{len(result) + 1:06d}",
+                text="sentinel bad turn",
+                start_ms=first_start,
+                end_ms=last_end,
+                speaker_ref=collapsed_ref,
                 display_label=None,
             )
         )
@@ -372,7 +391,7 @@ def _baseline_spans(
             speaker_ref = _channel_speaker_ref(span.channel_id, channel_refs)
         elif baseline_id == "timestamp_shifted":
             start_ms, end_ms = _shift_interval(start_ms, end_ms, duration_ms)
-        elif baseline_id in {"perfect_text_wrong_speaker", "bad_turn_builder"}:
+        elif baseline_id == "perfect_text_wrong_speaker":
             speaker_ref = collapsed_ref
         result.append(
             replace(
@@ -391,21 +410,75 @@ def _shuffled_words(
     speaker_map: dict[str, str],
     baseline_id: SentinelBaselineId,
 ) -> tuple[CanonicalWord, ...]:
-    speaker_refs = tuple(speaker_map.values())
-    if not speaker_refs:
+    rotated_refs = _rotated_speaker_map(speaker_map)
+    if not rotated_refs:
         return ()
     result = []
     for index, word in enumerate(words):
-        speaker_ref = speaker_refs[index % len(speaker_refs)] if word.speaker_ref is not None else None
+        base_id = f"sentinel-baseline:{baseline_id}:word:{index + 1:06d}"
+        if word.speaker_ref is None:
+            result.append(replace(word, word_id=base_id, display_label=None))
+            continue
+        speaker_ref = speaker_map[word.speaker_ref]
+        rotated_ref = rotated_refs[word.speaker_ref]
+        if speaker_ref == rotated_ref:
+            result.append(
+                replace(
+                    word,
+                    word_id=base_id,
+                    speaker_ref=speaker_ref,
+                    display_label=None,
+                )
+            )
+            continue
+        midpoint = word.start_ms + ((word.end_ms - word.start_ms) // 2)
+        if word.start_ms < midpoint < word.end_ms:
+            result.append(
+                replace(
+                    word,
+                    word_id=f"{base_id}:a",
+                    end_ms=midpoint,
+                    speaker_ref=speaker_ref,
+                    display_label=None,
+                )
+            )
+            result.append(
+                replace(
+                    word,
+                    word_id=f"{base_id}:b",
+                    start_ms=midpoint,
+                    speaker_ref=rotated_ref,
+                    display_label=None,
+                )
+            )
+            continue
         result.append(
             replace(
                 word,
-                word_id=f"sentinel-baseline:{baseline_id}:word:{index + 1:06d}",
+                word_id=f"{base_id}:a",
                 speaker_ref=speaker_ref,
                 display_label=None,
             )
         )
+        result.append(
+            replace(
+                word,
+                word_id=f"{base_id}:b",
+                speaker_ref=rotated_ref,
+                display_label=None,
+            )
+        )
     return tuple(result)
+
+
+def _rotated_speaker_map(speaker_map: dict[str, str]) -> dict[str, str]:
+    original_refs = tuple(speaker_map)
+    if len(original_refs) < 2:
+        return dict(speaker_map)
+    return {
+        speaker_ref: speaker_map[original_refs[(index + 1) % len(original_refs)]]
+        for index, speaker_ref in enumerate(original_refs)
+    }
 
 
 def _shuffled_spans(
@@ -466,7 +539,9 @@ def _shift_interval(start_ms: int, end_ms: int, duration_ms: int, shift_ms: int 
     interval_ms = end_ms - start_ms
     if interval_ms >= duration_ms:
         return start_ms, end_ms
-    shifted_start = min(max(0, start_ms + shift_ms), duration_ms - interval_ms)
+    latest_start = duration_ms - interval_ms
+    right_start = min(start_ms + shift_ms, latest_start)
+    shifted_start = right_start if right_start != start_ms else max(0, start_ms - shift_ms)
     return shifted_start, shifted_start + interval_ms
 
 

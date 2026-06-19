@@ -7,6 +7,9 @@ from keyframe.diarization import (
     SENTINEL_BASELINE_IDS,
     ReferenceBundle,
     SentinelBaselineReport,
+    ScoringRegion,
+    SpeakerRecord,
+    SpeakerSpan,
     ValidationError,
     build_sentinel_baseline_outputs,
     evaluate_sentinel_baselines,
@@ -85,6 +88,54 @@ def test_bad_text_baseline_separates_asr_failure_from_speaker_attribution():
     assert check.metrics["word_speaker_label_accuracy"] == 1.0
     assert check.metrics["turn_speaker_label_accuracy"] == 1.0
     assert check.metrics["speaker_count_error"] == 0
+
+
+def test_shuffled_speaker_baseline_degrades_word_only_references():
+    reference = _reference_bundle()
+    recording = replace(
+        reference.recording,
+        speaker_spans=(),
+    )
+
+    report = evaluate_sentinel_baselines(ReferenceBundle.from_recording(recording, artifact_id="word-only-reference"))
+    check = _checks_by_id(report)["shuffled_speakers"]
+
+    assert check.status == "passed"
+    assert check.metrics["diarization_error_rate"] > 0.0
+
+
+def test_timestamp_shift_baseline_degrades_end_aligned_intervals():
+    reference = _reference_bundle()
+    recording = replace(
+        reference.recording,
+        duration_ms=1_000,
+        speakers=(SpeakerRecord("spk-a"),),
+        speaker_spans=(
+            SpeakerSpan(
+                span_id="span-end-aligned",
+                speaker_ref="spk-a",
+                start_ms=500,
+                end_ms=1_000,
+                channel_id="ch-1",
+            ),
+        ),
+        words=(),
+        scoring_regions=(ScoringRegion("uem-1", 0, 1_000, channel_id="ch-1"),),
+    )
+
+    report = evaluate_sentinel_baselines(ReferenceBundle.from_recording(recording, artifact_id="end-aligned-reference"))
+    check = _checks_by_id(report)["timestamp_shifted"]
+
+    assert check.status == "passed"
+    assert check.metrics["diarization_error_rate"] > 0.0
+
+
+def test_bad_turn_builder_preserves_word_attribution_while_degrading_turns():
+    report = evaluate_sentinel_baselines(_reference_bundle())
+    check = _checks_by_id(report)["bad_turn_builder"]
+
+    assert check.metrics["word_speaker_label_accuracy"] == 1.0
+    assert check.metrics["turn_speaker_label_accuracy"] < 1.0
 
 
 def test_sentinel_gate_blocks_engine_benchmark_execution_when_health_fails():
