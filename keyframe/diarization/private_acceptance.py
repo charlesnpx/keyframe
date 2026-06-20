@@ -16,7 +16,8 @@ from typing import Any, Literal
 from keyframe.diarization.models import ValidationError
 
 
-PRIVATE_ACCEPTANCE_METADATA_SCHEMA_VERSION = 1
+PRIVATE_ACCEPTANCE_METADATA_SCHEMA_VERSION = 2
+SUPPORTED_PRIVATE_ACCEPTANCE_METADATA_SCHEMA_VERSIONS = frozenset({1, 2})
 
 PrivateAcceptanceLabel = Literal["adjudicated", "unadjudicated_diagnostic", "reference_unstable", "no_score"]
 PrivateAnnotationQualityGateStatus = Literal["passed", "failed", "unavailable"]
@@ -645,9 +646,18 @@ class PrivateAcceptanceMetadata:
         if self.coverage_plan is not None and not isinstance(self.coverage_plan, PrivateAcceptanceCoveragePlan):
             raise ValidationError("private_acceptance.coverage_plan must be PrivateAcceptanceCoveragePlan")
         if self.coverage_plan is not None:
-            allowed_slice_ids = {item.slice_id for item in slices if item.label == "adjudicated"}
+            if self.schema_version < 2:
+                raise ValidationError("private_acceptance.coverage_plan requires schema_version 2")
+            slice_ids = {item.slice_id for item in slices}
+            target_ids = {target.slice_id for target in self.coverage_plan.targets}
+            unknown_targets = target_ids - slice_ids
+            if unknown_targets:
+                raise ValidationError(
+                    f"private_acceptance.coverage_plan references unknown slice: {sorted(unknown_targets)[0]}"
+                )
+            adjudicated_slice_ids = {item.slice_id for item in slices if item.label == "adjudicated"}
             promoted_slice_ids = {target.slice_id for target in self.coverage_plan.targets if not target.diagnostic_only}
-            unknown_promoted = promoted_slice_ids - allowed_slice_ids
+            unknown_promoted = promoted_slice_ids - adjudicated_slice_ids
             if unknown_promoted:
                 raise ValidationError(
                     f"private_acceptance.coverage_plan requires adjudicated slice: {sorted(unknown_promoted)[0]}"
@@ -986,7 +996,7 @@ def _coverage_result_for_target(
 
 def _validate_schema_version(value: object) -> int:
     version = _positive_int(value, "private_acceptance.schema_version")
-    if version != PRIVATE_ACCEPTANCE_METADATA_SCHEMA_VERSION:
+    if version not in SUPPORTED_PRIVATE_ACCEPTANCE_METADATA_SCHEMA_VERSIONS:
         raise ValidationError(f"private_acceptance schema version is not supported: {version}")
     return version
 

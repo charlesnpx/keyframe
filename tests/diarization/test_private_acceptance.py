@@ -221,7 +221,7 @@ def test_private_acceptance_metadata_json_round_trip_is_stable():
     loaded = private_acceptance_metadata_json_loads(text)
 
     assert loaded.to_dict() == metadata.to_dict()
-    assert '"schema_version": 1' in text
+    assert '"schema_version": 2' in text
     assert loaded.coverage_plan is not None
     assert loaded.coverage_plan.targets[0].capture_modes == ("mono_mix", "separate_tracks")
     assert loaded.coverage_plan.targets[0].to_dict() == {
@@ -239,6 +239,24 @@ def test_private_acceptance_metadata_json_round_trip_is_stable():
         "slice_id": "adjudicated-core",
         "speaker_count_buckets": ["2", "3_plus"],
     }
+
+
+def test_private_acceptance_schema_version_one_metadata_without_coverage_plan_stays_readable():
+    payload = _metadata().to_dict()
+    payload["schema_version"] = 1
+
+    loaded = private_acceptance_metadata_from_dict(payload)
+
+    assert loaded.schema_version == 1
+    assert loaded.coverage_plan is None
+
+
+def test_private_acceptance_schema_version_one_rejects_coverage_plan_field():
+    payload = _metadata(coverage_plan=_coverage_plan()).to_dict()
+    payload["schema_version"] = 1
+
+    with pytest.raises(ValidationError, match="coverage_plan requires schema_version 2"):
+        private_acceptance_metadata_from_dict(payload)
 
 
 def test_private_acceptance_rejects_reference_speaker_identity_fields():
@@ -420,6 +438,23 @@ def test_optional_non_diagnostic_coverage_targets_must_be_adjudicated():
                     _coverage_target(
                         "diagnostic-unadjudicated",
                         diagnostic_only=False,
+                        required=False,
+                    ),
+                ),
+            )
+        )
+
+
+def test_diagnostic_coverage_targets_must_reference_existing_private_slices():
+    with pytest.raises(ValidationError, match="references unknown slice: stale-diagnostic"):
+        _metadata(
+            coverage_plan=PrivateAcceptanceCoveragePlan(
+                plan_id="bad-private-coverage",
+                version="1",
+                targets=(
+                    _coverage_target(
+                        "stale-diagnostic",
+                        diagnostic_only=True,
                         required=False,
                     ),
                 ),
