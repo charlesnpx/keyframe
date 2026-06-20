@@ -16,10 +16,12 @@ from typing import Any, Literal
 from keyframe.diarization.models import ValidationError
 
 
-PRIVATE_ACCEPTANCE_METADATA_SCHEMA_VERSION = 1
+PRIVATE_ACCEPTANCE_METADATA_SCHEMA_VERSION = 2
+SUPPORTED_PRIVATE_ACCEPTANCE_METADATA_SCHEMA_VERSIONS = frozenset({1, 2})
 
 PrivateAcceptanceLabel = Literal["adjudicated", "unadjudicated_diagnostic", "reference_unstable", "no_score"]
 PrivateAnnotationQualityGateStatus = Literal["passed", "failed", "unavailable"]
+PrivateAcceptanceCoverageStatus = Literal["sufficient", "insufficient_acceptance_coverage", "diagnostic_only"]
 
 ALLOWED_PRIVATE_ACCEPTANCE_LABELS = frozenset(
     {"adjudicated", "unadjudicated_diagnostic", "reference_unstable", "no_score"}
@@ -323,6 +325,302 @@ class PrivateAnnotationQualityGateResult:
 
 
 @dataclass(frozen=True)
+class PrivateAcceptanceCoverageSliceTarget:
+    """Minimum private acceptance coverage for one validated launch-scope slice."""
+
+    slice_id: str
+    capture_modes: tuple[str, ...]
+    speaker_count_buckets: tuple[str, ...]
+    duration_buckets: tuple[str, ...]
+    overlap_ratio_buckets: tuple[str, ...]
+    audio_quality_buckets: tuple[str, ...]
+    platform_sources: tuple[str, ...]
+    language_accent_domains: tuple[str, ...]
+    min_scored_recording_count: int
+    min_scored_duration_ms: int
+    required: bool = True
+    diagnostic_only: bool = False
+    description: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "slice_id", _require_id(self.slice_id, "coverage_target.slice_id"))
+        for field_name in (
+            "capture_modes",
+            "speaker_count_buckets",
+            "duration_buckets",
+            "overlap_ratio_buckets",
+            "audio_quality_buckets",
+            "platform_sources",
+            "language_accent_domains",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _non_empty_id_tuple(getattr(self, field_name), f"coverage_target.{field_name}"),
+            )
+        object.__setattr__(
+            self,
+            "min_scored_recording_count",
+            _positive_int(self.min_scored_recording_count, "coverage_target.min_scored_recording_count"),
+        )
+        object.__setattr__(
+            self,
+            "min_scored_duration_ms",
+            _positive_int(self.min_scored_duration_ms, "coverage_target.min_scored_duration_ms"),
+        )
+        object.__setattr__(self, "required", _require_bool(self.required, "coverage_target.required"))
+        object.__setattr__(
+            self,
+            "diagnostic_only",
+            _require_bool(self.diagnostic_only, "coverage_target.diagnostic_only"),
+        )
+        object.__setattr__(self, "description", _optional_text(self.description, "coverage_target.description"))
+        if self.required and self.diagnostic_only:
+            raise ValidationError("coverage_target cannot be both required and diagnostic_only")
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = {
+            "audio_quality_buckets": list(self.audio_quality_buckets),
+            "capture_modes": list(self.capture_modes),
+            "diagnostic_only": self.diagnostic_only,
+            "duration_buckets": list(self.duration_buckets),
+            "language_accent_domains": list(self.language_accent_domains),
+            "min_scored_duration_ms": self.min_scored_duration_ms,
+            "min_scored_recording_count": self.min_scored_recording_count,
+            "overlap_ratio_buckets": list(self.overlap_ratio_buckets),
+            "platform_sources": list(self.platform_sources),
+            "required": self.required,
+            "slice_id": self.slice_id,
+            "speaker_count_buckets": list(self.speaker_count_buckets),
+        }
+        if self.description is not None:
+            payload["description"] = self.description
+        return payload
+
+
+@dataclass(frozen=True)
+class PrivateAcceptanceCoverageObservation:
+    """Observed scored support for one private acceptance coverage slice."""
+
+    slice_id: str
+    scored_recording_count: int
+    scored_duration_ms: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "slice_id", _require_id(self.slice_id, "coverage_observation.slice_id"))
+        object.__setattr__(
+            self,
+            "scored_recording_count",
+            _non_negative_int(self.scored_recording_count, "coverage_observation.scored_recording_count"),
+        )
+        object.__setattr__(
+            self,
+            "scored_duration_ms",
+            _non_negative_int(self.scored_duration_ms, "coverage_observation.scored_duration_ms"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "scored_duration_ms": self.scored_duration_ms,
+            "scored_recording_count": self.scored_recording_count,
+            "slice_id": self.slice_id,
+        }
+
+
+@dataclass(frozen=True)
+class PrivateAcceptanceCoveragePlan:
+    """Versioned private sampling and launch-scope coverage targets."""
+
+    plan_id: str
+    version: str
+    targets: tuple[PrivateAcceptanceCoverageSliceTarget, ...]
+    validated_scope: tuple[str, ...] = ()
+    unsupported_scope: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "plan_id", _require_id(self.plan_id, "coverage_plan.plan_id"))
+        object.__setattr__(self, "version", _require_id(self.version, "coverage_plan.version"))
+        targets = _tuple_of(self.targets, PrivateAcceptanceCoverageSliceTarget, "coverage_plan.targets")
+        if not targets:
+            raise ValidationError("coverage_plan.targets is required")
+        _unique_ids(tuple(target.slice_id for target in targets), "coverage_plan.targets.slice_id")
+        object.__setattr__(self, "targets", targets)
+        object.__setattr__(self, "validated_scope", _id_tuple(self.validated_scope, "coverage_plan.validated_scope"))
+        object.__setattr__(
+            self,
+            "unsupported_scope",
+            _id_tuple(self.unsupported_scope, "coverage_plan.unsupported_scope"),
+        )
+        overlap = set(self.validated_scope) & set(self.unsupported_scope)
+        if overlap:
+            raise ValidationError(f"coverage_plan scope cannot be both validated and unsupported: {sorted(overlap)[0]}")
+        required_ids = {target.slice_id for target in targets if target.required}
+        unknown_scope = (set(self.validated_scope) | set(self.unsupported_scope)) - required_ids
+        if unknown_scope:
+            raise ValidationError(f"coverage_plan scope references unknown required slice: {sorted(unknown_scope)[0]}")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "plan_id": self.plan_id,
+            "targets": [target.to_dict() for target in self.targets],
+            "unsupported_scope": list(self.unsupported_scope),
+            "validated_scope": list(self.validated_scope),
+            "version": self.version,
+        }
+
+
+@dataclass(frozen=True)
+class PrivateAcceptanceCoverageSliceResult:
+    """Coverage status for one launch-scope slice."""
+
+    slice_id: str
+    status: PrivateAcceptanceCoverageStatus
+    required: bool
+    diagnostic_only: bool
+    scored_recording_count: int
+    scored_duration_ms: int
+    min_scored_recording_count: int
+    min_scored_duration_ms: int
+    reasons: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "slice_id", _require_id(self.slice_id, "coverage_result.slice_id"))
+        object.__setattr__(self, "status", _validate_coverage_status(self.status, "coverage_result.status"))
+        object.__setattr__(self, "required", _require_bool(self.required, "coverage_result.required"))
+        object.__setattr__(
+            self,
+            "diagnostic_only",
+            _require_bool(self.diagnostic_only, "coverage_result.diagnostic_only"),
+        )
+        for field_name in ("scored_recording_count", "scored_duration_ms"):
+            object.__setattr__(
+                self,
+                field_name,
+                _non_negative_int(getattr(self, field_name), f"coverage_result.{field_name}"),
+            )
+        for field_name in ("min_scored_recording_count", "min_scored_duration_ms"):
+            object.__setattr__(
+                self,
+                field_name,
+                _positive_int(getattr(self, field_name), f"coverage_result.{field_name}"),
+            )
+        reasons = tuple(_require_text(reason, "coverage_result.reasons") for reason in _sequence(self.reasons))
+        object.__setattr__(self, "reasons", reasons)
+        if self.diagnostic_only != (self.status == "diagnostic_only"):
+            raise ValidationError("coverage_result.diagnostic_only must match diagnostic_only status")
+        if self.required and self.diagnostic_only:
+            raise ValidationError("coverage_result cannot be both required and diagnostic_only")
+        below_threshold = (
+            self.scored_recording_count < self.min_scored_recording_count
+            or self.scored_duration_ms < self.min_scored_duration_ms
+        )
+        if self.status == "sufficient" and (reasons or below_threshold):
+            raise ValidationError("sufficient coverage results must meet minimum coverage without reasons")
+        if self.status == "insufficient_acceptance_coverage" and not below_threshold:
+            raise ValidationError("insufficient coverage results must be below minimum coverage")
+        if self.status != "sufficient" and not reasons:
+            raise ValidationError("insufficient or diagnostic coverage results require reasons")
+
+    @property
+    def passed(self) -> bool:
+        return self.status in {"sufficient", "diagnostic_only"}
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "diagnostic_only": self.diagnostic_only,
+            "min_scored_duration_ms": self.min_scored_duration_ms,
+            "min_scored_recording_count": self.min_scored_recording_count,
+            "passed": self.passed,
+            "reasons": list(self.reasons),
+            "required": self.required,
+            "scored_duration_ms": self.scored_duration_ms,
+            "scored_recording_count": self.scored_recording_count,
+            "slice_id": self.slice_id,
+            "status": self.status,
+        }
+
+
+@dataclass(frozen=True)
+class PrivateAcceptanceCoverageReport:
+    """Release-record-ready private acceptance coverage status."""
+
+    plan_id: str
+    plan_version: str
+    status: PrivateAcceptanceCoverageStatus
+    slice_results: tuple[PrivateAcceptanceCoverageSliceResult, ...]
+    validated_scope: tuple[str, ...]
+    unsupported_scope: tuple[str, ...]
+    failure_code: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "plan_id", _require_id(self.plan_id, "coverage_report.plan_id"))
+        object.__setattr__(self, "plan_version", _require_id(self.plan_version, "coverage_report.plan_version"))
+        object.__setattr__(self, "status", _validate_coverage_status(self.status, "coverage_report.status"))
+        results = _tuple_of(self.slice_results, PrivateAcceptanceCoverageSliceResult, "coverage_report.slice_results")
+        if not results:
+            raise ValidationError("coverage_report.slice_results is required")
+        result_ids = tuple(result.slice_id for result in results)
+        _unique_ids(result_ids, "coverage_report.slice_results.slice_id")
+        object.__setattr__(self, "slice_results", results)
+        validated_scope = _id_tuple(self.validated_scope, "coverage_report.validated_scope")
+        object.__setattr__(self, "validated_scope", validated_scope)
+        unsupported_scope = _id_tuple(self.unsupported_scope, "coverage_report.unsupported_scope")
+        object.__setattr__(
+            self,
+            "unsupported_scope",
+            unsupported_scope,
+        )
+        object.__setattr__(self, "failure_code", _optional_id(self.failure_code, "coverage_report.failure_code"))
+        expected_validated_scope = tuple(
+            result.slice_id
+            for result in results
+            if result.required and result.status == "sufficient"
+        )
+        expected_unsupported_scope = tuple(
+            result.slice_id
+            for result in results
+            if result.required and result.status == "insufficient_acceptance_coverage"
+        )
+        if validated_scope != expected_validated_scope:
+            raise ValidationError("coverage_report.validated_scope must match sufficient required slices")
+        if unsupported_scope != expected_unsupported_scope:
+            raise ValidationError("coverage_report.unsupported_scope must match insufficient required slices")
+        if self.status == "diagnostic_only":
+            raise ValidationError("coverage_report.status cannot be diagnostic_only")
+        has_required_insufficient = any(
+            result.required and result.status == "insufficient_acceptance_coverage"
+            for result in results
+        )
+        if self.status == "sufficient" and has_required_insufficient:
+            raise ValidationError("sufficient coverage reports cannot include insufficient required slices")
+        if self.status == "insufficient_acceptance_coverage" and not has_required_insufficient:
+            raise ValidationError("insufficient coverage reports require an insufficient required slice")
+        if (
+            self.status == "insufficient_acceptance_coverage"
+            and self.failure_code != "insufficient_acceptance_coverage"
+        ):
+            raise ValidationError("insufficient coverage reports require insufficient_acceptance_coverage failure_code")
+        if self.status != "insufficient_acceptance_coverage" and self.failure_code is not None:
+            raise ValidationError("sufficient coverage reports cannot include a failure_code")
+
+    @property
+    def passed(self) -> bool:
+        return self.status != "insufficient_acceptance_coverage"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "failure_code": self.failure_code,
+            "passed": self.passed,
+            "plan_id": self.plan_id,
+            "plan_version": self.plan_version,
+            "slice_results": [result.to_dict() for result in self.slice_results],
+            "status": self.status,
+            "unsupported_scope": list(self.unsupported_scope),
+            "validated_scope": list(self.validated_scope),
+        }
+
+
+@dataclass(frozen=True)
 class PrivateAcceptanceMetadata:
     """Manifest-safe private acceptance metadata without private annotations."""
 
@@ -330,6 +628,7 @@ class PrivateAcceptanceMetadata:
     protocol: PrivateAnnotationProtocol
     slices: tuple[PrivateAcceptanceSlice, ...]
     quality_metrics: PrivateAnnotationQualityMetrics | None = None
+    coverage_plan: PrivateAcceptanceCoveragePlan | None = None
     schema_version: int = PRIVATE_ACCEPTANCE_METADATA_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -344,6 +643,25 @@ class PrivateAcceptanceMetadata:
         object.__setattr__(self, "slices", slices)
         if self.quality_metrics is not None and not isinstance(self.quality_metrics, PrivateAnnotationQualityMetrics):
             raise ValidationError("private_acceptance.quality_metrics must be PrivateAnnotationQualityMetrics")
+        if self.coverage_plan is not None and not isinstance(self.coverage_plan, PrivateAcceptanceCoveragePlan):
+            raise ValidationError("private_acceptance.coverage_plan must be PrivateAcceptanceCoveragePlan")
+        if self.coverage_plan is not None:
+            if self.schema_version < 2:
+                raise ValidationError("private_acceptance.coverage_plan requires schema_version 2")
+            slice_ids = {item.slice_id for item in slices}
+            target_ids = {target.slice_id for target in self.coverage_plan.targets}
+            unknown_targets = target_ids - slice_ids
+            if unknown_targets:
+                raise ValidationError(
+                    f"private_acceptance.coverage_plan references unknown slice: {sorted(unknown_targets)[0]}"
+                )
+            adjudicated_slice_ids = {item.slice_id for item in slices if item.label == "adjudicated"}
+            promoted_slice_ids = {target.slice_id for target in self.coverage_plan.targets if not target.diagnostic_only}
+            unknown_promoted = promoted_slice_ids - adjudicated_slice_ids
+            if unknown_promoted:
+                raise ValidationError(
+                    f"private_acceptance.coverage_plan requires adjudicated slice: {sorted(unknown_promoted)[0]}"
+                )
 
     def to_dict(self) -> dict[str, Any]:
         payload = {
@@ -354,6 +672,8 @@ class PrivateAcceptanceMetadata:
         }
         if self.quality_metrics is not None:
             payload["quality_metrics"] = self.quality_metrics.to_dict()
+        if self.coverage_plan is not None:
+            payload["coverage_plan"] = self.coverage_plan.to_dict()
         return payload
 
 
@@ -399,6 +719,51 @@ def evaluate_private_annotation_quality(
     )
 
 
+def evaluate_private_acceptance_coverage(
+    metadata: PrivateAcceptanceMetadata,
+    observations: tuple[PrivateAcceptanceCoverageObservation, ...],
+) -> PrivateAcceptanceCoverageReport:
+    """Evaluate private acceptance coverage against the validated launch scope."""
+
+    if not isinstance(metadata, PrivateAcceptanceMetadata):
+        raise ValidationError("metadata must be PrivateAcceptanceMetadata")
+    if metadata.coverage_plan is None:
+        raise ValidationError("metadata.coverage_plan is required")
+    plan = metadata.coverage_plan
+    observations = _tuple_of(observations, PrivateAcceptanceCoverageObservation, "coverage_observations")
+    target_ids = {target.slice_id for target in plan.targets}
+    observed_by_slice: dict[str, PrivateAcceptanceCoverageObservation] = {}
+    for observation in observations:
+        if observation.slice_id not in target_ids:
+            raise ValidationError(f"coverage observation references unknown slice_id: {observation.slice_id}")
+        if observation.slice_id in observed_by_slice:
+            raise ValidationError(f"duplicate coverage observation slice_id: {observation.slice_id}")
+        observed_by_slice[observation.slice_id] = observation
+
+    results = tuple(
+        _coverage_result_for_target(target, observed_by_slice.get(target.slice_id))
+        for target in plan.targets
+    )
+    has_insufficient = any(result.status == "insufficient_acceptance_coverage" for result in results if result.required)
+    return PrivateAcceptanceCoverageReport(
+        plan_id=plan.plan_id,
+        plan_version=plan.version,
+        status="insufficient_acceptance_coverage" if has_insufficient else "sufficient",
+        slice_results=results,
+        validated_scope=tuple(
+            result.slice_id
+            for result in results
+            if result.required and result.status == "sufficient"
+        ),
+        unsupported_scope=tuple(
+            result.slice_id
+            for result in results
+            if result.required and result.status == "insufficient_acceptance_coverage"
+        ),
+        failure_code="insufficient_acceptance_coverage" if has_insufficient else None,
+    )
+
+
 def private_acceptance_metadata_to_dict(metadata: PrivateAcceptanceMetadata) -> dict[str, Any]:
     if not isinstance(metadata, PrivateAcceptanceMetadata):
         raise ValidationError("metadata must be PrivateAcceptanceMetadata")
@@ -410,7 +775,7 @@ def private_acceptance_metadata_from_dict(payload: object) -> PrivateAcceptanceM
     _reject_reference_identity_fields(data, "private_acceptance")
     _reject_unknown_fields(
         data,
-        {"metadata_id", "protocol", "quality_metrics", "schema_version", "slices"},
+        {"coverage_plan", "metadata_id", "protocol", "quality_metrics", "schema_version", "slices"},
         "private_acceptance",
     )
     return PrivateAcceptanceMetadata(
@@ -422,6 +787,9 @@ def private_acceptance_metadata_from_dict(payload: object) -> PrivateAcceptanceM
             None
             if data.get("quality_metrics") is None
             else _quality_metrics_from_dict(data.get("quality_metrics"))
+        ),
+        coverage_plan=(
+            None if data.get("coverage_plan") is None else _coverage_plan_from_dict(data.get("coverage_plan"))
         ),
     )
 
@@ -530,9 +898,105 @@ def _quality_metrics_from_dict(payload: object) -> PrivateAnnotationQualityMetri
     )
 
 
+def _coverage_plan_from_dict(payload: object) -> PrivateAcceptanceCoveragePlan:
+    data = _mapping(payload, "coverage_plan")
+    _reject_reference_identity_fields(data, "coverage_plan")
+    _reject_unknown_fields(
+        data,
+        {"plan_id", "targets", "unsupported_scope", "validated_scope", "version"},
+        "coverage_plan",
+    )
+    return PrivateAcceptanceCoveragePlan(
+        plan_id=_required(data, "plan_id", "coverage_plan"),
+        version=_required(data, "version", "coverage_plan"),
+        targets=tuple(
+            _coverage_target_from_dict(item)
+            for item in _sequence(_required(data, "targets", "coverage_plan"))
+        ),
+        validated_scope=tuple(_sequence(data.get("validated_scope", ()))),
+        unsupported_scope=tuple(_sequence(data.get("unsupported_scope", ()))),
+    )
+
+
+def _coverage_target_from_dict(payload: object) -> PrivateAcceptanceCoverageSliceTarget:
+    data = _mapping(payload, "coverage_target")
+    _reject_reference_identity_fields(data, "coverage_target")
+    _reject_unknown_fields(
+        data,
+        {
+            "audio_quality_buckets",
+            "capture_modes",
+            "description",
+            "diagnostic_only",
+            "duration_buckets",
+            "language_accent_domains",
+            "min_scored_duration_ms",
+            "min_scored_recording_count",
+            "overlap_ratio_buckets",
+            "platform_sources",
+            "required",
+            "slice_id",
+            "speaker_count_buckets",
+        },
+        "coverage_target",
+    )
+    return PrivateAcceptanceCoverageSliceTarget(
+        slice_id=_required(data, "slice_id", "coverage_target"),
+        capture_modes=tuple(_sequence(_required(data, "capture_modes", "coverage_target"))),
+        speaker_count_buckets=tuple(_sequence(_required(data, "speaker_count_buckets", "coverage_target"))),
+        duration_buckets=tuple(_sequence(_required(data, "duration_buckets", "coverage_target"))),
+        overlap_ratio_buckets=tuple(_sequence(_required(data, "overlap_ratio_buckets", "coverage_target"))),
+        audio_quality_buckets=tuple(_sequence(_required(data, "audio_quality_buckets", "coverage_target"))),
+        platform_sources=tuple(_sequence(_required(data, "platform_sources", "coverage_target"))),
+        language_accent_domains=tuple(_sequence(_required(data, "language_accent_domains", "coverage_target"))),
+        min_scored_recording_count=_required(data, "min_scored_recording_count", "coverage_target"),
+        min_scored_duration_ms=_required(data, "min_scored_duration_ms", "coverage_target"),
+        required=data.get("required", True),
+        diagnostic_only=data.get("diagnostic_only", False),
+        description=data.get("description"),
+    )
+
+
+def _coverage_result_for_target(
+    target: PrivateAcceptanceCoverageSliceTarget,
+    observation: PrivateAcceptanceCoverageObservation | None,
+) -> PrivateAcceptanceCoverageSliceResult:
+    scored_recording_count = 0 if observation is None else observation.scored_recording_count
+    scored_duration_ms = 0 if observation is None else observation.scored_duration_ms
+    if target.diagnostic_only:
+        return PrivateAcceptanceCoverageSliceResult(
+            slice_id=target.slice_id,
+            status="diagnostic_only",
+            required=target.required,
+            diagnostic_only=True,
+            scored_recording_count=scored_recording_count,
+            scored_duration_ms=scored_duration_ms,
+            min_scored_recording_count=target.min_scored_recording_count,
+            min_scored_duration_ms=target.min_scored_duration_ms,
+            reasons=("diagnostic slice is not promoted through private acceptance protocol",),
+        )
+
+    reasons: list[str] = []
+    if scored_recording_count < target.min_scored_recording_count:
+        reasons.append("scored_recording_count below threshold")
+    if scored_duration_ms < target.min_scored_duration_ms:
+        reasons.append("scored_duration_ms below threshold")
+    return PrivateAcceptanceCoverageSliceResult(
+        slice_id=target.slice_id,
+        status="insufficient_acceptance_coverage" if reasons else "sufficient",
+        required=target.required,
+        diagnostic_only=False,
+        scored_recording_count=scored_recording_count,
+        scored_duration_ms=scored_duration_ms,
+        min_scored_recording_count=target.min_scored_recording_count,
+        min_scored_duration_ms=target.min_scored_duration_ms,
+        reasons=tuple(reasons),
+    )
+
+
 def _validate_schema_version(value: object) -> int:
     version = _positive_int(value, "private_acceptance.schema_version")
-    if version != PRIVATE_ACCEPTANCE_METADATA_SCHEMA_VERSION:
+    if version not in SUPPORTED_PRIVATE_ACCEPTANCE_METADATA_SCHEMA_VERSIONS:
         raise ValidationError(f"private_acceptance schema version is not supported: {version}")
     return version
 
@@ -542,6 +1006,13 @@ def _validate_label(value: object) -> PrivateAcceptanceLabel:
     if label not in ALLOWED_PRIVATE_ACCEPTANCE_LABELS:
         raise ValidationError(f"private acceptance label is not supported: {label}")
     return label  # type: ignore[return-value]
+
+
+def _validate_coverage_status(value: object, field_name: str) -> PrivateAcceptanceCoverageStatus:
+    status = _require_id(value, field_name)
+    if status not in {"sufficient", "insufficient_acceptance_coverage", "diagnostic_only"}:
+        raise ValidationError(f"{field_name} is not supported: {status}")
+    return status  # type: ignore[return-value]
 
 
 def _mapping(value: object, context: str) -> dict[str, Any]:
@@ -606,6 +1077,17 @@ def _non_empty_text_tuple(values: object, field_name: str) -> tuple[str, ...]:
     return result
 
 
+def _non_empty_id_tuple(values: object, field_name: str) -> tuple[str, ...]:
+    result = _id_tuple(values, field_name)
+    if not result:
+        raise ValidationError(f"{field_name} is required")
+    return result
+
+
+def _id_tuple(values: object, field_name: str) -> tuple[str, ...]:
+    return tuple(_require_id(item, field_name) for item in _sequence(values))
+
+
 def _probability_map(value: object, field_name: str) -> dict[str, float]:
     if not isinstance(value, dict):
         raise ValidationError(f"{field_name} must be an object")
@@ -659,6 +1141,18 @@ def _require_id(value: object, field_name: str) -> str:
     value = value.strip()
     if not value:
         raise ValidationError(f"{field_name} is required")
+    return value
+
+
+def _optional_id(value: object, field_name: str) -> str | None:
+    if value is None:
+        return None
+    return _require_id(value, field_name)
+
+
+def _require_bool(value: object, field_name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValidationError(f"{field_name} must be a boolean")
     return value
 
 
