@@ -41,6 +41,7 @@ from keyframe.diarization.models import (
     ValidationError,
 )
 from keyframe.diarization.provenance import AudioTimelineProvenance, NormalizedArtifactProvenance
+from keyframe.diarization.preflight import PreflightJobRecord
 from keyframe.diarization.rendering import (
     RenderedTranscript,
     RenderedTurn,
@@ -554,6 +555,7 @@ def create_pipeline_branch_run_record(
     evaluated_split_ids: tuple[str, ...] = (),
     execution_mode: BenchmarkExecutionMode = "default_no_network",
     derived_artifacts: dict[str, str] | None = None,
+    preflight: PreflightJobRecord | None = None,
 ) -> BenchmarkRunRecord:
     """Create a run record whose branch field is a validated pipeline branch ID."""
 
@@ -569,6 +571,7 @@ def create_pipeline_branch_run_record(
         evaluated_split_ids=evaluated_split_ids,
         execution_mode=execution_mode,
         derived_artifacts=derived_artifacts,
+        preflight=preflight,
     )
 
 

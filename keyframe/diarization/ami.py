@@ -38,6 +38,7 @@ from keyframe.diarization.models import (
     SpeakerSpan,
     ValidationError,
 )
+from keyframe.diarization.preflight import PreflightJobRecord
 from keyframe.diarization.scoring_exports import write_rttm, write_uem
 
 
@@ -681,6 +682,7 @@ def create_ami_benchmark_run_record(
     tuned_on_splits: tuple[str, ...] = (),
     evaluated_on_splits: tuple[str, ...] = (),
     derived_artifacts: dict[str, str] | None = None,
+    preflight: PreflightJobRecord | None = None,
 ) -> BenchmarkRunRecord:
     evaluated_on_splits = evaluated_on_splits or (split_id,)
     plan = build_ami_split_plan(
@@ -704,6 +706,7 @@ def create_ami_benchmark_run_record(
         tuned_split_ids=plan.tuned_on_splits,
         evaluated_split_ids=plan.evaluated_on_splits,
         derived_artifacts=run_artifacts,
+        preflight=preflight,
     )
 
 

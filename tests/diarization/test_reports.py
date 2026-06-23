@@ -3,6 +3,7 @@ import json
 import pytest
 
 from keyframe.diarization import (
+    BENCHMARK_REPORT_SCHEMA_VERSION,
     BenchmarkEvaluationCase,
     BenchmarkGateConfig,
     BenchmarkMetricResult,
@@ -14,13 +15,14 @@ from keyframe.diarization import (
     DiarizationSliceMetricRow,
     EvaluationInterval,
     EvaluationSliceDefinition,
+    PreflightRouteAssessment,
     RegressionGateResult,
     ReviewSignalSpan,
     UncertaintyInterval,
     benchmark_report_json_dumps,
     benchmark_report_json_loads,
     benchmark_report_to_markdown,
-    build_benchmark_report,
+    build_benchmark_report as _build_benchmark_report,
     calibrate_review_signals,
     read_benchmark_report_json,
     score_diagnostic_critical_spans,
@@ -174,6 +176,26 @@ def _cases_for_signals():
     return (
         _case("rec-1", current_der=0.05, baseline_der=0.05, current_overlap_der=0.10, baseline_overlap_der=0.10),
         _case("rec-2", current_der=0.05, baseline_der=0.05, current_overlap_der=0.10, baseline_overlap_der=0.10),
+    )
+
+
+def build_benchmark_report(report_id, cases, **kwargs):
+    cases = tuple(cases)
+    if "route_assessments" not in kwargs and cases:
+        kwargs["route_assessments"] = _route_assessments_for_cases(cases)
+    return _build_benchmark_report(report_id, cases, **kwargs)
+
+
+def _route_assessments_for_cases(cases):
+    return tuple(
+        PreflightRouteAssessment(
+            corpus_id=case.corpus_id,
+            branch_id=case.branch_id,
+            recording_id=case.evaluation.recording_id,
+            predicted_route="confident_pipeline",
+            reference_route="confident_pipeline",
+        )
+        for case in cases
     )
 
 
@@ -596,8 +618,19 @@ def test_combined_point_and_regression_budget_preserves_point_failure_without_ba
 
 
 def test_report_requires_at_least_one_scored_metric_observation():
-    with pytest.raises(ValidationError, match="at least one scored metric observation"):
+    with pytest.raises(ValidationError, match="route_assessments are required"):
         build_benchmark_report("empty-report", ())
+
+
+def test_current_report_builder_requires_route_assessments():
+    with pytest.raises(ValidationError, match="route_assessments are required"):
+        _build_benchmark_report(
+            "missing-route-assessments",
+            (
+                _case("rec-1", current_der=0.05, baseline_der=0.05, current_overlap_der=0.10, baseline_overlap_der=0.10),
+            ),
+            route_assessments=(),
+        )
 
 
 def test_configured_regression_budget_must_match_a_metric_result():
@@ -800,6 +833,7 @@ def test_report_constructor_rejects_metric_gate_that_conflicts_with_budget():
             status="passed",
             gate_config=gate_config,
             corpus_results=(forged_result,),
+            schema_version=1,
         )
 
 
@@ -1287,6 +1321,115 @@ def test_report_embeds_review_signal_and_critical_span_diagnostics():
     assert report.critical_span_diagnostic is not None
     assert report.critical_span_diagnostic.status == "passed"
     assert "Critical Span Diagnostic" in benchmark_report_to_markdown(report)
+
+
+def test_report_fails_on_out_of_scope_false_confident_routing():
+    report = build_benchmark_report(
+        "route-confusion",
+        (
+            _case("rec-1", current_der=0.05, baseline_der=0.05, current_overlap_der=0.10, baseline_overlap_der=0.10),
+        ),
+        route_assessments=(
+            PreflightRouteAssessment(
+                corpus_id="ami-smoke",
+                branch_id="separate-tracks",
+                recording_id="rec-1",
+                predicted_route="confident_pipeline",
+                reference_route="diagnostic_only",
+            ),
+        ),
+    )
+
+    assert report.status == "failed"
+    assert report.route_confusion is not None
+    assert report.route_confusion.out_of_scope_false_confident_count == 1
+    assert report.route_confusion.matrix["diagnostic_only"]["confident_pipeline"] == 1
+    assert "Route Confusion" in benchmark_report_to_markdown(report)
+    assert benchmark_report_json_loads(json.dumps(report.to_dict())).to_dict() == report.to_dict()
+
+
+def test_report_schema_version_one_without_route_confusion_stays_readable():
+    report = build_benchmark_report(
+        "legacy-report",
+        (
+            _case("rec-1", current_der=0.05, baseline_der=0.05, current_overlap_der=0.10, baseline_overlap_der=0.10),
+        ),
+    )
+    payload = report.to_dict()
+    assert payload["schema_version"] == BENCHMARK_REPORT_SCHEMA_VERSION
+    payload["schema_version"] = 1
+    payload.pop("route_confusion")
+
+    loaded = benchmark_report_json_loads(json.dumps(payload))
+
+    assert loaded.schema_version == 1
+    assert loaded.route_confusion is None
+    assert "route_confusion" not in loaded.to_dict()
+
+
+def test_report_schema_version_one_rejects_route_confusion():
+    report = build_benchmark_report(
+        "route-confusion-v1",
+        (
+            _case("rec-1", current_der=0.05, baseline_der=0.05, current_overlap_der=0.10, baseline_overlap_der=0.10),
+        ),
+        route_assessments=(
+            PreflightRouteAssessment(
+                corpus_id="ami-smoke",
+                branch_id="separate-tracks",
+                recording_id="rec-1",
+                predicted_route="confident_pipeline",
+                reference_route="confident_pipeline",
+            ),
+        ),
+    )
+    payload = report.to_dict()
+    payload["schema_version"] = 1
+
+    with pytest.raises(ValidationError, match="route_confusion requires schema_version 2"):
+        benchmark_report_json_loads(json.dumps(payload))
+
+
+def test_route_assessments_must_cover_every_evaluated_case():
+    with pytest.raises(ValidationError, match="route_assessments must cover every evaluated benchmark case"):
+        build_benchmark_report(
+            "incomplete-route-confusion",
+            _cases_for_signals(),
+            route_assessments=(
+                PreflightRouteAssessment(
+                    corpus_id="ami-smoke",
+                    branch_id="separate-tracks",
+                    recording_id="rec-1",
+                    predicted_route="confident_pipeline",
+                    reference_route="confident_pipeline",
+                ),
+            ),
+        )
+
+
+def test_report_excludes_manual_route_overrides_from_confusion_metrics():
+    report = build_benchmark_report(
+        "route-confusion-manual",
+        (
+            _case("rec-1", current_der=0.05, baseline_der=0.05, current_overlap_der=0.10, baseline_overlap_der=0.10),
+        ),
+        route_assessments=(
+            PreflightRouteAssessment(
+                corpus_id="ami-smoke",
+                branch_id="separate-tracks",
+                recording_id="rec-1",
+                predicted_route="confident_pipeline",
+                reference_route="diagnostic_only",
+                manual_override_applied=True,
+            ),
+        ),
+    )
+
+    assert report.status == "passed"
+    assert report.route_confusion is not None
+    assert report.route_confusion.manual_override_count == 1
+    assert report.route_confusion.out_of_scope_false_confident_count == 0
+    assert report.route_confusion.matrix["diagnostic_only"]["confident_pipeline"] == 0
 
 
 def test_report_fails_when_configured_critical_span_policy_has_no_diagnostic_support():

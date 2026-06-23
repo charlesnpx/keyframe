@@ -12,6 +12,11 @@ from dataclasses import dataclass
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from keyframe.diarization.models import ValidationError
+from keyframe.diarization.rendering import (
+    RenderedTranscript,
+    TranscriptOverlay,
+    render_transcript,
+)
 
 
 PreflightCaptureMode = Literal["separate_tracks", "mono_mix", "authenticated_track_metadata"]
@@ -345,6 +350,217 @@ class PreflightRouteDecision:
         }
 
 
+@dataclass(frozen=True)
+class PreflightManualOverrideAudit:
+    """Audit trail for a human route override that is excluded from benchmark truth."""
+
+    override_id: str
+    actor_id: str
+    reason: str
+    override_route: PreflightRoute
+    created_at: str
+    excluded_from_benchmark_truth: bool = True
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "override_id", _require_id(self.override_id, "preflight_override.override_id"))
+        object.__setattr__(self, "actor_id", _require_id(self.actor_id, "preflight_override.actor_id"))
+        object.__setattr__(self, "reason", _require_text(self.reason, "preflight_override.reason"))
+        route = _require_id(self.override_route, "preflight_override.override_route")
+        if route not in ALLOWED_PREFLIGHT_ROUTES:
+            raise ValidationError(f"preflight_override.override_route is not supported: {route}")
+        object.__setattr__(self, "override_route", route)
+        object.__setattr__(self, "created_at", _require_id(self.created_at, "preflight_override.created_at"))
+        if self.excluded_from_benchmark_truth is not True:
+            raise ValidationError("preflight_override.excluded_from_benchmark_truth must be true")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "actor_id": self.actor_id,
+            "created_at": self.created_at,
+            "excluded_from_benchmark_truth": self.excluded_from_benchmark_truth,
+            "override_id": self.override_id,
+            "override_route": self.override_route,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True)
+class PreflightJobRecord:
+    """Persisted route state for one runtime job or benchmark candidate."""
+
+    job_id: str
+    decision: PreflightRouteDecision
+    validated_launch_scope_version: str
+    manual_override: PreflightManualOverrideAudit | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "job_id", _require_id(self.job_id, "preflight_job.job_id"))
+        if not isinstance(self.decision, PreflightRouteDecision):
+            raise ValidationError("preflight_job.decision must be a PreflightRouteDecision")
+        object.__setattr__(
+            self,
+            "validated_launch_scope_version",
+            _require_id(
+                self.validated_launch_scope_version,
+                "preflight_job.validated_launch_scope_version",
+            ),
+        )
+        if self.manual_override is not None and not isinstance(self.manual_override, PreflightManualOverrideAudit):
+            raise ValidationError("preflight_job.manual_override must be PreflightManualOverrideAudit")
+
+    @property
+    def route(self) -> PreflightRoute:
+        return self.decision.route
+
+    @property
+    def effective_route(self) -> PreflightRoute:
+        return self.manual_override.override_route if self.manual_override is not None else self.route
+
+    @property
+    def manual_override_applied(self) -> bool:
+        return self.manual_override is not None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "effective_route": self.effective_route,
+            "features": self.decision.features.to_dict(),
+            "frozen_git_sha": self.decision.frozen_git_sha,
+            "job_id": self.job_id,
+            "manual_override": self.manual_override.to_dict() if self.manual_override is not None else None,
+            "manual_override_applied": self.manual_override_applied,
+            "policy_id": self.decision.policy_id,
+            "policy_version": self.decision.policy_version,
+            "reasons": list(self.decision.reasons),
+            "route": self.route,
+            "tuned_on_splits": list(self.decision.tuned_on_splits),
+            "validated_launch_scope_version": self.validated_launch_scope_version,
+            "validated_on_splits": list(self.decision.validated_on_splits),
+        }
+
+
+@dataclass(frozen=True)
+class PreflightRouteAssessment:
+    """Benchmark truth row for route-level confusion reporting."""
+
+    corpus_id: str
+    branch_id: str
+    recording_id: str
+    predicted_route: PreflightRoute
+    reference_route: PreflightRoute
+    manual_override_applied: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "corpus_id", _require_id(self.corpus_id, "route_assessment.corpus_id"))
+        object.__setattr__(self, "branch_id", _require_id(self.branch_id, "route_assessment.branch_id"))
+        object.__setattr__(self, "recording_id", _require_id(self.recording_id, "route_assessment.recording_id"))
+        object.__setattr__(
+            self,
+            "predicted_route",
+            _validate_preflight_route(self.predicted_route, "route_assessment.predicted_route"),
+        )
+        object.__setattr__(
+            self,
+            "reference_route",
+            _validate_preflight_route(self.reference_route, "route_assessment.reference_route"),
+        )
+        object.__setattr__(
+            self,
+            "manual_override_applied",
+            _require_bool(self.manual_override_applied, "route_assessment.manual_override_applied"),
+        )
+
+    @property
+    def counted_in_benchmark(self) -> bool:
+        return not self.manual_override_applied
+
+    @property
+    def serious_failure(self) -> bool:
+        return (
+            self.counted_in_benchmark
+            and self.predicted_route == "confident_pipeline"
+            and self.reference_route != "confident_pipeline"
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "branch_id": self.branch_id,
+            "corpus_id": self.corpus_id,
+            "counted_in_benchmark": self.counted_in_benchmark,
+            "manual_override_applied": self.manual_override_applied,
+            "predicted_route": self.predicted_route,
+            "recording_id": self.recording_id,
+            "reference_route": self.reference_route,
+            "serious_failure": self.serious_failure,
+        }
+
+
+@dataclass(frozen=True)
+class PreflightRouteConfusionReport:
+    """Route-level confusion table for benchmark and release records."""
+
+    assessments: tuple[PreflightRouteAssessment, ...]
+
+    def __post_init__(self) -> None:
+        assessments = _tuple_of(
+            self.assessments,
+            PreflightRouteAssessment,
+            "route_confusion.assessments",
+        )
+        if not assessments:
+            raise ValidationError("route_confusion.assessments is required")
+        seen: set[tuple[str, str, str]] = set()
+        for assessment in assessments:
+            key = (assessment.corpus_id, assessment.branch_id, assessment.recording_id)
+            if key in seen:
+                raise ValidationError(
+                    "route_confusion.assessments contains duplicate recording scope: "
+                    f"{assessment.corpus_id}/{assessment.branch_id}/{assessment.recording_id}"
+                )
+            seen.add(key)
+        object.__setattr__(self, "assessments", assessments)
+
+    @property
+    def counted_assessments(self) -> tuple[PreflightRouteAssessment, ...]:
+        return tuple(assessment for assessment in self.assessments if assessment.counted_in_benchmark)
+
+    @property
+    def manual_override_count(self) -> int:
+        return sum(1 for assessment in self.assessments if assessment.manual_override_applied)
+
+    @property
+    def serious_failure_count(self) -> int:
+        return sum(1 for assessment in self.assessments if assessment.serious_failure)
+
+    @property
+    def out_of_scope_false_confident_count(self) -> int:
+        return self.serious_failure_count
+
+    @property
+    def passed(self) -> bool:
+        return self.serious_failure_count == 0
+
+    @property
+    def matrix(self) -> dict[str, dict[str, int]]:
+        result = {
+            reference_route: {predicted_route: 0 for predicted_route in ALLOWED_PREFLIGHT_ROUTES}
+            for reference_route in ALLOWED_PREFLIGHT_ROUTES
+        }
+        for assessment in self.counted_assessments:
+            result[assessment.reference_route][assessment.predicted_route] += 1
+        return {route: dict(sorted(counts.items())) for route, counts in sorted(result.items())}
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "assessments": [assessment.to_dict() for assessment in self.assessments],
+            "counted_assessment_count": len(self.counted_assessments),
+            "manual_override_count": self.manual_override_count,
+            "matrix": self.matrix,
+            "out_of_scope_false_confident_count": self.out_of_scope_false_confident_count,
+            "passed": self.passed,
+            "serious_failure_count": self.serious_failure_count,
+        }
+
+
 def route_preflight(policy: PreflightPolicy, features: PreflightFeatures) -> PreflightRouteDecision:
     """Route one call using only candidate-visible features and policy thresholds."""
 
@@ -397,6 +613,38 @@ def route_preflight(policy: PreflightPolicy, features: PreflightFeatures) -> Pre
     return _decision(policy, features, "confident_pipeline", ())
 
 
+def render_transcript_for_preflight(
+    recording: Any,
+    preflight: PreflightRouteDecision | PreflightJobRecord,
+    *,
+    overlays: tuple[TranscriptOverlay, ...] = (),
+    label_source: str = "diarization_cluster",
+    max_gap_ms: int = 900,
+    split_after_punctuation: bool = True,
+    min_speaker_confidence: float = 0.5,
+) -> RenderedTranscript:
+    """Render route-aware output while preventing non-confident speaker-label promotion."""
+
+    if isinstance(preflight, PreflightJobRecord):
+        route = preflight.effective_route
+    elif isinstance(preflight, PreflightRouteDecision):
+        route = preflight.route
+    else:
+        raise ValidationError("preflight must be PreflightRouteDecision or PreflightJobRecord")
+    review_reasons = ("speaker_attribution_unavailable",) if route == "needs_review" else ()
+    degraded_state = None if route == "confident_pipeline" else route
+    return render_transcript(
+        recording,
+        overlays=overlays,
+        label_source=label_source,  # type: ignore[arg-type]
+        max_gap_ms=max_gap_ms,
+        split_after_punctuation=split_after_punctuation,
+        degraded_state=degraded_state,
+        review_reasons=review_reasons,  # type: ignore[arg-type]
+        min_speaker_confidence=min_speaker_confidence,
+    )
+
+
 def preflight_features_from_dict(payload: object) -> PreflightFeatures:
     """Parse candidate-visible feature payloads while rejecting hidden identity inputs."""
 
@@ -434,6 +682,162 @@ def preflight_features_from_dict(payload: object) -> PreflightFeatures:
     )
 
 
+def preflight_decision_from_dict(payload: object) -> PreflightRouteDecision:
+    data = _mapping(payload, "preflight_decision")
+    _reject_unknown_fields(
+        data,
+        {
+            "accepted_for_pipeline",
+            "features",
+            "frozen_git_sha",
+            "policy_id",
+            "policy_version",
+            "reasons",
+            "route",
+            "tuned_on_splits",
+            "validated_on_splits",
+        },
+        "preflight_decision",
+    )
+    decision = PreflightRouteDecision(
+        route=_required(data, "route", "preflight_decision"),
+        reasons=tuple(_sequence(_required(data, "reasons", "preflight_decision"), "preflight_decision.reasons")),
+        policy_id=_required(data, "policy_id", "preflight_decision"),
+        policy_version=_required(data, "policy_version", "preflight_decision"),
+        frozen_git_sha=_required(data, "frozen_git_sha", "preflight_decision"),
+        tuned_on_splits=tuple(
+            _sequence(_required(data, "tuned_on_splits", "preflight_decision"), "preflight_decision.tuned_on_splits")
+        ),
+        validated_on_splits=tuple(
+            _sequence(
+                _required(data, "validated_on_splits", "preflight_decision"),
+                "preflight_decision.validated_on_splits",
+            )
+        ),
+        features=preflight_features_from_dict(_required(data, "features", "preflight_decision")),
+    )
+    if data.get("accepted_for_pipeline") != decision.accepted_for_pipeline:
+        raise ValidationError("preflight_decision.accepted_for_pipeline must match route")
+    return decision
+
+
+def preflight_job_record_from_dict(payload: object) -> PreflightJobRecord:
+    data = _mapping(payload, "preflight_job")
+    _reject_unknown_fields(
+        data,
+        {
+            "effective_route",
+            "features",
+            "frozen_git_sha",
+            "job_id",
+            "manual_override",
+            "manual_override_applied",
+            "policy_id",
+            "policy_version",
+            "reasons",
+            "route",
+            "tuned_on_splits",
+            "validated_launch_scope_version",
+            "validated_on_splits",
+        },
+        "preflight_job",
+    )
+    decision = PreflightRouteDecision(
+        route=_required(data, "route", "preflight_job"),
+        reasons=tuple(_sequence(_required(data, "reasons", "preflight_job"), "preflight_job.reasons")),
+        policy_id=_required(data, "policy_id", "preflight_job"),
+        policy_version=_required(data, "policy_version", "preflight_job"),
+        frozen_git_sha=_required(data, "frozen_git_sha", "preflight_job"),
+        tuned_on_splits=tuple(
+            _sequence(_required(data, "tuned_on_splits", "preflight_job"), "preflight_job.tuned_on_splits")
+        ),
+        validated_on_splits=tuple(
+            _sequence(_required(data, "validated_on_splits", "preflight_job"), "preflight_job.validated_on_splits")
+        ),
+        features=preflight_features_from_dict(_required(data, "features", "preflight_job")),
+    )
+    manual_override = data.get("manual_override")
+    record = PreflightJobRecord(
+        job_id=_required(data, "job_id", "preflight_job"),
+        decision=decision,
+        validated_launch_scope_version=_required(data, "validated_launch_scope_version", "preflight_job"),
+        manual_override=(
+            None if manual_override is None else preflight_manual_override_audit_from_dict(manual_override)
+        ),
+    )
+    if data.get("manual_override_applied") != record.manual_override_applied:
+        raise ValidationError("preflight_job.manual_override_applied must match manual_override")
+    if data.get("effective_route") != record.effective_route:
+        raise ValidationError("preflight_job.effective_route must match route and manual_override")
+    return record
+
+
+def preflight_manual_override_audit_from_dict(payload: object) -> PreflightManualOverrideAudit:
+    data = _mapping(payload, "preflight_override")
+    _reject_unknown_fields(
+        data,
+        {
+            "actor_id",
+            "created_at",
+            "excluded_from_benchmark_truth",
+            "override_id",
+            "override_route",
+            "reason",
+        },
+        "preflight_override",
+    )
+    return PreflightManualOverrideAudit(
+        override_id=_required(data, "override_id", "preflight_override"),
+        actor_id=_required(data, "actor_id", "preflight_override"),
+        reason=_required(data, "reason", "preflight_override"),
+        override_route=_required(data, "override_route", "preflight_override"),
+        created_at=_required(data, "created_at", "preflight_override"),
+        excluded_from_benchmark_truth=_required(data, "excluded_from_benchmark_truth", "preflight_override"),
+    )
+
+
+def build_preflight_route_confusion_report(
+    assessments: tuple[PreflightRouteAssessment, ...],
+) -> PreflightRouteConfusionReport:
+    return PreflightRouteConfusionReport(assessments=assessments)
+
+
+def preflight_route_confusion_report_from_dict(payload: object) -> PreflightRouteConfusionReport:
+    data = _mapping(payload, "route_confusion")
+    _reject_unknown_fields(
+        data,
+        {
+            "assessments",
+            "counted_assessment_count",
+            "manual_override_count",
+            "matrix",
+            "out_of_scope_false_confident_count",
+            "passed",
+            "serious_failure_count",
+        },
+        "route_confusion",
+    )
+    report = PreflightRouteConfusionReport(
+        assessments=tuple(
+            _route_assessment_from_dict(item)
+            for item in _sequence(_required(data, "assessments", "route_confusion"), "route_confusion.assessments")
+        )
+    )
+    if data.get("counted_assessment_count") != len(report.counted_assessments):
+        raise ValidationError("route_confusion.counted_assessment_count must match assessments")
+    if data.get("manual_override_count") != report.manual_override_count:
+        raise ValidationError("route_confusion.manual_override_count must match assessments")
+    if data.get("serious_failure_count") != report.serious_failure_count:
+        raise ValidationError("route_confusion.serious_failure_count must match assessments")
+    if data.get("out_of_scope_false_confident_count") != report.out_of_scope_false_confident_count:
+        raise ValidationError("route_confusion.out_of_scope_false_confident_count must match assessments")
+    if data.get("passed") != report.passed:
+        raise ValidationError("route_confusion.passed must match serious failures")
+    if data.get("matrix") != report.matrix:
+        raise ValidationError("route_confusion.matrix must match assessments")
+    return report
+
+
 def _decision(
     policy: PreflightPolicy,
     features: PreflightFeatures,
@@ -450,6 +854,37 @@ def _decision(
         validated_on_splits=policy.validated_on_splits,
         features=features,
     )
+
+
+def _route_assessment_from_dict(payload: object) -> PreflightRouteAssessment:
+    data = _mapping(payload, "route_assessment")
+    _reject_unknown_fields(
+        data,
+        {
+            "branch_id",
+            "corpus_id",
+            "counted_in_benchmark",
+            "manual_override_applied",
+            "predicted_route",
+            "recording_id",
+            "reference_route",
+            "serious_failure",
+        },
+        "route_assessment",
+    )
+    assessment = PreflightRouteAssessment(
+        corpus_id=_required(data, "corpus_id", "route_assessment"),
+        branch_id=_required(data, "branch_id", "route_assessment"),
+        recording_id=_required(data, "recording_id", "route_assessment"),
+        predicted_route=_required(data, "predicted_route", "route_assessment"),
+        reference_route=_required(data, "reference_route", "route_assessment"),
+        manual_override_applied=data.get("manual_override_applied", False),
+    )
+    if data.get("counted_in_benchmark") != assessment.counted_in_benchmark:
+        raise ValidationError("route_assessment.counted_in_benchmark must match manual_override_applied")
+    if data.get("serious_failure") != assessment.serious_failure:
+        raise ValidationError("route_assessment.serious_failure must match routes")
+    return assessment
 
 
 def _mapping(payload: object, field_name: str) -> dict[str, Any]:
@@ -511,6 +946,13 @@ def _validate_capture_mode(value: object, field_name: str) -> PreflightCaptureMo
     return mode  # type: ignore[return-value]
 
 
+def _validate_preflight_route(value: object, field_name: str) -> PreflightRoute:
+    route = _require_id(value, field_name)
+    if route not in ALLOWED_PREFLIGHT_ROUTES:
+        raise ValidationError(f"{field_name} is not supported: {route}")
+    return route  # type: ignore[return-value]
+
+
 def _validate_frozen_git_sha(value: object, field_name: str) -> str:
     sha = _require_id(value, field_name)
     if len(sha) != 40 or any(char not in _HEX_DIGITS for char in sha):
@@ -537,6 +979,14 @@ def _require_bool(value: object, field_name: str) -> bool:
     return value
 
 
+def _tuple_of(values: object, item_type: type[Any], field_name: str) -> tuple[Any, ...]:
+    result = _sequence(values, field_name)
+    for index, item in enumerate(result):
+        if not isinstance(item, item_type):
+            raise ValidationError(f"{field_name}[{index}] must be {item_type.__name__}")
+    return result
+
+
 def _probability(value: object, field_name: str) -> float:
     result = _finite_number(value, field_name)
     if result < 0.0 or result > 1.0:
@@ -560,5 +1010,13 @@ def _require_id(value: object, field_name: str) -> str:
         raise ValidationError(f"{field_name} must be a string")
     value = value.strip()
     if not value:
+        raise ValidationError(f"{field_name} is required")
+    return value
+
+
+def _require_text(value: object, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise ValidationError(f"{field_name} must be a string")
+    if not value.strip():
         raise ValidationError(f"{field_name} is required")
     return value

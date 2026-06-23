@@ -14,9 +14,16 @@ from keyframe.diarization.evaluator import (
     DiarizationSliceMetricRow,
 )
 from keyframe.diarization.models import ValidationError
+from keyframe.diarization.preflight import (
+    PreflightRouteAssessment,
+    PreflightRouteConfusionReport,
+    build_preflight_route_confusion_report,
+    preflight_route_confusion_report_from_dict,
+)
 
 
-BENCHMARK_REPORT_SCHEMA_VERSION = 1
+BENCHMARK_REPORT_SCHEMA_VERSION = 2
+SUPPORTED_BENCHMARK_REPORT_SCHEMA_VERSIONS = frozenset({1, 2})
 
 BenchmarkReportStatus = Literal["passed", "failed"]
 BenchmarkReportScopeType = Literal["corpus", "branch", "recording", "slice"]
@@ -741,6 +748,7 @@ class BenchmarkReport:
     review_signal_scope_calibrations: tuple[ReviewSignalScopeCalibration, ...] = ()
     critical_span_policy: CriticalSpanPolicyDefinition | None = None
     critical_span_diagnostic: CriticalSpanDiagnosticScore | None = None
+    route_confusion: PreflightRouteConfusionReport | None = None
     schema_version: int = BENCHMARK_REPORT_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -791,6 +799,15 @@ class BenchmarkReport:
             CriticalSpanDiagnosticScore,
         ):
             raise ValidationError("benchmark_report.critical_span_diagnostic must be a CriticalSpanDiagnosticScore")
+        if self.route_confusion is not None and not isinstance(
+            self.route_confusion,
+            PreflightRouteConfusionReport,
+        ):
+            raise ValidationError("benchmark_report.route_confusion must be a PreflightRouteConfusionReport")
+        if self.schema_version >= 2 and self.route_confusion is None:
+            raise ValidationError("benchmark_report.route_confusion is required for schema_version 2")
+        if self.schema_version < 2 and self.route_confusion is not None:
+            raise ValidationError("benchmark_report.route_confusion requires schema_version 2")
         metric_results = self.metric_results
         if not metric_results:
             raise ValidationError("benchmark_report requires at least one metric result")
@@ -802,7 +819,9 @@ class BenchmarkReport:
             self.gate_config,
             metric_results,
         )
-        has_failure = _has_failed_gate(metric_results, self.critical_span_diagnostic)
+        has_failure = _has_failed_gate(metric_results, self.critical_span_diagnostic) or (
+            self.route_confusion is not None and not self.route_confusion.passed
+        )
         if self.status == "passed" and has_failure:
             raise ValidationError("passed benchmark reports cannot include failed gates")
         if self.status == "failed" and not has_failure:
@@ -821,7 +840,7 @@ class BenchmarkReport:
         return self.status == "passed"
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "branch_results": [result.to_dict() for result in self.branch_results],
             "corpus_results": [result.to_dict() for result in self.corpus_results],
             "critical_span_diagnostic": (
@@ -843,6 +862,9 @@ class BenchmarkReport:
             "slice_results": [result.to_dict() for result in self.slice_results],
             "status": self.status,
         }
+        if self.schema_version >= 2:
+            payload["route_confusion"] = self.route_confusion.to_dict() if self.route_confusion is not None else None
+        return payload
 
 
 @dataclass(frozen=True)
@@ -867,6 +889,7 @@ def build_benchmark_report(
     gate_config: BenchmarkGateConfig | None = None,
     review_signals: tuple[ReviewSignalSpan, ...] = (),
     critical_span_policy: CriticalSpanPolicyDefinition | None = None,
+    route_assessments: tuple[PreflightRouteAssessment, ...] = (),
 ) -> BenchmarkReport:
     """Build a comparable benchmark report from evaluated recording cases."""
 
@@ -876,7 +899,11 @@ def build_benchmark_report(
     if not isinstance(gate_config, BenchmarkGateConfig):
         raise ValidationError("gate_config must be a BenchmarkGateConfig")
     review_signals = _tuple_of(review_signals, ReviewSignalSpan, "review_signals")
+    route_assessments = _tuple_of(route_assessments, PreflightRouteAssessment, "route_assessments")
+    if not route_assessments:
+        raise ValidationError("route_assessments are required for benchmark reports")
     _validate_review_signals_match_cases(cases, review_signals)
+    _validate_route_assessments_match_cases(cases, route_assessments)
     observations = tuple(observation for case in cases for observation in _observations_from_case(case))
     if not observations:
         raise ValidationError("benchmark reports require at least one scored metric observation")
@@ -903,10 +930,13 @@ def build_benchmark_report(
         if critical_span_policy is not None
         else None
     )
-    status: BenchmarkReportStatus = "failed" if _has_failed_gate(
-        all_results,
-        critical_score,
-    ) else "passed"
+    route_confusion = build_preflight_route_confusion_report(route_assessments)
+    status: BenchmarkReportStatus = (
+        "failed"
+        if _has_failed_gate(all_results, critical_score)
+        or (route_confusion is not None and not route_confusion.passed)
+        else "passed"
+    )
     return BenchmarkReport(
         report_id=report_id,
         status=status,
@@ -919,6 +949,7 @@ def build_benchmark_report(
         review_signal_scope_calibrations=review_scope_calibrations,
         critical_span_policy=critical_span_policy,
         critical_span_diagnostic=critical_score,
+        route_confusion=route_confusion,
     )
 
 
@@ -1064,6 +1095,27 @@ def benchmark_report_to_markdown(report: BenchmarkReport) -> str:
                 "",
             ]
         )
+    if report.route_confusion is not None:
+        route_report = report.route_confusion
+        lines.extend(
+            [
+                "## Route Confusion",
+                "",
+                f"- Counted assessments: {len(route_report.counted_assessments)}",
+                f"- Manual overrides excluded: {route_report.manual_override_count}",
+                f"- Out-of-scope false-confident routes: {route_report.out_of_scope_false_confident_count}",
+                "",
+                "| Reference Route | Predicted confident_pipeline | Predicted needs_review | "
+                "Predicted diagnostic_only | Predicted unsupported |",
+                "| --- | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for reference_route, counts in route_report.matrix.items():
+            lines.append(
+                f"| {reference_route} | {counts['confident_pipeline']} | {counts['needs_review']} | "
+                f"{counts['diagnostic_only']} | {counts['unsupported']} |"
+            )
+        lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -1116,6 +1168,11 @@ def benchmark_report_from_dict(data: Mapping[str, Any]) -> BenchmarkReport:
         critical_span_diagnostic=(
             _critical_span_score_from_dict(data["critical_span_diagnostic"])
             if data.get("critical_span_diagnostic") is not None
+            else None
+        ),
+        route_confusion=(
+            preflight_route_confusion_report_from_dict(data["route_confusion"])
+            if data.get("route_confusion") is not None
             else None
         ),
         schema_version=_required(data, "schema_version", "benchmark_report"),
@@ -1668,6 +1725,25 @@ def _validate_review_signals_match_cases(
             raise ValidationError("review_signals must match evaluated benchmark cases")
 
 
+def _validate_route_assessments_match_cases(
+    cases: tuple[BenchmarkEvaluationCase, ...],
+    assessments: tuple[PreflightRouteAssessment, ...],
+) -> None:
+    allowed = {
+        (case.corpus_id, case.branch_id, case.evaluation.recording_id)
+        for case in cases
+    }
+    provided = {
+        (assessment.corpus_id, assessment.branch_id, assessment.recording_id)
+        for assessment in assessments
+    }
+    for assessment in assessments:
+        if (assessment.corpus_id, assessment.branch_id, assessment.recording_id) not in allowed:
+            raise ValidationError("route_assessments must match evaluated benchmark cases")
+    if assessments and provided != allowed:
+        raise ValidationError("route_assessments must cover every evaluated benchmark case")
+
+
 def _validate_review_signal_scope_identity(scope_calibration: ReviewSignalScopeCalibration) -> None:
     if scope_calibration.scope_type == "corpus":
         if scope_calibration.corpus_id is None:
@@ -2144,7 +2220,7 @@ def _required(data: Mapping[str, Any], key: str, context: str) -> Any:
 
 def _validate_report_schema_version(value: object) -> int:
     version = _positive_int(value, "benchmark_report.schema_version")
-    if version != BENCHMARK_REPORT_SCHEMA_VERSION:
+    if version not in SUPPORTED_BENCHMARK_REPORT_SCHEMA_VERSIONS:
         raise ValidationError(f"benchmark_report.schema_version is not supported: {version}")
     return version
 

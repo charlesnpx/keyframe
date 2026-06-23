@@ -11,9 +11,11 @@ from typing import Any, Literal, Protocol, runtime_checkable
 from keyframe.diarization.bundles import ReferenceBundle
 from keyframe.diarization.manifests import DatasetManifest, DatasetSplitManifest, dataset_manifest_from_dict
 from keyframe.diarization.models import CanonicalRecording, ValidationError
+from keyframe.diarization.preflight import PreflightJobRecord, preflight_job_record_from_dict
 
 
-BENCHMARK_RUN_RECORD_SCHEMA_VERSION = 1
+BENCHMARK_RUN_RECORD_SCHEMA_VERSION = 2
+SUPPORTED_BENCHMARK_RUN_RECORD_SCHEMA_VERSIONS = frozenset({1, 2})
 BenchmarkExecutionMode = Literal["default_no_network", "dry_run", "full_benchmark"]
 ArtifactKind = Literal[
     "canonical_reference",
@@ -201,6 +203,7 @@ class BenchmarkRunRecord:
     execution_mode: BenchmarkExecutionMode
     no_network: bool
     derived_artifacts: dict[str, str] = field(default_factory=dict)
+    preflight: PreflightJobRecord | None = None
     schema_version: int = BENCHMARK_RUN_RECORD_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -231,6 +234,12 @@ class BenchmarkRunRecord:
             "derived_artifacts",
             _validate_string_map(self.derived_artifacts, "run_record.derived_artifacts"),
         )
+        if self.preflight is not None and not isinstance(self.preflight, PreflightJobRecord):
+            raise ValidationError("run_record.preflight must be a PreflightJobRecord")
+        if self.schema_version >= 2 and self.preflight is None:
+            raise ValidationError("run_record.preflight is required for schema_version 2")
+        if self.schema_version < 2 and self.preflight is not None:
+            raise ValidationError("run_record.preflight requires schema_version 2")
         manifest_split_ids = frozenset(split.split_id for split in dataset_snapshot.splits)
         if self.split_id not in manifest_split_ids:
             raise ValidationError(f"run_record.split_id is unknown: {self.split_id}")
@@ -247,7 +256,7 @@ class BenchmarkRunRecord:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "artifact_layout": self.artifact_layout.to_dict(),
             "branch": self.branch,
             "cache_root": self.cache_root,
@@ -262,6 +271,9 @@ class BenchmarkRunRecord:
             "split_id": self.split_id,
             "tuned_split_ids": list(self.tuned_split_ids),
         }
+        if self.schema_version >= 2:
+            payload["preflight"] = self.preflight.to_dict() if self.preflight is not None else None
+        return payload
 
 
 @runtime_checkable
@@ -364,7 +376,10 @@ def create_benchmark_run_record(
     evaluated_split_ids: tuple[str, ...] = (),
     execution_mode: BenchmarkExecutionMode = "default_no_network",
     derived_artifacts: dict[str, str] | None = None,
+    preflight: PreflightJobRecord | None = None,
 ) -> BenchmarkRunRecord:
+    if preflight is None:
+        raise ValidationError("preflight is required for benchmark run records")
     ensure_adapter_cache_policy(manifest, cache, execution_mode=execution_mode)
     manifest_split_ids = frozenset(split.split_id for split in manifest.splits)
     if split_id not in manifest_split_ids:
@@ -386,6 +401,7 @@ def create_benchmark_run_record(
         execution_mode=execution_mode,
         no_network=execution_mode in {"default_no_network", "dry_run"},
         derived_artifacts={} if derived_artifacts is None else derived_artifacts,
+        preflight=preflight,
     )
 
 
@@ -417,6 +433,7 @@ def benchmark_run_record_from_dict(payload: dict[str, Any]) -> BenchmarkRunRecor
             "evaluated_split_ids",
             "execution_mode",
             "no_network",
+            "preflight",
             "run_id",
             "schema_version",
             "split_id",
@@ -427,10 +444,12 @@ def benchmark_run_record_from_dict(payload: dict[str, Any]) -> BenchmarkRunRecor
     dataset_snapshot = dataset_manifest_from_dict(_required(data, "dataset_snapshot", "run_record"))
     dataset_id = _required(data, "dataset_id", "run_record")
     split_id = _required(data, "split_id", "run_record")
+    schema_version = _validate_run_record_schema_version(_required(data, "schema_version", "run_record"))
     tuned_split_ids = tuple(_sequence(_required(data, "tuned_split_ids", "run_record")))
     evaluated_split_ids = tuple(_sequence(_required(data, "evaluated_split_ids", "run_record")))
+    preflight = _required(data, "preflight", "run_record") if schema_version >= 2 else data.get("preflight")
     return BenchmarkRunRecord(
-        schema_version=_required(data, "schema_version", "run_record"),
+        schema_version=schema_version,
         run_id=_required(data, "run_id", "run_record"),
         dataset_id=dataset_id,
         dataset_snapshot=dataset_snapshot.to_dict(),
@@ -443,6 +462,7 @@ def benchmark_run_record_from_dict(payload: dict[str, Any]) -> BenchmarkRunRecor
         execution_mode=_required(data, "execution_mode", "run_record"),
         no_network=_required(data, "no_network", "run_record"),
         derived_artifacts=_required(data, "derived_artifacts", "run_record"),
+        preflight=None if preflight is None else preflight_job_record_from_dict(preflight),
     )
 
 
@@ -485,7 +505,7 @@ def _artifact_layout_from_dict(payload: object) -> BenchmarkArtifactLayout:
 def _validate_run_record_schema_version(value: object) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValidationError("run_record.schema_version must be an integer")
-    if value != BENCHMARK_RUN_RECORD_SCHEMA_VERSION:
+    if value not in SUPPORTED_BENCHMARK_RUN_RECORD_SCHEMA_VERSIONS:
         raise ValidationError(f"run_record.schema_version is not supported: {value}")
     return value
 
