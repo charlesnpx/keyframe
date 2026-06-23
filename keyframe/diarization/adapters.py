@@ -236,6 +236,8 @@ class BenchmarkRunRecord:
         )
         if self.preflight is not None and not isinstance(self.preflight, PreflightJobRecord):
             raise ValidationError("run_record.preflight must be a PreflightJobRecord")
+        if self.schema_version >= 2 and self.preflight is None:
+            raise ValidationError("run_record.preflight is required for schema_version 2")
         if self.schema_version < 2 and self.preflight is not None:
             raise ValidationError("run_record.preflight requires schema_version 2")
         manifest_split_ids = frozenset(split.split_id for split in dataset_snapshot.splits)
@@ -398,6 +400,7 @@ def create_benchmark_run_record(
         no_network=execution_mode in {"default_no_network", "dry_run"},
         derived_artifacts={} if derived_artifacts is None else derived_artifacts,
         preflight=preflight,
+        schema_version=BENCHMARK_RUN_RECORD_SCHEMA_VERSION if preflight is not None else 1,
     )
 
 

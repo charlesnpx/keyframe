@@ -3,7 +3,6 @@ import json
 import pytest
 
 from keyframe.diarization import (
-    BENCHMARK_REPORT_SCHEMA_VERSION,
     BenchmarkEvaluationCase,
     BenchmarkGateConfig,
     BenchmarkMetricResult,
@@ -802,6 +801,7 @@ def test_report_constructor_rejects_metric_gate_that_conflicts_with_budget():
             status="passed",
             gate_config=gate_config,
             corpus_results=(forged_result,),
+            schema_version=1,
         )
 
 
@@ -1324,9 +1324,8 @@ def test_report_schema_version_one_without_route_confusion_stays_readable():
         ),
     )
     payload = report.to_dict()
-    assert payload["schema_version"] == BENCHMARK_REPORT_SCHEMA_VERSION
-    payload["schema_version"] = 1
-    payload.pop("route_confusion")
+    assert payload["schema_version"] == 1
+    assert "route_confusion" not in payload
 
     loaded = benchmark_report_json_loads(json.dumps(payload))
 

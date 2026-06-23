@@ -804,6 +804,8 @@ class BenchmarkReport:
             PreflightRouteConfusionReport,
         ):
             raise ValidationError("benchmark_report.route_confusion must be a PreflightRouteConfusionReport")
+        if self.schema_version >= 2 and self.route_confusion is None:
+            raise ValidationError("benchmark_report.route_confusion is required for schema_version 2")
         if self.schema_version < 2 and self.route_confusion is not None:
             raise ValidationError("benchmark_report.route_confusion requires schema_version 2")
         metric_results = self.metric_results
@@ -948,6 +950,7 @@ def build_benchmark_report(
         critical_span_policy=critical_span_policy,
         critical_span_diagnostic=critical_score,
         route_confusion=route_confusion,
+        schema_version=BENCHMARK_REPORT_SCHEMA_VERSION if route_confusion is not None else 1,
     )
 
 

@@ -273,7 +273,7 @@ def test_benchmark_run_record_captures_snapshot_layout_cache_and_splits(tmp_path
     )
 
     payload = record.to_dict()
-    assert payload["schema_version"] == BENCHMARK_RUN_RECORD_SCHEMA_VERSION
+    assert payload["schema_version"] == 1
     assert payload["dataset_snapshot"]["dataset_id"] == "ami"
     assert payload["split_id"] == "ami-public-dev"
     assert payload["cache_root"] == str(tmp_path / "cache")
@@ -283,7 +283,7 @@ def test_benchmark_run_record_captures_snapshot_layout_cache_and_splits(tmp_path
     assert payload["evaluated_split_ids"] == ["ami-public-dev", "ami-public-holdout"]
     assert payload["execution_mode"] == "default_no_network"
     assert payload["no_network"] is True
-    assert payload["preflight"] is None
+    assert "preflight" not in payload
 
 
 def test_benchmark_run_record_persists_preflight_route_state_and_manual_override_audit(tmp_path):
@@ -401,6 +401,7 @@ def test_run_record_validation_rejects_unknown_split_and_inconsistent_evaluated_
             evaluated_split_ids=("ami-public-holdout",),
             execution_mode="default_no_network",
             no_network=True,
+            schema_version=1,
         )
 
 
@@ -420,6 +421,7 @@ def test_direct_run_record_constructor_validates_dataset_snapshot_identity(tmp_p
             evaluated_split_ids=("ami-public-dev",),
             execution_mode="default_no_network",
             no_network=True,
+            schema_version=1,
         )
 
 
@@ -460,6 +462,7 @@ def test_direct_run_record_constructor_applies_non_redistributable_cache_policy(
             evaluated_split_ids=("private-split",),
             execution_mode="full_benchmark",
             no_network=False,
+            schema_version=1,
         )
 
 
@@ -479,6 +482,7 @@ def test_direct_run_record_constructor_rejects_dry_run_with_network(tmp_path):
             evaluated_split_ids=("ami-public-dev",),
             execution_mode="dry_run",
             no_network=False,
+            schema_version=1,
         )
 
 
@@ -571,8 +575,6 @@ def test_run_record_schema_version_one_without_preflight_stays_readable(tmp_path
         cache=DatasetCacheConfig(cache_root=str(tmp_path / "cache")),
     )
     payload = record.to_dict()
-    payload["schema_version"] = 1
-    payload.pop("preflight")
 
     loaded = benchmark_run_record_json_loads(json.dumps(payload))
 
@@ -599,7 +601,7 @@ def test_run_record_schema_version_one_rejects_preflight_state(tmp_path):
         benchmark_run_record_json_loads(json.dumps(payload))
 
 
-@pytest.mark.parametrize("field_name", ["tuned_split_ids", "cache_root", "derived_artifacts", "preflight"])
+@pytest.mark.parametrize("field_name", ["tuned_split_ids", "cache_root", "derived_artifacts"])
 def test_run_record_loader_requires_all_serialized_audit_fields(tmp_path, field_name):
     manifest = _ami_manifest()
     record = create_benchmark_run_record(
@@ -614,4 +616,22 @@ def test_run_record_loader_requires_all_serialized_audit_fields(tmp_path, field_
     payload.pop(field_name)
 
     with pytest.raises(ValidationError, match=f"run_record.{field_name} is required"):
+        benchmark_run_record_json_loads(json.dumps(payload))
+
+
+def test_run_record_loader_requires_preflight_for_schema_version_two(tmp_path):
+    manifest = _ami_manifest()
+    record = create_benchmark_run_record(
+        run_id="run-001",
+        manifest=manifest,
+        split_id="ami-public-dev",
+        branch="feature/diarization-benchmark-platform",
+        artifact_root=tmp_path / "artifacts",
+        cache=DatasetCacheConfig(cache_root=str(tmp_path / "cache")),
+        preflight=_preflight_record(),
+    )
+    payload = record.to_dict()
+    payload.pop("preflight")
+
+    with pytest.raises(ValidationError, match="run_record.preflight is required"):
         benchmark_run_record_json_loads(json.dumps(payload))
