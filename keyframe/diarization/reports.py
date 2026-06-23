@@ -22,7 +22,8 @@ from keyframe.diarization.preflight import (
 )
 
 
-BENCHMARK_REPORT_SCHEMA_VERSION = 1
+BENCHMARK_REPORT_SCHEMA_VERSION = 2
+SUPPORTED_BENCHMARK_REPORT_SCHEMA_VERSIONS = frozenset({1, 2})
 
 BenchmarkReportStatus = Literal["passed", "failed"]
 BenchmarkReportScopeType = Literal["corpus", "branch", "recording", "slice"]
@@ -803,6 +804,8 @@ class BenchmarkReport:
             PreflightRouteConfusionReport,
         ):
             raise ValidationError("benchmark_report.route_confusion must be a PreflightRouteConfusionReport")
+        if self.schema_version < 2 and self.route_confusion is not None:
+            raise ValidationError("benchmark_report.route_confusion requires schema_version 2")
         metric_results = self.metric_results
         if not metric_results:
             raise ValidationError("benchmark_report requires at least one metric result")
@@ -835,7 +838,7 @@ class BenchmarkReport:
         return self.status == "passed"
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "branch_results": [result.to_dict() for result in self.branch_results],
             "corpus_results": [result.to_dict() for result in self.corpus_results],
             "critical_span_diagnostic": (
@@ -853,11 +856,13 @@ class BenchmarkReport:
             "review_signal_scope_calibrations": [
                 calibration.to_dict() for calibration in self.review_signal_scope_calibrations
             ],
-            "route_confusion": self.route_confusion.to_dict() if self.route_confusion is not None else None,
             "schema_version": self.schema_version,
             "slice_results": [result.to_dict() for result in self.slice_results],
             "status": self.status,
         }
+        if self.schema_version >= 2:
+            payload["route_confusion"] = self.route_confusion.to_dict() if self.route_confusion is not None else None
+        return payload
 
 
 @dataclass(frozen=True)
@@ -1726,9 +1731,15 @@ def _validate_route_assessments_match_cases(
         (case.corpus_id, case.branch_id, case.evaluation.recording_id)
         for case in cases
     }
+    provided = {
+        (assessment.corpus_id, assessment.branch_id, assessment.recording_id)
+        for assessment in assessments
+    }
     for assessment in assessments:
         if (assessment.corpus_id, assessment.branch_id, assessment.recording_id) not in allowed:
             raise ValidationError("route_assessments must match evaluated benchmark cases")
+    if assessments and provided != allowed:
+        raise ValidationError("route_assessments must cover every evaluated benchmark case")
 
 
 def _validate_review_signal_scope_identity(scope_calibration: ReviewSignalScopeCalibration) -> None:
@@ -2207,7 +2218,7 @@ def _required(data: Mapping[str, Any], key: str, context: str) -> Any:
 
 def _validate_report_schema_version(value: object) -> int:
     version = _positive_int(value, "benchmark_report.schema_version")
-    if version != BENCHMARK_REPORT_SCHEMA_VERSION:
+    if version not in SUPPORTED_BENCHMARK_REPORT_SCHEMA_VERSIONS:
         raise ValidationError(f"benchmark_report.schema_version is not supported: {version}")
     return version
 

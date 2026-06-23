@@ -3,6 +3,7 @@ from keyframe.diarization import (
     CanonicalWord,
     ChannelRecord,
     PreflightFeatures,
+    PreflightJobRecord,
     PreflightManualOverrideAudit,
     PreflightRouteAssessment,
     PreflightRouteDecision,
@@ -127,3 +128,24 @@ def test_manual_override_audit_is_marked_out_of_benchmark_truth():
     )
 
     assert audit.to_dict()["excluded_from_benchmark_truth"] is True
+
+
+def test_manual_override_effective_route_suppresses_confident_speaker_labels():
+    job = PreflightJobRecord(
+        job_id="job-override",
+        decision=_decision("confident_pipeline"),
+        validated_launch_scope_version="private-coverage-v1@2026-06-23",
+        manual_override=PreflightManualOverrideAudit(
+            override_id="override-001",
+            actor_id="reviewer-1",
+            reason="force human review before customer delivery",
+            override_route="diagnostic_only",
+            created_at="2026-06-23T16:00:00Z",
+        ),
+    )
+
+    transcript = render_transcript_for_preflight(_recording(), job)
+
+    assert transcript.state == "diagnostic_only"
+    assert transcript.speaker_attribution == "unavailable"
+    assert all(word.label is None for word in transcript.words)

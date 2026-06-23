@@ -3,6 +3,7 @@ import json
 import pytest
 
 from keyframe.diarization import (
+    BENCHMARK_REPORT_SCHEMA_VERSION,
     BenchmarkEvaluationCase,
     BenchmarkGateConfig,
     BenchmarkMetricResult,
@@ -1313,6 +1314,65 @@ def test_report_fails_on_out_of_scope_false_confident_routing():
     assert report.route_confusion.matrix["diagnostic_only"]["confident_pipeline"] == 1
     assert "Route Confusion" in benchmark_report_to_markdown(report)
     assert benchmark_report_json_loads(json.dumps(report.to_dict())).to_dict() == report.to_dict()
+
+
+def test_report_schema_version_one_without_route_confusion_stays_readable():
+    report = build_benchmark_report(
+        "legacy-report",
+        (
+            _case("rec-1", current_der=0.05, baseline_der=0.05, current_overlap_der=0.10, baseline_overlap_der=0.10),
+        ),
+    )
+    payload = report.to_dict()
+    assert payload["schema_version"] == BENCHMARK_REPORT_SCHEMA_VERSION
+    payload["schema_version"] = 1
+    payload.pop("route_confusion")
+
+    loaded = benchmark_report_json_loads(json.dumps(payload))
+
+    assert loaded.schema_version == 1
+    assert loaded.route_confusion is None
+    assert "route_confusion" not in loaded.to_dict()
+
+
+def test_report_schema_version_one_rejects_route_confusion():
+    report = build_benchmark_report(
+        "route-confusion-v1",
+        (
+            _case("rec-1", current_der=0.05, baseline_der=0.05, current_overlap_der=0.10, baseline_overlap_der=0.10),
+        ),
+        route_assessments=(
+            PreflightRouteAssessment(
+                corpus_id="ami-smoke",
+                branch_id="separate-tracks",
+                recording_id="rec-1",
+                predicted_route="confident_pipeline",
+                reference_route="confident_pipeline",
+            ),
+        ),
+    )
+    payload = report.to_dict()
+    payload["schema_version"] = 1
+
+    with pytest.raises(ValidationError, match="route_confusion requires schema_version 2"):
+        benchmark_report_json_loads(json.dumps(payload))
+
+
+def test_route_assessments_must_cover_every_evaluated_case():
+    with pytest.raises(ValidationError, match="route_assessments must cover every evaluated benchmark case"):
+        build_benchmark_report(
+            "incomplete-route-confusion",
+            _cases_for_signals(),
+            route_assessments=(
+                PreflightRouteAssessment(
+                    corpus_id="ami-smoke",
+                    branch_id="separate-tracks",
+                    recording_id="rec-1",
+                    predicted_route="confident_pipeline",
+                    reference_route="confident_pipeline",
+                ),
+            ),
+        )
 
 
 def test_report_excludes_manual_route_overrides_from_confusion_metrics():

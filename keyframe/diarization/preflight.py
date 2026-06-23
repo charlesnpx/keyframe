@@ -615,7 +615,7 @@ def route_preflight(policy: PreflightPolicy, features: PreflightFeatures) -> Pre
 
 def render_transcript_for_preflight(
     recording: Any,
-    decision: PreflightRouteDecision,
+    preflight: PreflightRouteDecision | PreflightJobRecord,
     *,
     overlays: tuple[TranscriptOverlay, ...] = (),
     label_source: str = "diarization_cluster",
@@ -625,10 +625,14 @@ def render_transcript_for_preflight(
 ) -> RenderedTranscript:
     """Render route-aware output while preventing non-confident speaker-label promotion."""
 
-    if not isinstance(decision, PreflightRouteDecision):
-        raise ValidationError("decision must be PreflightRouteDecision")
-    review_reasons = ("speaker_attribution_unavailable",) if decision.route == "needs_review" else ()
-    degraded_state = None if decision.route == "confident_pipeline" else decision.route
+    if isinstance(preflight, PreflightJobRecord):
+        route = preflight.effective_route
+    elif isinstance(preflight, PreflightRouteDecision):
+        route = preflight.route
+    else:
+        raise ValidationError("preflight must be PreflightRouteDecision or PreflightJobRecord")
+    review_reasons = ("speaker_attribution_unavailable",) if route == "needs_review" else ()
+    degraded_state = None if route == "confident_pipeline" else route
     return render_transcript(
         recording,
         overlays=overlays,
