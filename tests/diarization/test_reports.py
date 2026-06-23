@@ -14,6 +14,7 @@ from keyframe.diarization import (
     DiarizationSliceMetricRow,
     EvaluationInterval,
     EvaluationSliceDefinition,
+    PreflightRouteAssessment,
     RegressionGateResult,
     ReviewSignalSpan,
     UncertaintyInterval,
@@ -1287,6 +1288,56 @@ def test_report_embeds_review_signal_and_critical_span_diagnostics():
     assert report.critical_span_diagnostic is not None
     assert report.critical_span_diagnostic.status == "passed"
     assert "Critical Span Diagnostic" in benchmark_report_to_markdown(report)
+
+
+def test_report_fails_on_out_of_scope_false_confident_routing():
+    report = build_benchmark_report(
+        "route-confusion",
+        (
+            _case("rec-1", current_der=0.05, baseline_der=0.05, current_overlap_der=0.10, baseline_overlap_der=0.10),
+        ),
+        route_assessments=(
+            PreflightRouteAssessment(
+                corpus_id="ami-smoke",
+                branch_id="separate-tracks",
+                recording_id="rec-1",
+                predicted_route="confident_pipeline",
+                reference_route="diagnostic_only",
+            ),
+        ),
+    )
+
+    assert report.status == "failed"
+    assert report.route_confusion is not None
+    assert report.route_confusion.out_of_scope_false_confident_count == 1
+    assert report.route_confusion.matrix["diagnostic_only"]["confident_pipeline"] == 1
+    assert "Route Confusion" in benchmark_report_to_markdown(report)
+    assert benchmark_report_json_loads(json.dumps(report.to_dict())).to_dict() == report.to_dict()
+
+
+def test_report_excludes_manual_route_overrides_from_confusion_metrics():
+    report = build_benchmark_report(
+        "route-confusion-manual",
+        (
+            _case("rec-1", current_der=0.05, baseline_der=0.05, current_overlap_der=0.10, baseline_overlap_der=0.10),
+        ),
+        route_assessments=(
+            PreflightRouteAssessment(
+                corpus_id="ami-smoke",
+                branch_id="separate-tracks",
+                recording_id="rec-1",
+                predicted_route="confident_pipeline",
+                reference_route="diagnostic_only",
+                manual_override_applied=True,
+            ),
+        ),
+    )
+
+    assert report.status == "passed"
+    assert report.route_confusion is not None
+    assert report.route_confusion.manual_override_count == 1
+    assert report.route_confusion.out_of_scope_false_confident_count == 0
+    assert report.route_confusion.matrix["diagnostic_only"]["confident_pipeline"] == 0
 
 
 def test_report_fails_when_configured_critical_span_policy_has_no_diagnostic_support():

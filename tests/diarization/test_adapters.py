@@ -17,6 +17,10 @@ from keyframe.diarization import (
     DatasetSplitManifest,
     DatasetValidationResult,
     ExpectedDatasetFile,
+    PreflightFeatures,
+    PreflightJobRecord,
+    PreflightManualOverrideAudit,
+    PreflightRouteDecision,
     ReferenceBundle,
     ScoringPolicyManifest,
     ValidationError,
@@ -80,6 +84,36 @@ class FakeDatasetAdapter:
 
 def _ami_manifest():
     return read_dataset_manifest_json(MANIFEST_DIR / "ami.json")
+
+
+def _preflight_record(manual_override=None):
+    return PreflightJobRecord(
+        job_id="job-001",
+        decision=PreflightRouteDecision(
+            route="needs_review",
+            reasons=("speaker_count_hint_unknown",),
+            policy_id="launch-preflight",
+            policy_version="2026-06-23",
+            frozen_git_sha="c" * 40,
+            tuned_on_splits=("public_dev",),
+            validated_on_splits=("public_holdout", "private_acceptance"),
+            features=PreflightFeatures(
+                declared_locale="en-US",
+                source="zoom",
+                capture_mode="separate_tracks",
+                channel_count=2,
+                duration_ms=900_000,
+                sample_rate_hz=16_000,
+                codec="pcm_s16le",
+                clipping_estimate=0.01,
+                speech_ratio=0.62,
+                rough_overlap_estimate=0.12,
+                speaker_count_hint=None,
+            ),
+        ),
+        validated_launch_scope_version="private-coverage-v1@2026-06-23",
+        manual_override=manual_override,
+    )
 
 
 def test_fake_adapter_lifecycle_hooks_keep_scoring_centralized(tmp_path):
@@ -249,6 +283,41 @@ def test_benchmark_run_record_captures_snapshot_layout_cache_and_splits(tmp_path
     assert payload["evaluated_split_ids"] == ["ami-public-dev", "ami-public-holdout"]
     assert payload["execution_mode"] == "default_no_network"
     assert payload["no_network"] is True
+    assert payload["preflight"] is None
+
+
+def test_benchmark_run_record_persists_preflight_route_state_and_manual_override_audit(tmp_path):
+    manifest = _ami_manifest()
+    cache = DatasetCacheConfig(cache_root=str(tmp_path / "cache"))
+    override = PreflightManualOverrideAudit(
+        override_id="override-001",
+        actor_id="reviewer-1",
+        reason="human review required before customer delivery",
+        override_route="diagnostic_only",
+        created_at="2026-06-23T16:00:00Z",
+    )
+
+    record = create_benchmark_run_record(
+        run_id="run-001",
+        manifest=manifest,
+        split_id="ami-public-dev",
+        branch="feature/diarization-benchmark-platform",
+        artifact_root=tmp_path / "artifacts",
+        cache=cache,
+        preflight=_preflight_record(manual_override=override),
+    )
+    payload = record.to_dict()
+
+    assert payload["schema_version"] == BENCHMARK_RUN_RECORD_SCHEMA_VERSION
+    assert payload["preflight"]["policy_version"] == "2026-06-23"
+    assert payload["preflight"]["route"] == "needs_review"
+    assert payload["preflight"]["reasons"] == ["speaker_count_hint_unknown"]
+    assert payload["preflight"]["features"]["speaker_count_hint"] is None
+    assert payload["preflight"]["validated_launch_scope_version"] == "private-coverage-v1@2026-06-23"
+    assert payload["preflight"]["manual_override"]["override_route"] == "diagnostic_only"
+    assert payload["preflight"]["manual_override"]["excluded_from_benchmark_truth"] is True
+    assert payload["preflight"]["effective_route"] == "diagnostic_only"
+    assert benchmark_run_record_json_loads(json.dumps(payload)).to_dict() == payload
 
 
 def test_dry_run_run_record_is_no_network(tmp_path):
@@ -491,7 +560,46 @@ def test_run_record_loader_rejects_snapshot_and_split_tampering(tmp_path, mutate
         benchmark_run_record_json_loads(json.dumps(payload))
 
 
-@pytest.mark.parametrize("field_name", ["tuned_split_ids", "cache_root", "derived_artifacts"])
+def test_run_record_schema_version_one_without_preflight_stays_readable(tmp_path):
+    manifest = _ami_manifest()
+    record = create_benchmark_run_record(
+        run_id="run-001",
+        manifest=manifest,
+        split_id="ami-public-dev",
+        branch="feature/diarization-benchmark-platform",
+        artifact_root=tmp_path / "artifacts",
+        cache=DatasetCacheConfig(cache_root=str(tmp_path / "cache")),
+    )
+    payload = record.to_dict()
+    payload["schema_version"] = 1
+    payload.pop("preflight")
+
+    loaded = benchmark_run_record_json_loads(json.dumps(payload))
+
+    assert loaded.schema_version == 1
+    assert loaded.preflight is None
+    assert "preflight" not in loaded.to_dict()
+
+
+def test_run_record_schema_version_one_rejects_preflight_state(tmp_path):
+    manifest = _ami_manifest()
+    record = create_benchmark_run_record(
+        run_id="run-001",
+        manifest=manifest,
+        split_id="ami-public-dev",
+        branch="feature/diarization-benchmark-platform",
+        artifact_root=tmp_path / "artifacts",
+        cache=DatasetCacheConfig(cache_root=str(tmp_path / "cache")),
+        preflight=_preflight_record(),
+    )
+    payload = record.to_dict()
+    payload["schema_version"] = 1
+
+    with pytest.raises(ValidationError, match="run_record.preflight requires schema_version 2"):
+        benchmark_run_record_json_loads(json.dumps(payload))
+
+
+@pytest.mark.parametrize("field_name", ["tuned_split_ids", "cache_root", "derived_artifacts", "preflight"])
 def test_run_record_loader_requires_all_serialized_audit_fields(tmp_path, field_name):
     manifest = _ami_manifest()
     record = create_benchmark_run_record(
