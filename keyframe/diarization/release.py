@@ -11,12 +11,7 @@ from typing import Any, Literal, Mapping
 
 from keyframe.diarization.adapters import BENCHMARK_RUN_RECORD_SCHEMA_VERSION
 from keyframe.diarization.engines import EngineConfigMetadata
-from keyframe.diarization.manifests import (
-    DATASET_MANIFEST_SCHEMA_VERSION,
-    ScoringPolicyManifest,
-    dataset_manifest_from_dict,
-    scoring_policy_from_dict,
-)
+from keyframe.diarization.manifests import ScoringPolicyManifest, dataset_manifest_from_dict, scoring_policy_from_dict
 from keyframe.diarization.models import ValidationError
 from keyframe.diarization.pipelines import BranchAcceptanceRecord
 from keyframe.diarization.preflight import (
@@ -27,7 +22,6 @@ from keyframe.diarization.preflight import (
 )
 from keyframe.diarization.private_acceptance import PrivateAnnotationProtocol
 from keyframe.diarization.reports import (
-    BENCHMARK_REPORT_SCHEMA_VERSION,
     BenchmarkReport,
     benchmark_report_from_dict,
 )
@@ -511,10 +505,16 @@ def release_expected_runtime_config(record: ReleaseCandidateRecord) -> ReleaseRu
     return ReleaseRuntimeConfig(
         git_sha=record.git_sha,
         schema_versions={
-            "benchmark_report": BENCHMARK_REPORT_SCHEMA_VERSION,
+            "benchmark_report": _single_schema_version(
+                tuple(report.schema_version for report in record.benchmark_reports),
+                "release.benchmark_reports.schema_version",
+            ),
             "benchmark_run_record": BENCHMARK_RUN_RECORD_SCHEMA_VERSION,
-            "dataset_manifest": DATASET_MANIFEST_SCHEMA_VERSION,
-            "release_record": RELEASE_RECORD_SCHEMA_VERSION,
+            "dataset_manifest": _single_schema_version(
+                tuple(snapshot["schema_version"] for snapshot in record.dataset_snapshots),
+                "release.dataset_snapshots.schema_version",
+            ),
+            "release_record": record.schema_version,
         },
         dataset_snapshot_ids={
             snapshot["dataset_id"]: _release_payload_hash(snapshot) for snapshot in record.dataset_snapshots
@@ -905,12 +905,13 @@ def _validate_engine_configs_pinned(configs: tuple[EngineConfigMetadata, ...]) -
         _reject_forbidden_runtime_identity_fields(config.parameters, "release.engine_config.parameters")
         if config.model_version is None and config.config_id is None:
             raise ValidationError("release engine configs must pin model_version or config_id")
+        if config.provider == "self-hosted":
+            model = config.parameters.get("model_governance")
+            if not isinstance(model, dict) or not model.get("package_versions"):
+                raise ValidationError("self-hosted release configs must pin package_versions")
         hosted = config.parameters.get("hosted_provider_governance")
         if isinstance(hosted, dict) and (not hosted.get("model_version") or not hosted.get("version_pinning")):
             raise ValidationError("hosted provider release configs must pin model_version and version_pinning")
-        model = config.parameters.get("model_governance")
-        if isinstance(model, dict) and not model.get("package_versions"):
-            raise ValidationError("self-hosted release configs must pin package_versions")
 
 
 def _engine_config_fingerprint(config: EngineConfigMetadata) -> str:
@@ -920,6 +921,16 @@ def _engine_config_fingerprint(config: EngineConfigMetadata) -> str:
 def _release_payload_hash(payload: Mapping[str, Any]) -> str:
     text = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _single_schema_version(values: tuple[object, ...], field_name: str) -> int:
+    versions = tuple(_require_int(value, field_name) for value in values)
+    if not versions:
+        raise ValidationError(f"{field_name} is required")
+    unique_versions = set(versions)
+    if len(unique_versions) != 1:
+        raise ValidationError(f"{field_name} must be consistent across release artifacts")
+    return versions[0]
 
 
 def _preflight_policy_from_dict(payload: object) -> PreflightPolicy:

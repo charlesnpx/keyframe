@@ -19,6 +19,7 @@ from keyframe.diarization import (
     ValidationError,
     build_preflight_route_confusion_report,
     check_release_runtime_config,
+    benchmark_report_from_dict,
     read_dataset_manifest_json,
     release_expected_runtime_config,
     release_record_content_hash,
@@ -252,6 +253,26 @@ def test_engine_fingerprint_includes_pinned_package_versions():
 
     assert check.status == "degraded"
     assert [event.code for event in check.audit_events] == ["engine_config_ids_mismatch"]
+
+
+def test_self_hosted_release_requires_package_version_pins():
+    missing_packages = _engine_config(parameters={"model_governance": {"checkpoint": "local-model"}})
+
+    with pytest.raises(ValidationError, match="pin package_versions"):
+        _release(engine_configs=(missing_packages,))
+
+
+def test_runtime_schema_fingerprint_is_derived_from_release_artifacts():
+    legacy_payload = _benchmark_report().to_dict()
+    legacy_payload["schema_version"] = 1
+    legacy_payload.pop("route_confusion")
+    record = _release(benchmark_reports=(benchmark_report_from_dict(legacy_payload),))
+
+    runtime_config = release_expected_runtime_config(record)
+
+    assert runtime_config.schema_versions["benchmark_report"] == 1
+    assert runtime_config.schema_versions["dataset_manifest"] == _manifest().schema_version
+    assert runtime_config.schema_versions["release_record"] == record.schema_version
 
 
 def test_invalid_active_runtime_metadata_degrades_with_audit_event():
