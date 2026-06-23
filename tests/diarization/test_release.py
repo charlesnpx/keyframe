@@ -233,6 +233,36 @@ def test_runtime_config_mismatch_disables_confident_labels_and_emits_audit_event
     assert [event.code for event in check.audit_events] == ["preflight_policy_version_mismatch"]
 
 
+def test_engine_fingerprint_includes_pinned_package_versions():
+    record = _release()
+    active_payload = release_expected_runtime_config(record).to_dict()
+    drifted = _engine_config(
+        parameters={
+            "model_governance": {
+                "checkpoint": "pyannote/speaker-diarization-3.1",
+                "package_versions": {"pyannote.audio": "3.1.1", "whisperx": "3.2.0"},
+                "runtime_config": {"cache_root": "/models/local"},
+            }
+        }
+    )
+    drifted_record = _release(engine_configs=(drifted,))
+    active_payload["engine_config_ids"] = release_expected_runtime_config(drifted_record).engine_config_ids
+
+    check = check_release_runtime_config(record, active_payload)
+
+    assert check.status == "degraded"
+    assert [event.code for event in check.audit_events] == ["engine_config_ids_mismatch"]
+
+
+def test_invalid_active_runtime_metadata_degrades_with_audit_event():
+    check = check_release_runtime_config(_release(), {"git_sha": "not-a-runtime-config"})
+
+    assert check.status == "degraded"
+    assert check.confident_speaker_attribution_enabled is False
+    assert check.degraded_route == "diagnostic_only"
+    assert [event.code for event in check.audit_events] == ["runtime_config_invalid"]
+
+
 def test_release_loader_requires_every_must_not_have_check():
     payload = _release().to_dict()
     payload["must_not_have_checks"].pop("no_cross_call_speaker_ids")

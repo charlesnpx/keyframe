@@ -544,7 +544,22 @@ def check_release_runtime_config(
     if not isinstance(record, ReleaseCandidateRecord):
         raise ValidationError("record must be ReleaseCandidateRecord")
     if isinstance(active_config, Mapping):
-        active_config = release_runtime_config_from_dict(active_config)
+        try:
+            active_config = release_runtime_config_from_dict(active_config)
+        except ValidationError as exc:
+            return ReleaseRuntimeCheck(
+                status="degraded",
+                confident_speaker_attribution_enabled=False,
+                degraded_route="diagnostic_only",
+                audit_events=(
+                    ReleaseRuntimeAuditEvent(
+                        code="runtime_config_invalid",
+                        message="Active runtime metadata is invalid.",
+                        expected="valid runtime_config payload",
+                        actual=str(exc),
+                    ),
+                ),
+            )
     if not isinstance(active_config, ReleaseRuntimeConfig):
         raise ValidationError("active_config must be ReleaseRuntimeConfig")
     expected = release_expected_runtime_config(record)
@@ -899,9 +914,7 @@ def _validate_engine_configs_pinned(configs: tuple[EngineConfigMetadata, ...]) -
 
 
 def _engine_config_fingerprint(config: EngineConfigMetadata) -> str:
-    model_version = config.model_version or "model-version-unset"
-    config_id = config.config_id or "config-id-unset"
-    return f"{config.provider}:{config.model_name}:{model_version}:{config_id}"
+    return _release_payload_hash(config.to_dict())
 
 
 def _release_payload_hash(payload: Mapping[str, Any]) -> str:
