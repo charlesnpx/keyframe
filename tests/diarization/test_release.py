@@ -221,6 +221,20 @@ def test_release_record_hash_round_trip_and_runtime_match_enable_confident_label
     assert check.audit_events == ()
 
 
+def test_release_record_payload_is_immutable_after_hashing():
+    record = _release()
+    original_hash = record.content_hash
+
+    with pytest.raises(TypeError):
+        record.dataset_snapshots[0]["dataset_id"] = "mutated"
+    payload = record.to_dict()
+    payload["dataset_snapshots"][0]["dataset_id"] = "mutated-copy"
+
+    assert record.content_hash == original_hash
+    assert release_record_content_hash(record) == original_hash
+    assert record.to_dict()["dataset_snapshots"][0]["dataset_id"] == "ami"
+
+
 def test_runtime_config_mismatch_disables_confident_labels_and_emits_audit_event():
     record = _release()
     active_payload = release_expected_runtime_config(record).to_dict()

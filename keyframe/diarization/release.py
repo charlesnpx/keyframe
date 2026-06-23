@@ -5,9 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, Mapping
+from types import MappingProxyType
+from typing import Any, Literal
 
 from keyframe.diarization.adapters import BENCHMARK_RUN_RECORD_SCHEMA_VERSION
 from keyframe.diarization.engines import EngineConfigMetadata
@@ -91,7 +93,8 @@ class ReleaseMustNotHaveChecks:
             "no_tuned_on_holdout_result",
         ):
             object.__setattr__(self, field_name, _require_bool(getattr(self, field_name), f"must_not_have.{field_name}"))
-        object.__setattr__(self, "evidence", _validate_string_map(self.evidence, "must_not_have.evidence"))
+        evidence = _validate_string_map(self.evidence, "must_not_have.evidence")
+        object.__setattr__(self, "evidence", _freeze_json(evidence))
 
     @property
     def passed(self) -> bool:
@@ -136,7 +139,7 @@ class ReleaseGoldenTestResult:
         object.__setattr__(self, "reason", _optional_text(self.reason, "golden_test.reason"))
         metadata = _validate_metadata(self.metadata, "golden_test.metadata")
         _reject_forbidden_runtime_identity_fields(metadata, "golden_test.metadata")
-        object.__setattr__(self, "metadata", metadata)
+        object.__setattr__(self, "metadata", _freeze_json(metadata))
         if self.status == "passed" and self.reason is not None:
             raise ValidationError("passed golden tests cannot include a reason")
         if self.status == "failed" and self.reason is None:
@@ -238,12 +241,12 @@ class ReleaseRuntimeConfig:
         object.__setattr__(
             self,
             "schema_versions",
-            _validate_int_map(self.schema_versions, "runtime_config.schema_versions"),
+            _freeze_json(_validate_int_map(self.schema_versions, "runtime_config.schema_versions")),
         )
         object.__setattr__(
             self,
             "dataset_snapshot_ids",
-            _validate_string_map(self.dataset_snapshot_ids, "runtime_config.dataset_snapshot_ids"),
+            _freeze_json(_validate_string_map(self.dataset_snapshot_ids, "runtime_config.dataset_snapshot_ids")),
         )
         object.__setattr__(
             self,
@@ -258,7 +261,7 @@ class ReleaseRuntimeConfig:
         object.__setattr__(
             self,
             "scoring_policy_versions",
-            _validate_string_map(self.scoring_policy_versions, "runtime_config.scoring_policy_versions"),
+            _freeze_json(_validate_string_map(self.scoring_policy_versions, "runtime_config.scoring_policy_versions")),
         )
         object.__setattr__(
             self,
@@ -274,12 +277,12 @@ class ReleaseRuntimeConfig:
         object.__setattr__(
             self,
             "branch_decisions",
-            _validate_string_map(self.branch_decisions, "runtime_config.branch_decisions"),
+            _freeze_json(_validate_string_map(self.branch_decisions, "runtime_config.branch_decisions")),
         )
         object.__setattr__(
             self,
             "engine_config_ids",
-            _validate_string_map(self.engine_config_ids, "runtime_config.engine_config_ids"),
+            _freeze_json(_validate_string_map(self.engine_config_ids, "runtime_config.engine_config_ids")),
         )
         object.__setattr__(self, "validated_scope", _id_tuple(self.validated_scope, "runtime_config.validated_scope"))
         object.__setattr__(
@@ -332,6 +335,8 @@ class ReleaseRuntimeAuditEvent:
         object.__setattr__(self, "message", _require_text(self.message, "runtime_audit.message"))
         _validate_json_value(self.expected, "runtime_audit.expected")
         _validate_json_value(self.actual, "runtime_audit.actual")
+        object.__setattr__(self, "expected", _freeze_json(self.expected))
+        object.__setattr__(self, "actual", _freeze_json(self.actual))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -481,9 +486,12 @@ class ReleaseCandidateRecord:
         if self.approval_status == "approved":
             _validate_approved_release(self)
         content_hash = _optional_sha256(self.content_hash, "release.content_hash")
-        computed_hash = _release_payload_hash(_release_payload(self, include_content_hash=False))
+        payload_without_hash = _release_payload_from_fields(self)
+        frozen_payload = _freeze_json(payload_without_hash)
+        computed_hash = _release_payload_hash(frozen_payload)
         if content_hash is not None and content_hash != computed_hash:
             raise ValidationError("release.content_hash must match immutable release payload")
+        object.__setattr__(self, "_payload_without_content_hash", frozen_payload)
         object.__setattr__(self, "content_hash", computed_hash)
 
     @property
@@ -502,36 +510,39 @@ class ReleaseCandidateRecord:
 def release_expected_runtime_config(record: ReleaseCandidateRecord) -> ReleaseRuntimeConfig:
     if not isinstance(record, ReleaseCandidateRecord):
         raise ValidationError("record must be ReleaseCandidateRecord")
+    payload = _release_payload(record, include_content_hash=False)
     return ReleaseRuntimeConfig(
-        git_sha=record.git_sha,
+        git_sha=payload["git_sha"],
         schema_versions={
             "benchmark_report": _single_schema_version(
-                tuple(report.schema_version for report in record.benchmark_reports),
+                tuple(report["schema_version"] for report in payload["benchmark_reports"]),
                 "release.benchmark_reports.schema_version",
             ),
             "benchmark_run_record": BENCHMARK_RUN_RECORD_SCHEMA_VERSION,
             "dataset_manifest": _single_schema_version(
-                tuple(snapshot["schema_version"] for snapshot in record.dataset_snapshots),
+                tuple(snapshot["schema_version"] for snapshot in payload["dataset_snapshots"]),
                 "release.dataset_snapshots.schema_version",
             ),
-            "release_record": record.schema_version,
+            "release_record": payload["schema_version"],
         },
         dataset_snapshot_ids={
-            snapshot["dataset_id"]: _release_payload_hash(snapshot) for snapshot in record.dataset_snapshots
+            snapshot["dataset_id"]: _release_payload_hash(snapshot) for snapshot in payload["dataset_snapshots"]
         },
-        private_acceptance_split_id=record.private_acceptance_split_id,
+        private_acceptance_split_id=payload["private_acceptance_split_id"],
         annotation_protocol_version=(
-            f"{record.annotation_protocol.protocol_id}@{record.annotation_protocol.version}"
+            f"{payload['annotation_protocol']['protocol_id']}@{payload['annotation_protocol']['version']}"
         ),
-        scoring_policy_versions={policy.policy_id: policy.version for policy in record.scoring_policies},
-        preflight_policy_id=record.preflight_policy.policy_id,
-        preflight_policy_version=record.preflight_policy.version,
-        route=record.route_state.effective_route,
-        branch_decisions={decision.branch_id: decision.decision for decision in record.branch_decisions},
-        engine_config_ids={config.adapter_id: _engine_config_fingerprint(config) for config in record.engine_configs},
-        validated_scope=record.validated_scope,
-        unsupported_scope=record.unsupported_scope,
-        governance_decision=record.governance_decision,
+        scoring_policy_versions={policy["policy_id"]: policy["version"] for policy in payload["scoring_policies"]},
+        preflight_policy_id=payload["preflight_policy"]["policy_id"],
+        preflight_policy_version=payload["preflight_policy"]["version"],
+        route=payload["route_state"]["effective_route"],
+        branch_decisions={decision["branch_id"]: decision["decision"] for decision in payload["branch_decisions"]},
+        engine_config_ids={
+            config["adapter_id"]: _release_payload_hash(config) for config in payload["engine_configs"]
+        },
+        validated_scope=tuple(payload["validated_scope"]),
+        unsupported_scope=tuple(payload["unsupported_scope"]),
+        governance_decision=payload["governance_decision"],
     )
 
 
@@ -851,6 +862,17 @@ def write_release_record_json(path: str | Path, record: ReleaseCandidateRecord) 
 
 
 def _release_payload(record: ReleaseCandidateRecord, *, include_content_hash: bool) -> dict[str, Any]:
+    payload_without_hash = getattr(record, "_payload_without_content_hash", None)
+    if payload_without_hash is None:
+        payload = _release_payload_from_fields(record)
+    else:
+        payload = _thaw_json(payload_without_hash)
+    if include_content_hash:
+        payload["content_hash"] = record.content_hash
+    return payload
+
+
+def _release_payload_from_fields(record: ReleaseCandidateRecord) -> dict[str, Any]:
     payload = {
         "annotation_protocol": record.annotation_protocol.to_dict(),
         "approval_status": record.approval_status,
@@ -871,8 +893,6 @@ def _release_payload(record: ReleaseCandidateRecord, *, include_content_hash: bo
         "unsupported_scope": list(record.unsupported_scope),
         "validated_scope": list(record.validated_scope),
     }
-    if include_content_hash:
-        payload["content_hash"] = record.content_hash
     return payload
 
 
@@ -891,8 +911,11 @@ def _validate_approved_release(record: ReleaseCandidateRecord) -> None:
         raise ValidationError("approved releases cannot include failed branch gates")
 
 
-def _dataset_snapshots(values: object) -> tuple[dict[str, Any], ...]:
-    snapshots = tuple(dataset_manifest_from_dict(item).to_dict() for item in _sequence(values, "release.dataset_snapshots"))
+def _dataset_snapshots(values: object) -> tuple[Mapping[str, Any], ...]:
+    snapshots = tuple(
+        _freeze_json(dataset_manifest_from_dict(item).to_dict())
+        for item in _sequence(values, "release.dataset_snapshots")
+    )
     if not snapshots:
         raise ValidationError("release.dataset_snapshots is required")
     _reject_duplicates(tuple(snapshot["dataset_id"] for snapshot in snapshots), "release.dataset_snapshots.dataset_id")
@@ -914,12 +937,8 @@ def _validate_engine_configs_pinned(configs: tuple[EngineConfigMetadata, ...]) -
             raise ValidationError("hosted provider release configs must pin model_version and version_pinning")
 
 
-def _engine_config_fingerprint(config: EngineConfigMetadata) -> str:
-    return _release_payload_hash(config.to_dict())
-
-
 def _release_payload_hash(payload: Mapping[str, Any]) -> str:
-    text = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    text = json.dumps(_thaw_json(payload), ensure_ascii=True, separators=(",", ":"), sort_keys=True)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
@@ -1155,7 +1174,7 @@ def _validate_metadata(value: object, field_name: str) -> dict[str, Any]:
 
 
 def _reject_forbidden_runtime_identity_fields(value: object, field_name: str) -> None:
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         for key, item in value.items():
             key_text = _require_id(key, f"{field_name}.key")
             if key_text in _FORBIDDEN_RUNTIME_IDENTITY_KEYS:
@@ -1167,7 +1186,7 @@ def _reject_forbidden_runtime_identity_fields(value: object, field_name: str) ->
 
 
 def _validate_json_value(value: object, field_name: str) -> None:
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         for key, item in value.items():
             _require_id(key, f"{field_name}.key")
             _validate_json_value(item, f"{field_name}.{key}")
@@ -1183,8 +1202,19 @@ def _validate_json_value(value: object, field_name: str) -> None:
         raise ValidationError(f"{field_name} must be JSON-serializable")
 
 
+def _freeze_json(value: object) -> object:
+    _validate_json_value(value, "release.payload")
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {_require_id(key, "release.payload.key"): _freeze_json(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_json(item) for item in value)
+    return value
+
+
 def _thaw_json(value: object) -> object:
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         return {key: _thaw_json(item) for key, item in value.items()}
     if isinstance(value, tuple):
         return [_thaw_json(item) for item in value]
