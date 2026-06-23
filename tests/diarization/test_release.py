@@ -235,6 +235,20 @@ def test_release_record_payload_is_immutable_after_hashing():
     assert record.to_dict()["dataset_snapshots"][0]["dataset_id"] == "ami"
 
 
+def test_release_loader_rejects_tampered_branch_acceptance_payload():
+    payload = _release().to_dict()
+    payload["branch_decisions"][0]["non_enforced_fields"]["cost_delta"] = 12.34
+
+    with pytest.raises(ValidationError, match="non_enforced_fields must match"):
+        release_record_from_dict(payload)
+
+    payload = _release().to_dict()
+    payload["branch_decisions"][0]["enforced_gates"]["hidden_gate"] = True
+
+    with pytest.raises(ValidationError, match="branch_acceptance.enforced_gates has unsupported fields"):
+        release_record_from_dict(payload)
+
+
 def test_runtime_config_mismatch_disables_confident_labels_and_emits_audit_event():
     record = _release()
     active_payload = release_expected_runtime_config(record).to_dict()
@@ -274,6 +288,43 @@ def test_self_hosted_release_requires_package_version_pins():
 
     with pytest.raises(ValidationError, match="pin package_versions"):
         _release(engine_configs=(missing_packages,))
+
+    malformed_packages = _engine_config(
+        parameters={"model_governance": {"package_versions": ["pyannote.audio==3.1.0"]}}
+    )
+
+    with pytest.raises(ValidationError, match="package_versions must be an object"):
+        _release(engine_configs=(malformed_packages,))
+
+    non_string_package = _engine_config(
+        parameters={"model_governance": {"package_versions": {"pyannote.audio": 3.1}}}
+    )
+
+    with pytest.raises(ValidationError, match="package_versions.pyannote.audio must be a string"):
+        _release(engine_configs=(non_string_package,))
+
+
+def test_hosted_release_requires_well_formed_provider_pins():
+    missing_pinning = _engine_config(
+        provider="hosted-provider",
+        parameters={"hosted_provider_governance": {"model_version": "diarize-2026-06"}},
+    )
+
+    with pytest.raises(ValidationError, match="pin model_version and version_pinning"):
+        _release(engine_configs=(missing_pinning,))
+
+    malformed_pinning = _engine_config(
+        provider="hosted-provider",
+        parameters={
+            "hosted_provider_governance": {
+                "model_version": "diarize-2026-06",
+                "version_pinning": {"contract": "2026-06"},
+            }
+        },
+    )
+
+    with pytest.raises(ValidationError, match="version_pinning must be a string"):
+        _release(engine_configs=(malformed_pinning,))
 
 
 def test_runtime_schema_fingerprint_is_derived_from_release_artifacts():
@@ -321,6 +372,9 @@ def test_approved_release_rejects_unpinned_engine_config():
 def test_release_rejects_forbidden_cross_call_identity_metadata():
     with pytest.raises(ValidationError, match="voice_profile must not persist"):
         _golden_test(metadata={"voice_profile": "do-not-store"})
+
+    with pytest.raises(ValidationError, match="voice_profile must not persist"):
+        _must_not_have_checks(evidence={"voice_profile": "do-not-store"})
 
     with pytest.raises(ValidationError, match="reference_speaker_id must not persist"):
         validate_release_runtime_output({"words": [{"reference_speaker_id": "AMI-P1"}]})

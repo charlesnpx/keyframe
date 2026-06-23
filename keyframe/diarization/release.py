@@ -94,6 +94,7 @@ class ReleaseMustNotHaveChecks:
         ):
             object.__setattr__(self, field_name, _require_bool(getattr(self, field_name), f"must_not_have.{field_name}"))
         evidence = _validate_string_map(self.evidence, "must_not_have.evidence")
+        _reject_forbidden_runtime_identity_fields(evidence, "must_not_have.evidence")
         object.__setattr__(self, "evidence", _freeze_json(evidence))
 
     @property
@@ -930,11 +931,31 @@ def _validate_engine_configs_pinned(configs: tuple[EngineConfigMetadata, ...]) -
             raise ValidationError("release engine configs must pin model_version or config_id")
         if config.provider == "self-hosted":
             model = config.parameters.get("model_governance")
-            if not isinstance(model, dict) or not model.get("package_versions"):
+            if not isinstance(model, Mapping):
+                raise ValidationError("self-hosted release configs must include model_governance")
+            package_versions_payload = model.get("package_versions")
+            if package_versions_payload is None:
+                raise ValidationError("self-hosted release configs must pin package_versions")
+            package_versions = _validate_string_map(
+                package_versions_payload,
+                "release.engine_config.model_governance.package_versions",
+            )
+            if not package_versions:
                 raise ValidationError("self-hosted release configs must pin package_versions")
         hosted = config.parameters.get("hosted_provider_governance")
-        if isinstance(hosted, dict) and (not hosted.get("model_version") or not hosted.get("version_pinning")):
-            raise ValidationError("hosted provider release configs must pin model_version and version_pinning")
+        if isinstance(hosted, Mapping):
+            model_version = _optional_text(
+                hosted.get("model_version"),
+                "release.engine_config.hosted_provider_governance.model_version",
+            )
+            version_pinning = _optional_text(
+                hosted.get("version_pinning"),
+                "release.engine_config.hosted_provider_governance.version_pinning",
+            )
+            if model_version is None or version_pinning is None:
+                raise ValidationError("hosted provider release configs must pin model_version and version_pinning")
+        elif hosted is not None:
+            raise ValidationError("hosted provider release governance must be an object")
 
 
 def _release_payload_hash(payload: Mapping[str, Any]) -> str:
@@ -1091,8 +1112,32 @@ def _engine_config_from_dict(payload: object) -> EngineConfigMetadata:
 
 def _branch_acceptance_from_dict(payload: object) -> BranchAcceptanceRecord:
     data = _mapping(payload, "branch_acceptance")
+    _reject_unknown_fields(
+        data,
+        {
+            "branch_id",
+            "cost_delta",
+            "decision",
+            "enforced_gates",
+            "false_confidence_delta",
+            "governance_delta",
+            "job_failure_delta",
+            "latency_delta_ms",
+            "non_enforced_fields",
+            "private_coverage_ready",
+            "quality_delta",
+            "retry_delta",
+            "review_burden_delta",
+        },
+        "branch_acceptance",
+    )
     enforced_gates = _mapping(_required(data, "enforced_gates", "branch_acceptance"), "branch_acceptance.enforced_gates")
-    return BranchAcceptanceRecord(
+    _reject_unknown_fields(
+        enforced_gates,
+        {"false_confidence", "quality", "review_burden"},
+        "branch_acceptance.enforced_gates",
+    )
+    record = BranchAcceptanceRecord(
         branch_id=_required(data, "branch_id", "branch_acceptance"),
         decision=_required(data, "decision", "branch_acceptance"),
         quality_delta=_required(data, "quality_delta", "branch_acceptance"),
@@ -1108,6 +1153,10 @@ def _branch_acceptance_from_dict(payload: object) -> BranchAcceptanceRecord:
         governance_delta=data.get("governance_delta", {}),
         private_coverage_ready=_required(data, "private_coverage_ready", "branch_acceptance"),
     )
+    expected_non_enforced = record.to_dict()["non_enforced_fields"]
+    if data.get("non_enforced_fields", expected_non_enforced) != expected_non_enforced:
+        raise ValidationError("branch_acceptance.non_enforced_fields must match branch fields")
+    return record
 
 
 def _validate_release_schema_version(value: object) -> int:
