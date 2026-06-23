@@ -3,6 +3,7 @@ import json
 import pytest
 
 from keyframe.diarization import (
+    BENCHMARK_REPORT_SCHEMA_VERSION,
     BenchmarkEvaluationCase,
     BenchmarkGateConfig,
     BenchmarkMetricResult,
@@ -21,7 +22,7 @@ from keyframe.diarization import (
     benchmark_report_json_dumps,
     benchmark_report_json_loads,
     benchmark_report_to_markdown,
-    build_benchmark_report,
+    build_benchmark_report as _build_benchmark_report,
     calibrate_review_signals,
     read_benchmark_report_json,
     score_diagnostic_critical_spans,
@@ -175,6 +176,26 @@ def _cases_for_signals():
     return (
         _case("rec-1", current_der=0.05, baseline_der=0.05, current_overlap_der=0.10, baseline_overlap_der=0.10),
         _case("rec-2", current_der=0.05, baseline_der=0.05, current_overlap_der=0.10, baseline_overlap_der=0.10),
+    )
+
+
+def build_benchmark_report(report_id, cases, **kwargs):
+    cases = tuple(cases)
+    if "route_assessments" not in kwargs and cases:
+        kwargs["route_assessments"] = _route_assessments_for_cases(cases)
+    return _build_benchmark_report(report_id, cases, **kwargs)
+
+
+def _route_assessments_for_cases(cases):
+    return tuple(
+        PreflightRouteAssessment(
+            corpus_id=case.corpus_id,
+            branch_id=case.branch_id,
+            recording_id=case.evaluation.recording_id,
+            predicted_route="confident_pipeline",
+            reference_route="confident_pipeline",
+        )
+        for case in cases
     )
 
 
@@ -597,8 +618,19 @@ def test_combined_point_and_regression_budget_preserves_point_failure_without_ba
 
 
 def test_report_requires_at_least_one_scored_metric_observation():
-    with pytest.raises(ValidationError, match="at least one scored metric observation"):
+    with pytest.raises(ValidationError, match="route_assessments are required"):
         build_benchmark_report("empty-report", ())
+
+
+def test_current_report_builder_requires_route_assessments():
+    with pytest.raises(ValidationError, match="route_assessments are required"):
+        _build_benchmark_report(
+            "missing-route-assessments",
+            (
+                _case("rec-1", current_der=0.05, baseline_der=0.05, current_overlap_der=0.10, baseline_overlap_der=0.10),
+            ),
+            route_assessments=(),
+        )
 
 
 def test_configured_regression_budget_must_match_a_metric_result():
@@ -1324,8 +1356,9 @@ def test_report_schema_version_one_without_route_confusion_stays_readable():
         ),
     )
     payload = report.to_dict()
-    assert payload["schema_version"] == 1
-    assert "route_confusion" not in payload
+    assert payload["schema_version"] == BENCHMARK_REPORT_SCHEMA_VERSION
+    payload["schema_version"] = 1
+    payload.pop("route_confusion")
 
     loaded = benchmark_report_json_loads(json.dumps(payload))
 

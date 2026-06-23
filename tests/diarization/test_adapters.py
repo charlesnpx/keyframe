@@ -270,10 +270,11 @@ def test_benchmark_run_record_captures_snapshot_layout_cache_and_splits(tmp_path
             "raw_provider_json": "raw/provider_json/ami-public-dev.json",
             "run_record": "run_records/run-001.json",
         },
+        preflight=_preflight_record(),
     )
 
     payload = record.to_dict()
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == BENCHMARK_RUN_RECORD_SCHEMA_VERSION
     assert payload["dataset_snapshot"]["dataset_id"] == "ami"
     assert payload["split_id"] == "ami-public-dev"
     assert payload["cache_root"] == str(tmp_path / "cache")
@@ -283,7 +284,7 @@ def test_benchmark_run_record_captures_snapshot_layout_cache_and_splits(tmp_path
     assert payload["evaluated_split_ids"] == ["ami-public-dev", "ami-public-holdout"]
     assert payload["execution_mode"] == "default_no_network"
     assert payload["no_network"] is True
-    assert "preflight" not in payload
+    assert payload["preflight"]["policy_version"] == "2026-06-23"
 
 
 def test_benchmark_run_record_persists_preflight_route_state_and_manual_override_audit(tmp_path):
@@ -331,6 +332,7 @@ def test_dry_run_run_record_is_no_network(tmp_path):
         artifact_root=tmp_path / "artifacts",
         cache=DatasetCacheConfig(cache_root=str(tmp_path / "cache")),
         execution_mode="dry_run",
+        preflight=_preflight_record(),
     )
 
     assert record.execution_mode == "dry_run"
@@ -353,6 +355,7 @@ def test_dry_run_cache_policy_rejects_network_flags(tmp_path):
             artifact_root=tmp_path / "artifacts",
             cache=cache,
             execution_mode="dry_run",
+            preflight=_preflight_record(),
         )
 
 
@@ -365,6 +368,7 @@ def test_benchmark_run_record_json_round_trip_is_stable(tmp_path):
         branch="feature/diarization-benchmark-platform",
         artifact_root=tmp_path / "artifacts",
         cache=DatasetCacheConfig(cache_root=str(tmp_path / "cache")),
+        preflight=_preflight_record(),
     )
     target = tmp_path / "run-record.json"
 
@@ -386,6 +390,7 @@ def test_run_record_validation_rejects_unknown_split_and_inconsistent_evaluated_
             branch="feature/diarization-benchmark-platform",
             artifact_root=tmp_path / "artifacts",
             cache=DatasetCacheConfig(cache_root=str(tmp_path / "cache")),
+            preflight=_preflight_record(),
         )
 
     with pytest.raises(ValidationError, match="must be included in evaluated_split_ids"):
@@ -504,6 +509,7 @@ def test_run_record_creation_rejects_split_lists_outside_manifest(tmp_path, fiel
             branch="feature/diarization-benchmark-platform",
             artifact_root=tmp_path / "artifacts",
             cache=DatasetCacheConfig(cache_root=str(tmp_path / "cache")),
+            preflight=_preflight_record(),
             **kwargs,
         )
 
@@ -526,6 +532,7 @@ def test_run_record_creation_rejects_duplicate_split_lists(tmp_path, field_name,
             branch="feature/diarization-benchmark-platform",
             artifact_root=tmp_path / "artifacts",
             cache=DatasetCacheConfig(cache_root=str(tmp_path / "cache")),
+            preflight=_preflight_record(),
             **kwargs,
         )
 
@@ -556,6 +563,7 @@ def test_run_record_loader_rejects_snapshot_and_split_tampering(tmp_path, mutate
         branch="feature/diarization-benchmark-platform",
         artifact_root=tmp_path / "artifacts",
         cache=DatasetCacheConfig(cache_root=str(tmp_path / "cache")),
+        preflight=_preflight_record(),
     )
     payload = record.to_dict()
     mutate(payload)
@@ -566,13 +574,19 @@ def test_run_record_loader_rejects_snapshot_and_split_tampering(tmp_path, mutate
 
 def test_run_record_schema_version_one_without_preflight_stays_readable(tmp_path):
     manifest = _ami_manifest()
-    record = create_benchmark_run_record(
+    record = BenchmarkRunRecord(
         run_id="run-001",
-        manifest=manifest,
+        dataset_id=manifest.dataset_id,
+        dataset_snapshot=manifest.to_dict(),
         split_id="ami-public-dev",
         branch="feature/diarization-benchmark-platform",
-        artifact_root=tmp_path / "artifacts",
-        cache=DatasetCacheConfig(cache_root=str(tmp_path / "cache")),
+        artifact_layout=build_artifact_layout(tmp_path / "artifacts"),
+        cache_root=str(tmp_path / "cache"),
+        tuned_split_ids=(),
+        evaluated_split_ids=("ami-public-dev",),
+        execution_mode="default_no_network",
+        no_network=True,
+        schema_version=1,
     )
     payload = record.to_dict()
 
@@ -611,6 +625,7 @@ def test_run_record_loader_requires_all_serialized_audit_fields(tmp_path, field_
         branch="feature/diarization-benchmark-platform",
         artifact_root=tmp_path / "artifacts",
         cache=DatasetCacheConfig(cache_root=str(tmp_path / "cache")),
+        preflight=_preflight_record(),
     )
     payload = record.to_dict()
     payload.pop(field_name)

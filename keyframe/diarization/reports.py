@@ -900,6 +900,8 @@ def build_benchmark_report(
         raise ValidationError("gate_config must be a BenchmarkGateConfig")
     review_signals = _tuple_of(review_signals, ReviewSignalSpan, "review_signals")
     route_assessments = _tuple_of(route_assessments, PreflightRouteAssessment, "route_assessments")
+    if not route_assessments:
+        raise ValidationError("route_assessments are required for benchmark reports")
     _validate_review_signals_match_cases(cases, review_signals)
     _validate_route_assessments_match_cases(cases, route_assessments)
     observations = tuple(observation for case in cases for observation in _observations_from_case(case))
@@ -928,9 +930,7 @@ def build_benchmark_report(
         if critical_span_policy is not None
         else None
     )
-    route_confusion = (
-        build_preflight_route_confusion_report(route_assessments) if route_assessments else None
-    )
+    route_confusion = build_preflight_route_confusion_report(route_assessments)
     status: BenchmarkReportStatus = (
         "failed"
         if _has_failed_gate(all_results, critical_score)
@@ -950,7 +950,6 @@ def build_benchmark_report(
         critical_span_policy=critical_span_policy,
         critical_span_diagnostic=critical_score,
         route_confusion=route_confusion,
-        schema_version=BENCHMARK_REPORT_SCHEMA_VERSION if route_confusion is not None else 1,
     )
 
 

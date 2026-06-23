@@ -13,6 +13,9 @@ from keyframe.diarization import (
     AMISpeakerSegment,
     AMIWordAnnotation,
     DatasetCacheConfig,
+    PreflightFeatures,
+    PreflightJobRecord,
+    PreflightRouteDecision,
     ValidationError,
     ami_dataset_snapshot_id,
     ami_run_record_identifiers,
@@ -54,6 +57,35 @@ def _recording_source(recording_id="ES2002a"):
 
 def _payload_text(payload):
     return json.dumps(payload, sort_keys=True)
+
+
+def _preflight_record():
+    return PreflightJobRecord(
+        job_id="job-001",
+        decision=PreflightRouteDecision(
+            route="confident_pipeline",
+            reasons=(),
+            policy_id="launch-preflight",
+            policy_version="2026-06-23",
+            frozen_git_sha="c" * 40,
+            tuned_on_splits=("public_dev",),
+            validated_on_splits=("public_holdout", "private_acceptance"),
+            features=PreflightFeatures(
+                declared_locale="en-US",
+                source="ami",
+                capture_mode="separate_tracks",
+                channel_count=2,
+                duration_ms=1_300,
+                sample_rate_hz=16_000,
+                codec="pcm_s16le",
+                clipping_estimate=0.01,
+                speech_ratio=0.62,
+                rough_overlap_estimate=0.12,
+                speaker_count_hint=2,
+            ),
+        ),
+        validated_launch_scope_version="private-coverage-v1@2026-06-23",
+    )
 
 
 def test_ami_nxt_words_segments_and_channels_parse_from_minimal_fixture():
@@ -271,6 +303,7 @@ def test_ami_split_plan_rejects_holdout_tuning_and_run_record_identifies_frozen_
         cache=DatasetCacheConfig(cache_root=str(FIXTURE_ROOT)),
         tuned_on_splits=("ami-public-dev",),
         evaluated_on_splits=("ami-public-holdout",),
+        preflight=_preflight_record(),
     )
     identifiers = ami_run_record_identifiers(record)
 

@@ -12,6 +12,9 @@ from keyframe.diarization import (
     EngineConfigMetadata,
     NormalizedArtifactProvenance,
     NormalizedEngineOutput,
+    PreflightFeatures,
+    PreflightJobRecord,
+    PreflightRouteDecision,
     ReferenceBundle,
     SpeakerSpan,
     ValidationError,
@@ -65,6 +68,35 @@ def _bundle(mode, channel_ids=("left", "right"), channel_names=("Alex", "Blair")
         ),
         bundle_id=f"candidate-{mode}",
         mode=mode,
+    )
+
+
+def _preflight_record():
+    return PreflightJobRecord(
+        job_id="job-001",
+        decision=PreflightRouteDecision(
+            route="confident_pipeline",
+            reasons=(),
+            policy_id="launch-preflight",
+            policy_version="2026-06-23",
+            frozen_git_sha="c" * 40,
+            tuned_on_splits=("public_dev",),
+            validated_on_splits=("public_holdout", "private_acceptance"),
+            features=PreflightFeatures(
+                declared_locale="en-US",
+                source="zoom",
+                capture_mode="separate_tracks",
+                channel_count=2,
+                duration_ms=1_200,
+                sample_rate_hz=16_000,
+                codec="pcm_s16le",
+                clipping_estimate=0.01,
+                speech_ratio=0.62,
+                rough_overlap_estimate=0.12,
+                speaker_count_hint=2,
+            ),
+        ),
+        validated_launch_scope_version="private-coverage-v1@2026-06-23",
     )
 
 
@@ -426,6 +458,7 @@ def test_pipeline_branch_ids_flow_into_run_records_and_report_cases(tmp_path):
         artifact_root=tmp_path / "artifacts",
         cache=DatasetCacheConfig(cache_root=str(tmp_path / "cache")),
         evaluated_split_ids=("ami-public-dev",),
+        preflight=_preflight_record(),
     )
 
     evaluation = DiarizationEvaluationResult(

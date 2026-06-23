@@ -378,6 +378,8 @@ def create_benchmark_run_record(
     derived_artifacts: dict[str, str] | None = None,
     preflight: PreflightJobRecord | None = None,
 ) -> BenchmarkRunRecord:
+    if preflight is None:
+        raise ValidationError("preflight is required for benchmark run records")
     ensure_adapter_cache_policy(manifest, cache, execution_mode=execution_mode)
     manifest_split_ids = frozenset(split.split_id for split in manifest.splits)
     if split_id not in manifest_split_ids:
@@ -400,7 +402,6 @@ def create_benchmark_run_record(
         no_network=execution_mode in {"default_no_network", "dry_run"},
         derived_artifacts={} if derived_artifacts is None else derived_artifacts,
         preflight=preflight,
-        schema_version=BENCHMARK_RUN_RECORD_SCHEMA_VERSION if preflight is not None else 1,
     )
 
 
