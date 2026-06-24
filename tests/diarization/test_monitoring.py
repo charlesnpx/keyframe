@@ -129,6 +129,10 @@ def test_monitoring_records_reject_unsupported_timeline_metadata_fields():
     (
         ("engine_config_versions", {"audio_fingerprint": "config-001"}),
         ("engine_config_versions", {"audioFingerprint": "config-001"}),
+        ("engine_config_versions", {"contactEmail": "config-001"}),
+        ("engine_config_versions", {"participantEmailAddress": "config-001"}),
+        ("engine_config_versions", {"customerAccountId": "config-001"}),
+        ("engine_config_versions", {"accountIdentifier": "config-001"}),
         ("edit_operation_counts", {"cross_session_speaker_key": 1}),
         ("edit_operation_counts", {"crossSessionSpeakerKey": 1}),
     ),

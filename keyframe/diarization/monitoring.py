@@ -108,6 +108,20 @@ _FORBIDDEN_MONITORING_KEYS = frozenset(
 _FORBIDDEN_MONITORING_KEY_ALIASES = frozenset(
     "".join(char for char in key.casefold() if char.isalnum()) for key in _FORBIDDEN_MONITORING_KEYS
 )
+_FORBIDDEN_MONITORING_KEY_FRAGMENTS = frozenset(
+    {
+        "account",
+        "contact",
+        "customer",
+        "email",
+        "fingerprint",
+        "identifier",
+        "identity",
+        "participant",
+        "profile",
+        "userid",
+    }
+)
 _EDIT_OPERATION_TYPES = frozenset(
     {
         "assign_span",
@@ -639,9 +653,16 @@ def _reject_forbidden_monitoring_fields(value: object, field_name: str) -> None:
 
 def _monitoring_safe_key(key: object, field_name: str) -> str:
     key_text = _require_id(key, f"{field_name}.key")
-    if _monitoring_key_alias(key_text) in _FORBIDDEN_MONITORING_KEY_ALIASES:
+    if _monitoring_key_is_forbidden(key_text):
         raise ValidationError(f"{field_name}.{key_text} must not persist sensitive monitoring identity material")
     return key_text
+
+
+def _monitoring_key_is_forbidden(key: str) -> bool:
+    alias = _monitoring_key_alias(key)
+    return alias in _FORBIDDEN_MONITORING_KEY_ALIASES or any(
+        fragment in alias for fragment in _FORBIDDEN_MONITORING_KEY_FRAGMENTS
+    )
 
 
 def _monitoring_key_alias(key: str) -> str:
