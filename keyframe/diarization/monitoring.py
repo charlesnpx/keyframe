@@ -174,7 +174,11 @@ class MonitoringRecord:
             "release_record_schema_version",
             _positive_int(self.release_record_schema_version, "monitoring.release_record_schema_version"),
         )
-        engine_versions = _validate_string_map(self.engine_config_versions, "monitoring.engine_config_versions")
+        engine_versions = _validate_string_map(
+            self.engine_config_versions,
+            "monitoring.engine_config_versions",
+            reject_sensitive_keys=True,
+        )
         if not engine_versions:
             raise ValidationError("monitoring.engine_config_versions is required")
         object.__setattr__(self, "engine_config_versions", engine_versions)
@@ -219,7 +223,11 @@ class MonitoringRecord:
         object.__setattr__(
             self,
             "edit_operation_counts",
-            _validate_non_negative_int_map(self.edit_operation_counts, "monitoring.edit_operation_counts"),
+            _validate_non_negative_int_map(
+                self.edit_operation_counts,
+                "monitoring.edit_operation_counts",
+                reject_sensitive_keys=True,
+            ),
         )
         if self.review_time_ms is not None:
             object.__setattr__(self, "review_time_ms", _non_negative_int(self.review_time_ms, "monitoring.review_time_ms"))
@@ -296,7 +304,11 @@ class MonitoringAggregate:
         object.__setattr__(
             self,
             "edit_operation_totals",
-            _validate_non_negative_int_map(self.edit_operation_totals, "monitoring_aggregate.edit_operation_totals"),
+            _validate_non_negative_int_map(
+                self.edit_operation_totals,
+                "monitoring_aggregate.edit_operation_totals",
+                reject_sensitive_keys=True,
+            ),
         )
         object.__setattr__(
             self,
@@ -522,13 +534,18 @@ def _validate_required_timeline_metadata(timeline: Mapping[str, Any]) -> None:
 def _reject_forbidden_monitoring_fields(value: object, field_name: str) -> None:
     if isinstance(value, Mapping):
         for key, item in value.items():
-            key_text = _require_id(key, f"{field_name}.key")
-            if key_text in _FORBIDDEN_MONITORING_KEYS:
-                raise ValidationError(f"{field_name}.{key_text} must not persist sensitive monitoring identity material")
+            key_text = _monitoring_safe_key(key, field_name)
             _reject_forbidden_monitoring_fields(item, f"{field_name}.{key_text}")
     elif isinstance(value, (list, tuple)):
         for index, item in enumerate(value):
             _reject_forbidden_monitoring_fields(item, f"{field_name}[{index}]")
+
+
+def _monitoring_safe_key(key: object, field_name: str) -> str:
+    key_text = _require_id(key, f"{field_name}.key")
+    if key_text in _FORBIDDEN_MONITORING_KEYS:
+        raise ValidationError(f"{field_name}.{key_text} must not persist sensitive monitoring identity material")
+    return key_text
 
 
 def _validate_schema_version(value: object) -> int:
@@ -545,20 +562,35 @@ def _validate_route(value: object, field_name: str) -> PreflightRoute:
     return route  # type: ignore[return-value]
 
 
-def _validate_string_map(value: object, field_name: str) -> dict[str, str]:
+def _validate_string_map(value: object, field_name: str, *, reject_sensitive_keys: bool = False) -> dict[str, str]:
     data = _mapping(value, field_name)
-    return {
-        _require_id(key, f"{field_name}.key"): _require_id(item, f"{field_name}.{key}")
-        for key, item in data.items()
-    }
+    result: dict[str, str] = {}
+    for key, item in data.items():
+        key_text = (
+            _monitoring_safe_key(key, field_name)
+            if reject_sensitive_keys
+            else _require_id(key, f"{field_name}.key")
+        )
+        result[key_text] = _require_id(item, f"{field_name}.{key_text}")
+    return result
 
 
-def _validate_non_negative_int_map(value: object, field_name: str) -> dict[str, int]:
+def _validate_non_negative_int_map(
+    value: object,
+    field_name: str,
+    *,
+    reject_sensitive_keys: bool = False,
+) -> dict[str, int]:
     data = _mapping(value, field_name)
-    return {
-        _require_id(key, f"{field_name}.key"): _non_negative_int(item, f"{field_name}.{key}")
-        for key, item in data.items()
-    }
+    result: dict[str, int] = {}
+    for key, item in data.items():
+        key_text = (
+            _monitoring_safe_key(key, field_name)
+            if reject_sensitive_keys
+            else _require_id(key, f"{field_name}.key")
+        )
+        result[key_text] = _non_negative_int(item, f"{field_name}.{key_text}")
+    return result
 
 
 def _validate_json_value(value: object, field_name: str) -> None:

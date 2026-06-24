@@ -2,6 +2,7 @@ import pytest
 
 from keyframe.diarization import (
     MONITORING_RECORD_SCHEMA_VERSION,
+    MonitoringAggregate,
     MonitoringPromotionState,
     MonitoringRecord,
     ValidationError,
@@ -93,6 +94,32 @@ def test_monitoring_records_reject_sensitive_identity_or_audio_fields(field_name
 
     with pytest.raises(ValidationError, match=field_name):
         _record(canonical_timeline_metadata=metadata)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    (
+        ("engine_config_versions", {"audio_fingerprint": "config-001"}),
+        ("edit_operation_counts", {"cross_session_speaker_key": 1}),
+    ),
+)
+def test_monitoring_records_reject_sensitive_map_keys(field_name, value):
+    with pytest.raises(ValidationError, match="must not persist sensitive monitoring identity material"):
+        _record(**{field_name: value})
+
+
+def test_monitoring_aggregate_rejects_sensitive_edit_total_keys():
+    with pytest.raises(ValidationError, match="must not persist sensitive monitoring identity material"):
+        MonitoringAggregate(
+            generated_at="2026-07-01T00:00:00Z",
+            total_records=0,
+            active_record_count=0,
+            expired_record_count=0,
+            route_counts={},
+            degraded_record_count=0,
+            edit_operation_totals={"embedding": 1},
+            review_time_ms_total=0,
+        )
 
 
 def test_monitoring_records_require_expiry_and_valid_degraded_state():
