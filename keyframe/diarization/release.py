@@ -36,11 +36,32 @@ ReleaseApprovalStatus = Literal["pending", "approved", "rejected"]
 ReleaseGovernanceDecision = Literal["approve_confident_labels", "degraded_only", "reject"]
 ReleaseRuntimeCheckStatus = Literal["approved", "degraded"]
 ReleaseGoldenTestStatus = Literal["passed", "failed"]
+ReleaseRevalidationTrigger = Literal[
+    "model_version",
+    "provider_contract",
+    "scoring_policy",
+    "preflight_policy",
+    "canonical_transform",
+    "launch_scope",
+    "annotation_protocol",
+    "governance_retention",
+]
 
 _APPROVAL_STATUSES = frozenset({"pending", "approved", "rejected"})
 _GOVERNANCE_DECISIONS = frozenset({"approve_confident_labels", "degraded_only", "reject"})
 _RUNTIME_CHECK_STATUSES = frozenset({"approved", "degraded"})
 _GOLDEN_TEST_STATUSES = frozenset({"passed", "failed"})
+_DEFAULT_REVALIDATE_ON: tuple[ReleaseRevalidationTrigger, ...] = (
+    "model_version",
+    "provider_contract",
+    "scoring_policy",
+    "preflight_policy",
+    "canonical_transform",
+    "launch_scope",
+    "annotation_protocol",
+    "governance_retention",
+)
+_REVALIDATION_TRIGGERS = frozenset(_DEFAULT_REVALIDATE_ON)
 _HEX_DIGITS = frozenset("0123456789abcdef")
 _FORBIDDEN_RUNTIME_IDENTITY_KEYS = frozenset(
     {
@@ -74,6 +95,21 @@ _FORBIDDEN_RUNTIME_IDENTITY_KEYS = frozenset(
     }
 )
 _HOSTED_PROVIDER_CONFIG_PROVIDERS = frozenset({"aws_transcribe", "google_speech", "deepgram"})
+_EMERGENCY_DEGRADED_ROUTES = frozenset({"diagnostic_only", "needs_review"})
+_RUNTIME_FIELD_REVALIDATION_TRIGGERS: dict[str, tuple[ReleaseRevalidationTrigger, ...]] = {
+    "annotation_protocol_version": ("annotation_protocol",),
+    "branch_decisions": ("launch_scope", "governance_retention"),
+    "dataset_snapshot_ids": ("canonical_transform",),
+    "engine_config_ids": ("model_version", "provider_contract", "governance_retention"),
+    "governance_decision": ("governance_retention",),
+    "preflight_policy_id": ("preflight_policy",),
+    "preflight_policy_version": ("preflight_policy",),
+    "private_acceptance_split_id": ("launch_scope",),
+    "route": ("preflight_policy",),
+    "scoring_policy_versions": ("scoring_policy",),
+    "unsupported_scope": ("launch_scope",),
+    "validated_scope": ("launch_scope",),
+}
 
 
 @dataclass(frozen=True)
@@ -376,6 +412,7 @@ class ReleaseRuntimeCheck:
     confident_speaker_attribution_enabled: bool
     degraded_route: PreflightRoute | None
     audit_events: tuple[ReleaseRuntimeAuditEvent, ...] = ()
+    degraded_transcript_output_allowed: bool = True
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -402,17 +439,102 @@ class ReleaseRuntimeCheck:
             "audit_events",
             _tuple_of(self.audit_events, ReleaseRuntimeAuditEvent, "runtime_check.audit_events"),
         )
+        object.__setattr__(
+            self,
+            "degraded_transcript_output_allowed",
+            _require_bool(
+                self.degraded_transcript_output_allowed,
+                "runtime_check.degraded_transcript_output_allowed",
+            ),
+        )
         if self.status == "approved" and (not self.confident_speaker_attribution_enabled or self.audit_events):
             raise ValidationError("approved runtime checks cannot include audit events or disabled attribution")
         if self.status == "degraded" and (self.confident_speaker_attribution_enabled or not self.audit_events):
             raise ValidationError("degraded runtime checks require disabled attribution and audit events")
+        if self.status == "degraded" and self.degraded_route not in _EMERGENCY_DEGRADED_ROUTES:
+            raise ValidationError("degraded runtime checks require diagnostic_only or needs_review route")
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "audit_events": [event.to_dict() for event in self.audit_events],
             "confident_speaker_attribution_enabled": self.confident_speaker_attribution_enabled,
             "degraded_route": self.degraded_route,
+            "degraded_transcript_output_allowed": self.degraded_transcript_output_allowed,
             "status": self.status,
+        }
+
+
+@dataclass(frozen=True)
+class ReleaseRevalidationReport:
+    """Operator-facing summary of why a release requires revalidation."""
+
+    release_candidate_id: str
+    rollback_release_candidate_id: str | None
+    requires_revalidation: bool
+    triggers: tuple[ReleaseRevalidationTrigger, ...]
+    emergency_degraded_route: PreflightRoute | None
+    degraded_transcript_output_allowed: bool
+    audit_events: tuple[ReleaseRuntimeAuditEvent, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "release_candidate_id",
+            _require_id(self.release_candidate_id, "revalidation_report.release_candidate_id"),
+        )
+        object.__setattr__(
+            self,
+            "rollback_release_candidate_id",
+            _optional_id(self.rollback_release_candidate_id, "revalidation_report.rollback_release_candidate_id"),
+        )
+        object.__setattr__(
+            self,
+            "requires_revalidation",
+            _require_bool(self.requires_revalidation, "revalidation_report.requires_revalidation"),
+        )
+        object.__setattr__(
+            self,
+            "triggers",
+            _validate_revalidation_triggers(
+                self.triggers,
+                "revalidation_report.triggers",
+                allow_empty=True,
+            ),
+        )
+        if self.emergency_degraded_route is not None:
+            object.__setattr__(
+                self,
+                "emergency_degraded_route",
+                _validate_emergency_degraded_route(
+                    self.emergency_degraded_route,
+                    "revalidation_report.emergency_degraded_route",
+                ),
+            )
+        object.__setattr__(
+            self,
+            "degraded_transcript_output_allowed",
+            _require_bool(
+                self.degraded_transcript_output_allowed,
+                "revalidation_report.degraded_transcript_output_allowed",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "audit_events",
+            _tuple_of(self.audit_events, ReleaseRuntimeAuditEvent, "revalidation_report.audit_events"),
+        )
+        if self.requires_revalidation != bool(self.triggers):
+            raise ValidationError("revalidation_report.requires_revalidation must match triggers")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "audit_events": [event.to_dict() for event in self.audit_events],
+            "degraded_transcript_output_allowed": self.degraded_transcript_output_allowed,
+            "emergency_degraded_route": self.emergency_degraded_route,
+            "release_candidate_id": self.release_candidate_id,
+            "requires_revalidation": self.requires_revalidation,
+            "rollback_release_candidate_id": self.rollback_release_candidate_id,
+            "triggers": list(self.triggers),
         }
 
 
@@ -437,6 +559,10 @@ class ReleaseCandidateRecord:
     golden_tests: tuple[ReleaseGoldenTestResult, ...]
     approval_status: ReleaseApprovalStatus
     must_not_have_checks: ReleaseMustNotHaveChecks
+    rollback_release_candidate_id: str | None = None
+    revalidate_on: tuple[ReleaseRevalidationTrigger, ...] = _DEFAULT_REVALIDATE_ON
+    emergency_degraded_route: PreflightRoute = "diagnostic_only"
+    degraded_transcript_output_allowed: bool = True
     schema_version: int = RELEASE_RECORD_SCHEMA_VERSION
     content_hash: str | None = None
 
@@ -507,6 +633,31 @@ class ReleaseCandidateRecord:
         )
         if not isinstance(self.must_not_have_checks, ReleaseMustNotHaveChecks):
             raise ValidationError("release.must_not_have_checks must be ReleaseMustNotHaveChecks")
+        rollback_release_candidate_id = _optional_id(
+            self.rollback_release_candidate_id,
+            "release.rollback_release_candidate_id",
+        )
+        if rollback_release_candidate_id == self.release_candidate_id:
+            raise ValidationError("release.rollback_release_candidate_id must differ from release_candidate_id")
+        object.__setattr__(self, "rollback_release_candidate_id", rollback_release_candidate_id)
+        object.__setattr__(
+            self,
+            "revalidate_on",
+            _validate_revalidation_triggers(self.revalidate_on, "release.revalidate_on"),
+        )
+        object.__setattr__(
+            self,
+            "emergency_degraded_route",
+            _validate_emergency_degraded_route(self.emergency_degraded_route, "release.emergency_degraded_route"),
+        )
+        object.__setattr__(
+            self,
+            "degraded_transcript_output_allowed",
+            _require_bool(
+                self.degraded_transcript_output_allowed,
+                "release.degraded_transcript_output_allowed",
+            ),
+        )
         if self.approval_status == "approved":
             _validate_approved_release(self)
         content_hash = _optional_sha256(self.content_hash, "release.content_hash")
@@ -582,11 +733,9 @@ def check_release_runtime_config(
         try:
             active_config = release_runtime_config_from_dict(active_config)
         except ValidationError as exc:
-            return ReleaseRuntimeCheck(
-                status="degraded",
-                confident_speaker_attribution_enabled=False,
-                degraded_route="diagnostic_only",
-                audit_events=(
+            return _degraded_runtime_check(
+                record,
+                (
                     ReleaseRuntimeAuditEvent(
                         code="runtime_config_invalid",
                         message="Active runtime metadata is invalid.",
@@ -600,11 +749,9 @@ def check_release_runtime_config(
     try:
         expected = release_expected_runtime_config(record)
     except ValidationError as exc:
-        return ReleaseRuntimeCheck(
-            status="degraded",
-            confident_speaker_attribution_enabled=False,
-            degraded_route="diagnostic_only",
-            audit_events=(
+        return _degraded_runtime_check(
+            record,
+            (
                 ReleaseRuntimeAuditEvent(
                     code="release_runtime_config_invalid",
                     message="Release runtime metadata is invalid.",
@@ -646,30 +793,60 @@ def check_release_runtime_config(
     for key, expected_value in expected_payload.items():
         actual_value = active_payload.get(key)
         if actual_value != expected_value:
-            events.append(
-                ReleaseRuntimeAuditEvent(
-                    code=f"{key}_mismatch",
-                    message=f"Active runtime {key} does not match the approved release.",
-                    expected=expected_value,
-                    actual=actual_value,
+            events.extend(
+                _runtime_revalidation_events(
+                    record,
+                    runtime_field=key,
+                    expected_value=expected_value,
+                    actual_value=actual_value,
                 )
             )
     if events:
-        return ReleaseRuntimeCheck(
-            status="degraded",
-            confident_speaker_attribution_enabled=False,
-            degraded_route=(
-                record.route_state.effective_route
-                if record.route_state.effective_route != "confident_pipeline"
-                else "diagnostic_only"
-            ),
-            audit_events=tuple(events),
-        )
+        return _degraded_runtime_check(record, tuple(events))
     return ReleaseRuntimeCheck(
         status="approved",
         confident_speaker_attribution_enabled=True,
         degraded_route=None,
         audit_events=(),
+        degraded_transcript_output_allowed=True,
+    )
+
+
+def release_revalidation_report(
+    record: ReleaseCandidateRecord,
+    active_config: ReleaseRuntimeConfig | Mapping[str, Any],
+) -> ReleaseRevalidationReport:
+    """Build an operator report for release invalidation and rollback routing."""
+
+    if not isinstance(record, ReleaseCandidateRecord):
+        raise ValidationError("record must be ReleaseCandidateRecord")
+    check = check_release_runtime_config(record, active_config)
+    triggers = _revalidation_triggers_from_events(check.audit_events)
+    return ReleaseRevalidationReport(
+        release_candidate_id=record.release_candidate_id,
+        rollback_release_candidate_id=record.rollback_release_candidate_id,
+        requires_revalidation=bool(triggers),
+        triggers=triggers,
+        emergency_degraded_route=check.degraded_route,
+        degraded_transcript_output_allowed=check.degraded_transcript_output_allowed,
+        audit_events=check.audit_events,
+    )
+
+
+def release_revalidation_summary(
+    record: ReleaseCandidateRecord,
+    active_config: ReleaseRuntimeConfig | Mapping[str, Any],
+) -> str:
+    """Return a compact command-line-friendly revalidation summary."""
+
+    report = release_revalidation_report(record, active_config)
+    if not report.requires_revalidation:
+        return f"{report.release_candidate_id}: no revalidation required"
+    rollback = report.rollback_release_candidate_id or "none"
+    return (
+        f"{report.release_candidate_id}: revalidation required for {', '.join(report.triggers)}; "
+        f"rollback={rollback}; emergency_route={report.emergency_degraded_route}; "
+        f"degraded_transcript_output_allowed={str(report.degraded_transcript_output_allowed).lower()}"
     )
 
 
@@ -711,6 +888,8 @@ def release_record_from_dict(payload: Mapping[str, Any]) -> ReleaseCandidateReco
             "branch_decisions",
             "content_hash",
             "dataset_snapshots",
+            "degraded_transcript_output_allowed",
+            "emergency_degraded_route",
             "engine_configs",
             "git_sha",
             "golden_tests",
@@ -718,7 +897,9 @@ def release_record_from_dict(payload: Mapping[str, Any]) -> ReleaseCandidateReco
             "must_not_have_checks",
             "preflight_policy",
             "private_acceptance_split_id",
+            "revalidate_on",
             "release_candidate_id",
+            "rollback_release_candidate_id",
             "route_state",
             "schema_version",
             "scoring_policies",
@@ -762,6 +943,14 @@ def release_record_from_dict(payload: Mapping[str, Any]) -> ReleaseCandidateReco
         approval_status=_required(data, "approval_status", "release"),
         must_not_have_checks=release_must_not_have_checks_from_dict(
             _required(data, "must_not_have_checks", "release")
+        ),
+        rollback_release_candidate_id=_required(data, "rollback_release_candidate_id", "release"),
+        revalidate_on=tuple(_sequence(_required(data, "revalidate_on", "release"), "release.revalidate_on")),
+        emergency_degraded_route=_required(data, "emergency_degraded_route", "release"),
+        degraded_transcript_output_allowed=_required(
+            data,
+            "degraded_transcript_output_allowed",
+            "release",
         ),
         content_hash=_required(data, "content_hash", "release"),
     )
@@ -918,6 +1107,8 @@ def _release_payload_from_fields(record: ReleaseCandidateRecord) -> dict[str, An
         "benchmark_reports": [report.to_dict() for report in record.benchmark_reports],
         "branch_decisions": [decision.to_dict() for decision in record.branch_decisions],
         "dataset_snapshots": [_thaw_json(snapshot) for snapshot in record.dataset_snapshots],
+        "degraded_transcript_output_allowed": record.degraded_transcript_output_allowed,
+        "emergency_degraded_route": record.emergency_degraded_route,
         "engine_configs": [config.to_dict() for config in record.engine_configs],
         "git_sha": record.git_sha,
         "golden_tests": [test.to_dict() for test in record.golden_tests],
@@ -925,7 +1116,9 @@ def _release_payload_from_fields(record: ReleaseCandidateRecord) -> dict[str, An
         "must_not_have_checks": record.must_not_have_checks.to_dict(),
         "preflight_policy": record.preflight_policy.to_dict(),
         "private_acceptance_split_id": record.private_acceptance_split_id,
+        "revalidate_on": list(record.revalidate_on),
         "release_candidate_id": record.release_candidate_id,
+        "rollback_release_candidate_id": record.rollback_release_candidate_id,
         "route_state": record.route_state.to_dict(),
         "schema_version": record.schema_version,
         "scoring_policies": [policy.to_dict() for policy in record.scoring_policies],
@@ -952,6 +1145,64 @@ def _validate_approved_release(record: ReleaseCandidateRecord) -> None:
         raise ValidationError("approved releases require accepted branch decisions")
     if any(not decision.private_coverage_ready for decision in record.branch_decisions):
         raise ValidationError("approved releases require private coverage ready branch decisions")
+
+
+def _degraded_runtime_check(
+    record: ReleaseCandidateRecord,
+    events: tuple[ReleaseRuntimeAuditEvent, ...],
+) -> ReleaseRuntimeCheck:
+    return ReleaseRuntimeCheck(
+        status="degraded",
+        confident_speaker_attribution_enabled=False,
+        degraded_route=record.emergency_degraded_route,
+        audit_events=events,
+        degraded_transcript_output_allowed=record.degraded_transcript_output_allowed,
+    )
+
+
+def _runtime_revalidation_events(
+    record: ReleaseCandidateRecord,
+    *,
+    runtime_field: str,
+    expected_value: Any,
+    actual_value: Any,
+) -> tuple[ReleaseRuntimeAuditEvent, ...]:
+    triggers = tuple(
+        trigger
+        for trigger in _RUNTIME_FIELD_REVALIDATION_TRIGGERS.get(runtime_field, ())
+        if trigger in record.revalidate_on
+    )
+    if not triggers:
+        return (
+            ReleaseRuntimeAuditEvent(
+                code=f"{runtime_field}_mismatch",
+                message=f"Active runtime {runtime_field} does not match the approved release.",
+                expected=expected_value,
+                actual=actual_value,
+            ),
+        )
+    return tuple(
+        ReleaseRuntimeAuditEvent(
+            code=f"{trigger}_revalidation_required",
+            message=f"Active runtime {runtime_field} invalidates release trigger {trigger}.",
+            expected={"runtime_field": runtime_field, "trigger": trigger, "value": expected_value},
+            actual={"runtime_field": runtime_field, "trigger": trigger, "value": actual_value},
+        )
+        for trigger in triggers
+    )
+
+
+def _revalidation_triggers_from_events(
+    events: tuple[ReleaseRuntimeAuditEvent, ...],
+) -> tuple[ReleaseRevalidationTrigger, ...]:
+    triggers: list[ReleaseRevalidationTrigger] = []
+    for event in events:
+        actual = _thaw_json(event.actual)
+        if isinstance(actual, Mapping):
+            trigger = actual.get("trigger")
+            if isinstance(trigger, str) and trigger in _REVALIDATION_TRIGGERS and trigger not in triggers:
+                triggers.append(trigger)  # type: ignore[arg-type]
+    return tuple(triggers)
 
 
 def _immutable_release_engine_config(config: EngineConfigMetadata) -> EngineConfigMetadata:
@@ -1224,6 +1475,13 @@ def _validate_preflight_route(value: object, field_name: str) -> PreflightRoute:
     return route  # type: ignore[return-value]
 
 
+def _validate_emergency_degraded_route(value: object, field_name: str) -> PreflightRoute:
+    route = _validate_preflight_route(value, field_name)
+    if route not in _EMERGENCY_DEGRADED_ROUTES:
+        raise ValidationError(f"{field_name} must be diagnostic_only or needs_review")
+    return route
+
+
 def _validate_git_sha(value: object, field_name: str) -> str:
     sha = _require_id(value, field_name)
     if len(sha) != 40 or any(char not in _HEX_DIGITS for char in sha):
@@ -1245,6 +1503,29 @@ def _validate_choice(value: object, choices: frozenset[str], field_name: str) ->
     if text not in choices:
         raise ValidationError(f"{field_name} is not supported: {text}")
     return text
+
+
+def _validate_revalidation_trigger(value: object, field_name: str) -> ReleaseRevalidationTrigger:
+    trigger = _require_id(value, field_name)
+    if trigger not in _REVALIDATION_TRIGGERS:
+        raise ValidationError(f"{field_name} is not supported: {trigger}")
+    return trigger  # type: ignore[return-value]
+
+
+def _validate_revalidation_triggers(
+    values: object,
+    field_name: str,
+    *,
+    allow_empty: bool = False,
+) -> tuple[ReleaseRevalidationTrigger, ...]:
+    triggers = tuple(
+        _validate_revalidation_trigger(item, f"{field_name}[{index}]")
+        for index, item in enumerate(_sequence(values, field_name))
+    )
+    if not triggers and not allow_empty:
+        raise ValidationError(f"{field_name} is required")
+    _reject_duplicates(triggers, field_name)
+    return triggers
 
 
 def _id_tuple(values: object, field_name: str) -> tuple[str, ...]:
@@ -1377,6 +1658,12 @@ def _require_id(value: object, field_name: str) -> str:
     if not value:
         raise ValidationError(f"{field_name} is required")
     return value
+
+
+def _optional_id(value: object, field_name: str) -> str | None:
+    if value is None:
+        return None
+    return _require_id(value, field_name)
 
 
 def _require_text(value: object, field_name: str) -> str:

@@ -14,6 +14,7 @@ from keyframe.diarization import (
     ReleaseCandidateRecord,
     ReleaseGoldenTestResult,
     ReleaseMustNotHaveChecks,
+    ReleaseRevalidationReport,
     ReleaseRouteState,
     UncertaintyInterval,
     ValidationError,
@@ -22,6 +23,8 @@ from keyframe.diarization import (
     benchmark_report_from_dict,
     read_dataset_manifest_json,
     release_expected_runtime_config,
+    release_revalidation_report,
+    release_revalidation_summary,
     release_record_content_hash,
     release_record_from_dict,
     release_record_json_dumps,
@@ -237,6 +240,38 @@ def test_release_record_hash_round_trip_and_runtime_match_enable_confident_label
     assert check.audit_events == ()
 
 
+def test_release_record_includes_rollback_and_revalidation_metadata():
+    record = _release(
+        rollback_release_candidate_id="release-2026-06-22",
+        revalidate_on=("model_version", "scoring_policy", "governance_retention"),
+        emergency_degraded_route="needs_review",
+    )
+    payload = record.to_dict()
+
+    assert payload["rollback_release_candidate_id"] == "release-2026-06-22"
+    assert payload["revalidate_on"] == ["model_version", "scoring_policy", "governance_retention"]
+    assert payload["emergency_degraded_route"] == "needs_review"
+    assert payload["degraded_transcript_output_allowed"] is True
+    assert release_record_from_dict(payload).to_dict() == payload
+
+
+def test_release_record_validates_rollback_and_revalidation_metadata():
+    with pytest.raises(ValidationError, match="must differ from release_candidate_id"):
+        _release(rollback_release_candidate_id="release-2026-06-23")
+
+    with pytest.raises(ValidationError, match="release.revalidate_on is required"):
+        _release(revalidate_on=())
+
+    with pytest.raises(ValidationError, match="contains duplicate"):
+        _release(revalidate_on=("model_version", "model_version"))
+
+    with pytest.raises(ValidationError, match="is not supported"):
+        _release(revalidate_on=("unsupported_trigger",))
+
+    with pytest.raises(ValidationError, match="diagnostic_only or needs_review"):
+        _release(emergency_degraded_route="confident_pipeline")
+
+
 def test_release_loader_requires_persisted_content_hash():
     payload = _release().to_dict()
     payload.pop("content_hash")
@@ -303,7 +338,9 @@ def test_runtime_config_mismatch_disables_confident_labels_and_emits_audit_event
     assert check.status == "degraded"
     assert check.confident_speaker_attribution_enabled is False
     assert check.degraded_route == "diagnostic_only"
-    assert [event.code for event in check.audit_events] == ["preflight_policy_version_mismatch"]
+    assert check.degraded_transcript_output_allowed is True
+    assert [event.code for event in check.audit_events] == ["preflight_policy_revalidation_required"]
+    assert check.audit_events[0].actual["trigger"] == "preflight_policy"
 
 
 def test_engine_fingerprint_includes_pinned_package_versions():
@@ -324,7 +361,79 @@ def test_engine_fingerprint_includes_pinned_package_versions():
     check = check_release_runtime_config(record, active_payload)
 
     assert check.status == "degraded"
-    assert [event.code for event in check.audit_events] == ["engine_config_ids_mismatch"]
+    assert [event.code for event in check.audit_events] == [
+        "model_version_revalidation_required",
+        "provider_contract_revalidation_required",
+        "governance_retention_revalidation_required",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("trigger", "runtime_field", "replacement"),
+    (
+        ("model_version", "engine_config_ids", {"release-engine": "model-drift"}),
+        ("provider_contract", "engine_config_ids", {"release-engine": "provider-contract-drift"}),
+        ("scoring_policy", "scoring_policy_versions", {"ami-diarization-v1": "2026-07-01"}),
+        ("preflight_policy", "preflight_policy_version", "2026-07-01"),
+        ("canonical_transform", "dataset_snapshot_ids", {"ami": "canonical-transform-drift"}),
+        ("launch_scope", "validated_scope", ["separate_tracks_2_speaker", "mono_mix_low_overlap"]),
+        ("annotation_protocol", "annotation_protocol_version", "private-annotation@2026-07-01"),
+        ("governance_retention", "governance_decision", "degraded_only"),
+    ),
+)
+def test_release_revalidation_report_identifies_each_trigger(trigger, runtime_field, replacement):
+    record = _release(
+        rollback_release_candidate_id="release-2026-06-22",
+        revalidate_on=(trigger,),
+    )
+    active_payload = release_expected_runtime_config(record).to_dict()
+    active_payload[runtime_field] = replacement
+
+    report = release_revalidation_report(record, active_payload)
+    summary = release_revalidation_summary(record, active_payload)
+
+    assert isinstance(report, ReleaseRevalidationReport)
+    assert report.requires_revalidation is True
+    assert report.rollback_release_candidate_id == "release-2026-06-22"
+    assert report.triggers == (trigger,)
+    assert report.emergency_degraded_route == "diagnostic_only"
+    assert report.degraded_transcript_output_allowed is True
+    assert [event.code for event in report.audit_events] == [f"{trigger}_revalidation_required"]
+    assert report.audit_events[0].actual["runtime_field"] == runtime_field
+    assert trigger in summary
+    assert "rollback=release-2026-06-22" in summary
+
+
+def test_release_revalidation_report_allows_clean_runtime_config():
+    record = _release(rollback_release_candidate_id="release-2026-06-22")
+    active_config = release_expected_runtime_config(record)
+
+    report = release_revalidation_report(record, active_config)
+
+    assert report.requires_revalidation is False
+    assert report.triggers == ()
+    assert report.audit_events == ()
+    assert release_revalidation_summary(record, active_config) == "release-2026-06-23: no revalidation required"
+
+
+def test_emergency_degradation_can_route_to_needs_review_and_preserve_degraded_output():
+    record = _release(
+        rollback_release_candidate_id="release-2026-06-22",
+        revalidate_on=("scoring_policy",),
+        emergency_degraded_route="needs_review",
+    )
+    active_payload = release_expected_runtime_config(record).to_dict()
+    active_payload["scoring_policy_versions"] = {"ami-diarization-v1": "2026-07-01"}
+
+    check = check_release_runtime_config(record, active_payload)
+    report = release_revalidation_report(record, active_payload)
+
+    assert check.status == "degraded"
+    assert check.confident_speaker_attribution_enabled is False
+    assert check.degraded_route == "needs_review"
+    assert check.degraded_transcript_output_allowed is True
+    assert report.emergency_degraded_route == "needs_review"
+    assert report.triggers == ("scoring_policy",)
 
 
 def test_self_hosted_release_requires_package_version_pins():
