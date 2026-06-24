@@ -29,8 +29,8 @@ from keyframe.diarization.reports import (
 )
 
 
-RELEASE_RECORD_SCHEMA_VERSION = 1
-SUPPORTED_RELEASE_RECORD_SCHEMA_VERSIONS = frozenset({1})
+RELEASE_RECORD_SCHEMA_VERSION = 2
+SUPPORTED_RELEASE_RECORD_SCHEMA_VERSIONS = frozenset({2})
 
 ReleaseApprovalStatus = Literal["pending", "approved", "rejected"]
 ReleaseGovernanceDecision = Literal["approve_confident_labels", "degraded_only", "reject"]
@@ -523,8 +523,10 @@ class ReleaseRevalidationReport:
             "audit_events",
             _tuple_of(self.audit_events, ReleaseRuntimeAuditEvent, "revalidation_report.audit_events"),
         )
-        if self.requires_revalidation != bool(self.triggers):
-            raise ValidationError("revalidation_report.requires_revalidation must match triggers")
+        if self.triggers and not self.requires_revalidation:
+            raise ValidationError("revalidation_report.requires_revalidation must include trigger failures")
+        if not self.requires_revalidation and self.audit_events:
+            raise ValidationError("revalidation_report clean results cannot include audit events")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -825,7 +827,7 @@ def release_revalidation_report(
     return ReleaseRevalidationReport(
         release_candidate_id=record.release_candidate_id,
         rollback_release_candidate_id=record.rollback_release_candidate_id,
-        requires_revalidation=bool(triggers),
+        requires_revalidation=check.status == "degraded",
         triggers=triggers,
         emergency_degraded_route=check.degraded_route,
         degraded_transcript_output_allowed=check.degraded_transcript_output_allowed,
@@ -842,9 +844,10 @@ def release_revalidation_summary(
     report = release_revalidation_report(record, active_config)
     if not report.requires_revalidation:
         return f"{report.release_candidate_id}: no revalidation required"
+    reasons = report.triggers or tuple(event.code for event in report.audit_events)
     rollback = report.rollback_release_candidate_id or "none"
     return (
-        f"{report.release_candidate_id}: revalidation required for {', '.join(report.triggers)}; "
+        f"{report.release_candidate_id}: revalidation required for {', '.join(reasons)}; "
         f"rollback={rollback}; emergency_route={report.emergency_degraded_route}; "
         f"degraded_transcript_output_allowed={str(report.degraded_transcript_output_allowed).lower()}"
     )
@@ -908,8 +911,9 @@ def release_record_from_dict(payload: Mapping[str, Any]) -> ReleaseCandidateReco
         },
         "release",
     )
+    schema_version = _validate_release_schema_version(_required(data, "schema_version", "release"))
     return ReleaseCandidateRecord(
-        schema_version=_required(data, "schema_version", "release"),
+        schema_version=schema_version,
         release_candidate_id=_required(data, "release_candidate_id", "release"),
         git_sha=_required(data, "git_sha", "release"),
         dataset_snapshots=tuple(_sequence(_required(data, "dataset_snapshots", "release"), "release.dataset_snapshots")),

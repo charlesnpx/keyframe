@@ -1,6 +1,7 @@
 import pytest
 
 from keyframe.diarization import (
+    RELEASE_RECORD_SCHEMA_VERSION,
     BenchmarkGateConfig,
     BenchmarkMetricResult,
     BenchmarkRegressionBudget,
@@ -248,6 +249,8 @@ def test_release_record_includes_rollback_and_revalidation_metadata():
     )
     payload = record.to_dict()
 
+    assert record.schema_version == RELEASE_RECORD_SCHEMA_VERSION == 2
+    assert payload["schema_version"] == 2
     assert payload["rollback_release_candidate_id"] == "release-2026-06-22"
     assert payload["revalidate_on"] == ["model_version", "scoring_policy", "governance_retention"]
     assert payload["emergency_degraded_route"] == "needs_review"
@@ -277,6 +280,18 @@ def test_release_loader_requires_persisted_content_hash():
     payload.pop("content_hash")
 
     with pytest.raises(ValidationError, match="release.content_hash is required"):
+        release_record_from_dict(payload)
+
+
+def test_release_loader_rejects_legacy_schema_before_required_v2_fields():
+    payload = _release().to_dict()
+    payload["schema_version"] = 1
+    payload.pop("rollback_release_candidate_id")
+    payload.pop("revalidate_on")
+    payload.pop("emergency_degraded_route")
+    payload.pop("degraded_transcript_output_allowed")
+
+    with pytest.raises(ValidationError, match="release.schema_version is not supported: 1"):
         release_record_from_dict(payload)
 
 
@@ -414,6 +429,21 @@ def test_release_revalidation_report_allows_clean_runtime_config():
     assert report.triggers == ()
     assert report.audit_events == ()
     assert release_revalidation_summary(record, active_config) == "release-2026-06-23: no revalidation required"
+
+
+def test_release_revalidation_report_marks_degraded_events_without_trigger_as_required():
+    record = _release(revalidate_on=("model_version",))
+    active_payload = release_expected_runtime_config(record).to_dict()
+    active_payload["preflight_policy_version"] = "2026-07-01"
+
+    report = release_revalidation_report(record, active_payload)
+    summary = release_revalidation_summary(record, active_payload)
+
+    assert report.requires_revalidation is True
+    assert report.triggers == ()
+    assert [event.code for event in report.audit_events] == ["preflight_policy_version_mismatch"]
+    assert "preflight_policy_version_mismatch" in summary
+    assert "no revalidation required" not in summary
 
 
 def test_emergency_degradation_can_route_to_needs_review_and_preserve_degraded_output():
