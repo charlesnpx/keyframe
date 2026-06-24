@@ -36,8 +36,11 @@ _FORBIDDEN_MONITORING_KEYS = frozenset(
         "audio_fingerprint",
         "audio_fingerprints",
         "audio_sha256",
+        "benchmark_result",
         "canonical_audio_id",
         "canonical_audio_sha256",
+        "corpus_identity",
+        "corpus_recording_id",
         "corpus_speaker_id",
         "corpus_speaker_ids",
         "cross_call_speaker_id",
@@ -45,12 +48,19 @@ _FORBIDDEN_MONITORING_KEYS = frozenset(
         "cross_recording_speaker_id",
         "cross_session_speaker_key",
         "cross_session_speaker_keys",
+        "display_label",
+        "display_labels",
         "embedding",
         "embeddings",
+        "evaluator_speaker_map",
         "global_identity",
         "global_speaker_id",
+        "gold_label",
+        "gold_labels",
         "identity_profile",
         "local_audio_sha256",
+        "oracle",
+        "oracle_metadata",
         "original_audio_id",
         "original_audio_sha256",
         "participant_id",
@@ -60,11 +70,17 @@ _FORBIDDEN_MONITORING_KEYS = frozenset(
         "raw_audio",
         "raw_audio_bytes",
         "raw_audio_path",
+        "reference_label",
+        "reference_labels",
         "reference_speaker_id",
         "reference_speaker_ids",
         "retained_voice_profile",
+        "source_speaker_id",
+        "source_speaker_ids",
         "speaker_embedding",
         "speaker_embeddings",
+        "speaker_id",
+        "speaker_ids",
         "speaker_profile",
         "speaker_ref",
         "speaker_refs",
@@ -338,6 +354,13 @@ class MonitoringAggregate:
             "degraded_record_count",
             _non_negative_int(self.degraded_record_count, "monitoring_aggregate.degraded_record_count"),
         )
+        if sum(self.route_counts.values()) != self.total_records:
+            raise ValidationError("monitoring_aggregate.route_counts must sum to total_records")
+        degraded_route_count = sum(
+            count for route, count in self.route_counts.items() if route != "confident_pipeline"
+        )
+        if self.degraded_record_count != degraded_route_count:
+            raise ValidationError("monitoring_aggregate.degraded_record_count must match degraded route counts")
         object.__setattr__(
             self,
             "edit_operation_totals",
@@ -365,6 +388,10 @@ class MonitoringAggregate:
             "active_timeline_ids",
             _id_tuple(self.active_timeline_ids, "monitoring_aggregate.active_timeline_ids"),
         )
+        if len(self.active_monitoring_record_ids) != self.active_record_count:
+            raise ValidationError("monitoring_aggregate.active_monitoring_record_ids must match active_record_count")
+        if len(self.active_timeline_ids) != self.active_record_count:
+            raise ValidationError("monitoring_aggregate.active_timeline_ids must match active_record_count")
 
     def to_dict(self) -> dict[str, Any]:
         return {

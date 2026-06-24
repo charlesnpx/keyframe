@@ -99,6 +99,13 @@ def test_monitoring_record_rejects_malformed_payload_field_names():
         ("identityProfile", "speaker-global-1"),
         ("profile_id", "speaker-global-1"),
         ("profileId", "speaker-global-1"),
+        ("corpus_identity", "speaker-global-1"),
+        ("source_speaker_id", "speaker-global-1"),
+        ("evaluator_speaker_map", {"cluster-a": "AMI-P1"}),
+        ("oracle_metadata", {"speaker": "AMI-P1"}),
+        ("display_label", "Speaker 1"),
+        ("gold_label", "AMI-P1"),
+        ("reference_label", "AMI-P1"),
     ),
 )
 def test_monitoring_records_reject_sensitive_identity_or_audio_fields(field_name, value):
@@ -187,6 +194,58 @@ def test_monitoring_aggregate_rejects_unknown_route_and_edit_total_keys():
             degraded_record_count=0,
             edit_operation_totals={"sessionSpecificEdit": 1},
             review_time_ms_total=0,
+        )
+
+
+def test_monitoring_aggregate_rejects_inconsistent_redaction_counts():
+    with pytest.raises(ValidationError, match="route_counts must sum to total_records"):
+        MonitoringAggregate(
+            generated_at="2026-07-01T00:00:00Z",
+            total_records=1,
+            active_record_count=0,
+            expired_record_count=1,
+            route_counts={},
+            degraded_record_count=0,
+            edit_operation_totals={},
+            review_time_ms_total=0,
+        )
+
+    with pytest.raises(ValidationError, match="degraded_record_count must match"):
+        MonitoringAggregate(
+            generated_at="2026-07-01T00:00:00Z",
+            total_records=1,
+            active_record_count=0,
+            expired_record_count=1,
+            route_counts={"needs_review": 1},
+            degraded_record_count=0,
+            edit_operation_totals={},
+            review_time_ms_total=0,
+        )
+
+    with pytest.raises(ValidationError, match="active_monitoring_record_ids must match"):
+        MonitoringAggregate(
+            generated_at="2026-07-01T00:00:00Z",
+            total_records=1,
+            active_record_count=0,
+            expired_record_count=1,
+            route_counts={"confident_pipeline": 1},
+            degraded_record_count=0,
+            edit_operation_totals={},
+            review_time_ms_total=0,
+            active_monitoring_record_ids=("monitoring-expired",),
+        )
+
+    with pytest.raises(ValidationError, match="active_timeline_ids must match"):
+        MonitoringAggregate(
+            generated_at="2026-07-01T00:00:00Z",
+            total_records=1,
+            active_record_count=0,
+            expired_record_count=1,
+            route_counts={"confident_pipeline": 1},
+            degraded_record_count=0,
+            edit_operation_totals={},
+            review_time_ms_total=0,
+            active_timeline_ids=("timeline-expired",),
         )
 
 
