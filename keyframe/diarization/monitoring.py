@@ -28,7 +28,8 @@ MonitoringPromotionStep = Literal[
 ]
 
 _RETENTION_CLASSES = frozenset({"ephemeral", "diagnostic_30d", "private_candidate"})
-_DEGRADED_ROUTES = frozenset({"diagnostic_only", "needs_review"})
+_DEGRADED_ROUTES = frozenset({"diagnostic_only", "needs_review", "unsupported"})
+_TIME_BASES = frozenset({"canonical_ms", "chunk_relative_ms", "sample_index", "frame_index"})
 _FORBIDDEN_MONITORING_KEYS = frozenset(
     {
         "audio_bytes",
@@ -192,21 +193,28 @@ class MonitoringRecord:
                 "monitoring.confident_speaker_attribution_enabled",
             ),
         )
+        if self.route == "confident_pipeline" and not self.confident_speaker_attribution_enabled:
+            raise ValidationError("confident_pipeline monitoring records require confident_speaker_attribution_enabled")
+        if self.route != "confident_pipeline" and self.confident_speaker_attribution_enabled:
+            raise ValidationError("degraded monitoring records cannot enable confident_speaker_attribution")
         if self.degraded_route is not None:
             degraded_route = _validate_route(self.degraded_route, "monitoring.degraded_route")
             if degraded_route not in _DEGRADED_ROUTES:
-                raise ValidationError("monitoring.degraded_route must be diagnostic_only or needs_review")
+                raise ValidationError("monitoring.degraded_route must be diagnostic_only, needs_review, or unsupported")
             object.__setattr__(self, "degraded_route", degraded_route)
         if self.confident_speaker_attribution_enabled and self.degraded_route is not None:
             raise ValidationError("confident monitoring records cannot include degraded_route")
         if not self.confident_speaker_attribution_enabled and self.degraded_route is None:
             raise ValidationError("degraded monitoring records require degraded_route")
+        if self.degraded_route is not None and self.degraded_route != self.route:
+            raise ValidationError("monitoring.degraded_route must match route for degraded records")
         timeline = _monitoring_safe_metadata(self.canonical_timeline_metadata, "monitoring.timeline")
         missing_timeline_fields = _REQUIRED_TIMELINE_FIELDS - set(timeline)
         if missing_timeline_fields:
             raise ValidationError(
                 "monitoring.timeline missing required fields: " + ", ".join(sorted(missing_timeline_fields))
             )
+        _validate_required_timeline_metadata(timeline)
         object.__setattr__(self, "canonical_timeline_metadata", timeline)
         object.__setattr__(
             self,
@@ -499,6 +507,16 @@ def _monitoring_safe_metadata(value: object, field_name: str) -> dict[str, Any]:
     _validate_json_value(data, field_name)
     _reject_forbidden_monitoring_fields(data, field_name)
     return _freeze_json(data)  # type: ignore[return-value]
+
+
+def _validate_required_timeline_metadata(timeline: Mapping[str, Any]) -> None:
+    _require_id(timeline["timeline_id"], "monitoring.timeline.timeline_id")
+    _require_id(timeline["transform_chain_id"], "monitoring.timeline.transform_chain_id")
+    _positive_int(timeline["duration_ms"], "monitoring.timeline.duration_ms")
+    _positive_int(timeline["sample_rate_hz"], "monitoring.timeline.sample_rate_hz")
+    time_basis = _require_id(timeline["time_basis"], "monitoring.timeline.time_basis")
+    if time_basis not in _TIME_BASES:
+        raise ValidationError(f"monitoring.timeline.time_basis is not supported: {time_basis}")
 
 
 def _reject_forbidden_monitoring_fields(value: object, field_name: str) -> None:

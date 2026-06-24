@@ -99,16 +99,54 @@ def test_monitoring_records_require_expiry_and_valid_degraded_state():
     with pytest.raises(ValidationError, match="monitoring.expires_at"):
         _record(expires_at=None)
 
+    with pytest.raises(ValidationError, match="cannot enable confident_speaker_attribution"):
+        _record(route="needs_review", confident_speaker_attribution_enabled=True)
+
+    with pytest.raises(ValidationError, match="confident_pipeline monitoring records require"):
+        _record(
+            route="confident_pipeline",
+            confident_speaker_attribution_enabled=False,
+            degraded_route="needs_review",
+        )
+
     with pytest.raises(ValidationError, match="degraded monitoring records require degraded_route"):
         _record(route="needs_review", confident_speaker_attribution_enabled=False)
+
+    with pytest.raises(ValidationError, match="degraded_route must match route"):
+        _record(
+            route="needs_review",
+            confident_speaker_attribution_enabled=False,
+            degraded_route="diagnostic_only",
+        )
 
     degraded = _record(
         route="needs_review",
         confident_speaker_attribution_enabled=False,
         degraded_route="needs_review",
     )
+    unsupported = _record(
+        route="unsupported",
+        confident_speaker_attribution_enabled=False,
+        degraded_route="unsupported",
+    )
 
     assert degraded.to_dict()["degraded_route"] == "needs_review"
+    assert unsupported.to_dict()["degraded_route"] == "unsupported"
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    (
+        ({"timeline_id": 123}, "monitoring.timeline.timeline_id must be a string"),
+        ({"transform_chain_id": ""}, "monitoring.timeline.transform_chain_id is required"),
+        ({"duration_ms": -1}, "monitoring.timeline.duration_ms must be greater than 0"),
+        ({"sample_rate_hz": "bad"}, "monitoring.timeline.sample_rate_hz must be an integer"),
+        ({"time_basis": "wall_clock"}, "monitoring.timeline.time_basis is not supported"),
+    ),
+)
+def test_monitoring_records_validate_required_timeline_metadata_shape(override, message):
+    with pytest.raises(ValidationError, match=message):
+        _record(canonical_timeline_metadata=_timeline_metadata(**override))
 
 
 def test_monitoring_promotion_requires_consent_access_split_annotation_and_adjudication():
