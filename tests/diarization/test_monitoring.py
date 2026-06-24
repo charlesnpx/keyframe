@@ -151,6 +151,22 @@ def test_monitoring_records_reject_sensitive_map_keys(field_name, value):
         _record(**{field_name: value})
 
 
+def test_monitoring_records_allow_non_identifier_guidance_keys():
+    record = _record(
+        engine_config_versions={
+            "audioGuideVersion": "config-001",
+            "guidanceVersion": "config-002",
+            "sourceGuideline": "config-003",
+        }
+    )
+
+    assert record.to_dict()["engine_config_versions"] == {
+        "audioGuideVersion": "config-001",
+        "guidanceVersion": "config-002",
+        "sourceGuideline": "config-003",
+    }
+
+
 def test_monitoring_records_reject_unknown_edit_operation_keys():
     with pytest.raises(ValidationError, match="monitoring.edit_operation_counts.sessionSpecificEdit is not supported"):
         _record(edit_operation_counts={"sessionSpecificEdit": 1})
@@ -434,3 +450,21 @@ def test_monitoring_aggregation_redacts_expired_session_local_identifiers():
     assert payload["active_timeline_ids"] == ["timeline-active"]
     assert "monitoring-expired" not in str(payload)
     assert "timeline-expired" not in str(payload)
+
+
+def test_monitoring_aggregation_allows_shared_active_timeline_ids():
+    first = _record(
+        monitoring_record_id="monitoring-active-1",
+        canonical_timeline_metadata=_timeline_metadata(timeline_id="timeline-shared"),
+    )
+    second = _record(
+        monitoring_record_id="monitoring-active-2",
+        canonical_timeline_metadata=_timeline_metadata(timeline_id="timeline-shared"),
+    )
+
+    aggregate = aggregate_monitoring_records((first, second), as_of="2026-07-01T00:00:00Z")
+    payload = aggregate.to_dict()
+
+    assert payload["active_record_count"] == 2
+    assert payload["active_monitoring_record_ids"] == ["monitoring-active-1", "monitoring-active-2"]
+    assert payload["active_timeline_ids"] == ["timeline-shared", "timeline-shared"]

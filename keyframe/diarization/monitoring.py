@@ -115,14 +115,12 @@ _FORBIDDEN_MONITORING_KEY_FRAGMENTS = frozenset(
         "customer",
         "email",
         "fingerprint",
-        "guid",
         "identifier",
         "identity",
         "participant",
         "profile",
         "speakerkey",
         "userid",
-        "uuid",
     }
 )
 _EDIT_OPERATION_TYPES = frozenset(
@@ -413,7 +411,7 @@ class MonitoringAggregate:
         object.__setattr__(
             self,
             "active_timeline_ids",
-            _id_tuple(self.active_timeline_ids, "monitoring_aggregate.active_timeline_ids"),
+            _id_tuple(self.active_timeline_ids, "monitoring_aggregate.active_timeline_ids", reject_duplicates=False),
         )
         if len(self.active_monitoring_record_ids) != self.active_record_count:
             raise ValidationError("monitoring_aggregate.active_monitoring_record_ids must match active_record_count")
@@ -663,8 +661,22 @@ def _monitoring_safe_key(key: object, field_name: str) -> str:
 
 def _monitoring_key_is_forbidden(key: str) -> bool:
     alias = _monitoring_key_alias(key)
-    return alias in _FORBIDDEN_MONITORING_KEY_ALIASES or any(
-        fragment in alias for fragment in _FORBIDDEN_MONITORING_KEY_FRAGMENTS
+    return (
+        alias in _FORBIDDEN_MONITORING_KEY_ALIASES
+        or _monitoring_key_has_forbidden_identifier_suffix(alias)
+        or any(fragment in alias for fragment in _FORBIDDEN_MONITORING_KEY_FRAGMENTS)
+    )
+
+
+def _monitoring_key_has_forbidden_identifier_suffix(alias: str) -> bool:
+    return alias.endswith(("guid", "uuid")) and (
+        alias in {"guid", "uuid"}
+        or "speaker" in alias
+        or "session" in alias
+        or "user" in alias
+        or "participant" in alias
+        or "customer" in alias
+        or "account" in alias
     )
 
 
@@ -765,11 +777,12 @@ def _tuple_of(values: object, item_type: type[Any], field_name: str) -> tuple[An
     return result
 
 
-def _id_tuple(values: object, field_name: str) -> tuple[str, ...]:
+def _id_tuple(values: object, field_name: str, *, reject_duplicates: bool = True) -> tuple[str, ...]:
     if isinstance(values, (str, bytes)) or not isinstance(values, (list, tuple)):
         raise ValidationError(f"{field_name} must be an array")
     result = tuple(_require_id(item, f"{field_name}[{index}]") for index, item in enumerate(values))
-    _reject_duplicates(result, field_name)
+    if reject_duplicates:
+        _reject_duplicates(result, field_name)
     return result
 
 
