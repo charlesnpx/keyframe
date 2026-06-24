@@ -305,6 +305,11 @@ def test_self_hosted_release_requires_package_version_pins():
 
 
 def test_hosted_release_requires_well_formed_provider_pins():
+    missing_governance = _engine_config(provider="aws_transcribe", parameters={})
+
+    with pytest.raises(ValidationError, match="include hosted_provider_governance"):
+        _release(engine_configs=(missing_governance,))
+
     missing_pinning = _engine_config(
         provider="hosted-provider",
         parameters={"hosted_provider_governance": {"model_version": "diarize-2026-06"}},
@@ -347,6 +352,25 @@ def test_invalid_active_runtime_metadata_degrades_with_audit_event():
     assert check.confident_speaker_attribution_enabled is False
     assert check.degraded_route == "diagnostic_only"
     assert [event.code for event in check.audit_events] == ["runtime_config_invalid"]
+
+
+def test_invalid_release_runtime_metadata_degrades_with_audit_event():
+    legacy_payload = _benchmark_report().to_dict()
+    legacy_payload["report_id"] = "benchmark-report-legacy"
+    legacy_payload["schema_version"] = 1
+    legacy_payload.pop("route_confusion")
+    mixed_schema_record = _release(
+        benchmark_reports=(_benchmark_report(), benchmark_report_from_dict(legacy_payload))
+    )
+    active_payload = release_expected_runtime_config(_release()).to_dict()
+
+    check = check_release_runtime_config(mixed_schema_record, active_payload)
+
+    assert check.status == "degraded"
+    assert check.confident_speaker_attribution_enabled is False
+    assert check.degraded_route == "diagnostic_only"
+    assert [event.code for event in check.audit_events] == ["release_runtime_config_invalid"]
+    assert "release.benchmark_reports.schema_version" in check.audit_events[0].actual
 
 
 def test_release_loader_requires_every_must_not_have_check():

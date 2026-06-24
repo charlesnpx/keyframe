@@ -71,6 +71,7 @@ _FORBIDDEN_RUNTIME_IDENTITY_KEYS = frozenset(
         "voice_profiles",
     }
 )
+_HOSTED_PROVIDER_CONFIG_PROVIDERS = frozenset({"aws_transcribe", "google_speech", "deepgram"})
 
 
 @dataclass(frozen=True)
@@ -574,7 +575,22 @@ def check_release_runtime_config(
             )
     if not isinstance(active_config, ReleaseRuntimeConfig):
         raise ValidationError("active_config must be ReleaseRuntimeConfig")
-    expected = release_expected_runtime_config(record)
+    try:
+        expected = release_expected_runtime_config(record)
+    except ValidationError as exc:
+        return ReleaseRuntimeCheck(
+            status="degraded",
+            confident_speaker_attribution_enabled=False,
+            degraded_route="diagnostic_only",
+            audit_events=(
+                ReleaseRuntimeAuditEvent(
+                    code="release_runtime_config_invalid",
+                    message="Release runtime metadata is invalid.",
+                    expected="valid release runtime_config payload",
+                    actual=str(exc),
+                ),
+            ),
+        )
     events: list[ReleaseRuntimeAuditEvent] = []
     if record.approval_status != "approved":
         events.append(
@@ -943,6 +959,8 @@ def _validate_engine_configs_pinned(configs: tuple[EngineConfigMetadata, ...]) -
             if not package_versions:
                 raise ValidationError("self-hosted release configs must pin package_versions")
         hosted = config.parameters.get("hosted_provider_governance")
+        if hosted is None and config.provider in _HOSTED_PROVIDER_CONFIG_PROVIDERS:
+            raise ValidationError("hosted provider release configs must include hosted_provider_governance")
         if isinstance(hosted, Mapping):
             model_version = _optional_text(
                 hosted.get("model_version"),
