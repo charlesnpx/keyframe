@@ -853,7 +853,10 @@ def release_revalidation_summary(
     report = release_revalidation_report(record, active_config)
     if not report.requires_revalidation:
         return f"{report.release_candidate_id}: no revalidation required"
-    reasons = report.triggers or tuple(event.code for event in report.audit_events)
+    trigger_event_codes = {f"{trigger}_revalidation_required" for trigger in report.triggers}
+    reasons = tuple(report.triggers) + tuple(
+        event.code for event in report.audit_events if event.code not in trigger_event_codes
+    )
     rollback = report.rollback_release_candidate_id or "none"
     return (
         f"{report.release_candidate_id}: revalidation required for {', '.join(reasons)}; "

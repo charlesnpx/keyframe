@@ -450,6 +450,18 @@ def test_release_revalidation_report_marks_degraded_events_without_trigger_as_re
     assert "no revalidation required" not in summary
 
 
+def test_release_revalidation_summary_includes_trigger_and_non_trigger_failures():
+    record = _release(revalidate_on=("preflight_policy",))
+    active_payload = release_expected_runtime_config(record).to_dict()
+    active_payload["preflight_policy_version"] = "2026-07-01"
+    active_payload["git_sha"] = "d" * 40
+
+    summary = release_revalidation_summary(record, active_payload)
+
+    assert "preflight_policy" in summary
+    assert "git_sha_mismatch" in summary
+
+
 def test_validated_launch_scope_version_drift_requires_launch_scope_revalidation():
     record = _release(revalidate_on=("launch_scope",))
     active_payload = release_expected_runtime_config(record).to_dict()
