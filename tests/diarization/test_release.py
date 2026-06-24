@@ -450,6 +450,19 @@ def test_release_revalidation_report_marks_degraded_events_without_trigger_as_re
     assert "no revalidation required" not in summary
 
 
+def test_validated_launch_scope_version_drift_requires_launch_scope_revalidation():
+    record = _release(revalidate_on=("launch_scope",))
+    active_payload = release_expected_runtime_config(record).to_dict()
+    active_payload["validated_launch_scope_version"] = "private-coverage-v2@2026-07-01"
+
+    report = release_revalidation_report(record, active_payload)
+
+    assert report.requires_revalidation is True
+    assert report.triggers == ("launch_scope",)
+    assert [event.code for event in report.audit_events] == ["launch_scope_revalidation_required"]
+    assert report.audit_events[0].actual["runtime_field"] == "validated_launch_scope_version"
+
+
 def test_emergency_degradation_can_route_to_needs_review_and_preserve_degraded_output():
     record = _release(
         rollback_release_candidate_id="release-2026-06-22",

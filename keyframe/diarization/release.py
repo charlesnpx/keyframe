@@ -108,6 +108,7 @@ _RUNTIME_FIELD_REVALIDATION_TRIGGERS: dict[str, tuple[ReleaseRevalidationTrigger
     "route": ("preflight_policy",),
     "scoring_policy_versions": ("scoring_policy",),
     "unsupported_scope": ("launch_scope",),
+    "validated_launch_scope_version": ("launch_scope",),
     "validated_scope": ("launch_scope",),
 }
 
@@ -287,6 +288,7 @@ class ReleaseRuntimeConfig:
     preflight_policy_id: str
     preflight_policy_version: str
     route: PreflightRoute
+    validated_launch_scope_version: str
     branch_decisions: dict[str, str]
     engine_config_ids: dict[str, str]
     validated_scope: tuple[str, ...]
@@ -333,6 +335,11 @@ class ReleaseRuntimeConfig:
         object.__setattr__(self, "route", _validate_preflight_route(self.route, "runtime_config.route"))
         object.__setattr__(
             self,
+            "validated_launch_scope_version",
+            _require_id(self.validated_launch_scope_version, "runtime_config.validated_launch_scope_version"),
+        )
+        object.__setattr__(
+            self,
             "branch_decisions",
             _freeze_json(_validate_string_map(self.branch_decisions, "runtime_config.branch_decisions")),
         )
@@ -374,6 +381,7 @@ class ReleaseRuntimeConfig:
             "schema_versions": dict(self.schema_versions),
             "scoring_policy_versions": dict(self.scoring_policy_versions),
             "unsupported_scope": list(self.unsupported_scope),
+            "validated_launch_scope_version": self.validated_launch_scope_version,
             "validated_scope": list(self.validated_scope),
         }
 
@@ -713,6 +721,7 @@ def release_expected_runtime_config(record: ReleaseCandidateRecord) -> ReleaseRu
         preflight_policy_id=payload["preflight_policy"]["policy_id"],
         preflight_policy_version=payload["preflight_policy"]["version"],
         route=payload["route_state"]["effective_route"],
+        validated_launch_scope_version=payload["route_state"]["validated_launch_scope_version"],
         branch_decisions={decision["branch_id"]: decision["decision"] for decision in payload["branch_decisions"]},
         engine_config_ids={
             config["adapter_id"]: _release_payload_hash(config) for config in payload["engine_configs"]
@@ -978,6 +987,7 @@ def release_runtime_config_from_dict(payload: Mapping[str, Any]) -> ReleaseRunti
             "schema_versions",
             "scoring_policy_versions",
             "unsupported_scope",
+            "validated_launch_scope_version",
             "validated_scope",
         },
         "runtime_config",
@@ -992,6 +1002,7 @@ def release_runtime_config_from_dict(payload: Mapping[str, Any]) -> ReleaseRunti
         preflight_policy_id=_required(data, "preflight_policy_id", "runtime_config"),
         preflight_policy_version=_required(data, "preflight_policy_version", "runtime_config"),
         route=_required(data, "route", "runtime_config"),
+        validated_launch_scope_version=_required(data, "validated_launch_scope_version", "runtime_config"),
         branch_decisions=_required(data, "branch_decisions", "runtime_config"),
         engine_config_ids=_required(data, "engine_config_ids", "runtime_config"),
         validated_scope=tuple(_sequence(_required(data, "validated_scope", "runtime_config"), "runtime_config.validated_scope")),
