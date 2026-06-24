@@ -237,18 +237,46 @@ def test_release_record_hash_round_trip_and_runtime_match_enable_confident_label
     assert check.audit_events == ()
 
 
+def test_release_loader_requires_persisted_content_hash():
+    payload = _release().to_dict()
+    payload.pop("content_hash")
+
+    with pytest.raises(ValidationError, match="release.content_hash is required"):
+        release_record_from_dict(payload)
+
+
 def test_release_record_payload_is_immutable_after_hashing():
-    record = _release()
+    engine_config = _engine_config()
+    record = _release(engine_configs=(engine_config,))
     original_hash = record.content_hash
 
     with pytest.raises(TypeError):
         record.dataset_snapshots[0]["dataset_id"] = "mutated"
+    with pytest.raises(TypeError):
+        record.engine_configs[0].parameters["model_governance"] = {}
+    with pytest.raises(TypeError):
+        record.engine_configs[0].parameters["model_governance"]["package_versions"]["pyannote.audio"] = "mutated"
+
+    engine_config.parameters["model_governance"]["package_versions"]["pyannote.audio"] = "mutated-source"
     payload = record.to_dict()
     payload["dataset_snapshots"][0]["dataset_id"] = "mutated-copy"
+    payload["engine_configs"][0]["parameters"]["model_governance"]["package_versions"][
+        "pyannote.audio"
+    ] = "mutated-copy"
 
     assert record.content_hash == original_hash
     assert release_record_content_hash(record) == original_hash
     assert record.to_dict()["dataset_snapshots"][0]["dataset_id"] == "ami"
+    assert (
+        record.engine_configs[0].parameters["model_governance"]["package_versions"]["pyannote.audio"]
+        == "3.1.0"
+    )
+    assert (
+        record.to_dict()["engine_configs"][0]["parameters"]["model_governance"]["package_versions"][
+            "pyannote.audio"
+        ]
+        == "3.1.0"
+    )
 
 
 def test_release_loader_rejects_tampered_branch_acceptance_payload():

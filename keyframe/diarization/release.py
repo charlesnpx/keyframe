@@ -77,6 +77,23 @@ _HOSTED_PROVIDER_CONFIG_PROVIDERS = frozenset({"aws_transcribe", "google_speech"
 
 
 @dataclass(frozen=True)
+class _ImmutableReleaseEngineConfigMetadata(EngineConfigMetadata):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        object.__setattr__(self, "parameters", _freeze_json(self.parameters))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "adapter_id": self.adapter_id,
+            "config_id": self.config_id,
+            "model_name": self.model_name,
+            "model_version": self.model_version,
+            "parameters": _thaw_json(self.parameters),
+            "provider": self.provider,
+        }
+
+
+@dataclass(frozen=True)
 class ReleaseMustNotHaveChecks:
     """Required release gates for privacy, provenance, and holdout hygiene."""
 
@@ -454,7 +471,10 @@ class ReleaseCandidateRecord:
             raise ValidationError("release.branch_decisions is required")
         _reject_duplicates(tuple(decision.branch_id for decision in branch_decisions), "release.branch_decisions.branch_id")
         object.__setattr__(self, "branch_decisions", branch_decisions)
-        engine_configs = _tuple_of(self.engine_configs, EngineConfigMetadata, "release.engine_configs")
+        engine_configs = tuple(
+            _immutable_release_engine_config(config)
+            for config in _tuple_of(self.engine_configs, EngineConfigMetadata, "release.engine_configs")
+        )
         if not engine_configs:
             raise ValidationError("release.engine_configs is required")
         _validate_engine_configs_pinned(engine_configs)
@@ -743,7 +763,7 @@ def release_record_from_dict(payload: Mapping[str, Any]) -> ReleaseCandidateReco
         must_not_have_checks=release_must_not_have_checks_from_dict(
             _required(data, "must_not_have_checks", "release")
         ),
-        content_hash=data.get("content_hash"),
+        content_hash=_required(data, "content_hash", "release"),
     )
 
 
@@ -932,6 +952,12 @@ def _validate_approved_release(record: ReleaseCandidateRecord) -> None:
         raise ValidationError("approved releases require accepted branch decisions")
     if any(not decision.private_coverage_ready for decision in record.branch_decisions):
         raise ValidationError("approved releases require private coverage ready branch decisions")
+
+
+def _immutable_release_engine_config(config: EngineConfigMetadata) -> EngineConfigMetadata:
+    if isinstance(config, _ImmutableReleaseEngineConfigMetadata):
+        return config
+    return _ImmutableReleaseEngineConfigMetadata(**config.to_dict())
 
 
 def _dataset_snapshots(values: object) -> tuple[Mapping[str, Any], ...]:
