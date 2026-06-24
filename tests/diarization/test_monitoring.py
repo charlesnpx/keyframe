@@ -129,6 +129,11 @@ def test_monitoring_records_reject_unsupported_timeline_metadata_fields():
     (
         ("engine_config_versions", {"audio_fingerprint": "config-001"}),
         ("engine_config_versions", {"audioFingerprint": "config-001"}),
+        ("engine_config_versions", {"audio_id": "config-001"}),
+        ("engine_config_versions", {"audioId": "config-001"}),
+        ("engine_config_versions", {"recordingId": "config-001"}),
+        ("engine_config_versions", {"audio_hash": "config-001"}),
+        ("engine_config_versions", {"audioHash": "config-001"}),
         ("engine_config_versions", {"contactEmail": "config-001"}),
         ("engine_config_versions", {"participantEmailAddress": "config-001"}),
         ("engine_config_versions", {"customerAccountId": "config-001"}),
@@ -357,6 +362,26 @@ def test_monitoring_records_require_expiry_and_valid_degraded_state():
 def test_monitoring_records_validate_required_timeline_metadata_shape(override, message):
     with pytest.raises(ValidationError, match=message):
         _record(canonical_timeline_metadata=_timeline_metadata(**override))
+
+
+def test_monitoring_records_normalize_required_timeline_metadata_ids():
+    payload = _record(
+        canonical_timeline_metadata=_timeline_metadata(
+            channel_ids=(" ch-1 ",),
+            time_basis=" canonical_ms ",
+            timeline_id=" timeline-session-001 ",
+            transform_chain_id=" identity ",
+        )
+    ).to_dict()
+
+    assert payload["canonical_timeline_metadata"] == {
+        "channel_ids": ["ch-1"],
+        "duration_ms": 120_000,
+        "sample_rate_hz": 16_000,
+        "time_basis": "canonical_ms",
+        "timeline_id": "timeline-session-001",
+        "transform_chain_id": "identity",
+    }
 
 
 def test_monitoring_promotion_requires_consent_access_split_annotation_and_adjudication():

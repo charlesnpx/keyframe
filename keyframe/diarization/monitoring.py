@@ -115,10 +115,13 @@ _FORBIDDEN_MONITORING_KEY_FRAGMENTS = frozenset(
         "customer",
         "email",
         "fingerprint",
+        "audiohash",
+        "audioid",
         "identifier",
         "identity",
         "participant",
         "profile",
+        "recordingid",
         "speakerkey",
         "userid",
     }
@@ -621,19 +624,27 @@ def _monitoring_safe_metadata(value: object, field_name: str) -> dict[str, Any]:
     _validate_json_value(data, field_name)
     _reject_forbidden_monitoring_fields(data, field_name)
     _reject_unsupported_timeline_fields(data, field_name)
-    return _freeze_json(data)  # type: ignore[return-value]
+    return _freeze_json(_normalize_timeline_metadata(data))  # type: ignore[return-value]
 
 
-def _validate_required_timeline_metadata(timeline: Mapping[str, Any]) -> None:
-    _require_id(timeline["timeline_id"], "monitoring.timeline.timeline_id")
-    _require_id(timeline["transform_chain_id"], "monitoring.timeline.transform_chain_id")
-    _positive_int(timeline["duration_ms"], "monitoring.timeline.duration_ms")
-    _positive_int(timeline["sample_rate_hz"], "monitoring.timeline.sample_rate_hz")
+def _normalize_timeline_metadata(timeline: Mapping[str, Any]) -> dict[str, Any]:
     time_basis = _require_id(timeline["time_basis"], "monitoring.timeline.time_basis")
     if time_basis not in _TIME_BASES:
         raise ValidationError(f"monitoring.timeline.time_basis is not supported: {time_basis}")
+    normalized: dict[str, Any] = {
+        "duration_ms": _positive_int(timeline["duration_ms"], "monitoring.timeline.duration_ms"),
+        "sample_rate_hz": _positive_int(timeline["sample_rate_hz"], "monitoring.timeline.sample_rate_hz"),
+        "time_basis": time_basis,
+        "timeline_id": _require_id(timeline["timeline_id"], "monitoring.timeline.timeline_id"),
+        "transform_chain_id": _require_id(timeline["transform_chain_id"], "monitoring.timeline.transform_chain_id"),
+    }
     if "channel_ids" in timeline:
-        _id_tuple(timeline["channel_ids"], "monitoring.timeline.channel_ids")
+        normalized["channel_ids"] = _id_tuple(timeline["channel_ids"], "monitoring.timeline.channel_ids")
+    return normalized
+
+
+def _validate_required_timeline_metadata(timeline: Mapping[str, Any]) -> None:
+    _normalize_timeline_metadata(timeline)
 
 
 def _reject_unsupported_timeline_fields(timeline: Mapping[str, Any], field_name: str) -> None:
