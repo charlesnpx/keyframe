@@ -391,7 +391,10 @@ def advance_monitoring_promotion_state(
     if step == "verify_access":
         return replace(state, access_checked=True)
     if step == "assign_split":
-        return replace(state, split_id=_require_id(split_id, "promotion.split_id"))
+        split_id = _require_id(split_id, "promotion.split_id")
+        if state.split_id is not None and state.split_id != split_id and (state.annotated or state.adjudicated):
+            raise ValidationError("promotion split assignment cannot change after annotation or adjudication")
+        return replace(state, split_id=split_id)
     if step == "mark_annotated":
         return replace(
             state,

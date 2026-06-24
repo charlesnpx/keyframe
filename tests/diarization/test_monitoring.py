@@ -255,6 +255,10 @@ def test_monitoring_promotion_requires_consent_access_split_annotation_and_adjud
         "mark_annotated",
         annotation_protocol_version="private-annotation@2026-06-24",
     )
+    assert advance_monitoring_promotion_state(state, "assign_split", split_id="private_acceptance") == state
+
+    with pytest.raises(ValidationError, match="cannot change after annotation or adjudication"):
+        advance_monitoring_promotion_state(state, "assign_split", split_id="private_holdout")
 
     with pytest.raises(ValidationError, match="adjudication requires adjudication_id"):
         MonitoringPromotionState(
