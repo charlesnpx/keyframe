@@ -111,17 +111,17 @@ _FORBIDDEN_MONITORING_KEY_ALIASES = frozenset(
 _FORBIDDEN_MONITORING_KEY_FRAGMENTS = frozenset(
     {
         "account",
+        "audio",
         "contact",
         "customer",
         "email",
         "fingerprint",
-        "audiohash",
-        "audioid",
         "identifier",
         "identity",
         "participant",
         "profile",
-        "recordingid",
+        "recording",
+        "sha256",
         "speakerkey",
         "userid",
     }

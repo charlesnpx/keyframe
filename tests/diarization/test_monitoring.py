@@ -134,6 +134,11 @@ def test_monitoring_records_reject_unsupported_timeline_metadata_fields():
         ("engine_config_versions", {"recordingId": "config-001"}),
         ("engine_config_versions", {"audio_hash": "config-001"}),
         ("engine_config_versions", {"audioHash": "config-001"}),
+        ("engine_config_versions", {"recording_hash": "config-001"}),
+        ("engine_config_versions", {"recordingHash": "config-001"}),
+        ("engine_config_versions", {"recordingSha256": "config-001"}),
+        ("engine_config_versions", {"audioGuid": "config-001"}),
+        ("engine_config_versions", {"recordingUuid": "config-001"}),
         ("engine_config_versions", {"contactEmail": "config-001"}),
         ("engine_config_versions", {"participantEmailAddress": "config-001"}),
         ("engine_config_versions", {"customerAccountId": "config-001"}),
@@ -159,15 +164,15 @@ def test_monitoring_records_reject_sensitive_map_keys(field_name, value):
 def test_monitoring_records_allow_non_identifier_guidance_keys():
     record = _record(
         engine_config_versions={
-            "audioGuideVersion": "config-001",
+            "releaseGuideVersion": "config-001",
             "guidanceVersion": "config-002",
             "sourceGuideline": "config-003",
         }
     )
 
     assert record.to_dict()["engine_config_versions"] == {
-        "audioGuideVersion": "config-001",
         "guidanceVersion": "config-002",
+        "releaseGuideVersion": "config-001",
         "sourceGuideline": "config-003",
     }
 
