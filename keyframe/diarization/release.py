@@ -926,6 +926,10 @@ def _validate_approved_release(record: ReleaseCandidateRecord) -> None:
         raise ValidationError("approved releases cannot include failed golden tests")
     if any(not decision.enforced_gates_passed for decision in record.branch_decisions):
         raise ValidationError("approved releases cannot include failed branch gates")
+    if any(decision.decision != "accept_complex_branch" for decision in record.branch_decisions):
+        raise ValidationError("approved releases require accepted branch decisions")
+    if any(not decision.private_coverage_ready for decision in record.branch_decisions):
+        raise ValidationError("approved releases require private coverage ready branch decisions")
 
 
 def _dataset_snapshots(values: object) -> tuple[Mapping[str, Any], ...]:

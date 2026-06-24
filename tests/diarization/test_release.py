@@ -120,6 +120,22 @@ def _branch_decision():
     )
 
 
+def _branch_decision_with(**overrides):
+    values = _branch_decision().to_dict()
+    values.update(overrides)
+    enforced_gates = values.pop("enforced_gates")
+    non_enforced_fields = values.pop("non_enforced_fields")
+    values["quality_gate_passed"] = enforced_gates["quality"]
+    values["false_confidence_gate_passed"] = enforced_gates["false_confidence"]
+    values["review_burden_gate_passed"] = enforced_gates["review_burden"]
+    values["latency_delta_ms"] = non_enforced_fields["latency_delta_ms"]
+    values["cost_delta"] = non_enforced_fields["cost_delta"]
+    values["job_failure_delta"] = non_enforced_fields["job_failure_delta"]
+    values["retry_delta"] = non_enforced_fields["retry_delta"]
+    values["governance_delta"] = non_enforced_fields["governance_delta"]
+    return BranchAcceptanceRecord(**values)
+
+
 def _engine_config(**overrides):
     values = {
         "adapter_id": "release-engine",
@@ -391,6 +407,26 @@ def test_approved_release_rejects_unpinned_engine_config():
 
     with pytest.raises(ValidationError, match="pin model_version or config_id"):
         _release(engine_configs=(unpinned,))
+
+
+def test_approved_release_rejects_unaccepted_or_private_coverage_gap_branch_decisions():
+    coverage_gap = _branch_decision_with(
+        decision="needs_more_private_coverage",
+        private_coverage_ready=False,
+    )
+
+    with pytest.raises(ValidationError, match="accepted branch decisions"):
+        _release(branch_decisions=(coverage_gap,))
+
+    degraded_only = _branch_decision_with(decision="ship_degraded_only")
+
+    with pytest.raises(ValidationError, match="accepted branch decisions"):
+        _release(branch_decisions=(degraded_only,))
+
+    accepted_without_private_coverage = _branch_decision_with(private_coverage_ready=False)
+
+    with pytest.raises(ValidationError, match="private coverage ready"):
+        _release(branch_decisions=(accepted_without_private_coverage,))
 
 
 def test_release_rejects_forbidden_cross_call_identity_metadata():
