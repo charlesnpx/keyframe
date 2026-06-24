@@ -127,6 +127,16 @@ def test_monitoring_records_reject_unknown_edit_operation_keys():
         _record(edit_operation_counts={"sessionSpecificEdit": 1})
 
 
+def test_monitoring_record_maps_are_immutable_after_validation():
+    record = _record()
+
+    with pytest.raises(TypeError):
+        record.engine_config_versions["audioFingerprint"] = "config-002"
+
+    with pytest.raises(TypeError):
+        record.edit_operation_counts["sessionSpecificEdit"] = 1
+
+
 def test_monitoring_record_loader_requires_explicit_promotion_state():
     payload = _record().to_dict()
     payload.pop("promotion_state")
@@ -178,6 +188,16 @@ def test_monitoring_aggregate_rejects_unknown_route_and_edit_total_keys():
             edit_operation_totals={"sessionSpecificEdit": 1},
             review_time_ms_total=0,
         )
+
+
+def test_monitoring_aggregate_maps_are_immutable_after_validation():
+    aggregate = aggregate_monitoring_records((_record(),), as_of="2026-07-01T00:00:00Z")
+
+    with pytest.raises(TypeError):
+        aggregate.route_counts["session-route"] = 1
+
+    with pytest.raises(TypeError):
+        aggregate.edit_operation_totals["speakerEmbedding"] = 1
 
 
 def test_monitoring_records_require_expiry_and_valid_degraded_state():

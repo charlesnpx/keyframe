@@ -205,7 +205,7 @@ class MonitoringRecord:
         )
         if not engine_versions:
             raise ValidationError("monitoring.engine_config_versions is required")
-        object.__setattr__(self, "engine_config_versions", engine_versions)
+        object.__setattr__(self, "engine_config_versions", MappingProxyType(engine_versions))
         object.__setattr__(self, "preflight_policy_id", _require_id(self.preflight_policy_id, "monitoring.preflight_policy_id"))
         object.__setattr__(
             self,
@@ -247,11 +247,13 @@ class MonitoringRecord:
         object.__setattr__(
             self,
             "edit_operation_counts",
-            _validate_non_negative_int_map(
-                self.edit_operation_counts,
-                "monitoring.edit_operation_counts",
-                allowed_keys=_EDIT_OPERATION_TYPES,
-                reject_sensitive_keys=True,
+            MappingProxyType(
+                _validate_non_negative_int_map(
+                    self.edit_operation_counts,
+                    "monitoring.edit_operation_counts",
+                    allowed_keys=_EDIT_OPERATION_TYPES,
+                    reject_sensitive_keys=True,
+                )
             ),
         )
         if self.review_time_ms is not None:
@@ -323,10 +325,12 @@ class MonitoringAggregate:
         object.__setattr__(
             self,
             "route_counts",
-            _validate_non_negative_int_map(
-                self.route_counts,
-                "monitoring_aggregate.route_counts",
-                allowed_keys=ALLOWED_PREFLIGHT_ROUTES,
+            MappingProxyType(
+                _validate_non_negative_int_map(
+                    self.route_counts,
+                    "monitoring_aggregate.route_counts",
+                    allowed_keys=ALLOWED_PREFLIGHT_ROUTES,
+                )
             ),
         )
         object.__setattr__(
@@ -337,11 +341,13 @@ class MonitoringAggregate:
         object.__setattr__(
             self,
             "edit_operation_totals",
-            _validate_non_negative_int_map(
-                self.edit_operation_totals,
-                "monitoring_aggregate.edit_operation_totals",
-                allowed_keys=_EDIT_OPERATION_TYPES,
-                reject_sensitive_keys=True,
+            MappingProxyType(
+                _validate_non_negative_int_map(
+                    self.edit_operation_totals,
+                    "monitoring_aggregate.edit_operation_totals",
+                    allowed_keys=_EDIT_OPERATION_TYPES,
+                    reject_sensitive_keys=True,
+                )
             ),
         )
         object.__setattr__(
