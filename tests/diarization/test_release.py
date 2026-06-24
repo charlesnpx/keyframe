@@ -420,7 +420,10 @@ def test_release_revalidation_report_identifies_each_trigger(trigger, runtime_fi
 
 
 def test_release_revalidation_report_allows_clean_runtime_config():
-    record = _release(rollback_release_candidate_id="release-2026-06-22")
+    record = _release(
+        rollback_release_candidate_id="release-2026-06-22",
+        degraded_transcript_output_allowed=False,
+    )
     active_config = release_expected_runtime_config(record)
 
     report = release_revalidation_report(record, active_config)
@@ -428,6 +431,7 @@ def test_release_revalidation_report_allows_clean_runtime_config():
     assert report.requires_revalidation is False
     assert report.triggers == ()
     assert report.audit_events == ()
+    assert report.degraded_transcript_output_allowed is False
     assert release_revalidation_summary(record, active_config) == "release-2026-06-23: no revalidation required"
 
 

@@ -810,7 +810,7 @@ def check_release_runtime_config(
         confident_speaker_attribution_enabled=True,
         degraded_route=None,
         audit_events=(),
-        degraded_transcript_output_allowed=True,
+        degraded_transcript_output_allowed=record.degraded_transcript_output_allowed,
     )
 
 
