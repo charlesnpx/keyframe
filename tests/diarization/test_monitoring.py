@@ -84,9 +84,13 @@ def test_monitoring_record_rejects_malformed_payload_field_names():
     (
         ("raw_audio_path", "/tmp/raw.wav"),
         ("voice_profile", "do-not-store"),
+        ("Voice_Profile", "do-not-store"),
         ("embedding", [0.1, 0.2]),
         ("audio_fingerprint", "do-not-store"),
+        ("audioFingerprint", "do-not-store"),
+        ("speakerEmbedding", [0.1, 0.2]),
         ("cross_session_speaker_key", "speaker-global-1"),
+        ("crossSessionSpeakerKey", "speaker-global-1"),
     ),
 )
 def test_monitoring_records_reject_sensitive_identity_or_audio_fields(field_name, value):
@@ -100,7 +104,9 @@ def test_monitoring_records_reject_sensitive_identity_or_audio_fields(field_name
     ("field_name", "value"),
     (
         ("engine_config_versions", {"audio_fingerprint": "config-001"}),
+        ("engine_config_versions", {"audioFingerprint": "config-001"}),
         ("edit_operation_counts", {"cross_session_speaker_key": 1}),
+        ("edit_operation_counts", {"crossSessionSpeakerKey": 1}),
     ),
 )
 def test_monitoring_records_reject_sensitive_map_keys(field_name, value):
@@ -117,7 +123,7 @@ def test_monitoring_aggregate_rejects_sensitive_edit_total_keys():
             expired_record_count=0,
             route_counts={},
             degraded_record_count=0,
-            edit_operation_totals={"embedding": 1},
+            edit_operation_totals={"speakerEmbedding": 1},
             review_time_ms_total=0,
         )
 
@@ -189,11 +195,30 @@ def test_monitoring_promotion_requires_consent_access_split_annotation_and_adjud
     with pytest.raises(ValidationError, match="adjudication requires annotation"):
         MonitoringPromotionState(consent_granted=True, access_checked=True, split_id="private_acceptance", adjudicated=True)
 
+    with pytest.raises(ValidationError, match="annotation requires annotation_protocol_version"):
+        MonitoringPromotionState(
+            consent_granted=True,
+            access_checked=True,
+            split_id="private_acceptance",
+            annotated=True,
+        )
+
     state = advance_monitoring_promotion_state(
         state,
         "mark_annotated",
         annotation_protocol_version="private-annotation@2026-06-24",
     )
+
+    with pytest.raises(ValidationError, match="adjudication requires adjudication_id"):
+        MonitoringPromotionState(
+            consent_granted=True,
+            access_checked=True,
+            split_id="private_acceptance",
+            annotated=True,
+            annotation_protocol_version="private-annotation@2026-06-24",
+            adjudicated=True,
+        )
+
     state = advance_monitoring_promotion_state(state, "mark_adjudicated", adjudication_id="adjudication-001")
 
     assert state.eligible_for_private_fixture is True

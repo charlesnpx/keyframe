@@ -70,6 +70,9 @@ _FORBIDDEN_MONITORING_KEYS = frozenset(
         "voice_profiles",
     }
 )
+_FORBIDDEN_MONITORING_KEY_ALIASES = frozenset(
+    "".join(char for char in key.casefold() if char.isalnum()) for key in _FORBIDDEN_MONITORING_KEYS
+)
 _REQUIRED_TIMELINE_FIELDS = frozenset(
     {"duration_ms", "sample_rate_hz", "time_basis", "timeline_id", "transform_chain_id"}
 )
@@ -107,10 +110,14 @@ class MonitoringPromotionState:
             raise ValidationError("promotion annotation_protocol_version requires annotated")
         if self.annotated and self.split_id is None:
             raise ValidationError("promotion annotation requires split assignment")
+        if self.annotated and self.annotation_protocol_version is None:
+            raise ValidationError("promotion annotation requires annotation_protocol_version")
         if self.adjudicated and not self.annotated:
             raise ValidationError("promotion adjudication requires annotation")
         if self.adjudication_id is not None and not self.adjudicated:
             raise ValidationError("promotion adjudication_id requires adjudicated")
+        if self.adjudicated and self.adjudication_id is None:
+            raise ValidationError("promotion adjudication requires adjudication_id")
 
     @property
     def eligible_for_private_fixture(self) -> bool:
@@ -543,9 +550,13 @@ def _reject_forbidden_monitoring_fields(value: object, field_name: str) -> None:
 
 def _monitoring_safe_key(key: object, field_name: str) -> str:
     key_text = _require_id(key, f"{field_name}.key")
-    if key_text in _FORBIDDEN_MONITORING_KEYS:
+    if _monitoring_key_alias(key_text) in _FORBIDDEN_MONITORING_KEY_ALIASES:
         raise ValidationError(f"{field_name}.{key_text} must not persist sensitive monitoring identity material")
     return key_text
+
+
+def _monitoring_key_alias(key: str) -> str:
+    return "".join(char for char in key.casefold() if char.isalnum())
 
 
 def _validate_schema_version(value: object) -> int:
