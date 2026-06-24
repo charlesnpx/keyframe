@@ -134,6 +134,11 @@ def test_monitoring_record_loader_requires_explicit_promotion_state():
     with pytest.raises(ValidationError, match="monitoring.promotion_state is required"):
         monitoring_record_from_dict(payload)
 
+    payload["promotion_state"] = {}
+
+    with pytest.raises(ValidationError, match="promotion.consent_granted is required"):
+        monitoring_record_from_dict(payload)
+
 
 def test_monitoring_aggregate_rejects_sensitive_edit_total_keys():
     with pytest.raises(ValidationError, match="must not persist sensitive monitoring identity material"):
@@ -260,6 +265,13 @@ def test_monitoring_promotion_requires_consent_access_split_annotation_and_adjud
     with pytest.raises(ValidationError, match="cannot change after annotation or adjudication"):
         advance_monitoring_promotion_state(state, "assign_split", split_id="private_holdout")
 
+    with pytest.raises(ValidationError, match="annotation_protocol_version cannot change"):
+        advance_monitoring_promotion_state(
+            state,
+            "mark_annotated",
+            annotation_protocol_version="private-annotation@2026-06-25",
+        )
+
     with pytest.raises(ValidationError, match="adjudication requires adjudication_id"):
         MonitoringPromotionState(
             consent_granted=True,
@@ -271,6 +283,10 @@ def test_monitoring_promotion_requires_consent_access_split_annotation_and_adjud
         )
 
     state = advance_monitoring_promotion_state(state, "mark_adjudicated", adjudication_id="adjudication-001")
+    assert advance_monitoring_promotion_state(state, "mark_adjudicated", adjudication_id="adjudication-001") == state
+
+    with pytest.raises(ValidationError, match="adjudication_id cannot change"):
+        advance_monitoring_promotion_state(state, "mark_adjudicated", adjudication_id="adjudication-002")
 
     assert state.eligible_for_private_fixture is True
     assert _record(promotion_state=state).to_dict()["promotion_state"]["eligible_for_private_fixture"] is True

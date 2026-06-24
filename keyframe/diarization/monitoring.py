@@ -396,16 +396,25 @@ def advance_monitoring_promotion_state(
             raise ValidationError("promotion split assignment cannot change after annotation or adjudication")
         return replace(state, split_id=split_id)
     if step == "mark_annotated":
+        annotation_protocol_version = _require_id(
+            annotation_protocol_version,
+            "promotion.annotation_protocol_version",
+        )
+        if (
+            state.annotation_protocol_version is not None
+            and state.annotation_protocol_version != annotation_protocol_version
+        ):
+            raise ValidationError("promotion annotation_protocol_version cannot change after annotation")
         return replace(
             state,
             annotated=True,
-            annotation_protocol_version=_require_id(
-                annotation_protocol_version,
-                "promotion.annotation_protocol_version",
-            ),
+            annotation_protocol_version=annotation_protocol_version,
         )
     if step == "mark_adjudicated":
-        return replace(state, adjudicated=True, adjudication_id=_require_id(adjudication_id, "promotion.adjudication_id"))
+        adjudication_id = _require_id(adjudication_id, "promotion.adjudication_id")
+        if state.adjudication_id is not None and state.adjudication_id != adjudication_id:
+            raise ValidationError("promotion adjudication_id cannot change after adjudication")
+        return replace(state, adjudicated=True, adjudication_id=adjudication_id)
     raise ValidationError(f"promotion step is not supported: {step}")
 
 
@@ -515,13 +524,13 @@ def monitoring_promotion_state_from_dict(payload: Mapping[str, Any]) -> Monitori
         "promotion",
     )
     state = MonitoringPromotionState(
-        consent_granted=data.get("consent_granted", False),
-        access_checked=data.get("access_checked", False),
-        split_id=data.get("split_id"),
-        annotation_protocol_version=data.get("annotation_protocol_version"),
-        annotated=data.get("annotated", False),
-        adjudicated=data.get("adjudicated", False),
-        adjudication_id=data.get("adjudication_id"),
+        consent_granted=_required(data, "consent_granted", "promotion"),
+        access_checked=_required(data, "access_checked", "promotion"),
+        split_id=_required(data, "split_id", "promotion"),
+        annotation_protocol_version=_required(data, "annotation_protocol_version", "promotion"),
+        annotated=_required(data, "annotated", "promotion"),
+        adjudicated=_required(data, "adjudicated", "promotion"),
+        adjudication_id=_required(data, "adjudication_id", "promotion"),
         note=data.get("note"),
     )
     if "eligible_for_private_fixture" in data and data["eligible_for_private_fixture"] != state.eligible_for_private_fixture:
