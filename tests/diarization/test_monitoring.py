@@ -106,6 +106,10 @@ def test_monitoring_record_rejects_malformed_payload_field_names():
         ("display_label", "Speaker 1"),
         ("gold_label", "AMI-P1"),
         ("reference_label", "AMI-P1"),
+        ("participantEmail", "speaker@example.com"),
+        ("participantName", "Speaker One"),
+        ("userId", "user-001"),
+        ("customerId", "customer-001"),
     ),
 )
 def test_monitoring_records_reject_sensitive_identity_or_audio_fields(field_name, value):
@@ -113,6 +117,11 @@ def test_monitoring_records_reject_sensitive_identity_or_audio_fields(field_name
 
     with pytest.raises(ValidationError, match=field_name):
         _record(canonical_timeline_metadata=metadata)
+
+
+def test_monitoring_records_reject_unsupported_timeline_metadata_fields():
+    with pytest.raises(ValidationError, match="monitoring.timeline has unsupported fields: processing_notes"):
+        _record(canonical_timeline_metadata=_timeline_metadata(processing_notes="manual notes"))
 
 
 @pytest.mark.parametrize(
@@ -154,6 +163,14 @@ def test_monitoring_record_loader_requires_explicit_promotion_state():
     payload["promotion_state"] = {}
 
     with pytest.raises(ValidationError, match="promotion.consent_granted is required"):
+        monitoring_record_from_dict(payload)
+
+
+def test_monitoring_record_loader_rejects_persisted_promotion_notes():
+    payload = _record().to_dict()
+    payload["promotion_state"]["note"] = "speaker@example.com"
+
+    with pytest.raises(ValidationError, match="promotion has unsupported fields: note"):
         monitoring_record_from_dict(payload)
 
 

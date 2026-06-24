@@ -36,6 +36,8 @@ _FORBIDDEN_MONITORING_KEYS = frozenset(
         "audio_fingerprint",
         "audio_fingerprints",
         "audio_sha256",
+        "account_id",
+        "account_ids",
         "benchmark_result",
         "canonical_audio_id",
         "canonical_audio_sha256",
@@ -48,8 +50,12 @@ _FORBIDDEN_MONITORING_KEYS = frozenset(
         "cross_recording_speaker_id",
         "cross_session_speaker_key",
         "cross_session_speaker_keys",
+        "customer_id",
+        "customer_ids",
         "display_label",
         "display_labels",
+        "email",
+        "emails",
         "embedding",
         "embeddings",
         "evaluator_speaker_map",
@@ -65,6 +71,10 @@ _FORBIDDEN_MONITORING_KEYS = frozenset(
         "original_audio_sha256",
         "participant_id",
         "participant_ids",
+        "participant_email",
+        "participant_emails",
+        "participant_name",
+        "participant_names",
         "profile_id",
         "profile_ids",
         "raw_audio",
@@ -85,6 +95,8 @@ _FORBIDDEN_MONITORING_KEYS = frozenset(
         "speaker_ref",
         "speaker_refs",
         "transform_config_hash",
+        "user_id",
+        "user_ids",
         "voice_embedding",
         "voice_embeddings",
         "voice_fingerprint",
@@ -109,6 +121,7 @@ _EDIT_OPERATION_TYPES = frozenset(
 _REQUIRED_TIMELINE_FIELDS = frozenset(
     {"duration_ms", "sample_rate_hz", "time_basis", "timeline_id", "transform_chain_id"}
 )
+_ALLOWED_TIMELINE_FIELDS = _REQUIRED_TIMELINE_FIELDS | frozenset({"channel_ids"})
 
 
 @dataclass(frozen=True)
@@ -122,7 +135,6 @@ class MonitoringPromotionState:
     annotated: bool = False
     adjudicated: bool = False
     adjudication_id: str | None = None
-    note: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "consent_granted", _require_bool(self.consent_granted, "promotion.consent_granted"))
@@ -136,7 +148,6 @@ class MonitoringPromotionState:
         object.__setattr__(self, "annotated", _require_bool(self.annotated, "promotion.annotated"))
         object.__setattr__(self, "adjudicated", _require_bool(self.adjudicated, "promotion.adjudicated"))
         object.__setattr__(self, "adjudication_id", _optional_id(self.adjudication_id, "promotion.adjudication_id"))
-        object.__setattr__(self, "note", _optional_text(self.note, "promotion.note"))
         if self.split_id is not None and not (self.consent_granted and self.access_checked):
             raise ValidationError("promotion split assignment requires consent and access check")
         if self.annotation_protocol_version is not None and not self.annotated:
@@ -173,7 +184,6 @@ class MonitoringPromotionState:
             "annotation_protocol_version": self.annotation_protocol_version,
             "consent_granted": self.consent_granted,
             "eligible_for_private_fixture": self.eligible_for_private_fixture,
-            "note": self.note,
             "split_id": self.split_id,
         }
 
@@ -551,7 +561,6 @@ def monitoring_promotion_state_from_dict(payload: Mapping[str, Any]) -> Monitori
             "annotation_protocol_version",
             "consent_granted",
             "eligible_for_private_fixture",
-            "note",
             "split_id",
         },
         "promotion",
@@ -564,7 +573,6 @@ def monitoring_promotion_state_from_dict(payload: Mapping[str, Any]) -> Monitori
         annotated=_required(data, "annotated", "promotion"),
         adjudicated=_required(data, "adjudicated", "promotion"),
         adjudication_id=_required(data, "adjudication_id", "promotion"),
-        note=data.get("note"),
     )
     if "eligible_for_private_fixture" in data and data["eligible_for_private_fixture"] != state.eligible_for_private_fixture:
         raise ValidationError("promotion.eligible_for_private_fixture must match promotion gates")
@@ -597,6 +605,7 @@ def _monitoring_safe_metadata(value: object, field_name: str) -> dict[str, Any]:
     data = _mapping(value, field_name)
     _validate_json_value(data, field_name)
     _reject_forbidden_monitoring_fields(data, field_name)
+    _reject_unsupported_timeline_fields(data, field_name)
     return _freeze_json(data)  # type: ignore[return-value]
 
 
@@ -608,6 +617,14 @@ def _validate_required_timeline_metadata(timeline: Mapping[str, Any]) -> None:
     time_basis = _require_id(timeline["time_basis"], "monitoring.timeline.time_basis")
     if time_basis not in _TIME_BASES:
         raise ValidationError(f"monitoring.timeline.time_basis is not supported: {time_basis}")
+    if "channel_ids" in timeline:
+        _id_tuple(timeline["channel_ids"], "monitoring.timeline.channel_ids")
+
+
+def _reject_unsupported_timeline_fields(timeline: Mapping[str, Any], field_name: str) -> None:
+    unknown = sorted(set(timeline) - _ALLOWED_TIMELINE_FIELDS)
+    if unknown:
+        raise ValidationError(f"{field_name} has unsupported fields: {', '.join(unknown)}")
 
 
 def _reject_forbidden_monitoring_fields(value: object, field_name: str) -> None:
