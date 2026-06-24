@@ -1,0 +1,170 @@
+import pytest
+
+from keyframe.diarization import (
+    MONITORING_RECORD_SCHEMA_VERSION,
+    MonitoringPromotionState,
+    MonitoringRecord,
+    ValidationError,
+    advance_monitoring_promotion_state,
+    aggregate_monitoring_records,
+    monitoring_record_from_dict,
+    monitoring_record_json_dumps,
+    monitoring_record_json_loads,
+)
+
+
+def _timeline_metadata(**overrides):
+    values = {
+        "channel_ids": ["ch-1"],
+        "duration_ms": 120_000,
+        "sample_rate_hz": 16_000,
+        "time_basis": "canonical_ms",
+        "timeline_id": "timeline-session-001",
+        "transform_chain_id": "identity",
+    }
+    values.update(overrides)
+    return values
+
+
+def _record(**overrides):
+    values = {
+        "monitoring_record_id": "monitoring-session-001",
+        "release_candidate_id": "release-2026-06-24",
+        "monitoring_policy_version": "monitoring-v1",
+        "release_record_schema_version": 2,
+        "engine_config_versions": {"release-engine": "config-001"},
+        "preflight_policy_id": "launch-preflight",
+        "preflight_policy_version": "2026-06-24",
+        "route": "confident_pipeline",
+        "confident_speaker_attribution_enabled": True,
+        "canonical_timeline_metadata": _timeline_metadata(),
+        "edit_operation_counts": {"merge_speakers": 1, "rename_label": 2},
+        "review_time_ms": 45_000,
+        "retention_class": "diagnostic_30d",
+        "expires_at": "2026-07-24T00:00:00Z",
+    }
+    values.update(overrides)
+    return MonitoringRecord(**values)
+
+
+def test_monitoring_record_round_trips_versions_route_timeline_review_and_retention():
+    record = _record()
+
+    payload = record.to_dict()
+    loaded = monitoring_record_json_loads(monitoring_record_json_dumps(record))
+
+    assert payload["schema_version"] == MONITORING_RECORD_SCHEMA_VERSION
+    assert payload["monitoring_policy_version"] == "monitoring-v1"
+    assert payload["release_record_schema_version"] == 2
+    assert payload["engine_config_versions"] == {"release-engine": "config-001"}
+    assert payload["preflight_policy_version"] == "2026-06-24"
+    assert payload["route"] == "confident_pipeline"
+    assert payload["confident_speaker_attribution_enabled"] is True
+    assert payload["degraded_route"] is None
+    assert payload["canonical_timeline_metadata"]["timeline_id"] == "timeline-session-001"
+    assert payload["edit_operation_counts"] == {"merge_speakers": 1, "rename_label": 2}
+    assert payload["review_time_ms"] == 45_000
+    assert payload["retention_class"] == "diagnostic_30d"
+    assert payload["expires_at"] == "2026-07-24T00:00:00Z"
+    assert loaded.to_dict() == payload
+    assert monitoring_record_from_dict(payload).to_dict() == payload
+
+
+def test_monitoring_record_rejects_malformed_payload_field_names():
+    payload = _record().to_dict()
+    payload[1] = "not-a-monitoring-field"
+
+    with pytest.raises(ValidationError, match="monitoring field names must be strings"):
+        monitoring_record_from_dict(payload)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    (
+        ("raw_audio_path", "/tmp/raw.wav"),
+        ("voice_profile", "do-not-store"),
+        ("embedding", [0.1, 0.2]),
+        ("audio_fingerprint", "do-not-store"),
+        ("cross_session_speaker_key", "speaker-global-1"),
+    ),
+)
+def test_monitoring_records_reject_sensitive_identity_or_audio_fields(field_name, value):
+    metadata = _timeline_metadata(extra={field_name: value})
+
+    with pytest.raises(ValidationError, match=field_name):
+        _record(canonical_timeline_metadata=metadata)
+
+
+def test_monitoring_records_require_expiry_and_valid_degraded_state():
+    with pytest.raises(ValidationError, match="monitoring.expires_at"):
+        _record(expires_at=None)
+
+    with pytest.raises(ValidationError, match="degraded monitoring records require degraded_route"):
+        _record(route="needs_review", confident_speaker_attribution_enabled=False)
+
+    degraded = _record(
+        route="needs_review",
+        confident_speaker_attribution_enabled=False,
+        degraded_route="needs_review",
+    )
+
+    assert degraded.to_dict()["degraded_route"] == "needs_review"
+
+
+def test_monitoring_promotion_requires_consent_access_split_annotation_and_adjudication():
+    state = MonitoringPromotionState()
+
+    with pytest.raises(ValidationError, match="requires consent and access check"):
+        advance_monitoring_promotion_state(state, "assign_split", split_id="private_acceptance")
+
+    state = advance_monitoring_promotion_state(state, "grant_consent")
+    state = advance_monitoring_promotion_state(state, "verify_access")
+    state = advance_monitoring_promotion_state(state, "assign_split", split_id="private_acceptance")
+
+    with pytest.raises(ValidationError, match="adjudication requires annotation"):
+        MonitoringPromotionState(consent_granted=True, access_checked=True, split_id="private_acceptance", adjudicated=True)
+
+    state = advance_monitoring_promotion_state(
+        state,
+        "mark_annotated",
+        annotation_protocol_version="private-annotation@2026-06-24",
+    )
+    state = advance_monitoring_promotion_state(state, "mark_adjudicated", adjudication_id="adjudication-001")
+
+    assert state.eligible_for_private_fixture is True
+    assert _record(promotion_state=state).to_dict()["promotion_state"]["eligible_for_private_fixture"] is True
+
+
+def test_monitoring_aggregation_redacts_expired_session_local_identifiers():
+    active = _record(
+        monitoring_record_id="monitoring-active",
+        canonical_timeline_metadata=_timeline_metadata(timeline_id="timeline-active"),
+        edit_operation_counts={"rename_label": 2},
+        review_time_ms=10_000,
+        expires_at="2026-07-24T00:00:00Z",
+    )
+    expired = _record(
+        monitoring_record_id="monitoring-expired",
+        route="needs_review",
+        confident_speaker_attribution_enabled=False,
+        degraded_route="needs_review",
+        canonical_timeline_metadata=_timeline_metadata(timeline_id="timeline-expired"),
+        edit_operation_counts={"merge_speakers": 1},
+        review_time_ms=20_000,
+        expires_at="2026-06-24T00:00:00Z",
+    )
+
+    aggregate = aggregate_monitoring_records((active, expired), as_of="2026-07-01T00:00:00Z")
+    payload = aggregate.to_dict()
+
+    assert payload["total_records"] == 2
+    assert payload["active_record_count"] == 1
+    assert payload["expired_record_count"] == 1
+    assert payload["degraded_record_count"] == 1
+    assert payload["route_counts"] == {"confident_pipeline": 1, "needs_review": 1}
+    assert payload["edit_operation_totals"] == {"merge_speakers": 1, "rename_label": 2}
+    assert payload["review_time_ms_total"] == 30_000
+    assert payload["active_monitoring_record_ids"] == ["monitoring-active"]
+    assert payload["active_timeline_ids"] == ["timeline-active"]
+    assert "monitoring-expired" not in str(payload)
+    assert "timeline-expired" not in str(payload)
