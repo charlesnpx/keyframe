@@ -119,6 +119,7 @@ _FORBIDDEN_MONITORING_KEY_FRAGMENTS = frozenset(
         "identity",
         "participant",
         "profile",
+        "speakerkey",
         "userid",
     }
 )
