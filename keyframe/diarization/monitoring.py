@@ -41,10 +41,14 @@ _FORBIDDEN_MONITORING_KEYS = frozenset(
         "corpus_speaker_id",
         "corpus_speaker_ids",
         "cross_call_speaker_id",
+        "cross_recording_identity",
+        "cross_recording_speaker_id",
         "cross_session_speaker_key",
         "cross_session_speaker_keys",
         "embedding",
         "embeddings",
+        "global_identity",
+        "global_speaker_id",
         "local_audio_sha256",
         "original_audio_id",
         "original_audio_sha256",
@@ -463,7 +467,7 @@ def monitoring_record_from_dict(payload: Mapping[str, Any]) -> MonitoringRecord:
         review_time_ms=data.get("review_time_ms"),
         retention_class=_required(data, "retention_class", "monitoring"),
         expires_at=_required(data, "expires_at", "monitoring"),
-        promotion_state=monitoring_promotion_state_from_dict(data.get("promotion_state", {})),
+        promotion_state=monitoring_promotion_state_from_dict(_required(data, "promotion_state", "monitoring")),
     )
 
 

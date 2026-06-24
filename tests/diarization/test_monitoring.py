@@ -91,6 +91,10 @@ def test_monitoring_record_rejects_malformed_payload_field_names():
         ("speakerEmbedding", [0.1, 0.2]),
         ("cross_session_speaker_key", "speaker-global-1"),
         ("crossSessionSpeakerKey", "speaker-global-1"),
+        ("cross_recording_identity", "speaker-global-1"),
+        ("crossRecordingIdentity", "speaker-global-1"),
+        ("global_identity", "speaker-global-1"),
+        ("globalIdentity", "speaker-global-1"),
     ),
 )
 def test_monitoring_records_reject_sensitive_identity_or_audio_fields(field_name, value):
@@ -112,6 +116,14 @@ def test_monitoring_records_reject_sensitive_identity_or_audio_fields(field_name
 def test_monitoring_records_reject_sensitive_map_keys(field_name, value):
     with pytest.raises(ValidationError, match="must not persist sensitive monitoring identity material"):
         _record(**{field_name: value})
+
+
+def test_monitoring_record_loader_requires_explicit_promotion_state():
+    payload = _record().to_dict()
+    payload.pop("promotion_state")
+
+    with pytest.raises(ValidationError, match="monitoring.promotion_state is required"):
+        monitoring_record_from_dict(payload)
 
 
 def test_monitoring_aggregate_rejects_sensitive_edit_total_keys():
