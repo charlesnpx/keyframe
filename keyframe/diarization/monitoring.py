@@ -115,12 +115,14 @@ _FORBIDDEN_MONITORING_KEY_FRAGMENTS = frozenset(
         "customer",
         "email",
         "fingerprint",
+        "guid",
         "identifier",
         "identity",
         "participant",
         "profile",
         "speakerkey",
         "userid",
+        "uuid",
     }
 )
 _EDIT_OPERATION_TYPES = frozenset(
