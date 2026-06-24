@@ -50,6 +50,8 @@ _FORBIDDEN_RUNTIME_IDENTITY_KEYS = frozenset(
         "cross_call_speaker_id",
         "cross_recording_identity",
         "cross_session_speaker_key",
+        "embedding",
+        "embeddings",
         "global_identity",
         "identity_profile",
         "local_audio_sha256",
@@ -1322,7 +1324,12 @@ def _required(data: Mapping[str, Any], key: str, field_name: str) -> Any:
 
 
 def _reject_unknown_fields(data: Mapping[str, Any], allowed_fields: set[str], field_name: str) -> None:
-    unknown = sorted(set(data) - allowed_fields)
+    field_names = set()
+    for key in data:
+        if not isinstance(key, str):
+            raise ValidationError(f"{field_name} field names must be strings")
+        field_names.add(key)
+    unknown = sorted(field_names - allowed_fields)
     if unknown:
         raise ValidationError(f"{field_name} has unsupported fields: {', '.join(unknown)}")
 

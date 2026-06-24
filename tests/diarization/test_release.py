@@ -370,6 +370,16 @@ def test_invalid_active_runtime_metadata_degrades_with_audit_event():
     assert [event.code for event in check.audit_events] == ["runtime_config_invalid"]
 
 
+def test_malformed_active_runtime_metadata_keys_degrade_with_audit_event():
+    check = check_release_runtime_config(_release(), {1: "not-a-runtime-config"})
+
+    assert check.status == "degraded"
+    assert check.confident_speaker_attribution_enabled is False
+    assert check.degraded_route == "diagnostic_only"
+    assert [event.code for event in check.audit_events] == ["runtime_config_invalid"]
+    assert "field names must be strings" in check.audit_events[0].actual
+
+
 def test_invalid_release_runtime_metadata_degrades_with_audit_event():
     legacy_payload = _benchmark_report().to_dict()
     legacy_payload["report_id"] = "benchmark-report-legacy"
@@ -436,5 +446,11 @@ def test_release_rejects_forbidden_cross_call_identity_metadata():
     with pytest.raises(ValidationError, match="voice_profile must not persist"):
         _must_not_have_checks(evidence={"voice_profile": "do-not-store"})
 
+    with pytest.raises(ValidationError, match="embedding must not persist"):
+        _must_not_have_checks(evidence={"embedding": "do-not-store"})
+
     with pytest.raises(ValidationError, match="reference_speaker_id must not persist"):
         validate_release_runtime_output({"words": [{"reference_speaker_id": "AMI-P1"}]})
+
+    with pytest.raises(ValidationError, match="embeddings must not persist"):
+        validate_release_runtime_output({"diagnostics": {"embeddings": [0.1, 0.2]}})
