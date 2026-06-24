@@ -95,6 +95,10 @@ def test_monitoring_record_rejects_malformed_payload_field_names():
         ("crossRecordingIdentity", "speaker-global-1"),
         ("global_identity", "speaker-global-1"),
         ("globalIdentity", "speaker-global-1"),
+        ("identity_profile", "speaker-global-1"),
+        ("identityProfile", "speaker-global-1"),
+        ("profile_id", "speaker-global-1"),
+        ("profileId", "speaker-global-1"),
     ),
 )
 def test_monitoring_records_reject_sensitive_identity_or_audio_fields(field_name, value):
@@ -118,6 +122,11 @@ def test_monitoring_records_reject_sensitive_map_keys(field_name, value):
         _record(**{field_name: value})
 
 
+def test_monitoring_records_reject_unknown_edit_operation_keys():
+    with pytest.raises(ValidationError, match="monitoring.edit_operation_counts.sessionSpecificEdit is not supported"):
+        _record(edit_operation_counts={"sessionSpecificEdit": 1})
+
+
 def test_monitoring_record_loader_requires_explicit_promotion_state():
     payload = _record().to_dict()
     payload.pop("promotion_state")
@@ -136,6 +145,32 @@ def test_monitoring_aggregate_rejects_sensitive_edit_total_keys():
             route_counts={},
             degraded_record_count=0,
             edit_operation_totals={"speakerEmbedding": 1},
+            review_time_ms_total=0,
+        )
+
+
+def test_monitoring_aggregate_rejects_unknown_route_and_edit_total_keys():
+    with pytest.raises(ValidationError, match="monitoring_aggregate.route_counts.session-route is not supported"):
+        MonitoringAggregate(
+            generated_at="2026-07-01T00:00:00Z",
+            total_records=0,
+            active_record_count=0,
+            expired_record_count=0,
+            route_counts={"session-route": 1},
+            degraded_record_count=0,
+            edit_operation_totals={},
+            review_time_ms_total=0,
+        )
+
+    with pytest.raises(ValidationError, match="monitoring_aggregate.edit_operation_totals.sessionSpecificEdit"):
+        MonitoringAggregate(
+            generated_at="2026-07-01T00:00:00Z",
+            total_records=0,
+            active_record_count=0,
+            expired_record_count=0,
+            route_counts={},
+            degraded_record_count=0,
+            edit_operation_totals={"sessionSpecificEdit": 1},
             review_time_ms_total=0,
         )
 

@@ -49,11 +49,14 @@ _FORBIDDEN_MONITORING_KEYS = frozenset(
         "embeddings",
         "global_identity",
         "global_speaker_id",
+        "identity_profile",
         "local_audio_sha256",
         "original_audio_id",
         "original_audio_sha256",
         "participant_id",
         "participant_ids",
+        "profile_id",
+        "profile_ids",
         "raw_audio",
         "raw_audio_bytes",
         "raw_audio_path",
@@ -76,6 +79,16 @@ _FORBIDDEN_MONITORING_KEYS = frozenset(
 )
 _FORBIDDEN_MONITORING_KEY_ALIASES = frozenset(
     "".join(char for char in key.casefold() if char.isalnum()) for key in _FORBIDDEN_MONITORING_KEYS
+)
+_EDIT_OPERATION_TYPES = frozenset(
+    {
+        "assign_span",
+        "mark_overlap",
+        "mark_uncertain",
+        "merge_speakers",
+        "rename_label",
+        "split_speaker",
+    }
 )
 _REQUIRED_TIMELINE_FIELDS = frozenset(
     {"duration_ms", "sample_rate_hz", "time_basis", "timeline_id", "transform_chain_id"}
@@ -237,6 +250,7 @@ class MonitoringRecord:
             _validate_non_negative_int_map(
                 self.edit_operation_counts,
                 "monitoring.edit_operation_counts",
+                allowed_keys=_EDIT_OPERATION_TYPES,
                 reject_sensitive_keys=True,
             ),
         )
@@ -306,7 +320,15 @@ class MonitoringAggregate:
         )
         if self.total_records != self.active_record_count + self.expired_record_count:
             raise ValidationError("monitoring_aggregate record counts must add to total_records")
-        object.__setattr__(self, "route_counts", _validate_non_negative_int_map(self.route_counts, "monitoring_aggregate.route_counts"))
+        object.__setattr__(
+            self,
+            "route_counts",
+            _validate_non_negative_int_map(
+                self.route_counts,
+                "monitoring_aggregate.route_counts",
+                allowed_keys=ALLOWED_PREFLIGHT_ROUTES,
+            ),
+        )
         object.__setattr__(
             self,
             "degraded_record_count",
@@ -318,6 +340,7 @@ class MonitoringAggregate:
             _validate_non_negative_int_map(
                 self.edit_operation_totals,
                 "monitoring_aggregate.edit_operation_totals",
+                allowed_keys=_EDIT_OPERATION_TYPES,
                 reject_sensitive_keys=True,
             ),
         )
@@ -594,6 +617,7 @@ def _validate_non_negative_int_map(
     value: object,
     field_name: str,
     *,
+    allowed_keys: frozenset[str] | None = None,
     reject_sensitive_keys: bool = False,
 ) -> dict[str, int]:
     data = _mapping(value, field_name)
@@ -604,6 +628,8 @@ def _validate_non_negative_int_map(
             if reject_sensitive_keys
             else _require_id(key, f"{field_name}.key")
         )
+        if allowed_keys is not None and key_text not in allowed_keys:
+            raise ValidationError(f"{field_name}.{key_text} is not supported")
         result[key_text] = _non_negative_int(item, f"{field_name}.{key_text}")
     return result
 
