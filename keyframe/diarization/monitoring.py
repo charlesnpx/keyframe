@@ -112,8 +112,34 @@ _FORBIDDEN_MONITORING_KEY_ALIASES = frozenset(
 _FORBIDDEN_MONITORING_ABBREVIATED_IDENTIFIER_PREFIXES = frozenset(
     {"cid", "conv", "convid", "mtg", "mtgid", "sess", "sessid", "sid"}
 )
+_FORBIDDEN_MONITORING_ABBREVIATED_IDENTIFIER_ACRONYM_PATTERN = "|".join(
+    sorted(
+        (
+            re.escape(prefix.upper())
+            for prefix in _FORBIDDEN_MONITORING_ABBREVIATED_IDENTIFIER_PREFIXES
+        ),
+        key=len,
+        reverse=True,
+    )
+)
 _FORBIDDEN_MONITORING_ABBREVIATED_IDENTIFIER_SUFFIXES = frozenset(
-    {"", "guid", "hash", "id", "ids", "key", "keys", "number", "token", "uuid", "value", "values"}
+    {
+        "",
+        "external",
+        "guid",
+        "hash",
+        "id",
+        "ids",
+        "key",
+        "keys",
+        "number",
+        "opaque",
+        "raw",
+        "token",
+        "uuid",
+        "value",
+        "values",
+    }
 )
 _FORBIDDEN_MONITORING_ABBREVIATED_IDENTIFIER_SUFFIX_TOKENS = tuple(
     sorted(token for token in _FORBIDDEN_MONITORING_ABBREVIATED_IDENTIFIER_SUFFIXES if token)
@@ -729,6 +755,12 @@ def _monitoring_token_has_forbidden_abbreviated_identifier(token: str) -> bool:
 def _monitoring_key_tokens(key: str) -> tuple[str, ...]:
     separated = re.sub(r"[^0-9A-Za-z]+", " ", key)
     separated = re.sub(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", " ", separated)
+    separated = re.sub(
+        rf"\b({_FORBIDDEN_MONITORING_ABBREVIATED_IDENTIFIER_ACRONYM_PATTERN})"
+        r"(?=[A-Z0-9])",
+        r"\1 ",
+        separated,
+    )
     return tuple(part.casefold() for part in separated.split())
 
 
