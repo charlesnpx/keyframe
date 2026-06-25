@@ -706,15 +706,8 @@ def _monitoring_key_is_forbidden(key: str) -> bool:
 
 def _monitoring_key_has_forbidden_abbreviated_identifier(key: str, alias: str) -> bool:
     tokens = _monitoring_key_tokens(key)
-    for index, token in enumerate(tokens):
-        if token not in _FORBIDDEN_MONITORING_ABBREVIATED_IDENTIFIER_PREFIXES:
-            continue
-        suffix_tokens = tokens[index + 1 :]
-        if not suffix_tokens or any(
-            suffix_token in _FORBIDDEN_MONITORING_ABBREVIATED_IDENTIFIER_SUFFIXES
-            for suffix_token in suffix_tokens
-        ):
-            return True
+    if any(token in _FORBIDDEN_MONITORING_ABBREVIATED_IDENTIFIER_PREFIXES for token in tokens):
+        return True
 
     return _monitoring_token_has_forbidden_abbreviated_identifier(alias) or any(
         pattern in alias for pattern in _FORBIDDEN_MONITORING_ABBREVIATED_IDENTIFIER_PATTERNS
