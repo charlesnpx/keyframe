@@ -139,6 +139,11 @@ def test_monitoring_records_reject_unsupported_timeline_metadata_fields():
         ("engine_config_versions", {"recordingSha256": "config-001"}),
         ("engine_config_versions", {"audioGuid": "config-001"}),
         ("engine_config_versions", {"recordingUuid": "config-001"}),
+        ("engine_config_versions", {"session_id": "config-001"}),
+        ("engine_config_versions", {"sessionId": "config-001"}),
+        ("engine_config_versions", {"callId": "config-001"}),
+        ("engine_config_versions", {"meeting_id": "config-001"}),
+        ("engine_config_versions", {"conversationId": "config-001"}),
         ("engine_config_versions", {"contactEmail": "config-001"}),
         ("engine_config_versions", {"participantEmailAddress": "config-001"}),
         ("engine_config_versions", {"customerAccountId": "config-001"}),
@@ -178,8 +183,8 @@ def test_monitoring_records_allow_non_identifier_guidance_keys():
 
 
 def test_monitoring_records_reject_unknown_edit_operation_keys():
-    with pytest.raises(ValidationError, match="monitoring.edit_operation_counts.sessionSpecificEdit is not supported"):
-        _record(edit_operation_counts={"sessionSpecificEdit": 1})
+    with pytest.raises(ValidationError, match="monitoring.edit_operation_counts.custom_edit is not supported"):
+        _record(edit_operation_counts={"custom_edit": 1})
 
 
 def test_monitoring_record_maps_are_immutable_after_validation():
