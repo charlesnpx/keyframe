@@ -61,12 +61,20 @@ _FORBIDDEN_MONITORING_KEYS = frozenset(
         "emails",
         "embedding",
         "embeddings",
+        "family_name",
+        "family_names",
         "evaluator_speaker_map",
         "global_identity",
         "global_speaker_id",
         "gold_label",
         "gold_labels",
+        "full_name",
+        "full_names",
+        "given_name",
+        "given_names",
         "identity_profile",
+        "last_name",
+        "last_names",
         "local_audio_sha256",
         "oracle",
         "oracle_metadata",
@@ -94,6 +102,8 @@ _FORBIDDEN_MONITORING_KEYS = frozenset(
         "speaker_embeddings",
         "speaker_id",
         "speaker_ids",
+        "speaker_label",
+        "speaker_labels",
         "speaker_name",
         "speaker_names",
         "speaker_profile",
@@ -104,6 +114,8 @@ _FORBIDDEN_MONITORING_KEYS = frozenset(
         "user_display_names",
         "user_id",
         "user_ids",
+        "user_label",
+        "user_labels",
         "user_name",
         "user_names",
         "username",
@@ -172,9 +184,14 @@ _FORBIDDEN_MONITORING_KEY_FRAGMENTS = frozenset(
         "customer",
         "displayname",
         "email",
+        "familyname",
         "fingerprint",
+        "firstname",
+        "fullname",
+        "givenname",
         "identifier",
         "identity",
+        "lastname",
         "meeting",
         "participant",
         "profile",
@@ -182,8 +199,10 @@ _FORBIDDEN_MONITORING_KEY_FRAGMENTS = frozenset(
         "sha256",
         "session",
         "speakerkey",
+        "speakerlabel",
         "speakername",
         "userid",
+        "userlabel",
         "username",
     }
 )
@@ -371,6 +390,8 @@ class MonitoringRecord:
         object.__setattr__(self, "expires_at", _require_text(self.expires_at, "monitoring.expires_at"))
         if not isinstance(self.promotion_state, MonitoringPromotionState):
             raise ValidationError("monitoring.promotion_state must be MonitoringPromotionState")
+        if retention_class == "private_candidate" and not self.promotion_state.eligible_for_private_fixture:
+            raise ValidationError("private_candidate monitoring records require completed promotion gates")
 
     def is_expired(self, as_of: str | datetime) -> bool:
         return _parse_timestamp(self.expires_at, "monitoring.expires_at") <= _parse_timestamp(as_of, "as_of")
@@ -817,6 +838,8 @@ def _validate_string_map(value: object, field_name: str, *, reject_sensitive_key
             if reject_sensitive_keys
             else _require_id(key, f"{field_name}.key")
         )
+        if key_text in result:
+            raise ValidationError(f"{field_name}.{key_text} contains duplicate normalized key")
         result[key_text] = _require_id(item, f"{field_name}.{key_text}")
     return result
 
@@ -838,6 +861,8 @@ def _validate_non_negative_int_map(
         )
         if allowed_keys is not None and key_text not in allowed_keys:
             raise ValidationError(f"{field_name}.{key_text} is not supported")
+        if key_text in result:
+            raise ValidationError(f"{field_name}.{key_text} contains duplicate normalized key")
         result[key_text] = _non_negative_int(item, f"{field_name}.{key_text}")
     return result
 

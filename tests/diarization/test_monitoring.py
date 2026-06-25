@@ -185,6 +185,15 @@ def test_monitoring_records_reject_unsupported_timeline_metadata_fields():
         ("engine_config_versions", {"displayName": "config-001"}),
         ("engine_config_versions", {"userName": "config-001"}),
         ("engine_config_versions", {"userDisplayName": "config-001"}),
+        ("engine_config_versions", {"speakerFullName": "config-001"}),
+        ("engine_config_versions", {"userFullName": "config-001"}),
+        ("engine_config_versions", {"fullName": "config-001"}),
+        ("engine_config_versions", {"speakerLabel": "config-001"}),
+        ("engine_config_versions", {"firstName": "config-001"}),
+        ("engine_config_versions", {"givenName": "config-001"}),
+        ("engine_config_versions", {"familyName": "config-001"}),
+        ("engine_config_versions", {"lastName": "config-001"}),
+        ("engine_config_versions", {"userLabel": "config-001"}),
         ("engine_config_versions", {"contactEmail": "config-001"}),
         ("engine_config_versions", {"participantEmailAddress": "config-001"}),
         ("engine_config_versions", {"customerAccountId": "config-001"}),
@@ -226,6 +235,14 @@ def test_monitoring_records_allow_non_identifier_guidance_keys():
 def test_monitoring_records_reject_unknown_edit_operation_keys():
     with pytest.raises(ValidationError, match="monitoring.edit_operation_counts.custom_edit is not supported"):
         _record(edit_operation_counts={"custom_edit": 1})
+
+
+def test_monitoring_records_reject_duplicate_normalized_map_keys():
+    with pytest.raises(ValidationError, match="duplicate normalized key"):
+        _record(engine_config_versions={"release-engine": "config-001", " release-engine ": "config-002"})
+
+    with pytest.raises(ValidationError, match="duplicate normalized key"):
+        _record(edit_operation_counts={"merge_speakers": 1, " merge_speakers ": 2})
 
 
 def test_monitoring_record_maps_are_immutable_after_validation():
@@ -447,6 +464,9 @@ def test_monitoring_records_normalize_required_timeline_metadata_ids():
 def test_monitoring_promotion_requires_consent_access_split_annotation_and_adjudication():
     state = MonitoringPromotionState()
 
+    with pytest.raises(ValidationError, match="private_candidate monitoring records require completed promotion gates"):
+        _record(retention_class="private_candidate")
+
     with pytest.raises(ValidationError, match="requires consent and access check"):
         advance_monitoring_promotion_state(state, "assign_split", split_id="private_acceptance")
 
@@ -500,6 +520,10 @@ def test_monitoring_promotion_requires_consent_access_split_annotation_and_adjud
 
     assert state.eligible_for_private_fixture is True
     assert _record(promotion_state=state).to_dict()["promotion_state"]["eligible_for_private_fixture"] is True
+    assert _record(
+        promotion_state=state,
+        retention_class="private_candidate",
+    ).retention_class == "private_candidate"
 
 
 def test_monitoring_aggregation_redacts_expired_session_local_identifiers():
