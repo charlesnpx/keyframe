@@ -369,6 +369,15 @@ def test_monitoring_records_validate_required_timeline_metadata_shape(override, 
         _record(canonical_timeline_metadata=_timeline_metadata(**override))
 
 
+def test_monitoring_records_reject_missing_required_timeline_metadata_fields():
+    metadata = _timeline_metadata()
+    metadata.pop("time_basis")
+    metadata.pop("duration_ms")
+
+    with pytest.raises(ValidationError, match="monitoring.timeline missing required fields: duration_ms, time_basis"):
+        _record(canonical_timeline_metadata=metadata)
+
+
 def test_monitoring_records_normalize_required_timeline_metadata_ids():
     payload = _record(
         canonical_timeline_metadata=_timeline_metadata(

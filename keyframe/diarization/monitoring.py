@@ -624,6 +624,9 @@ def _monitoring_safe_metadata(value: object, field_name: str) -> dict[str, Any]:
     _validate_json_value(data, field_name)
     _reject_forbidden_monitoring_fields(data, field_name)
     _reject_unsupported_timeline_fields(data, field_name)
+    missing_timeline_fields = _REQUIRED_TIMELINE_FIELDS - set(data)
+    if missing_timeline_fields:
+        raise ValidationError(f"{field_name} missing required fields: {', '.join(sorted(missing_timeline_fields))}")
     return _freeze_json(_normalize_timeline_metadata(data))  # type: ignore[return-value]
 
 
