@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -116,6 +117,13 @@ _FORBIDDEN_MONITORING_ABBREVIATED_IDENTIFIER_SUFFIXES = frozenset(
 )
 _FORBIDDEN_MONITORING_ABBREVIATED_IDENTIFIER_SUFFIX_TOKENS = tuple(
     sorted(token for token in _FORBIDDEN_MONITORING_ABBREVIATED_IDENTIFIER_SUFFIXES if token)
+)
+_FORBIDDEN_MONITORING_ABBREVIATED_IDENTIFIER_PATTERNS = tuple(
+    sorted(
+        f"{prefix}{suffix}"
+        for prefix in _FORBIDDEN_MONITORING_ABBREVIATED_IDENTIFIER_PREFIXES
+        for suffix in _FORBIDDEN_MONITORING_ABBREVIATED_IDENTIFIER_SUFFIX_TOKENS
+    )
 )
 _FORBIDDEN_MONITORING_KEY_FRAGMENTS = frozenset(
     {
@@ -690,26 +698,45 @@ def _monitoring_key_is_forbidden(key: str) -> bool:
     alias = _monitoring_key_alias(key)
     return (
         alias in _FORBIDDEN_MONITORING_KEY_ALIASES
-        or _monitoring_key_has_forbidden_abbreviated_identifier(alias)
+        or _monitoring_key_has_forbidden_abbreviated_identifier(key, alias)
         or _monitoring_key_has_forbidden_identifier_suffix(alias)
         or any(fragment in alias for fragment in _FORBIDDEN_MONITORING_KEY_FRAGMENTS)
     )
 
 
-def _monitoring_key_has_forbidden_abbreviated_identifier(alias: str) -> bool:
-    for prefix in _FORBIDDEN_MONITORING_ABBREVIATED_IDENTIFIER_PREFIXES:
-        if not alias.startswith(prefix):
+def _monitoring_key_has_forbidden_abbreviated_identifier(key: str, alias: str) -> bool:
+    tokens = _monitoring_key_tokens(key)
+    for index, token in enumerate(tokens):
+        if token not in _FORBIDDEN_MONITORING_ABBREVIATED_IDENTIFIER_PREFIXES:
             continue
-        suffix = alias.removeprefix(prefix)
-        if (
-            suffix in _FORBIDDEN_MONITORING_ABBREVIATED_IDENTIFIER_SUFFIXES
-            or any(
-                token in suffix
-                for token in _FORBIDDEN_MONITORING_ABBREVIATED_IDENTIFIER_SUFFIX_TOKENS
-            )
+        suffix_tokens = tokens[index + 1 :]
+        if not suffix_tokens or any(
+            suffix_token in _FORBIDDEN_MONITORING_ABBREVIATED_IDENTIFIER_SUFFIXES
+            for suffix_token in suffix_tokens
         ):
             return True
+
+    return _monitoring_token_has_forbidden_abbreviated_identifier(alias) or any(
+        pattern in alias for pattern in _FORBIDDEN_MONITORING_ABBREVIATED_IDENTIFIER_PATTERNS
+    )
+
+
+def _monitoring_token_has_forbidden_abbreviated_identifier(token: str) -> bool:
+    for prefix in _FORBIDDEN_MONITORING_ABBREVIATED_IDENTIFIER_PREFIXES:
+        if not token.startswith(prefix):
+            continue
+        suffix = token.removeprefix(prefix)
+        return suffix in _FORBIDDEN_MONITORING_ABBREVIATED_IDENTIFIER_SUFFIXES or any(
+            suffix_token in suffix
+            for suffix_token in _FORBIDDEN_MONITORING_ABBREVIATED_IDENTIFIER_SUFFIX_TOKENS
+        )
     return False
+
+
+def _monitoring_key_tokens(key: str) -> tuple[str, ...]:
+    separated = re.sub(r"[^0-9A-Za-z]+", " ", key)
+    separated = re.sub(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", " ", separated)
+    return tuple(part.casefold() for part in separated.split())
 
 
 def _monitoring_key_has_forbidden_identifier_suffix(alias: str) -> bool:
