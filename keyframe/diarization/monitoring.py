@@ -108,7 +108,12 @@ _FORBIDDEN_MONITORING_KEYS = frozenset(
 _FORBIDDEN_MONITORING_KEY_ALIASES = frozenset(
     "".join(char for char in key.casefold() if char.isalnum()) for key in _FORBIDDEN_MONITORING_KEYS
 )
-_FORBIDDEN_MONITORING_EXACT_ALIASES = frozenset({"cid", "convid", "mtgid", "sessid", "sid"})
+_FORBIDDEN_MONITORING_ABBREVIATED_IDENTIFIER_PREFIXES = frozenset(
+    {"cid", "convid", "mtgid", "sessid", "sid"}
+)
+_FORBIDDEN_MONITORING_ABBREVIATED_IDENTIFIER_SUFFIXES = frozenset(
+    {"", "guid", "hash", "key", "keys", "number", "token", "uuid", "value", "values"}
+)
 _FORBIDDEN_MONITORING_KEY_FRAGMENTS = frozenset(
     {
         "account",
@@ -682,9 +687,17 @@ def _monitoring_key_is_forbidden(key: str) -> bool:
     alias = _monitoring_key_alias(key)
     return (
         alias in _FORBIDDEN_MONITORING_KEY_ALIASES
-        or alias in _FORBIDDEN_MONITORING_EXACT_ALIASES
+        or _monitoring_key_has_forbidden_abbreviated_identifier(alias)
         or _monitoring_key_has_forbidden_identifier_suffix(alias)
         or any(fragment in alias for fragment in _FORBIDDEN_MONITORING_KEY_FRAGMENTS)
+    )
+
+
+def _monitoring_key_has_forbidden_abbreviated_identifier(alias: str) -> bool:
+    return any(
+        alias.startswith(prefix)
+        and alias.removeprefix(prefix) in _FORBIDDEN_MONITORING_ABBREVIATED_IDENTIFIER_SUFFIXES
+        for prefix in _FORBIDDEN_MONITORING_ABBREVIATED_IDENTIFIER_PREFIXES
     )
 
 
