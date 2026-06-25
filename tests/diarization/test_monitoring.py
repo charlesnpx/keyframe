@@ -242,7 +242,16 @@ def test_monitoring_records_reject_duplicate_normalized_map_keys():
         _record(engine_config_versions={"release-engine": "config-001", " release-engine ": "config-002"})
 
     with pytest.raises(ValidationError, match="duplicate normalized key"):
+        _record(engine_config_versions={"release-engine": "config-001", "release_engine": "config-002"})
+
+    with pytest.raises(ValidationError, match="duplicate normalized key"):
+        _record(engine_config_versions={"ReleaseEngine": "config-001", "release-engine": "config-002"})
+
+    with pytest.raises(ValidationError, match="duplicate normalized key"):
         _record(edit_operation_counts={"merge_speakers": 1, " merge_speakers ": 2})
+
+    with pytest.raises(ValidationError, match="duplicate normalized key"):
+        _record(edit_operation_counts={"merge_speakers": 1, "merge-speakers": 2})
 
 
 def test_monitoring_record_maps_are_immutable_after_validation():

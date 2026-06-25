@@ -832,14 +832,17 @@ def _validate_route(value: object, field_name: str) -> PreflightRoute:
 def _validate_string_map(value: object, field_name: str, *, reject_sensitive_keys: bool = False) -> dict[str, str]:
     data = _mapping(value, field_name)
     result: dict[str, str] = {}
+    seen_normalized_keys: set[str] = set()
     for key, item in data.items():
         key_text = (
             _monitoring_safe_key(key, field_name)
             if reject_sensitive_keys
             else _require_id(key, f"{field_name}.key")
         )
-        if key_text in result:
+        normalized_key = _monitoring_key_alias(key_text)
+        if normalized_key in seen_normalized_keys:
             raise ValidationError(f"{field_name}.{key_text} contains duplicate normalized key")
+        seen_normalized_keys.add(normalized_key)
         result[key_text] = _require_id(item, f"{field_name}.{key_text}")
     return result
 
@@ -853,16 +856,19 @@ def _validate_non_negative_int_map(
 ) -> dict[str, int]:
     data = _mapping(value, field_name)
     result: dict[str, int] = {}
+    seen_normalized_keys: set[str] = set()
     for key, item in data.items():
         key_text = (
             _monitoring_safe_key(key, field_name)
             if reject_sensitive_keys
             else _require_id(key, f"{field_name}.key")
         )
+        normalized_key = _monitoring_key_alias(key_text)
+        if normalized_key in seen_normalized_keys:
+            raise ValidationError(f"{field_name}.{key_text} contains duplicate normalized key")
+        seen_normalized_keys.add(normalized_key)
         if allowed_keys is not None and key_text not in allowed_keys:
             raise ValidationError(f"{field_name}.{key_text} is not supported")
-        if key_text in result:
-            raise ValidationError(f"{field_name}.{key_text} contains duplicate normalized key")
         result[key_text] = _non_negative_int(item, f"{field_name}.{key_text}")
     return result
 
