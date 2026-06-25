@@ -135,6 +135,7 @@ _FORBIDDEN_MONITORING_ABBREVIATED_IDENTIFIER_SUFFIXES = frozenset(
         "number",
         "opaque",
         "raw",
+        "s",
         "token",
         "uuid",
         "value",
