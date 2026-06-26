@@ -1,6 +1,6 @@
 ---
 name: keyframe
-description: "Extract key frames and timestamped transcripts from video or audio files. Produces a folder of semantically distinct screenshots + a Whisper transcript."
+description: "Extract key frames and timestamped transcripts from video or audio files. Produces a folder of semantically distinct screenshots + a speaker-labeled transcript when HF_TOKEN is configured."
 argument-hint: "<path to video/audio file>"
 ---
 
@@ -34,9 +34,12 @@ Extract key frames and/or a timestamped transcript from a video or audio file.
    Common flags:
    - `--frames-only` — skip transcript extraction
    - `--transcript-only` — skip frame extraction
+   - `--no-speaker-detection` — force Whisper-only transcription
    - `--whisper-model medium` — transcription model (default: medium)
    - `--pass1-clusters 20` — more candidate frames before merging (default: 15)
    - `--similarity-threshold` — deprecated no-op; do not tune with this flag
+
+   Speaker detection is attempted by default when `HF_TOKEN` exists. To enable it, accept the pyannote model terms at `https://huggingface.co/pyannote/speaker-diarization-community-1`, create a Hugging Face token at `https://huggingface.co/settings/tokens`, and export it as `HF_TOKEN`. If `HF_TOKEN` is missing or pyannote access fails, Keyframe warns and falls back to Whisper-only transcription.
 
 4. **Present the results.** After extraction completes:
    - Read the transcript first; treat it as narrative authority for what was said
@@ -55,16 +58,17 @@ Extract key frames and/or a timestamped transcript from a video or audio file.
     ...
     captions.json              # Florence-2 captions + merge metadata
     manifest.json              # Deterministic frame triage index
-  transcript.txt               # Timestamped transcript
-  transcript.json              # Machine-readable transcript
+  transcript.txt               # Timestamped transcript, speaker-labeled when available
+  transcript.json              # Machine-readable transcript; includes speaker when available
 ```
 
 ## Tips
 
 - For UI demo recordings with many similar screens, use `--pass1-clusters 20` to capture more detail
 - For long videos, the frame extraction takes ~20-30s regardless of length (it samples at 0.5s intervals)
-- Whisper defaults to `medium`; use `large` only when accuracy is worth the extra time and download
-- The transcript.json file contains structured `[{start, end, text}]` segments for programmatic use
+- WhisperX/Whisper defaults to `medium`; use `large` only when accuracy is worth the extra time and download
+- Speaker labels use raw pyannote labels such as `SPEAKER_00`; JSON segments are `[{start, end, text, speaker}]` when labels are available
+- The transcript.json file contains structured `[{start, end, text}]` segments for programmatic use when speaker detection is unavailable or disabled
 - Audio-only files (.m4a, .mp3) automatically skip frame extraction even without `--transcript-only`
 
 ## Grounding Rules
@@ -76,6 +80,6 @@ Extract key frames and/or a timestamped transcript from a video or audio file.
 
 ## Error handling
 
-- If `keyframe` is not found, tell the user to install it: `pipx install git+ssh://git@github.com/charlesnpx/keyframe.git && keyframe install-skills`
-- If models fail to download (SSL errors), suggest: `/Applications/Python\ 3.14/Install\ Certificates.command`
+- If `keyframe` is not found, tell the user to install it with Python 3.12: `pipx install --python python3.12 git+ssh://git@github.com/charlesnpx/keyframe.git && keyframe install-skills`
+- If models fail to download (SSL errors), suggest: `/Applications/Python\ 3.12/Install\ Certificates.command`
 - If ffmpeg is missing (Whisper needs it), suggest: `brew install ffmpeg`

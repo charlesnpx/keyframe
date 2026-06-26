@@ -212,6 +212,7 @@ def cmd_extract(args):
             model_name=args.whisper_model,
             output=str(transcript_path),
             fmt=args.transcript_format,
+            speaker_detection=not bool(getattr(args, "no_speaker_detection", False)),
         )
 
         if args.transcript_format != "json":
@@ -311,6 +312,8 @@ def _add_extract_args(parser):
     parser.add_argument("--transcript-format", default="txt",
                         choices=["txt", "srt", "vtt", "json"],
                         help="Transcript format (default: txt)")
+    parser.add_argument("--no-speaker-detection", action="store_true",
+                        help="Use Whisper-only transcription even when HF_TOKEN is set")
 
 
 if __name__ == "__main__":

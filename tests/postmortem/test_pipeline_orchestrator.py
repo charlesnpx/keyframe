@@ -155,6 +155,72 @@ def test_cli_transcript_manifest_rewrite_materializes_candidate_records(tmp_path
     assert manifest["frames"][0]["transcript_window"] == "hello"
 
 
+def test_cli_no_speaker_detection_passed_to_transcript(tmp_path, monkeypatch):
+    from keyframe import cli
+    import keyframe.transcript as transcript
+
+    video = tmp_path / "input.mp4"
+    video.write_bytes(b"not a real video")
+    out_dir = tmp_path / "out"
+    calls = []
+
+    def fake_extract_transcript(**kwargs):
+        calls.append(kwargs)
+        return ([{"start": 0.0, "end": 2.0, "text": "hello"}], "en")
+
+    monkeypatch.setattr(transcript, "extract_transcript", fake_extract_transcript)
+
+    cli.cmd_extract(SimpleNamespace(
+        video=str(video),
+        output=str(out_dir),
+        transcript_only=True,
+        frames_only=False,
+        sample_interval=0.75,
+        pass1_clusters=9,
+        similarity_threshold=0.85,
+        max_output_frames=None,
+        verbose_trace=False,
+        debug_qa_targets=None,
+        whisper_model="medium",
+        transcript_format="json",
+        no_speaker_detection=True,
+    ))
+
+    assert calls[0]["speaker_detection"] is False
+
+
+def test_cli_frames_only_does_not_import_transcript(tmp_path, monkeypatch):
+    import sys
+    from keyframe import cli
+    import keyframe.pipeline as pipeline
+
+    video = tmp_path / "input.mp4"
+    video.write_bytes(b"not a real video")
+    out_dir = tmp_path / "out"
+
+    monkeypatch.setenv("HF_TOKEN", "hf_test")
+    monkeypatch.setattr(pipeline, "extract_keyframes", lambda video_path, output_dir, config: _fake_record_result(output_dir))
+    sys.modules.pop("keyframe.transcript", None)
+
+    cli.cmd_extract(SimpleNamespace(
+        video=str(video),
+        output=str(out_dir),
+        transcript_only=False,
+        frames_only=True,
+        sample_interval=0.75,
+        pass1_clusters=9,
+        similarity_threshold=0.85,
+        max_output_frames=None,
+        verbose_trace=False,
+        debug_qa_targets=None,
+        whisper_model="medium",
+        transcript_format="txt",
+        no_speaker_detection=False,
+    ))
+
+    assert "keyframe.transcript" not in sys.modules
+
+
 def test_survival_stage_applies_explicit_output_cap_after_dedupe():
     from PIL import Image
     from keyframe.pipeline.config import KeyframeExtractionConfig
