@@ -1,6 +1,6 @@
 ---
 name: keyframe
-description: "Extract key frames and timestamped transcripts from video or audio files. Produces a folder of semantically distinct screenshots + a speaker-labeled transcript when HF_TOKEN is configured."
+description: "Extract key frames and timestamped transcripts from video or audio files. Produces semantically distinct screenshots and optional pyannote speaker labels on Whisper transcript segments."
 argument-hint: "<path to video/audio file>"
 ---
 
@@ -39,7 +39,7 @@ Extract key frames and/or a timestamped transcript from a video or audio file.
    - `--pass1-clusters 20` — more candidate frames before merging (default: 15)
    - `--similarity-threshold` — deprecated no-op; do not tune with this flag
 
-   Speaker detection is attempted by default when `HF_TOKEN` exists. To enable it, accept the pyannote model terms at `https://huggingface.co/pyannote/speaker-diarization-community-1`, create a Hugging Face token at `https://huggingface.co/settings/tokens`, and export it as `HF_TOKEN`. If `HF_TOKEN` is missing or pyannote access fails, Keyframe warns and falls back to Whisper-only transcription.
+   Whisper always provides transcript text and segment timing. Speaker detection is attempted by default when `HF_TOKEN` exists; pyannote then adds segment-level labels to Whisper segments. To enable it, accept the pyannote model terms at `https://huggingface.co/pyannote/speaker-diarization-community-1`, create a Hugging Face token at `https://huggingface.co/settings/tokens`, and export it as `HF_TOKEN`. If `HF_TOKEN` is missing or pyannote access fails, Keyframe warns and keeps the unlabeled Whisper transcript.
 
 4. **Present the results.** After extraction completes:
    - Read the transcript first; treat it as narrative authority for what was said
@@ -66,8 +66,8 @@ Extract key frames and/or a timestamped transcript from a video or audio file.
 
 - For UI demo recordings with many similar screens, use `--pass1-clusters 20` to capture more detail
 - For long videos, the frame extraction takes ~20-30s regardless of length (it samples at 0.5s intervals)
-- WhisperX/Whisper defaults to `medium`; use `large` only when accuracy is worth the extra time and download
-- Speaker labels use raw pyannote labels such as `SPEAKER_00`; JSON segments are `[{start, end, text, speaker}]` when labels are available
+- Whisper defaults to `medium`; use `large` only when accuracy is worth the extra time and download
+- Speaker labels use raw pyannote labels such as `SPEAKER_00`; JSON includes `speaker` only on labeled segments
 - The transcript.json file contains structured `[{start, end, text}]` segments for programmatic use when speaker detection is unavailable or disabled
 - Audio-only files (.m4a, .mp3) automatically skip frame extraction even without `--transcript-only`
 

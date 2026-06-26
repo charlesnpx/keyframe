@@ -1,6 +1,6 @@
 # keyframe
 
-Extract key frames and timestamped, speaker-labeled transcripts from video files using CLIP, Florence-2, WhisperX, pyannote, and Whisper fallback models. All models run locally.
+Extract key frames and timestamped, optionally speaker-labeled transcripts from video files using CLIP, Florence-2, Whisper, and pyannote. All models run locally.
 
 ## Install
 
@@ -54,8 +54,8 @@ export SSL_CERT_FILE=/path/to/corporate-ca-bundle.crt
 These download automatically and are cached:
 - **CLIP ViT-B-32** (~350MB) — image/text embeddings
 - **Florence-2-base** (~450MB) — frame captioning
-- **WhisperX / Whisper medium** (~1.4GB) — speech transcription and word alignment
-- **pyannote speaker diarization** — speaker labels when `HF_TOKEN` is configured
+- **Whisper medium** (~1.4GB) — speech transcription and segment timing
+- **pyannote speaker diarization** — segment-level speaker labels when `HF_TOKEN` is configured
 
 ## Usage
 
@@ -120,7 +120,7 @@ $keyframe ~/Downloads/meeting-recording.mp4
 | `-t, --similarity-threshold` | `0.85` | Deprecated no-op; deterministic merge vetoes are used |
 | `-w, --whisper-model` | `medium` | Whisper model: tiny/base/small/medium/large |
 | `--transcript-format` | `txt` | Output format: txt/srt/vtt/json |
-| `--no-speaker-detection` | | Force Whisper-only transcription and skip WhisperX/pyannote |
+| `--no-speaker-detection` | | Force Whisper-only transcription and skip pyannote speaker detection |
 
 ## How it works
 
@@ -134,9 +134,9 @@ Scrolling a data table (visually different but semantically identical) gets coll
 
 ### Transcript extraction
 
-When `HF_TOKEN` is set, WhisperX transcribes and aligns words, pyannote detects speakers with `pyannote/speaker-diarization-community-1`, and Keyframe writes contiguous speaker-run transcript segments. If `HF_TOKEN` is missing or speaker detection fails, Keyframe warns and falls back to Whisper-only transcription.
+Whisper always provides the transcript text and segment boundaries. When `HF_TOKEN` is set, pyannote detects speakers with `pyannote/speaker-diarization-community-1`, and Keyframe assigns a dominant speaker label to each Whisper segment based on diarization overlap. If `HF_TOKEN` is missing or speaker detection fails, Keyframe warns and keeps the unlabeled Whisper transcript.
 
-Speaker labels use raw pyannote labels such as `SPEAKER_00`. TXT output places the label after the timestamp, SRT/VTT prefix each caption, and JSON includes a `speaker` field.
+Speaker labels use raw pyannote labels such as `SPEAKER_00`. TXT output places the label after the timestamp, SRT/VTT prefix each caption, and JSON includes `speaker` only on labeled segments.
 
 ## Output structure
 

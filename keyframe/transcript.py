@@ -20,12 +20,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
-import re
 import sys
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from itertools import groupby
 from pathlib import Path
 from typing import Any
 
@@ -52,8 +51,7 @@ class TranscriptSegment:
         object.__setattr__(self, "start", start)
         object.__setattr__(self, "end", end)
         object.__setattr__(self, "text", str(self.text).strip())
-        if self.speaker is not None:
-            object.__setattr__(self, "speaker", str(self.speaker))
+        object.__setattr__(self, "speaker", _normalize_speaker_label(self.speaker))
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -72,6 +70,13 @@ class TranscriptSegment:
         if not hasattr(self, key):
             raise KeyError(key)
         return getattr(self, key)
+
+
+@dataclass(frozen=True)
+class DiarizationRow:
+    start: float
+    end: float
+    speaker: str
 
 
 def format_time(seconds):
@@ -178,64 +183,110 @@ def _coerce_seconds(value: Any, default: float) -> float:
         return float(default)
 
 
-def _clean_word_text(words: Sequence[Mapping[str, Any]]) -> str:
-    text = " ".join(
-        str(word.get("word") or word.get("text") or "").strip()
-        for word in words
-        if str(word.get("word") or word.get("text") or "").strip()
-    )
-    text = re.sub(r"\s+([,.;:!?%])", r"\1", text)
-    text = re.sub(r"([({\[])\s+", r"\1", text)
-    text = re.sub(r"\s+([)}\]])", r"\1", text)
-    return text.strip()
+NULL_SPEAKER_LABELS = {"<na>", "nat", "none", "null", "nan"}
 
 
-def _word_run_segment(
-    words: Sequence[Mapping[str, Any]],
-    speaker: str | None,
-    fallback_text: str,
-    fallback_start: float,
-    fallback_end: float,
-) -> TranscriptSegment | None:
-    text = _clean_word_text(words) or fallback_text.strip()
-    if not text:
+def _normalize_speaker_label(label: Any) -> str | None:
+    if label is None:
         return None
-    first_word = words[0] if words else {}
-    last_word = words[-1] if words else {}
-    start = _coerce_seconds(first_word.get("start"), fallback_start)
-    end = _coerce_seconds(last_word.get("end"), fallback_end)
-    if end < start:
-        start, end = fallback_start, max(fallback_end, fallback_start)
-    return TranscriptSegment(start=start, end=end, text=text, speaker=speaker)
+    normalized = str(label).strip()
+    if not normalized or normalized.lower() in NULL_SPEAKER_LABELS:
+        return None
+    return normalized
 
 
-def _split_whisperx_segment(raw_segment: Mapping[str, Any]) -> tuple[TranscriptSegment, ...]:
-    raw_start = _coerce_seconds(raw_segment.get("start"), 0.0)
-    raw_end = _coerce_seconds(raw_segment.get("end"), raw_start)
-    raw_text = str(raw_segment.get("text", "")).strip()
-    segment_speaker = raw_segment.get("speaker")
-    raw_words = raw_segment.get("words") or ()
-    words = tuple(word for word in raw_words if isinstance(word, Mapping))
-
-    if not words or not any(word.get("speaker") or segment_speaker for word in words):
-        return (TranscriptSegment(raw_start, raw_end, raw_text, segment_speaker),)
-
-    return tuple(
-        segment
-        for speaker, run in groupby(words, key=lambda word: word.get("speaker") or segment_speaker)
-        for segment in (_word_run_segment(tuple(run), speaker, raw_text, raw_start, raw_end),)
-        if segment is not None
-    )
+def _finite_seconds(value: Any) -> float | None:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(seconds):
+        return None
+    return seconds
 
 
-def whisperx_segments_to_transcript_segments(result: Mapping[str, Any]) -> tuple[TranscriptSegment, ...]:
-    """Convert WhisperX word-speaker output into product transcript segments."""
-    return tuple(
-        segment
-        for raw_segment in result.get("segments", ())
-        if isinstance(raw_segment, Mapping)
-        for segment in _split_whisperx_segment(raw_segment)
-    )
+def _diarization_records(diarization: Any) -> tuple[Mapping[str, Any], ...]:
+    if diarization is None:
+        return ()
+    if (
+        isinstance(diarization, tuple)
+        and len(diarization) == 2
+        and not isinstance(diarization[0], Mapping)
+        and (
+            hasattr(diarization[0], "to_dict")
+            or isinstance(diarization[0], Sequence)
+        )
+        and (diarization[1] is None or isinstance(diarization[1], Mapping))
+    ):
+        diarization = diarization[0]
+    if hasattr(diarization, "to_dict"):
+        try:
+            records = diarization.to_dict("records")
+        except TypeError:
+            records = ()
+        return tuple(record for record in records if isinstance(record, Mapping))
+    if isinstance(diarization, Mapping):
+        return (diarization,)
+    if isinstance(diarization, Sequence) and not isinstance(diarization, (str, bytes)):
+        return tuple(record for record in diarization if isinstance(record, Mapping))
+    return ()
+
+
+def _valid_diarization_rows(diarization: Any) -> tuple[DiarizationRow, ...]:
+    rows = []
+    if isinstance(diarization, DiarizationRow):
+        rows.append(diarization)
+    elif isinstance(diarization, Sequence) and not isinstance(diarization, (str, bytes)):
+        rows.extend(row for row in diarization if isinstance(row, DiarizationRow))
+
+    for record in _diarization_records(diarization):
+        speaker = _normalize_speaker_label(record.get("speaker"))
+        start = _finite_seconds(record.get("start"))
+        end = _finite_seconds(record.get("end"))
+        if speaker is None or start is None or end is None or end <= start:
+            continue
+        rows.append(DiarizationRow(start=start, end=end, speaker=speaker))
+    normalized_rows = []
+    for row in rows:
+        speaker = _normalize_speaker_label(row.speaker)
+        start = _finite_seconds(row.start)
+        end = _finite_seconds(row.end)
+        if speaker is None or start is None or end is None or end <= start:
+            continue
+        normalized_rows.append(DiarizationRow(start=start, end=end, speaker=speaker))
+    return tuple(normalized_rows)
+
+
+def _assign_speakers(
+    segments: Iterable[Mapping[str, Any] | TranscriptSegment],
+    diarization: Any,
+) -> tuple[TranscriptSegment, ...]:
+    source_segments = transcript_segments(segments)
+    diarization_rows = _valid_diarization_rows(diarization)
+    labeled_segments = []
+
+    for segment in source_segments:
+        overlaps: dict[str, tuple[float, float]] = {}
+        for row in diarization_rows:
+            overlap_start = max(segment.start, row.start)
+            overlap_end = min(segment.end, row.end)
+            overlap = overlap_end - overlap_start
+            if overlap <= 0:
+                continue
+            total, earliest_start = overlaps.get(row.speaker, (0.0, overlap_start))
+            overlaps[row.speaker] = (total + overlap, min(earliest_start, overlap_start))
+
+        speaker = None
+        if overlaps:
+            speaker = min(
+                overlaps.items(),
+                key=lambda item: (-item[1][0], item[1][1], item[0]),
+            )[0]
+        labeled_segments.append(
+            TranscriptSegment(segment.start, segment.end, segment.text, speaker)
+        )
+
+    return tuple(labeled_segments)
 
 
 def _select_whisperx_device() -> tuple[str, str]:
@@ -289,34 +340,16 @@ def _extract_with_whisper(video: Path, model_name: str) -> tuple[tuple[Transcrip
     return transcript_segments(result["segments"]), result.get("language", "unknown")
 
 
-def _extract_with_whisperx(video: Path, model_name: str, hf_token: str) -> tuple[tuple[TranscriptSegment, ...], str]:
+def _detect_speakers(video: Path, hf_token: str) -> tuple[DiarizationRow, ...]:
     import whisperx
     from whisperx.diarize import DiarizationPipeline
 
-    device, compute_type = _select_whisperx_device()
-    print(f"Loading WhisperX model on {device} ({compute_type})...")
-    model = whisperx.load_model(model_name, device, compute_type=compute_type)
+    device, _compute_type = _select_whisperx_device()
     audio = whisperx.load_audio(str(video))
-
-    print("Transcribing and aligning words with WhisperX...")
-    result = model.transcribe(audio, batch_size=16)
-    language = result.get("language", "unknown")
-    align_model, metadata = whisperx.load_align_model(language_code=language, device=device)
-    result = whisperx.align(
-        result["segments"],
-        align_model,
-        metadata,
-        audio,
-        device,
-        return_char_alignments=False,
-    )
 
     print("Detecting speakers with pyannote...")
     diarize_model = DiarizationPipeline(PYANNOTE_MODEL, token=hf_token, device=device)
-    diarize_segments = diarize_model(audio)
-    result = whisperx.assign_word_speakers(diarize_segments, result)
-
-    return whisperx_segments_to_transcript_segments(result), language
+    return _valid_diarization_rows(diarize_model(audio))
 
 
 def extract_transcript(
@@ -335,7 +368,7 @@ def extract_transcript(
         output:      Output file path (auto-generated if None)
         fmt:         Output format: txt, srt, vtt, json
         speaker_detection:
-                     Attempt WhisperX + pyannote speaker detection when HF_TOKEN is set
+                     Attempt pyannote speaker detection when HF_TOKEN is set
 
     Returns:
         (segments, language) tuple
@@ -356,17 +389,21 @@ def extract_transcript(
     print(f"Video: {video_path}")
     print(f"Model: {model_name}")
 
-    hf_token = os.environ.get("HF_TOKEN")
-    if speaker_detection and hf_token:
-        try:
-            segments, language = _extract_with_whisperx(video, model_name, hf_token)
-        except Exception as exc:
-            _print_speaker_detection_failure(exc)
-            segments, language = _extract_with_whisper(video, model_name)
-    else:
-        if speaker_detection:
+    segments, language = _extract_with_whisper(video, model_name)
+
+    if speaker_detection and segments:
+        hf_token = (os.environ.get("HF_TOKEN") or "").strip()
+        if not hf_token:
             _print_missing_hf_token_warning()
-        segments, language = _extract_with_whisper(video, model_name)
+        else:
+            try:
+                diarization_rows = _detect_speakers(video, hf_token)
+                speaker_segments = _assign_speakers(segments, diarization_rows)
+                if not any(seg.speaker for seg in speaker_segments):
+                    raise RuntimeError("speaker diarization produced no usable speaker overlaps")
+                segments = speaker_segments
+            except Exception as exc:
+                _print_speaker_detection_failure(exc)
 
     print(f"Detected language: {language}")
     print(f"Segments: {len(segments)}")
