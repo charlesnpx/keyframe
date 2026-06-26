@@ -212,6 +212,46 @@ def test_untimed_diarized_words_still_get_numeric_bounds():
     )
 
 
+def test_partially_untimed_words_use_segment_bounds():
+    result = {
+        "segments": [
+            {
+                "start": 10.0,
+                "end": 14.0,
+                "text": "hello there yes",
+                "words": [
+                    {"word": "hello", "speaker": "SPEAKER_00"},
+                    {"start": 11.0, "end": 12.0, "word": "there", "speaker": "SPEAKER_00"},
+                    {"start": 12.5, "word": "yes", "speaker": "SPEAKER_01"},
+                ],
+            }
+        ]
+    }
+
+    assert transcript.whisperx_segments_to_transcript_segments(result) == (
+        transcript.TranscriptSegment(10.0, 12.0, "hello there", "SPEAKER_00"),
+        transcript.TranscriptSegment(12.5, 14.0, "yes", "SPEAKER_01"),
+    )
+
+
+def test_none_words_falls_back_to_segment_level_text_and_speaker():
+    result = {
+        "segments": [
+            {
+                "start": 10.0,
+                "end": 14.0,
+                "text": "segment text",
+                "speaker": "SPEAKER_00",
+                "words": None,
+            }
+        ]
+    }
+
+    assert transcript.whisperx_segments_to_transcript_segments(result) == (
+        transcript.TranscriptSegment(10.0, 14.0, "segment text", "SPEAKER_00"),
+    )
+
+
 def test_extract_with_whisperx_runs_diarization_pipeline(monkeypatch, tmp_path):
     video = tmp_path / "recording.mp4"
     video.write_bytes(b"not real media")

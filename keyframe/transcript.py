@@ -25,6 +25,7 @@ import re
 import sys
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from itertools import groupby
 from pathlib import Path
 from typing import Any
 
@@ -199,10 +200,12 @@ def _word_run_segment(
     text = _clean_word_text(words) or fallback_text.strip()
     if not text:
         return None
-    starts = [_coerce_seconds(word.get("start"), fallback_start) for word in words if word.get("start") is not None]
-    ends = [_coerce_seconds(word.get("end"), fallback_end) for word in words if word.get("end") is not None]
-    start = starts[0] if starts else fallback_start
-    end = ends[-1] if ends else fallback_end
+    first_word = words[0] if words else {}
+    last_word = words[-1] if words else {}
+    start = _coerce_seconds(first_word.get("start"), fallback_start)
+    end = _coerce_seconds(last_word.get("end"), fallback_end)
+    if end < start:
+        start, end = fallback_start, max(fallback_end, fallback_start)
     return TranscriptSegment(start=start, end=end, text=text, speaker=speaker)
 
 
@@ -211,29 +214,18 @@ def _split_whisperx_segment(raw_segment: Mapping[str, Any]) -> tuple[TranscriptS
     raw_end = _coerce_seconds(raw_segment.get("end"), raw_start)
     raw_text = str(raw_segment.get("text", "")).strip()
     segment_speaker = raw_segment.get("speaker")
-    words = tuple(word for word in raw_segment.get("words", ()) if isinstance(word, Mapping))
+    raw_words = raw_segment.get("words") or ()
+    words = tuple(word for word in raw_words if isinstance(word, Mapping))
 
     if not words or not any(word.get("speaker") or segment_speaker for word in words):
         return (TranscriptSegment(raw_start, raw_end, raw_text, segment_speaker),)
 
-    runs: list[TranscriptSegment] = []
-    run_words: list[Mapping[str, Any]] = []
-    run_speaker: str | None = None
-    for word in words:
-        word_speaker = word.get("speaker") or segment_speaker
-        if run_words and word_speaker != run_speaker:
-            segment = _word_run_segment(run_words, run_speaker, raw_text, raw_start, raw_end)
-            if segment is not None:
-                runs.append(segment)
-            run_words = []
-        run_words.append(word)
-        run_speaker = word_speaker
-
-    if run_words:
-        segment = _word_run_segment(run_words, run_speaker, raw_text, raw_start, raw_end)
-        if segment is not None:
-            runs.append(segment)
-    return tuple(runs)
+    return tuple(
+        segment
+        for speaker, run in groupby(words, key=lambda word: word.get("speaker") or segment_speaker)
+        for segment in (_word_run_segment(tuple(run), speaker, raw_text, raw_start, raw_end),)
+        if segment is not None
+    )
 
 
 def whisperx_segments_to_transcript_segments(result: Mapping[str, Any]) -> tuple[TranscriptSegment, ...]:
