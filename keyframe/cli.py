@@ -145,16 +145,27 @@ def cmd_install_skills(args):
         print("  Install Claude Code or Codex CLI first.")
 
 
+def _resolve_out_dir(video: Path, output: str | None) -> Path:
+    """Resolve the output directory for an extraction run.
+
+    When ``--output`` is not given, default to a folder next to the input file
+    (``<input-dir>/<stem>_extracted``). Fall back to ``/tmp`` when the input
+    file's folder isn't writable.
+    """
+    if output:
+        return Path(output)
+    if os.access(video.parent, os.W_OK):
+        return video.parent / f"{video.stem}_extracted"
+    return Path("/tmp") / f"{video.stem}_extracted"
+
+
 def cmd_extract(args):
     video = Path(args.video)
     if not video.exists():
         print(f"Error: file not found: {args.video}", file=sys.stderr)
         sys.exit(1)
 
-    if args.output:
-        out_dir = Path(args.output)
-    else:
-        out_dir = Path("/tmp") / f"{video.stem}_extracted"
+    out_dir = _resolve_out_dir(video, args.output)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output: {out_dir.resolve()}\n")
@@ -286,7 +297,8 @@ def main():
 def _add_extract_args(parser):
     parser.add_argument("video", nargs="?", help="Path to input video/audio file")
     parser.add_argument("--output", "-o", default=None,
-                        help="Output directory (default: /tmp/<video>_extracted/)")
+                        help="Output directory (default: <input-file-folder>/<video>_extracted/, "
+                             "falls back to /tmp if that folder isn't writable)")
 
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--frames-only", action="store_true",
