@@ -145,18 +145,38 @@ def cmd_install_skills(args):
         print("  Install Claude Code or Codex CLI first.")
 
 
+def _resolve_out_dir(video: Path, output: str | None) -> Path:
+    """Resolve and create the output directory for an extraction run.
+
+    When ``--output`` is not given, default to a folder next to the input file
+    (``<input-file-folder>/<stem>_extracted``). If that folder isn't writable,
+    fall back to ``/tmp``. An explicit ``--output`` is always honored verbatim.
+
+    The directory is created here so the fallback triggers on the actual failure
+    (EAFP) rather than a separate, advisory ``os.access`` pre-check.
+    """
+    if output:
+        out_dir = Path(output)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return out_dir
+
+    preferred = video.parent / f"{video.stem}_extracted"
+    try:
+        preferred.mkdir(parents=True, exist_ok=True)
+        return preferred
+    except OSError:
+        fallback = Path("/tmp") / f"{video.stem}_extracted"
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+
 def cmd_extract(args):
     video = Path(args.video)
     if not video.exists():
         print(f"Error: file not found: {args.video}", file=sys.stderr)
         sys.exit(1)
 
-    if args.output:
-        out_dir = Path(args.output)
-    else:
-        out_dir = Path("/tmp") / f"{video.stem}_extracted"
-
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = _resolve_out_dir(video, args.output)
     print(f"Output: {out_dir.resolve()}\n")
 
     t0 = time.time()
@@ -286,7 +306,8 @@ def main():
 def _add_extract_args(parser):
     parser.add_argument("video", nargs="?", help="Path to input video/audio file")
     parser.add_argument("--output", "-o", default=None,
-                        help="Output directory (default: /tmp/<video>_extracted/)")
+                        help="Output directory (default: <input-file-folder>/<video>_extracted/, "
+                             "falls back to /tmp if that folder isn't writable)")
 
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--frames-only", action="store_true",
