@@ -146,17 +146,28 @@ def cmd_install_skills(args):
 
 
 def _resolve_out_dir(video: Path, output: str | None) -> Path:
-    """Resolve the output directory for an extraction run.
+    """Resolve and create the output directory for an extraction run.
 
     When ``--output`` is not given, default to a folder next to the input file
-    (``<input-dir>/<stem>_extracted``). Fall back to ``/tmp`` when the input
-    file's folder isn't writable.
+    (``<input-file-folder>/<stem>_extracted``). If that folder isn't writable,
+    fall back to ``/tmp``. An explicit ``--output`` is always honored verbatim.
+
+    The directory is created here so the fallback triggers on the actual failure
+    (EAFP) rather than a separate, advisory ``os.access`` pre-check.
     """
     if output:
-        return Path(output)
-    if os.access(video.parent, os.W_OK):
-        return video.parent / f"{video.stem}_extracted"
-    return Path("/tmp") / f"{video.stem}_extracted"
+        out_dir = Path(output)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return out_dir
+
+    preferred = video.parent / f"{video.stem}_extracted"
+    try:
+        preferred.mkdir(parents=True, exist_ok=True)
+        return preferred
+    except OSError:
+        fallback = Path("/tmp") / f"{video.stem}_extracted"
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
 
 
 def cmd_extract(args):
@@ -166,8 +177,6 @@ def cmd_extract(args):
         sys.exit(1)
 
     out_dir = _resolve_out_dir(video, args.output)
-
-    out_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output: {out_dir.resolve()}\n")
 
     t0 = time.time()
