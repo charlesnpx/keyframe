@@ -40,6 +40,7 @@ from keyframe.visual import (
 _MAX_SINGLE_FRAME_BYTES = 64 * 1024 * 1024
 _MAX_CLIP_BATCH_BYTES = 64 * 1024 * 1024
 _MIN_TMPFS_HEADROOM_BYTES = 512 * 1024 * 1024
+_CLUSTER_WORKER_OVERHEAD_BYTES = 256 * 1024 * 1024
 
 
 class FramePipelineMemoryError(RuntimeError):
@@ -473,6 +474,19 @@ def _cluster_worker(embeddings: np.ndarray, n_clusters: int, memory_limit_bytes:
         queue.put(("error", f"{type(exc).__name__}: {exc}"))
 
 
+def _receive_worker_result(worker: Any, queue: Any) -> tuple[str, Any]:
+    """Drain the queue before joining so a large result cannot deadlock exit."""
+    while True:
+        try:
+            return queue.get(timeout=0.25)
+        except Empty:
+            if not worker.is_alive():
+                worker.join()
+                raise ClusteringWorkerError(
+                    f"average-linkage worker exited unexpectedly (status {worker.exitcode})"
+                )
+
+
 def average_linkage_labels(
     embeddings: np.ndarray,
     n_clusters: int,
@@ -490,9 +504,10 @@ def average_linkage_labels(
     # quadratic allocation from being attempted in the parent process.
     estimated = int(embeddings.nbytes) + (rows * rows * 16)
     limit = int(max_memory_mb) * 1024 * 1024
-    if estimated > limit:
+    admitted_peak = estimated + _CLUSTER_WORKER_OVERHEAD_BYTES
+    if admitted_peak > limit:
         raise ClusteringWorkerError(
-            f"average-linkage for {rows} samples needs about {estimated / (1024 * 1024):.1f} MiB, "
+            f"average-linkage for {rows} samples needs about {admitted_peak / (1024 * 1024):.1f} MiB, "
             f"above max_clustering_memory_mb={max_memory_mb}"
         )
 
@@ -504,19 +519,19 @@ def average_linkage_labels(
         daemon=True,
     )
     worker.start()
-    worker.join()
     try:
+        status, payload = _receive_worker_result(worker, queue)
+        worker.join()
         if worker.exitcode != 0:
             raise ClusteringWorkerError(
                 f"average-linkage worker exited unexpectedly (status {worker.exitcode})"
             )
-        try:
-            status, payload = queue.get(timeout=1)
-        except Empty as exc:
-            raise ClusteringWorkerError("average-linkage worker returned no result") from exc
         if status != "ok":
             raise ClusteringWorkerError(f"average-linkage worker failed: {payload}")
         return np.asarray(payload, dtype=np.int64)
     finally:
+        if worker.is_alive():
+            worker.terminate()
+        worker.join()
         queue.close()
         queue.join_thread()

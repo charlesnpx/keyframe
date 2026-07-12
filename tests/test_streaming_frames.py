@@ -9,7 +9,9 @@ import pytest
 from keyframe.pipeline.config import KeyframeExtractionConfig
 from keyframe.pipeline.streaming import (
     CandidateFrameCache,
+    ClusteringWorkerError,
     FrameCacheError,
+    _receive_worker_result,
     cache_candidate_frames,
     stream_video_features,
 )
@@ -88,3 +90,45 @@ def test_candidate_cache_rejects_union_above_configured_byte_limit(tmp_path):
 def test_pass1_cluster_config_has_a_finite_safety_bound(clusters):
     with pytest.raises(ValueError, match="pass1_clusters"):
         KeyframeExtractionConfig(pass1_clusters=clusters)
+
+
+def test_clustering_result_is_drained_before_the_worker_is_joined():
+    calls = []
+
+    class FakeWorker:
+        exitcode = 0
+
+        def is_alive(self):
+            return True
+
+        def join(self):
+            calls.append("join")
+
+    class FakeQueue:
+        def get(self, timeout):
+            calls.append(("get", timeout))
+            return "ok", np.zeros((1024 * 1024,), dtype=np.int8)
+
+    result = _receive_worker_result(FakeWorker(), FakeQueue())
+
+    assert result[0] == "ok"
+    assert calls == [("get", 0.25)]
+
+
+def test_clustering_worker_exit_without_result_is_controlled():
+    class DeadWorker:
+        exitcode = -9
+
+        def is_alive(self):
+            return False
+
+        def join(self):
+            pass
+
+    class EmptyQueue:
+        def get(self, timeout):
+            from queue import Empty
+            raise Empty
+
+    with pytest.raises(ClusteringWorkerError, match="exited unexpectedly"):
+        _receive_worker_result(DeadWorker(), EmptyQueue())
