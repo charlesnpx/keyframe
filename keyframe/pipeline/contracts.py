@@ -11,7 +11,14 @@ if TYPE_CHECKING:
 
 @dataclass
 class FrameStore:
-    frames: list[Any]
+    """An indexed source for the currently retained frame images.
+
+    During pass one this is deliberately empty: only compact metadata is kept.
+    After candidate selection it is replaced with a disk-backed provider that
+    exposes just the bounded candidate union.
+    """
+
+    frames: Any
 
 
 @dataclass
@@ -34,6 +41,10 @@ class SamplingOutput:
 class FeatureOutput:
     dhashes: list[int]
     clip_embeddings: Any
+    frame_metrics: "FrameMetricTable | None" = None
+    source_sharpness: list[float] = field(default_factory=list)
+    pixel_digests: list[str] = field(default_factory=list)
+    frame_sizes: list[tuple[int, int]] = field(default_factory=list)
 
 
 @dataclass

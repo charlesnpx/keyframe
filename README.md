@@ -116,7 +116,10 @@ $keyframe ~/Downloads/meeting-recording.mp4
 | `--frames-only` | | Skip transcript extraction |
 | `--transcript-only` | | Skip frame extraction |
 | `-i, --sample-interval` | `0.5` | Sample one frame every N seconds |
-| `-c, --pass1-clusters` | `15` | CLIP over-segmentation clusters |
+| `-c, --pass1-clusters` | `15` | CLIP over-segmentation clusters (1-64) |
+| `--max-clustering-memory-mb` | `2048` | Memory admission limit for each isolated average-linkage worker |
+| `--max-frame-cache-mb` | `8192` | Maximum size of the temporary, lossless candidate-frame cache |
+| `--frame-cache-dir` | OS temp directory | Override the directory used for the temporary candidate-frame cache |
 | `-t, --similarity-threshold` | `0.85` | Deprecated no-op; deterministic merge vetoes are used |
 | `-w, --whisper-model` | `medium` | Whisper model: tiny/base/small/medium/large |
 | `--transcript-format` | `txt` | Output format: txt/srt/vtt/json |
@@ -126,15 +129,15 @@ $keyframe ~/Downloads/meeting-recording.mp4
 
 ### Key frame extraction (two-pass)
 
-1. **Pass 1 (CLIP + dHash):** Sample frames at 0.5s intervals, compute dHashes, embed with CLIP ViT-B-32, allocate more clusters to visually novel scenes, and pick scored representatives.
+1. **Pass 1 (streaming CLIP + dHash):** Sample frames at 0.5s intervals, compute compact dHash/metric metadata and CLIP vectors in bounded batches, allocate more clusters to visually novel scenes, and pick scored representatives. Source-resolution frames are released immediately.
 
-2. **Pass 2 (Florence-2 + OCR):** Caption the candidates with Florence-2, extract OCR, collapse near-time duplicates, and merge with deterministic OCR/time/transcript vetoes.
+2. **Pass 2 (candidate cache + Florence-2 + OCR):** Re-decode only the finite candidate union into a private, lossless cache under the OS temporary directory (or `--frame-cache-dir`), verify it against the first-pass SHA-256 metadata, then caption and OCR in bounded batches before deterministic dedupe.
 
 Scrolling a data table (visually different but semantically identical) gets collapsed, while a dropdown opening (visually similar but semantically distinct) gets preserved.
 
 ### Transcript extraction
 
-Whisper always provides the transcript text and segment boundaries. When `HF_TOKEN` is set, pyannote detects speakers with `pyannote/speaker-diarization-community-1`, and Keyframe assigns a dominant speaker label to each Whisper segment based on diarization overlap. If `HF_TOKEN` is missing or speaker detection fails, Keyframe warns and keeps the unlabeled Whisper transcript.
+Whisper always provides the transcript text and segment boundaries. When `HF_TOKEN` is set, pyannote detects speakers with `pyannote/speaker-diarization-community-1`, and Keyframe assigns a dominant speaker label to each Whisper segment based on diarization overlap. Speaker detection shows a single 0–100% progress bar after model loading and audio decoding. If `HF_TOKEN` is missing or speaker detection fails, Keyframe warns and keeps the unlabeled Whisper transcript.
 
 Speaker labels use raw pyannote labels such as `SPEAKER_00`. TXT output places the label after the timestamp, SRT/VTT prefix each caption, and JSON includes `speaker` only on labeled segments.
 

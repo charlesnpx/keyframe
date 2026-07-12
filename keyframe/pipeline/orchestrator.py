@@ -52,16 +52,17 @@ def _candidate_batch(stage: str, candidates, metadata: dict[str, Any] | None = N
 def _select_pass1_candidates(
     *,
     clip_emb,
-    frames,
     timestamps,
     frame_indices,
     scenes,
     cluster_allocs,
     dhashes,
     frame_metrics=None,
+    source_sharpness=None,
+    max_clustering_memory_mb: int = 2048,
 ) -> tuple[tuple[CandidateRecord, ...], dict[int, int], dict[int, int]]:
     from keyframe.frames import clip_oversegment
-    from keyframe.visual import laplacian_sharpness
+    from keyframe.pipeline.streaming import average_linkage_labels
 
     all_candidates: list[dict[str, Any]] = []
     sample_clusters: dict[int, int] = {}
@@ -77,19 +78,17 @@ def _select_pass1_candidates(
         scene_emb = clip_emb[s_start:s_end + 1]
         scene_ts = timestamps[s_start:s_end + 1]
         scene_fi = frame_indices[s_start:s_end + 1]
-        scene_frames = frames[s_start:s_end + 1]
         scene_clusters = min(scene_clusters, len(scene_emb))
 
         if scene_clusters < 2 or len(scene_emb) < 2:
             if frame_metrics is not None:
                 best = max(
-                    range(len(scene_frames)),
+                    range(len(scene_emb)),
                     key=lambda i: float(frame_metrics.sharpness[s_start + i]),
                 )
                 sharpness = float(frame_metrics.sharpness[s_start + best])
             else:
-                best = max(range(len(scene_frames)), key=lambda i: laplacian_sharpness(scene_frames[i]))
-                sharpness = laplacian_sharpness(scene_frames[best])
+                raise RuntimeError("streaming proposal selection requires frame metrics")
             all_candidates.append({
                 "sample_idx": s_start + best,
                 "frame_idx": scene_fi[best],
@@ -105,15 +104,26 @@ def _select_pass1_candidates(
             cluster_offset += 1
             continue
 
+        scene_labels = average_linkage_labels(
+            scene_emb,
+            scene_clusters,
+            max_memory_mb=max_clustering_memory_mb,
+        )
         scene_cands, scene_labels = clip_oversegment(
             scene_emb,
             scene_ts,
             scene_fi,
             scene_clusters,
-            scene_frames,
+            frames=None,
             dhashes=dhashes[s_start:s_end + 1],
             max_reps_per_cluster=2,
             return_labels=True,
+            labels=scene_labels,
+            sharpness_values=(
+                source_sharpness[s_start:s_end + 1]
+                if source_sharpness is not None and len(source_sharpness) >= s_end + 1
+                else frame_metrics.sharpness[s_start:s_end + 1]
+            ),
         )
         for local_idx, label in enumerate(scene_labels):
             sample_clusters[s_start + local_idx] = cluster_offset + int(label)
@@ -158,6 +168,55 @@ class SamplingStage:
         )
         ctx.trace.exit(self.name, out)
         return out
+
+
+class StreamingAnalysisStage:
+    """First decode: compact sample metadata and bounded CLIP batches only."""
+
+    name = "streaming_analysis"
+
+    def __init__(self, preloader: Any, device: str):
+        self.preloader = preloader
+        self.device = device
+
+    def run(self, video_path: Path, ctx: RunContext) -> tuple[SamplingOutput, FeatureOutput]:
+        from keyframe.frames import CLIPEncoder
+        from keyframe.pipeline.streaming import stream_video_features
+
+        print("\n── Pass 1: streaming CLIP visual embedding ──")
+        clip = CLIPEncoder(device=self.device, preloaded=self.preloader.get_clip())
+        try:
+            streamed = stream_video_features(
+                video_path,
+                ctx.config.sample_interval,
+                embed_images=lambda batch: clip.embed_images(batch, batch_size=len(batch)),
+            )
+        finally:
+            clip.cleanup()
+            self.preloader.release_clip()
+        if len(streamed.timestamps) < 4:
+            print("Too few frames.", file=sys.stderr)
+            sys.exit(1)
+        sampling = SamplingOutput(
+            frame_store=FrameStore(frames=[]),
+            samples=SampleTable(
+                timestamps=streamed.timestamps,
+                frame_indices=streamed.frame_indices,
+            ),
+        )
+        features = FeatureOutput(
+            dhashes=streamed.dhashes,
+            clip_embeddings=streamed.clip_embeddings,
+            frame_metrics=streamed.frame_metrics,
+            source_sharpness=streamed.source_sharpness,
+            pixel_digests=streamed.pixel_digests,
+            frame_sizes=streamed.frame_sizes,
+        )
+        print(f"  Embedded {len(streamed.timestamps)} frames -> {streamed.clip_embeddings.shape}")
+        ctx.trace.exit("sampling", sampling)
+        ctx.trace.exit("features.dhash", {"dhash_count": len(features.dhashes)})
+        ctx.trace.exit("features.clip", features)
+        return sampling, features
 
 
 class FeatureStage:
@@ -243,23 +302,23 @@ class ProposalStage:
             build_rescue_shortlist,
             rescue_window_seconds,
         )
-        from keyframe.visual import build_frame_metric_table
-
-        frames = sampling.frame_store.frames
         timestamps = sampling.samples.timestamps
         frame_indices = sampling.samples.frame_indices
-        n_clusters = min(ctx.config.pass1_clusters, len(frames) // 2)
-        frame_metrics = build_frame_metric_table(frames, timestamps, frame_indices)
+        n_clusters = min(ctx.config.pass1_clusters, len(timestamps) // 2)
+        frame_metrics = features.frame_metrics
+        if frame_metrics is None:
+            raise RuntimeError("streaming proposal selection requires frame metrics")
 
         candidates, sample_clusters, sample_scenes = _select_pass1_candidates(
             clip_emb=features.clip_embeddings,
-            frames=frames,
             timestamps=timestamps,
             frame_indices=frame_indices,
             scenes=temporal.scenes,
             cluster_allocs=temporal.cluster_allocs,
             dhashes=features.dhashes,
             frame_metrics=frame_metrics,
+            source_sharpness=features.source_sharpness,
+            max_clustering_memory_mb=ctx.config.max_clustering_memory_mb,
         )
         temporal.sample_clusters = sample_clusters
         temporal.sample_scenes = sample_scenes
@@ -308,7 +367,7 @@ class ProposalStage:
             scene_count,
             legacy_proxy_dropped_count,
         ) = build_rescue_shortlist(
-            frames,
+            None,
             timestamps,
             frame_indices,
             candidates,
@@ -316,6 +375,7 @@ class ProposalStage:
             sample_clusters=sample_clusters,
             sample_scenes=sample_scenes,
             frame_metrics=frame_metrics,
+            frame_count=len(timestamps),
         )
         candidates = tuple(
             cand.with_selection(proxy_content_score=float(proxy_rows[int(cand.sample_idx)]["proxy_content_score"]))
@@ -644,8 +704,7 @@ class OutputStage:
         from keyframe.manifest import write_manifest
 
         frames = sampling.frame_store.frames
-        selected_imgs = {cand.sample_idx: frames[cand.sample_idx] for cand in final}
-        caption_log_path = save_results(final, selected_imgs, output_dir)
+        caption_log_path = save_results(final, frames, output_dir)
         manifest_metadata = {
             "scene_coalescence": temporal.scene_coalescence,
             "output_cap": {
@@ -726,13 +785,35 @@ def extract_keyframes(
     t0 = time.time()
     pipeline_trace_path: Path | None = None
     debug_qa_trace_path: Path | None = None
+    frame_cache = None
 
     try:
-        sampling = SamplingStage().run(video_path, ctx)
-        features = FeatureStage(preloader, device).run(sampling, ctx)
+        sampling, features = StreamingAnalysisStage(preloader, device).run(video_path, ctx)
         temporal = TemporalStage().run(video_path, sampling, features, ctx)
         proposal = ProposalStage().run(sampling, features, temporal, ctx)
         pre_rescue_candidate_count = len(proposal.candidates)
+
+        # The second decode is intentionally delayed until selection has
+        # reduced the source video to its finite pass-1/rescue candidate union.
+        # From here onward every image access is lazy and disk-backed.
+        from keyframe.pipeline.streaming import CandidateFrameCache, cache_candidate_frames
+
+        candidate_union = {
+            int(candidate.sample_idx)
+            for candidate in (*proposal.candidates, *proposal.rescue_shortlist)
+        }
+        frame_cache = CandidateFrameCache(
+            cache_root=cfg.frame_cache_dir,
+            max_bytes=int(cfg.max_frame_cache_mb) * 1024 * 1024,
+        )
+        sampling.frame_store.frames = cache_candidate_frames(
+            video_path,
+            cfg.sample_interval,
+            candidate_indices=candidate_union,
+            frame_sizes=features.frame_sizes,
+            pixel_digests=features.pixel_digests,
+            cache=frame_cache,
+        )
 
         RescueEvidenceStage(preloader).run(proposal, sampling, ctx)
         candidates = RescueSelectionStage().run(proposal, sampling, features, ctx)
@@ -819,6 +900,8 @@ def extract_keyframes(
             debug_qa_trace_path=debug_qa_trace_path,
         )
     finally:
+        if frame_cache is not None:
+            frame_cache.cleanup()
         preloader.shutdown()
         gc.collect()
         _empty_cache(device)

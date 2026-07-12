@@ -230,7 +230,7 @@ def assign_temporal_window_ids(
 
 
 def build_rescue_shortlist(
-    frames: Sequence[Image.Image],
+    frames: Sequence[Image.Image] | None,
     timestamps: Sequence[float],
     frame_indices: Sequence[int],
     candidates: Sequence[Mapping[str, Any] | CandidateRecord],
@@ -239,12 +239,18 @@ def build_rescue_shortlist(
     sample_clusters: Mapping[int, int] | None = None,
     sample_scenes: Mapping[int, int] | None = None,
     frame_metrics: FrameMetricTable | None = None,
+    frame_count: int | None = None,
 ) -> tuple[tuple[CandidateRecord, ...], list[dict[str, float]], int, int, int, int, int]:
     """Rank non-selected sampled frames for bounded OCR rescue."""
     candidates = _records(candidates)
+    sample_count = len(frames) if frames is not None else int(frame_count or 0)
+    if sample_count != len(timestamps) or sample_count != len(frame_indices):
+        raise ValueError("rescue frame metadata must have matching lengths")
+    if frame_metrics is None and frames is None:
+        raise ValueError("rescue shortlist requires frame metrics when frames are not retained")
     proxy_rows = frame_metrics.to_proxy_rows() if frame_metrics is not None else proxy_content_scores(frames)
     candidate_idxs = {int(c.sample_idx) for c in candidates}
-    eligible_mask = np.ones((len(frames),), dtype=bool)
+    eligible_mask = np.ones((sample_count,), dtype=bool)
     for idx in candidate_idxs:
         if 0 <= idx < len(eligible_mask):
             eligible_mask[idx] = False
@@ -265,8 +271,8 @@ def build_rescue_shortlist(
     if frame_metrics is not None:
         content_deltas = [float(value) for value in frame_metrics.content_prev_delta]
     else:
-        content_deltas = [0.0 for _ in frames]
-        for idx in range(1, len(frames)):
+        content_deltas = [0.0 for _ in range(sample_count)]
+        for idx in range(1, sample_count):
             content_deltas[idx] = mean_abs_content_delta(frames[idx - 1], frames[idx])
 
     ranked: list[dict[str, Any]] = []
@@ -344,7 +350,7 @@ def build_rescue_shortlist(
     def build_content_area_delta_lane() -> list[dict[str, Any]]:
         lane: list[dict[str, Any]] = []
         selected: set[int] = set()
-        if len(frames) < 3:
+        if sample_count < 3:
             return lane
         meaningful = [delta for delta in content_deltas if delta >= 3.0]
         if not meaningful:
@@ -352,7 +358,7 @@ def build_rescue_shortlist(
         threshold = max(3.0, float(np.percentile(meaningful, 70)))
         rows_by_idx = {int(row["sample_idx"]): row for row in ranked}
         scored: list[tuple[float, dict[str, Any]]] = []
-        for idx in range(1, len(frames) - 1):
+        for idx in range(1, sample_count - 1):
             if not eligible_mask[idx] or idx not in rows_by_idx:
                 continue
             prev_delta = float(content_deltas[idx])

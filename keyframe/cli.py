@@ -203,6 +203,13 @@ def cmd_extract(args):
                 pass1_clusters=args.pass1_clusters,
                 similarity_threshold=args.similarity_threshold,
                 max_output_frames=getattr(args, "max_output_frames", None),
+                max_clustering_memory_mb=getattr(args, "max_clustering_memory_mb", 2048),
+                max_frame_cache_mb=getattr(args, "max_frame_cache_mb", 8192),
+                frame_cache_dir=(
+                    Path(args.frame_cache_dir)
+                    if getattr(args, "frame_cache_dir", None)
+                    else None
+                ),
                 verbose_trace=bool(getattr(args, "verbose_trace", False)),
                 debug_qa_targets_path=(
                     Path(args.debug_qa_targets)
@@ -318,7 +325,13 @@ def _add_extract_args(parser):
     parser.add_argument("--sample-interval", "-i", type=float, default=0.5,
                         help="Sample one frame every N seconds (default: 0.5)")
     parser.add_argument("--pass1-clusters", "-c", type=int, default=15,
-                        help="Number of CLIP clusters in pass 1 (default: 15)")
+                        help="Number of CLIP clusters in pass 1 (1-64, default: 15)")
+    parser.add_argument("--max-clustering-memory-mb", type=int, default=2048,
+                        help="Maximum memory admitted for an isolated clustering worker (default: 2048)")
+    parser.add_argument("--max-frame-cache-mb", type=int, default=8192,
+                        help="Maximum lossless candidate cache size in MiB (default: 8192)")
+    parser.add_argument("--frame-cache-dir", default=None,
+                        help="Directory for temporary candidate frames (default: the OS temp directory)")
     parser.add_argument("--similarity-threshold", "-t", type=float, default=0.85,
                         help="Deprecated no-op; deterministic merge vetoes are used")
     parser.add_argument("--max-output-frames", type=int, default=None,

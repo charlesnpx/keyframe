@@ -597,7 +597,11 @@ def filter_low_information_candidates(
             if image is None:
                 survivors.append(row.with_selection(low_information_filter_reason="no_frame"))
                 continue
-            metrics = visual_information_score(image)
+            try:
+                metrics = visual_information_score(image)
+            finally:
+                if getattr(frames, "is_disk_backed", False):
+                    image.close()
         generic_sparse_transition = (
             not has_evidence
             and _is_generic_screen_transition(row)
@@ -741,7 +745,12 @@ def content_area_duplicate_veto(
             if left_image is None or right_image is None:
                 survivors.append(row)
                 continue
-            delta = mean_abs_content_delta(left_image, right_image)
+            try:
+                delta = mean_abs_content_delta(left_image, right_image)
+            finally:
+                if getattr(frames, "is_disk_backed", False):
+                    left_image.close()
+                    right_image.close()
         if delta > max_mean_abs_delta:
             survivors.append(row)
             continue

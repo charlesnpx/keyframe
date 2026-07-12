@@ -12,8 +12,19 @@ class KeyframeExtractionConfig:
     similarity_threshold: float = 0.85
     max_output_frames: int | None = None
     device: str | None = None
+    max_clustering_memory_mb: int = 2048
+    max_frame_cache_mb: int = 8192
+    frame_cache_dir: Path | None = None
     verbose_trace: bool = False
     debug_qa_targets_path: Path | None = None
+
+    def __post_init__(self) -> None:
+        if not 1 <= int(self.pass1_clusters) <= 64:
+            raise ValueError("pass1_clusters must be between 1 and 64")
+        if int(self.max_clustering_memory_mb) <= 0:
+            raise ValueError("max_clustering_memory_mb must be positive")
+        if int(self.max_frame_cache_mb) <= 0:
+            raise ValueError("max_frame_cache_mb must be positive")
 
 
 @dataclass
