@@ -42,6 +42,7 @@ class FeatureOutput:
     dhashes: list[int]
     clip_embeddings: Any
     frame_metrics: "FrameMetricTable | None" = None
+    source_sharpness: list[float] = field(default_factory=list)
     pixel_digests: list[str] = field(default_factory=list)
     frame_sizes: list[tuple[int, int]] = field(default_factory=list)
 

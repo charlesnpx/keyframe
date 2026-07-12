@@ -17,6 +17,7 @@ import errno
 from pathlib import Path
 import shutil
 import tempfile
+import time
 from typing import Any, Callable
 from queue import Empty
 
@@ -41,6 +42,8 @@ _MAX_SINGLE_FRAME_BYTES = 64 * 1024 * 1024
 _MAX_CLIP_BATCH_BYTES = 64 * 1024 * 1024
 _MIN_TMPFS_HEADROOM_BYTES = 512 * 1024 * 1024
 _CLUSTER_WORKER_OVERHEAD_BYTES = 256 * 1024 * 1024
+_MIN_CLUSTER_WORKER_TIMEOUT_SECONDS = 30.0
+_MAX_CLUSTER_WORKER_TIMEOUT_SECONDS = 600.0
 
 
 class FramePipelineMemoryError(RuntimeError):
@@ -62,6 +65,7 @@ class StreamedFeatures:
     dhashes: list[int]
     pixel_digests: list[str]
     frame_sizes: list[tuple[int, int]]
+    source_sharpness: list[float]
     clip_embeddings: np.ndarray
     frame_metrics: FrameMetricTable
 
@@ -97,6 +101,7 @@ def _stream_metric_row(image: Image.Image) -> dict[str, float]:
         "visual_bright_ratio": float(table.visual_bright_ratio[0]),
         "visual_entropy": float(table.visual_entropy[0]),
         "visual_unique_buckets": float(table.visual_unique_buckets[0]),
+        "sharpness": float(table.sharpness[0]),
     }
 
 
@@ -135,6 +140,7 @@ def stream_video_features(
         dhashes: list[int] = []
         pixel_digests: list[str] = []
         frame_sizes: list[tuple[int, int]] = []
+        source_sharpness: list[float] = []
         metric_rows: list[dict[str, float]] = []
         content_prev_delta: list[float] = []
         embeddings: list[np.ndarray] = []
@@ -178,11 +184,11 @@ def stream_video_features(
             pixel_digests.append(_rgb_digest(image))
             frame_sizes.append((int(width_now), int(height_now)))
             row = _stream_metric_row(image)
-            # Representative selection historically used the source-resolution
-            # Laplacian score, so retain that scalar rather than changing the
-            # algorithm to the compact metric-table approximation.
-            row["sharpness"] = float(laplacian_sharpness(image))
             metric_rows.append(row)
+            # clip_oversegment historically used source-resolution sharpness,
+            # while a one-cluster scene used the compact FrameMetricTable
+            # score. Retain both scalar forms without retaining the image.
+            source_sharpness.append(float(laplacian_sharpness(image)))
             content = np.asarray(
                 content_crop(image).convert("L").resize((160, 90), Image.Resampling.BILINEAR),
                 dtype=np.float32,
@@ -219,6 +225,7 @@ def stream_video_features(
             dhashes=dhashes,
             pixel_digests=pixel_digests,
             frame_sizes=frame_sizes,
+            source_sharpness=source_sharpness,
             clip_embeddings=clip_embeddings,
             frame_metrics=metrics,
         )
@@ -474,8 +481,9 @@ def _cluster_worker(embeddings: np.ndarray, n_clusters: int, memory_limit_bytes:
         queue.put(("error", f"{type(exc).__name__}: {exc}"))
 
 
-def _receive_worker_result(worker: Any, queue: Any) -> tuple[str, Any]:
+def _receive_worker_result(worker: Any, queue: Any, *, timeout_seconds: float) -> tuple[str, Any]:
     """Drain the queue before joining so a large result cannot deadlock exit."""
+    deadline = time.monotonic() + float(timeout_seconds)
     while True:
         try:
             return queue.get(timeout=0.25)
@@ -484,6 +492,10 @@ def _receive_worker_result(worker: Any, queue: Any) -> tuple[str, Any]:
                 worker.join()
                 raise ClusteringWorkerError(
                     f"average-linkage worker exited unexpectedly (status {worker.exitcode})"
+                )
+            if time.monotonic() >= deadline:
+                raise ClusteringWorkerError(
+                    f"average-linkage worker timed out after {timeout_seconds:.1f}s"
                 )
 
 
@@ -520,7 +532,15 @@ def average_linkage_labels(
     )
     worker.start()
     try:
-        status, payload = _receive_worker_result(worker, queue)
+        timeout_seconds = min(
+            _MAX_CLUSTER_WORKER_TIMEOUT_SECONDS,
+            max(_MIN_CLUSTER_WORKER_TIMEOUT_SECONDS, 30.0 + rows * 0.02),
+        )
+        status, payload = _receive_worker_result(
+            worker,
+            queue,
+            timeout_seconds=timeout_seconds,
+        )
         worker.join()
         if worker.exitcode != 0:
             raise ClusteringWorkerError(

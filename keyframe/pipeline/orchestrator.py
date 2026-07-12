@@ -58,6 +58,7 @@ def _select_pass1_candidates(
     cluster_allocs,
     dhashes,
     frame_metrics=None,
+    source_sharpness=None,
     max_clustering_memory_mb: int = 2048,
 ) -> tuple[tuple[CandidateRecord, ...], dict[int, int], dict[int, int]]:
     from keyframe.frames import clip_oversegment
@@ -119,9 +120,9 @@ def _select_pass1_candidates(
             return_labels=True,
             labels=scene_labels,
             sharpness_values=(
-                frame_metrics.sharpness[s_start:s_end + 1]
-                if frame_metrics is not None
-                else None
+                source_sharpness[s_start:s_end + 1]
+                if source_sharpness is not None and len(source_sharpness) >= s_end + 1
+                else frame_metrics.sharpness[s_start:s_end + 1]
             ),
         )
         for local_idx, label in enumerate(scene_labels):
@@ -207,6 +208,7 @@ class StreamingAnalysisStage:
             dhashes=streamed.dhashes,
             clip_embeddings=streamed.clip_embeddings,
             frame_metrics=streamed.frame_metrics,
+            source_sharpness=streamed.source_sharpness,
             pixel_digests=streamed.pixel_digests,
             frame_sizes=streamed.frame_sizes,
         )
@@ -315,6 +317,7 @@ class ProposalStage:
             cluster_allocs=temporal.cluster_allocs,
             dhashes=features.dhashes,
             frame_metrics=frame_metrics,
+            source_sharpness=features.source_sharpness,
             max_clustering_memory_mb=ctx.config.max_clustering_memory_mb,
         )
         temporal.sample_clusters = sample_clusters

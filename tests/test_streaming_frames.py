@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import cv2
@@ -12,6 +13,7 @@ from keyframe.pipeline.streaming import (
     ClusteringWorkerError,
     FrameCacheError,
     _receive_worker_result,
+    average_linkage_labels,
     cache_candidate_frames,
     stream_video_features,
 )
@@ -109,7 +111,7 @@ def test_clustering_result_is_drained_before_the_worker_is_joined():
             calls.append(("get", timeout))
             return "ok", np.zeros((1024 * 1024,), dtype=np.int8)
 
-    result = _receive_worker_result(FakeWorker(), FakeQueue())
+    result = _receive_worker_result(FakeWorker(), FakeQueue(), timeout_seconds=1)
 
     assert result[0] == "ok"
     assert calls == [("get", 0.25)]
@@ -131,4 +133,37 @@ def test_clustering_worker_exit_without_result_is_controlled():
             raise Empty
 
     with pytest.raises(ClusteringWorkerError, match="exited unexpectedly"):
-        _receive_worker_result(DeadWorker(), EmptyQueue())
+        _receive_worker_result(DeadWorker(), EmptyQueue(), timeout_seconds=1)
+
+
+def test_clustering_worker_timeout_is_controlled(monkeypatch):
+    class LiveWorker:
+        def is_alive(self):
+            return True
+
+        def join(self):
+            pass
+
+    class EmptyQueue:
+        def get(self, timeout):
+            from queue import Empty
+            raise Empty
+
+    clock = iter((0.0, 2.0))
+    monkeypatch.setattr("keyframe.pipeline.streaming.time.monotonic", lambda: next(clock))
+
+    with pytest.raises(ClusteringWorkerError, match="timed out"):
+        _receive_worker_result(LiveWorker(), EmptyQueue(), timeout_seconds=1)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="isolated worker regression test requires Unix process limits")
+def test_average_linkage_uses_a_spawned_worker_and_returns_labels():
+    embeddings = np.asarray(
+        [[1.0, 0.0], [0.9, 0.1], [0.0, 1.0], [0.1, 0.9]],
+        dtype=np.float32,
+    )
+
+    labels = average_linkage_labels(embeddings, 2, max_memory_mb=2048)
+
+    assert labels.shape == (4,)
+    assert len(set(labels.tolist())) == 2
