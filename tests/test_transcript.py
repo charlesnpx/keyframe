@@ -258,8 +258,11 @@ def test_detect_speakers_uses_only_whisperx_audio_and_pyannote(monkeypatch, tmp_
         def __init__(self, model_name, token, device):
             calls.append(("diarization_init", model_name, token, device))
 
-        def __call__(self, audio):
+        def __call__(self, audio, progress_callback=None):
             calls.append(("diarize", audio))
+            if progress_callback is not None:
+                progress_callback(25)
+                progress_callback(100)
             return [{"start": 0, "end": 1, "speaker": " SPEAKER_00 "}]
 
     fake_whisperx = ModuleType("whisperx")
@@ -290,6 +293,52 @@ def test_detect_speakers_uses_only_whisperx_audio_and_pyannote(monkeypatch, tmp_
         ("diarization_init", "pyannote/speaker-diarization-community-1", "hf_test", "cpu"),
         ("diarize", "audio"),
     ]
+
+
+def test_detect_speakers_reports_monotonic_progress_and_closes_bar(monkeypatch, tmp_path):
+    video = _video(tmp_path)
+    updates = []
+    closed = []
+
+    class FakeProgress:
+        def __init__(self, **kwargs):
+            assert kwargs["total"] == 100
+            assert kwargs["desc"] == "Detecting speakers"
+
+        def update(self, amount):
+            updates.append(amount)
+
+        def close(self):
+            closed.append(True)
+
+    class FakeDiarizationPipeline:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __call__(self, _audio, progress_callback=None):
+            progress_callback(20)
+            progress_callback(10)  # WhisperX callbacks may be repeated.
+            progress_callback(80)
+            progress_callback(100)
+            return [{"start": 0, "end": 1, "speaker": "SPEAKER_00"}]
+
+    fake_whisperx = ModuleType("whisperx")
+    fake_whisperx.__path__ = []
+    fake_whisperx.load_audio = lambda _path: "audio"
+    monkeypatch.setitem(sys.modules, "whisperx", fake_whisperx)
+    monkeypatch.setitem(
+        sys.modules,
+        "whisperx.diarize",
+        SimpleNamespace(DiarizationPipeline=FakeDiarizationPipeline),
+    )
+    monkeypatch.setitem(sys.modules, "tqdm", SimpleNamespace(tqdm=FakeProgress))
+    monkeypatch.setattr(transcript, "_select_whisperx_device", lambda: ("cpu", "int8"))
+
+    rows = transcript._detect_speakers(video, "hf_test")
+
+    assert rows == (transcript.DiarizationRow(0, 1, "SPEAKER_00"),)
+    assert updates == [20.0, 60.0, 20.0]
+    assert closed == [True]
 
 
 def test_assign_speakers_uses_largest_summed_overlap():

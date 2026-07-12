@@ -258,6 +258,11 @@ class FrameMetricTable:
             return 0.0
         if abs(left - right) == 1:
             return float(self.content_next_delta[min(left, right)])
+        # Streaming analysis intentionally retains scalar metrics rather than
+        # an N×90×160 image stack.  The caller can lazily read the two bounded
+        # candidate images from its disk cache for non-adjacent comparisons.
+        if self.content_gray_stack.shape[0] != self.sample_count:
+            return None
         return float(np.mean(np.abs(self.content_gray_stack[left] - self.content_gray_stack[right])))
 
     def summary(self) -> dict[str, Any]:
@@ -271,6 +276,78 @@ class FrameMetricTable:
             "proxy_content_score_max": proxy_max,
             "content_area_delta_score_max": delta_max,
         }
+
+
+def build_compact_frame_metric_table(
+    rows: Sequence[dict[str, float]],
+    *,
+    timestamps: Sequence[float],
+    frame_indices: Sequence[int],
+    content_prev_delta: Sequence[float],
+    content_next_delta: Sequence[float],
+) -> FrameMetricTable:
+    """Build the normal metric-table scalars without retaining image stacks.
+
+    The old helper accepts a list of full images and is still retained for
+    focused unit tests and callers that already have a small image list.  The
+    streaming path supplies equivalent per-frame scalar observations instead.
+    """
+    sample_count = len(rows)
+    if not (
+        len(timestamps) == len(frame_indices) == len(content_prev_delta) == len(content_next_delta) == sample_count
+    ):
+        raise ValueError("compact metric inputs must have matching lengths")
+
+    def values(name: str) -> np.ndarray:
+        return np.asarray([float(row.get(name, 0.0)) for row in rows], dtype=np.float32)
+
+    textline = values("textline_score")
+    edge = values("edge_score")
+    entropy = values("entropy")
+    dark = values("dark_ratio")
+    bright = values("bright_ratio")
+    normalized_textline = _normalize_array(textline)
+    normalized_edge = _normalize_array(edge)
+    normalized_entropy = _normalize_array(entropy)
+    blank_penalty = (
+        0.5 * np.maximum(0.0, dark - 0.7)
+        + 0.5 * np.maximum(0.0, bright - 0.7)
+    ).astype(np.float32)
+    proxy = np.clip(
+        0.45 * normalized_textline + 0.30 * normalized_edge + 0.25 * normalized_entropy - blank_penalty,
+        0.0,
+        1.0,
+    ).astype(np.float32)
+    prev = np.asarray(content_prev_delta, dtype=np.float32)
+    next_delta = np.asarray(content_next_delta, dtype=np.float32)
+    empty_stack = np.empty((0, 0, 0), dtype=np.float32)
+    return FrameMetricTable(
+        sample_idx=np.arange(sample_count, dtype=np.int64),
+        frame_idx=np.asarray(list(frame_indices), dtype=np.int64),
+        timestamp=np.asarray(list(timestamps), dtype=np.float64),
+        textline_score=textline,
+        edge_score=edge,
+        entropy=entropy,
+        dark_ratio=dark,
+        bright_ratio=bright,
+        normalized_textline_score=normalized_textline,
+        normalized_edge_score=normalized_edge,
+        normalized_entropy=normalized_entropy,
+        blank_penalty=blank_penalty,
+        proxy_content_score=proxy,
+        content_prev_delta=prev,
+        content_next_delta=next_delta,
+        content_area_delta_score=(np.maximum(prev, next_delta) / 255.0).astype(np.float32),
+        visual_stddev=values("visual_stddev"),
+        visual_edge_score=values("visual_edge_score"),
+        visual_dark_ratio=values("visual_dark_ratio"),
+        visual_bright_ratio=values("visual_bright_ratio"),
+        visual_entropy=values("visual_entropy"),
+        visual_unique_buckets=values("visual_unique_buckets"),
+        sharpness=values("sharpness"),
+        full_gray_stack=empty_stack,
+        content_gray_stack=empty_stack,
+    )
 
 
 def build_frame_metric_table(

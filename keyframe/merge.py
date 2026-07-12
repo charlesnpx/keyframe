@@ -176,9 +176,16 @@ def union_find_merge(
             cand = candidates[idx]
             if cand.selection.candidate_score is not None:
                 return float(cand.selection.candidate_score)
-            sample_idx = int(cand.sample_idx)
-            image = frames[sample_idx]
-            return float(score_candidate_for_rep(cand, image))
+            # Streaming candidates retain sharpness as compact metadata, so
+            # they do not need to materialize a source-resolution image here.
+            if cand.visual.sharpness is not None:
+                return float(score_candidate_for_rep(cand, None))
+            image = frames[int(cand.sample_idx)]
+            try:
+                return float(score_candidate_for_rep(cand, image))
+            finally:
+                if getattr(frames, "is_disk_backed", False):
+                    image.close()
 
         best_idx = max(group_idxs, key=score_idx)
         winner = candidates[best_idx].with_lineage(caption_cluster=int(cid))

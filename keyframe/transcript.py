@@ -343,13 +343,35 @@ def _extract_with_whisper(video: Path, model_name: str) -> tuple[tuple[Transcrip
 def _detect_speakers(video: Path, hf_token: str) -> tuple[DiarizationRow, ...]:
     import whisperx
     from whisperx.diarize import DiarizationPipeline
+    from tqdm import tqdm
 
     device, _compute_type = _select_whisperx_device()
     audio = whisperx.load_audio(str(video))
 
     print("Detecting speakers with pyannote...")
     diarize_model = DiarizationPipeline(PYANNOTE_MODEL, token=hf_token, device=device)
-    return _valid_diarization_rows(diarize_model(audio))
+    progress = tqdm(
+        total=100,
+        desc="Detecting speakers",
+        unit="%",
+        leave=False,
+    )
+    last_progress = 0.0
+
+    def update_progress(percent: float) -> None:
+        nonlocal last_progress
+        try:
+            bounded = min(100.0, max(last_progress, float(percent)))
+        except (TypeError, ValueError):
+            return
+        if bounded > last_progress:
+            progress.update(bounded - last_progress)
+        last_progress = bounded
+
+    try:
+        return _valid_diarization_rows(diarize_model(audio, progress_callback=update_progress))
+    finally:
+        progress.close()
 
 
 def extract_transcript(

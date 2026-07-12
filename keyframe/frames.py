@@ -288,7 +288,7 @@ def clip_oversegment(
     timestamps,
     frame_indices,
     n_clusters,
-    frames,
+    frames=None,
     transcript_density=None,
     dhashes=None,
     max_reps_per_cluster=1,
@@ -296,12 +296,18 @@ def clip_oversegment(
     alt_clip_distance_threshold=0.08,
     alt_sharpness_ratio_floor=0.5,
     return_labels=False,
+    labels=None,
+    sharpness_values=None,
 ):
     print(f"  Over-segmenting into {n_clusters} clusters...")
-    clustering = AgglomerativeClustering(
-        n_clusters=n_clusters, metric="cosine", linkage="average",
-    )
-    labels = clustering.fit_predict(embeddings)
+    if labels is None:
+        clustering = AgglomerativeClustering(
+            n_clusters=n_clusters, metric="cosine", linkage="average",
+        )
+        labels = clustering.fit_predict(embeddings)
+    labels = np.asarray(labels, dtype=np.int64)
+    if len(labels) != len(embeddings):
+        raise ValueError("cluster labels must match the embedding count")
 
     candidates = []
     for cid in range(n_clusters):
@@ -310,7 +316,12 @@ def clip_oversegment(
 
         scored = []
         for idx in idxs:
-            sharpness = _laplacian_sharpness(frames[idx])
+            if sharpness_values is not None:
+                sharpness = float(sharpness_values[idx])
+            elif frames is not None:
+                sharpness = _laplacian_sharpness(frames[idx])
+            else:
+                raise ValueError("frames or sharpness_values are required for representative scoring")
             if dhashes is not None and idx < len(dhashes):
                 left = dhashes[idx - 1] if idx > 0 else dhashes[idx]
                 right = dhashes[idx + 1] if idx + 1 < len(dhashes) else dhashes[idx]
@@ -323,7 +334,7 @@ def clip_oversegment(
                 timestamp=float(timestamps[idx]),
             ).with_visual(sharpness=float(sharpness)).with_selection(end_of_dwell_bonus=float(dwell_bonus))
             density = 0.0 if transcript_density is None else transcript_density.get(idx, 0.0)
-            scored.append((score_candidate_for_rep(cand, frames[idx], density, dwell_bonus), idx, sharpness))
+            scored.append((score_candidate_for_rep(cand, None, density, dwell_bonus), idx, sharpness))
         best_score, best, best_sharpness = max(scored)
 
         selected = [{
@@ -397,7 +408,7 @@ def clip_oversegment(
 
 # ── Pass 2: Florence-2 captioning ──────────────────────────────────────────
 
-def caption_candidates(candidates, frames, device="mps", preloaded=None):
+def caption_candidates(candidates, frames, device="mps", preloaded=None, batch_size=4):
     candidates = candidate_records(candidates)
     print(f"\n── Pass 2: Florence-2 captioning ({len(candidates)} frames) ──")
 
@@ -414,38 +425,45 @@ def caption_candidates(candidates, frames, device="mps", preloaded=None):
 
     prompt = "<MORE_DETAILED_CAPTION>"
 
-    candidate_images = [frames[c.sample_idx] for c in candidates]
-    batch_inputs = processor(
-        text=[prompt] * len(candidates),
-        images=candidate_images,
-        return_tensors="pt",
-        padding=True,
-    ).to(device)
-
-    # Cast pixel inputs to the model's compute dtype (fp16 on CUDA/MPS).
-    model_dtype = next(model.parameters()).dtype
-    if "pixel_values" in batch_inputs and batch_inputs["pixel_values"].dtype != model_dtype:
-        batch_inputs["pixel_values"] = batch_inputs["pixel_values"].to(model_dtype)
-
-    with torch.no_grad():
-        generated_ids = model.generate(
-            **batch_inputs,
-            max_new_tokens=80,
-            do_sample=False,
-        )
-
     captions = []
-    generated_texts = processor.batch_decode(generated_ids, skip_special_tokens=False)
     updated_candidates = []
-    for i, (cand, text) in enumerate(zip(candidates, generated_texts)):
-        img = candidate_images[i]
-        parsed = processor.post_process_generation(
-            text, task=prompt, image_size=(img.width, img.height)
-        )
-        caption = parsed.get(prompt, text)
-        captions.append(caption)
-        updated_candidates.append(cand.with_evidence(caption=caption))
-        print(f"  [{i+1}/{len(candidates)}] {cand.timestamp:5.1f}s -> \"{caption[:120]}\"")
+    owns_images = bool(getattr(frames, "is_disk_backed", False))
+    batch_size = max(1, int(batch_size))
+    for start in range(0, len(candidates), batch_size):
+        batch_candidates = candidates[start:start + batch_size]
+        candidate_images = [frames[c.sample_idx] for c in batch_candidates]
+        try:
+            batch_inputs = processor(
+                text=[prompt] * len(batch_candidates),
+                images=candidate_images,
+                return_tensors="pt",
+                padding=True,
+            ).to(device)
+
+            # Cast pixel inputs to the model's compute dtype (fp16 on CUDA/MPS).
+            model_dtype = next(model.parameters()).dtype
+            if "pixel_values" in batch_inputs and batch_inputs["pixel_values"].dtype != model_dtype:
+                batch_inputs["pixel_values"] = batch_inputs["pixel_values"].to(model_dtype)
+
+            with torch.no_grad():
+                generated_ids = model.generate(
+                    **batch_inputs,
+                    max_new_tokens=80,
+                    do_sample=False,
+                )
+            generated_texts = processor.batch_decode(generated_ids, skip_special_tokens=False)
+            for offset, (cand, text, img) in enumerate(zip(batch_candidates, generated_texts, candidate_images)):
+                parsed = processor.post_process_generation(
+                    text, task=prompt, image_size=(img.width, img.height)
+                )
+                caption = parsed.get(prompt, text)
+                captions.append(caption)
+                updated_candidates.append(cand.with_evidence(caption=caption))
+                print(f"  [{start + offset + 1}/{len(candidates)}] {cand.timestamp:5.1f}s -> \"{caption[:120]}\"")
+        finally:
+            if owns_images:
+                for image in candidate_images:
+                    image.close()
 
     del model, processor
     if device == "mps":
@@ -541,6 +559,7 @@ def ocr_candidates(candidates, frames, preloaded_engine=None):
 
     ocr_texts = []
     updated_candidates = []
+    owns_images = bool(getattr(frames, "is_disk_backed", False))
     for i, cand in enumerate(candidates):
         if cand.evidence.ocr_text is not None:
             raw_text = str(cand.evidence.ocr_text)
@@ -552,7 +571,11 @@ def ocr_candidates(candidates, frames, preloaded_engine=None):
             continue
 
         img = frames[cand.sample_idx]
-        lines = _ocr_apple_vision(img) if use_apple else _ocr_paddle(img, paddle_engine)
+        try:
+            lines = _ocr_apple_vision(img) if use_apple else _ocr_paddle(img, paddle_engine)
+        finally:
+            if owns_images:
+                img.close()
 
         raw_text = " ".join(lines)
         ocr_texts.append(raw_text)
@@ -755,6 +778,7 @@ def save_results(selected, frames, output_dir):
     out.mkdir(parents=True, exist_ok=True)
 
     rows = []
+    owns_images = bool(getattr(frames, "is_disk_backed", False))
     for s in selected:
         if isinstance(s, CandidateRecord):
             ts = s.timestamp
@@ -765,7 +789,12 @@ def save_results(selected, frames, output_dir):
             fidx = s["frame_idx"]
             sample_idx = s["sample_idx"]
         path = out / f"frame_{fidx:06d}_{ts:.2f}s.png"
-        frames[sample_idx].save(str(path))
+        image = frames[sample_idx]
+        try:
+            image.save(str(path))
+        finally:
+            if owns_images:
+                image.close()
         if isinstance(s, CandidateRecord):
             rows.append(candidate_to_caption_log_row(s, path=path))
         else:
@@ -835,7 +864,13 @@ def main():
     parser.add_argument("--sample-interval", "-i", type=float, default=0.5,
                         help="Sample one frame every N seconds (default: 0.5)")
     parser.add_argument("--pass1-clusters", "-c", type=int, default=15,
-                        help="Number of CLIP clusters in pass 1 (default: 15)")
+                        help="Number of CLIP clusters in pass 1 (1-64, default: 15)")
+    parser.add_argument("--max-clustering-memory-mb", type=int, default=2048,
+                        help="Maximum memory admitted for an isolated clustering worker (default: 2048)")
+    parser.add_argument("--max-frame-cache-mb", type=int, default=8192,
+                        help="Maximum lossless candidate cache size in MiB (default: 8192)")
+    parser.add_argument("--frame-cache-dir", default=None,
+                        help="Directory for temporary candidate frames (default: the OS temp directory)")
     parser.add_argument("--similarity-threshold", "-t", type=float, default=0.85,
                         help="Deprecated no-op; deterministic merge vetoes are used")
     parser.add_argument("--max-output-frames", type=int, default=None,
@@ -852,6 +887,9 @@ def main():
             pass1_clusters=args.pass1_clusters,
             similarity_threshold=args.similarity_threshold,
             max_output_frames=args.max_output_frames,
+            max_clustering_memory_mb=args.max_clustering_memory_mb,
+            max_frame_cache_mb=args.max_frame_cache_mb,
+            frame_cache_dir=Path(args.frame_cache_dir) if args.frame_cache_dir else None,
         ),
     )
 
