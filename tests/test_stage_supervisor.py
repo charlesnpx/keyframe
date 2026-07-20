@@ -1,0 +1,473 @@
+from __future__ import annotations
+
+import os
+import signal
+import time
+from pathlib import Path
+
+import pytest
+
+from keyframe import transcript
+from keyframe.stage_supervisor import (
+    DiarizationWorkerRequest,
+    OutputDirectoryLockedError,
+    StageCheckpointError,
+    StageProgress,
+    StageProtocolError,
+    StageSupervisor,
+    StageTerminal,
+    StageWorkerError,
+    SupervisorSignal,
+    TranscriptionWorkerRequest,
+    _close_worker_ipc,
+    diarization_worker_entry,
+    emit_stage_progress,
+    transcription_worker_entry,
+)
+
+
+class _FakeTerminal:
+    def __init__(self):
+        self.messages = []
+        self.closed = False
+
+    def send(self, message):
+        self.messages.append(message)
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeProgressQueue:
+    def __init__(self):
+        self.events = []
+        self.closed = False
+        self.joined = False
+
+    def put_nowait(self, event):
+        self.events.append(event)
+
+    def close(self):
+        self.closed = True
+
+    def join_thread(self):
+        self.joined = True
+
+
+class _FakeEvent:
+    def __init__(self, value=False):
+        self.value = value
+
+    def is_set(self):
+        return self.value
+
+
+def _spawn_test_worker(request, terminal_send, progress_queue, cancellation_event):
+    mode = request["mode"]
+    checkpoint = Path(request["checkpoint"])
+    try:
+        if mode == "crash":
+            os._exit(7)
+        if mode == "block":
+            Path(request["started"]).write_text(str(os.getpid()), encoding="utf-8")
+            while True:
+                time.sleep(0.05)
+        if mode == "missing-terminal":
+            return
+        if mode == "invalid":
+            checkpoint.write_text("not valid JSON", encoding="utf-8")
+        elif request["stage"] == "transcription":
+            transcript.write_raw_transcript_checkpoint(
+                [transcript.TranscriptSegment(0.123456789, 1.987654321, "worker")],
+                checkpoint,
+            )
+        else:
+            transcript.write_diarization_checkpoint(
+                [transcript.DiarizationRow(0.1, 1.9, "SPEAKER_00")],
+                checkpoint,
+            )
+
+        for index in range(request.get("progress_events", 0)):
+            emit_stage_progress(
+                progress_queue,
+                StageProgress(request["stage"], "progress", str(index)),
+            )
+        terminal = StageTerminal.succeeded(
+            request["stage"],
+            {"record_count": 1, "language": "en"},
+        )
+        terminal_send.send(terminal)
+        if mode == "duplicate-terminal":
+            terminal_send.send(terminal)
+    finally:
+        _close_worker_ipc(terminal_send, progress_queue)
+
+
+def _start_test_stage(supervisor, *, stage="transcription", mode="success", **request_values):
+    assert supervisor.staging is not None
+    if stage == "transcription":
+        checkpoint = supervisor.staging.transcript_raw
+        validator = transcript.read_raw_transcript_checkpoint
+    else:
+        checkpoint = supervisor.staging.diarization
+        validator = transcript.read_diarization_checkpoint
+    request = {
+        "stage": stage,
+        "mode": mode,
+        "checkpoint": str(checkpoint),
+        **request_values,
+    }
+    return supervisor._start_stage(
+        stage=stage,
+        target=_spawn_test_worker,
+        request=request,
+        checkpoint_path=checkpoint,
+        validator=validator,
+    )
+
+
+def _wait_for_path(path: Path, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while not path.exists():
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"timed out waiting for {path}")
+        time.sleep(0.01)
+
+
+def test_spawned_worker_is_non_daemon_validated_and_promoted(tmp_path):
+    output = tmp_path / "output"
+    progress = []
+
+    with StageSupervisor(
+        output,
+        progress_callback=progress.append,
+        run_id="success",
+    ) as supervisor:
+        handle = _start_test_stage(
+            supervisor,
+            progress_events=3,
+        )
+        assert handle.process.daemon is False
+
+        completion = supervisor.complete(handle)
+
+        assert completion.stage == "transcription"
+        assert completion.checkpoint_path == output / "transcript.raw.json"
+        assert completion.metadata == {"record_count": 1, "language": "en"}
+        assert completion.records == (
+            transcript.TranscriptSegment(0.123456789, 1.987654321, "worker"),
+        )
+        assert not handle.process.is_alive()
+        assert completion.checkpoint_path.exists()
+        assert not supervisor.staging.transcript_raw.exists()
+
+    assert not (output / "keyframe-run-success").exists()
+    assert (output / "keyframe-output.lock").exists()
+
+
+def test_lossy_progress_cannot_block_reliable_terminal_during_parent_work(tmp_path):
+    output = tmp_path / "output"
+    progress = []
+
+    with StageSupervisor(
+        output,
+        progress_callback=progress.append,
+        progress_capacity=1,
+        run_id="flood",
+    ) as supervisor:
+        handle = _start_test_stage(supervisor, progress_events=10_000)
+
+        # Stand in for synchronous frame extraction while the monitor keeps draining.
+        time.sleep(0.2)
+        completion = supervisor.complete(handle)
+
+    assert completion.metadata["record_count"] == 1
+    assert progress
+    assert len(progress) < 10_000
+
+
+def test_second_supervisor_fails_nonblocking_without_touching_artifacts(tmp_path):
+    output = tmp_path / "output"
+    output.mkdir()
+    sentinel = output / "sentinel.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+
+    with StageSupervisor(output, run_id="first"):
+        before = {path.name for path in output.iterdir()}
+        with pytest.raises(OutputDirectoryLockedError, match="already in use"):
+            with StageSupervisor(output, run_id="second"):
+                pytest.fail("the second supervisor must not acquire the lock")
+        after = {path.name for path in output.iterdir()}
+
+        assert after == before
+        assert sentinel.read_text(encoding="utf-8") == "keep"
+        assert not (output / "keyframe-run-second").exists()
+
+
+def test_nonzero_worker_exit_is_controlled_and_never_promoted(tmp_path):
+    output = tmp_path / "output"
+
+    with StageSupervisor(output, run_id="crash") as supervisor:
+        handle = _start_test_stage(supervisor, mode="crash")
+
+        with pytest.raises(StageWorkerError, match="status 7"):
+            supervisor.complete(handle)
+
+        assert not (output / "transcript.raw.json").exists()
+
+
+def test_successful_exit_without_terminal_message_is_protocol_error(tmp_path):
+    output = tmp_path / "output"
+
+    with StageSupervisor(output, run_id="missing") as supervisor:
+        handle = _start_test_stage(supervisor, mode="missing-terminal")
+
+        with pytest.raises(StageProtocolError, match="0 terminal messages"):
+            supervisor.complete(handle)
+
+
+def test_duplicate_terminal_message_is_protocol_error(tmp_path):
+    output = tmp_path / "output"
+
+    with StageSupervisor(output, run_id="duplicate") as supervisor:
+        handle = _start_test_stage(supervisor, mode="duplicate-terminal")
+
+        with pytest.raises(StageProtocolError, match="2 terminal messages"):
+            supervisor.complete(handle)
+
+
+def test_invalid_checkpoint_is_rejected_and_previous_public_artifact_survives(tmp_path):
+    output = tmp_path / "output"
+    output.mkdir()
+    public = output / "transcript.raw.json"
+    public.write_text("previous", encoding="utf-8")
+
+    with StageSupervisor(output, run_id="invalid") as supervisor:
+        handle = _start_test_stage(supervisor, mode="invalid")
+
+        with pytest.raises(StageCheckpointError, match="checkpoint is invalid"):
+            supervisor.complete(handle)
+
+        assert public.read_text(encoding="utf-8") == "previous"
+
+    assert not (output / "keyframe-run-invalid").exists()
+
+
+def test_cancel_escalates_joins_and_cleans_current_run(tmp_path):
+    output = tmp_path / "output"
+    started = tmp_path / "worker.pid"
+
+    with StageSupervisor(
+        output,
+        cancellation_grace_seconds=0.05,
+        run_id="cancel",
+    ) as supervisor:
+        handle = _start_test_stage(
+            supervisor,
+            mode="block",
+            started=str(started),
+        )
+        _wait_for_path(started)
+
+        supervisor.cancel(handle)
+
+        assert not handle.process.is_alive()
+        assert handle.process.exitcode is not None
+
+    assert not (output / "keyframe-run-cancel").exists()
+
+
+def test_parent_exception_joins_live_worker_and_cleans_current_run(tmp_path):
+    output = tmp_path / "output"
+    started = tmp_path / "exception-worker.pid"
+    handle = None
+
+    with pytest.raises(RuntimeError, match="parent failed"):
+        with StageSupervisor(
+            output,
+            cancellation_grace_seconds=0.05,
+            run_id="parent-error",
+        ) as supervisor:
+            handle = _start_test_stage(
+                supervisor,
+                mode="block",
+                started=str(started),
+            )
+            _wait_for_path(started)
+            raise RuntimeError("parent failed")
+
+    assert handle is not None
+    assert not handle.process.is_alive()
+    assert not (output / "keyframe-run-parent-error").exists()
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGTERM"), reason="SIGTERM is unavailable")
+def test_sigterm_unwinds_joins_worker_and_restores_handler(tmp_path):
+    output = tmp_path / "output"
+    started = tmp_path / "signal-worker.pid"
+    previous_handler = signal.getsignal(signal.SIGTERM)
+    handle = None
+
+    with pytest.raises(SupervisorSignal):
+        with StageSupervisor(
+            output,
+            cancellation_grace_seconds=0.05,
+            run_id="signal",
+        ) as supervisor:
+            handle = _start_test_stage(
+                supervisor,
+                mode="block",
+                started=str(started),
+            )
+            _wait_for_path(started)
+            os.kill(os.getpid(), signal.SIGTERM)
+
+    assert handle is not None
+    assert not handle.process.is_alive()
+    assert signal.getsignal(signal.SIGTERM) == previous_handler
+    assert not (output / "keyframe-run-signal").exists()
+
+
+def test_committed_raw_transcript_survives_later_diarization_failure(tmp_path):
+    output = tmp_path / "output"
+
+    with StageSupervisor(output, run_id="partial") as supervisor:
+        raw_handle = _start_test_stage(supervisor)
+        raw_completion = supervisor.complete(raw_handle)
+        assert raw_completion.checkpoint_path.exists()
+
+        diarization_handle = _start_test_stage(
+            supervisor,
+            stage="diarization",
+            mode="invalid",
+        )
+        with pytest.raises(StageCheckpointError):
+            supervisor.complete(diarization_handle)
+
+    assert transcript.read_raw_transcript_checkpoint(
+        output / "transcript.raw.json"
+    ) == (transcript.TranscriptSegment(0.123456789, 1.987654321, "worker"),)
+    assert not (output / "diarization.json").exists()
+    assert not (output / "keyframe-run-partial").exists()
+
+
+def test_stale_run_cleanup_is_scoped_and_does_not_follow_symlinks(tmp_path):
+    output = tmp_path / "output"
+    output.mkdir()
+    stale = output / "keyframe-run-stale"
+    stale.mkdir()
+    (stale / "partial.json").write_text("partial", encoding="utf-8")
+    unrelated = output / "keep-me"
+    unrelated.mkdir()
+    external = tmp_path / "external"
+    external.mkdir()
+    run_symlink = output / "keyframe-run-symlink"
+    run_symlink.symlink_to(external, target_is_directory=True)
+
+    with StageSupervisor(output, run_id="current") as supervisor:
+        assert not stale.exists()
+        assert unrelated.exists()
+        assert run_symlink.is_symlink()
+        assert external.exists()
+        assert supervisor.staging.root.exists()
+
+    assert unrelated.exists()
+    assert run_symlink.is_symlink()
+    assert external.exists()
+
+
+def test_transcription_worker_entry_keeps_bulk_result_on_disk(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "transcript.raw.json"
+    terminal = _FakeTerminal()
+    progress = _FakeProgressQueue()
+    cancellation = _FakeEvent()
+    runtime_platform = transcript.RuntimePlatform("Linux", "x86_64", None, 6)
+    monkeypatch.setattr(transcript, "current_runtime_platform", lambda: runtime_platform)
+    monkeypatch.setattr(
+        transcript,
+        "resolve_transcription_backend",
+        lambda *_args, **_kwargs: "whisper",
+    )
+    monkeypatch.setattr(
+        transcript,
+        "_extract_with_transcription_backend",
+        lambda *_args, **_kwargs: (
+            (transcript.TranscriptSegment(0.1, 2.3, "disk backed"),),
+            "en",
+        ),
+    )
+    request = TranscriptionWorkerRequest(
+        video_path=str(tmp_path / "video.mp4"),
+        model_name="medium",
+        requested_backend="auto",
+        checkpoint_path=str(checkpoint),
+    )
+
+    transcription_worker_entry(request, terminal, progress, cancellation)
+
+    assert transcript.read_raw_transcript_checkpoint(checkpoint) == (
+        transcript.TranscriptSegment(0.1, 2.3, "disk backed"),
+    )
+    assert len(terminal.messages) == 1
+    assert terminal.messages[0].metadata == {
+        "language": "en",
+        "segment_count": 1,
+        "requested_backend": "auto",
+        "effective_backend": "whisper",
+    }
+    assert not hasattr(terminal.messages[0], "segments")
+    assert terminal.closed
+    assert progress.closed
+    assert progress.joined
+
+
+def test_diarization_worker_entry_keeps_bulk_result_on_disk(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "diarization.json"
+    terminal = _FakeTerminal()
+    progress = _FakeProgressQueue()
+    cancellation = _FakeEvent()
+    monkeypatch.setattr(
+        transcript,
+        "_detect_speakers",
+        lambda *_args, **_kwargs: (
+            transcript.DiarizationRow(0.1, 2.3, "SPEAKER_00"),
+        ),
+    )
+    request = DiarizationWorkerRequest(
+        video_path=str(tmp_path / "video.mp4"),
+        hf_token=" hf_test ",
+        checkpoint_path=str(checkpoint),
+    )
+
+    diarization_worker_entry(request, terminal, progress, cancellation)
+
+    assert transcript.read_diarization_checkpoint(checkpoint) == (
+        transcript.DiarizationRow(0.1, 2.3, "SPEAKER_00"),
+    )
+    assert terminal.messages == [
+        StageTerminal.succeeded("diarization", {"row_count": 1})
+    ]
+
+
+def test_worker_error_has_reliable_terminal_metadata(tmp_path, monkeypatch):
+    terminal = _FakeTerminal()
+    progress = _FakeProgressQueue()
+    cancellation = _FakeEvent()
+    monkeypatch.setattr(
+        transcript,
+        "_detect_speakers",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("model failed")),
+    )
+    request = DiarizationWorkerRequest(
+        video_path=str(tmp_path / "video.mp4"),
+        hf_token="hf_test",
+        checkpoint_path=str(tmp_path / "diarization.json"),
+    )
+
+    with pytest.raises(RuntimeError, match="model failed"):
+        diarization_worker_entry(request, terminal, progress, cancellation)
+
+    assert len(terminal.messages) == 1
+    assert terminal.messages[0].status == "error"
+    assert terminal.messages[0].error_type == "RuntimeError"
+    assert terminal.messages[0].error_message == "model failed"
