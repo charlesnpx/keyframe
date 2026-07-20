@@ -19,6 +19,7 @@ Models in order of speed -> accuracy:
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import math
 import os
@@ -28,6 +29,8 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+
+from keyframe.artifacts import atomic_write_json, atomic_write_text, reject_path_aliases
 
 
 PYANNOTE_MODEL = "pyannote/speaker-diarization-community-1"
@@ -176,6 +179,14 @@ class DiarizationRow:
     speaker: str
 
 
+class CheckpointValidationError(ValueError):
+    """A transcript-stage checkpoint violates its strict public schema."""
+
+
+RAW_TRANSCRIPT_FIELDS = frozenset({"start", "end", "text"})
+DIARIZATION_FIELDS = frozenset({"start", "end", "speaker"})
+
+
 def format_time(seconds):
     """Format seconds into HH:MM:SS.sss"""
     h = int(seconds // 3600)
@@ -209,37 +220,40 @@ def _as_transcript_segment(seg: Mapping[str, Any] | TranscriptSegment) -> Transc
 
 def write_txt(segments, out_path):
     """Plain text with timestamps."""
-    with open(out_path, "w", encoding="utf-8") as f:
-        for seg in transcript_segments(segments):
-            start = format_time(seg.start)
-            end = format_time(seg.end)
-            text = seg.text
-            speaker = seg.speaker
-            prefix = f"{speaker}  " if speaker else ""
-            f.write(f"[{start} --> {end}]  {prefix}{text}\n")
+    payload = io.StringIO()
+    for seg in transcript_segments(segments):
+        start = format_time(seg.start)
+        end = format_time(seg.end)
+        text = seg.text
+        speaker = seg.speaker
+        prefix = f"{speaker}  " if speaker else ""
+        payload.write(f"[{start} --> {end}]  {prefix}{text}\n")
+    atomic_write_text(out_path, payload.getvalue())
     print(f"Saved: {out_path}")
 
 
 def write_srt(segments, out_path):
     """SubRip subtitle format."""
-    with open(out_path, "w", encoding="utf-8") as f:
-        for i, seg in enumerate(transcript_segments(segments), 1):
-            start = format_srt_time(seg.start)
-            end = format_srt_time(seg.end)
-            text = _caption_text(seg)
-            f.write(f"{i}\n{start} --> {end}\n{text}\n\n")
+    payload = io.StringIO()
+    for i, seg in enumerate(transcript_segments(segments), 1):
+        start = format_srt_time(seg.start)
+        end = format_srt_time(seg.end)
+        text = _caption_text(seg)
+        payload.write(f"{i}\n{start} --> {end}\n{text}\n\n")
+    atomic_write_text(out_path, payload.getvalue())
     print(f"Saved: {out_path}")
 
 
 def write_vtt(segments, out_path):
     """WebVTT subtitle format."""
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write("WEBVTT\n\n")
-        for seg in transcript_segments(segments):
-            start = format_time(seg.start)
-            end = format_time(seg.end)
-            text = _caption_text(seg)
-            f.write(f"{start} --> {end}\n{text}\n\n")
+    payload = io.StringIO()
+    payload.write("WEBVTT\n\n")
+    for seg in transcript_segments(segments):
+        start = format_time(seg.start)
+        end = format_time(seg.end)
+        text = _caption_text(seg)
+        payload.write(f"{start} --> {end}\n{text}\n\n")
+    atomic_write_text(out_path, payload.getvalue())
     print(f"Saved: {out_path}")
 
 
@@ -253,8 +267,7 @@ def write_json(segments, out_path):
         }
         for seg in transcript_segments(segments)
     ]
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    atomic_write_json(out_path, data, allow_nan=True)
     print(f"Saved: {out_path}")
 
 
@@ -300,6 +313,193 @@ def _finite_seconds(value: Any) -> float | None:
     if not math.isfinite(seconds):
         return None
     return seconds
+
+
+def _strict_checkpoint_seconds(
+    value: Any,
+    *,
+    row_index: int,
+    field: str,
+) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise CheckpointValidationError(
+            f"checkpoint row {row_index} field {field!r} must be a number"
+        )
+    seconds = float(value)
+    if not math.isfinite(seconds):
+        raise CheckpointValidationError(
+            f"checkpoint row {row_index} field {field!r} must be finite"
+        )
+    if seconds < 0:
+        raise CheckpointValidationError(
+            f"checkpoint row {row_index} field {field!r} must be non-negative"
+        )
+    return seconds
+
+
+def _raw_transcript_checkpoint_row(
+    row: Mapping[str, Any] | TranscriptSegment,
+    row_index: int,
+) -> dict[str, Any]:
+    if isinstance(row, TranscriptSegment):
+        if row.speaker is not None:
+            raise CheckpointValidationError(
+                f"raw transcript row {row_index} must not contain a speaker"
+            )
+        values = {"start": row.start, "end": row.end, "text": row.text}
+    elif isinstance(row, Mapping):
+        if set(row) != RAW_TRANSCRIPT_FIELDS:
+            raise CheckpointValidationError(
+                f"raw transcript row {row_index} must contain exactly "
+                f"{sorted(RAW_TRANSCRIPT_FIELDS)}"
+            )
+        values = row
+    else:
+        raise CheckpointValidationError(
+            f"raw transcript row {row_index} must be an object"
+        )
+
+    start = _strict_checkpoint_seconds(values.get("start"), row_index=row_index, field="start")
+    end = _strict_checkpoint_seconds(values.get("end"), row_index=row_index, field="end")
+    if end < start:
+        raise CheckpointValidationError(
+            f"raw transcript row {row_index} ends before it starts"
+        )
+    text = values.get("text")
+    if not isinstance(text, str):
+        raise CheckpointValidationError(
+            f"raw transcript row {row_index} field 'text' must be a string"
+        )
+    return {"start": start, "end": end, "text": text.strip()}
+
+
+def _diarization_checkpoint_row(
+    row: Mapping[str, Any] | DiarizationRow,
+    row_index: int,
+) -> dict[str, Any]:
+    if isinstance(row, DiarizationRow):
+        values = {"start": row.start, "end": row.end, "speaker": row.speaker}
+    elif isinstance(row, Mapping):
+        if set(row) != DIARIZATION_FIELDS:
+            raise CheckpointValidationError(
+                f"diarization row {row_index} must contain exactly "
+                f"{sorted(DIARIZATION_FIELDS)}"
+            )
+        values = row
+    else:
+        raise CheckpointValidationError(
+            f"diarization row {row_index} must be an object"
+        )
+
+    start = _strict_checkpoint_seconds(values.get("start"), row_index=row_index, field="start")
+    end = _strict_checkpoint_seconds(values.get("end"), row_index=row_index, field="end")
+    if end <= start:
+        raise CheckpointValidationError(
+            f"diarization row {row_index} must have positive duration"
+        )
+    speaker_value = values.get("speaker")
+    if not isinstance(speaker_value, str):
+        raise CheckpointValidationError(
+            f"diarization row {row_index} field 'speaker' must be a string"
+        )
+    speaker = _normalize_speaker_label(speaker_value)
+    if speaker is None:
+        raise CheckpointValidationError(
+            f"diarization row {row_index} has an empty speaker label"
+        )
+    return {"start": start, "end": end, "speaker": speaker}
+
+
+def _checkpoint_rows(value: Any, *, checkpoint_name: str) -> list[Any]:
+    if not isinstance(value, list):
+        raise CheckpointValidationError(f"{checkpoint_name} checkpoint must be a JSON array")
+    return value
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise CheckpointValidationError(f"duplicate JSON key: {key!r}")
+        value[key] = item
+    return value
+
+
+def _reject_json_constant(value: str) -> None:
+    raise CheckpointValidationError(f"non-finite JSON number: {value}")
+
+
+def _read_checkpoint_json(path: str | Path) -> Any:
+    try:
+        return json.loads(
+            Path(path).read_text(encoding="utf-8"),
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=_reject_json_constant,
+        )
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise CheckpointValidationError(f"invalid checkpoint JSON: {exc}") from exc
+
+
+def write_raw_transcript_checkpoint(
+    segments: Iterable[Mapping[str, Any] | TranscriptSegment],
+    path: str | Path,
+    *,
+    final_output_paths: Iterable[str | Path] = (),
+) -> Path:
+    reject_path_aliases(path, final_output_paths)
+    payload = [
+        _raw_transcript_checkpoint_row(segment, index)
+        for index, segment in enumerate(segments)
+    ]
+    return atomic_write_json(path, payload, allow_nan=False)
+
+
+def read_raw_transcript_checkpoint(
+    path: str | Path,
+    *,
+    final_output_paths: Iterable[str | Path] = (),
+) -> tuple[TranscriptSegment, ...]:
+    reject_path_aliases(path, final_output_paths)
+    rows = _checkpoint_rows(
+        _read_checkpoint_json(path),
+        checkpoint_name="raw transcript",
+    )
+    normalized = [
+        _raw_transcript_checkpoint_row(row, index)
+        for index, row in enumerate(rows)
+    ]
+    return tuple(TranscriptSegment(**row) for row in normalized)
+
+
+def write_diarization_checkpoint(
+    rows: Iterable[Mapping[str, Any] | DiarizationRow],
+    path: str | Path,
+    *,
+    final_output_paths: Iterable[str | Path] = (),
+) -> Path:
+    reject_path_aliases(path, final_output_paths)
+    payload = [
+        _diarization_checkpoint_row(row, index)
+        for index, row in enumerate(rows)
+    ]
+    return atomic_write_json(path, payload, allow_nan=False)
+
+
+def read_diarization_checkpoint(
+    path: str | Path,
+    *,
+    final_output_paths: Iterable[str | Path] = (),
+) -> tuple[DiarizationRow, ...]:
+    reject_path_aliases(path, final_output_paths)
+    rows = _checkpoint_rows(
+        _read_checkpoint_json(path),
+        checkpoint_name="diarization",
+    )
+    normalized = [
+        _diarization_checkpoint_row(row, index)
+        for index, row in enumerate(rows)
+    ]
+    return tuple(DiarizationRow(**row) for row in normalized)
 
 
 def _diarization_records(diarization: Any) -> tuple[Mapping[str, Any], ...]:

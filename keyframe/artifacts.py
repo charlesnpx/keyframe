@@ -1,0 +1,139 @@
+"""Atomic artifact primitives and run-scoped staging paths."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import tempfile
+from collections.abc import Iterable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+
+
+class ArtifactPathCollisionError(ValueError):
+    """Two logical artifacts resolve to the same filesystem target."""
+
+
+@dataclass(frozen=True)
+class RunStagingPaths:
+    output_dir: Path
+    run_id: str
+    root: Path
+    transcript_raw: Path
+    diarization: Path
+
+
+@dataclass(frozen=True)
+class TranscriptCheckpointPaths:
+    output_dir: Path
+    transcript_raw: Path
+    diarization: Path
+
+
+def transcript_checkpoint_paths(
+    output_dir: str | Path,
+) -> TranscriptCheckpointPaths:
+    output_dir = Path(output_dir)
+    return TranscriptCheckpointPaths(
+        output_dir=output_dir,
+        transcript_raw=output_dir / "transcript.raw.json",
+        diarization=output_dir / "diarization.json",
+    )
+
+
+def run_staging_paths(output_dir: str | Path, run_id: str) -> RunStagingPaths:
+    """Return non-hidden, output-filesystem staging paths for one CLI run."""
+    if not isinstance(run_id, str) or not RUN_ID_PATTERN.fullmatch(run_id):
+        raise ValueError(
+            "run_id must start with an alphanumeric character and contain only "
+            "letters, numbers, underscores, or hyphens"
+        )
+    output_dir = Path(output_dir)
+    root = output_dir / f"keyframe-run-{run_id}"
+    return RunStagingPaths(
+        output_dir=output_dir,
+        run_id=run_id,
+        root=root,
+        transcript_raw=root / "transcript.raw.json",
+        diarization=root / "diarization.json",
+    )
+
+
+def paths_alias(left: str | Path, right: str | Path) -> bool:
+    """Detect lexical, symlink, and existing hard-link aliases."""
+    left_path = Path(left)
+    right_path = Path(right)
+    if left_path.resolve(strict=False) == right_path.resolve(strict=False):
+        return True
+    try:
+        return left_path.exists() and right_path.exists() and os.path.samefile(
+            left_path,
+            right_path,
+        )
+    except OSError:
+        return False
+
+
+def reject_path_aliases(
+    artifact_path: str | Path,
+    other_paths: Iterable[str | Path],
+) -> None:
+    artifact_path = Path(artifact_path)
+    for other_path in other_paths:
+        if paths_alias(artifact_path, other_path):
+            raise ArtifactPathCollisionError(
+                f"artifact path {artifact_path} aliases {Path(other_path)}"
+            )
+
+
+def atomic_write_text(
+    path: str | Path,
+    payload: str,
+    *,
+    encoding: str = "utf-8",
+) -> Path:
+    """Flush text to a unique sibling file, then atomically replace the target."""
+    target = Path(path)
+    temporary_path: Path | None = None
+    descriptor: int | None = None
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=target.parent,
+            prefix=f"{target.name}.tmp-",
+        )
+        temporary_path = Path(temporary_name)
+        with os.fdopen(descriptor, "w", encoding=encoding) as handle:
+            descriptor = None
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, target)
+        temporary_path = None
+        return target
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def atomic_write_json(
+    path: str | Path,
+    payload: Any,
+    *,
+    indent: int | None = 2,
+    ensure_ascii: bool = False,
+    allow_nan: bool = False,
+) -> Path:
+    rendered = json.dumps(
+        payload,
+        indent=indent,
+        ensure_ascii=ensure_ascii,
+        allow_nan=allow_nan,
+    )
+    return atomic_write_text(path, rendered)
