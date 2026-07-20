@@ -22,20 +22,117 @@ import argparse
 import json
 import math
 import os
+import platform
 import sys
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 PYANNOTE_MODEL = "pyannote/speaker-diarization-community-1"
+TRANSCRIPTION_BACKENDS = ("auto", "mlx", "whisper")
+MLX_MINIMUM_MACOS_MAJOR = 14
+MLX_MINIMUM_DARWIN_MAJOR = 23
 SPEAKER_DETECTION_SETUP_WARNING = """Warning: no HF_TOKEN found; falling back to transcript without speaker detection.
 To enable speaker detection, accept the pyannote model terms at:
 https://huggingface.co/pyannote/speaker-diarization-community-1
 Then create a Hugging Face access token at:
 https://huggingface.co/settings/tokens
 and export it as HF_TOKEN."""
+
+
+@dataclass(frozen=True)
+class MLXModelSpec:
+    repository: str
+    revision: str
+
+
+MLX_MODEL_SPECS = {
+    "tiny": MLXModelSpec(
+        "mlx-community/whisper-tiny-mlx",
+        "6caf9c55601caafbe6508a8b0d216bdf4783c4e8",
+    ),
+    "base": MLXModelSpec(
+        "mlx-community/whisper-base-mlx",
+        "1e3e249fb8d01c655324bd6841b1deadffd6d04c",
+    ),
+    "small": MLXModelSpec(
+        "mlx-community/whisper-small-mlx",
+        "45f3915923c7a79a5a5b5a7d909d39aeb0e5630e",
+    ),
+    "medium": MLXModelSpec(
+        "mlx-community/whisper-medium-mlx",
+        "7fc08c4eac4c316526498f147dfdee6f6303f975",
+    ),
+    "large": MLXModelSpec(
+        "mlx-community/whisper-large-mlx",
+        "9310354911111f2406ead1478e0139d9c6ea3acc",
+    ),
+}
+
+
+@dataclass(frozen=True)
+class RuntimePlatform:
+    system: str
+    machine: str
+    macos_major: int | None = None
+    darwin_major: int | None = None
+
+    @property
+    def supports_mlx_whisper(self) -> bool:
+        if self.system != "Darwin" or self.machine.lower() != "arm64":
+            return False
+        if self.macos_major is not None:
+            return self.macos_major >= MLX_MINIMUM_MACOS_MAJOR
+        return (
+            self.darwin_major is not None
+            and self.darwin_major >= MLX_MINIMUM_DARWIN_MAJOR
+        )
+
+
+class TranscriptionError(RuntimeError):
+    """Base class for stage errors that callers may classify without string parsing."""
+
+
+class UnsupportedTranscriptionBackendError(TranscriptionError):
+    """The requested backend cannot run on the current platform."""
+
+
+class TranscriptionCancelled(TranscriptionError):
+    """The parent explicitly cancelled transcription."""
+
+
+class TranscriptOutputError(TranscriptionError):
+    """Writing an output failed after inference completed."""
+
+
+class MLXBackendError(TranscriptionError):
+    """An MLX failure for which auto mode may start a fresh Whisper process."""
+
+
+class MLXImportError(MLXBackendError):
+    """The pinned MLX runtime could not be imported."""
+
+
+class MLXModelAcquisitionError(MLXBackendError):
+    """The pinned model snapshot could not be acquired."""
+
+
+class MLXModelLoadError(MLXBackendError):
+    """The acquired model could not be loaded into MLX."""
+
+
+class MLXInferenceError(MLXBackendError):
+    """MLX inference failed or returned a malformed result."""
+
+
+@dataclass(frozen=True)
+class MLXRuntime:
+    snapshot_download: Callable[..., str]
+    load_model: Callable[[str, Any], Any]
+    transcribe: Callable[..., Mapping[str, Any]]
+    float16: Any
 
 
 @dataclass(frozen=True)
@@ -317,6 +414,150 @@ def _print_speaker_detection_failure(exc: Exception) -> None:
     )
 
 
+def _major_version(version: str) -> int | None:
+    try:
+        return int(version.split(".", 1)[0])
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def current_runtime_platform() -> RuntimePlatform:
+    macos_version = platform.mac_ver()[0]
+    return RuntimePlatform(
+        system=platform.system(),
+        machine=platform.machine(),
+        macos_major=_major_version(macos_version) if macos_version else None,
+        darwin_major=_major_version(platform.release()),
+    )
+
+
+def resolve_transcription_backend(
+    requested: str,
+    runtime_platform: RuntimePlatform | None = None,
+) -> str:
+    if requested not in TRANSCRIPTION_BACKENDS:
+        choices = ", ".join(TRANSCRIPTION_BACKENDS)
+        raise ValueError(f"unknown transcription backend {requested!r}; choose from: {choices}")
+
+    runtime_platform = runtime_platform or current_runtime_platform()
+    if requested == "auto":
+        return "mlx" if runtime_platform.supports_mlx_whisper else "whisper"
+    if requested == "mlx" and not runtime_platform.supports_mlx_whisper:
+        raise UnsupportedTranscriptionBackendError(
+            "MLX transcription requires Apple Silicon running macOS 14 or newer "
+            f"(detected system={runtime_platform.system!r}, "
+            f"machine={runtime_platform.machine!r}, "
+            f"macos_major={runtime_platform.macos_major!r}, "
+            f"darwin_major={runtime_platform.darwin_major!r})"
+        )
+    return requested
+
+
+def is_auto_fallback_eligible(exc: BaseException) -> bool:
+    return isinstance(exc, MLXBackendError)
+
+
+def _load_mlx_runtime() -> MLXRuntime:
+    try:
+        from huggingface_hub import snapshot_download
+        import mlx.core as mx
+        import mlx_whisper
+        from mlx_whisper.transcribe import ModelHolder
+    except (ImportError, OSError) as exc:
+        raise MLXImportError(
+            "the pinned MLX runtime could not be imported; reinstall keyframe on a "
+            "supported Apple Silicon Mac"
+        ) from exc
+
+    return MLXRuntime(
+        snapshot_download=snapshot_download,
+        load_model=ModelHolder.get_model,
+        transcribe=mlx_whisper.transcribe,
+        float16=mx.float16,
+    )
+
+
+def _normalize_mlx_result(
+    result: Mapping[str, Any],
+) -> tuple[tuple[TranscriptSegment, ...], str]:
+    if not isinstance(result, Mapping):
+        raise TypeError("MLX transcription result is not a mapping")
+    raw_segments = result.get("segments")
+    if not isinstance(raw_segments, Sequence) or isinstance(raw_segments, (str, bytes)):
+        raise TypeError("MLX transcription result has no segment sequence")
+
+    normalized = []
+    for index, raw_segment in enumerate(raw_segments):
+        if not isinstance(raw_segment, Mapping):
+            raise TypeError(f"MLX segment {index} is not a mapping")
+        start = _finite_seconds(raw_segment.get("start"))
+        end = _finite_seconds(raw_segment.get("end"))
+        if start is None or end is None or start < 0 or end < start:
+            raise ValueError(f"MLX segment {index} has invalid timestamps")
+        normalized.append(
+            TranscriptSegment(
+                start=start,
+                end=end,
+                text=str(raw_segment.get("text", "")),
+            )
+        )
+
+    language = result.get("language")
+    return tuple(normalized), str(language) if language else "unknown"
+
+
+def _extract_with_mlx(
+    video: Path,
+    model_name: str,
+    runtime_platform: RuntimePlatform | None = None,
+) -> tuple[tuple[TranscriptSegment, ...], str]:
+    runtime_platform = runtime_platform or current_runtime_platform()
+    resolve_transcription_backend("mlx", runtime_platform)
+    try:
+        model_spec = MLX_MODEL_SPECS[model_name]
+    except KeyError as exc:
+        raise ValueError(f"unsupported MLX Whisper model size: {model_name!r}") from exc
+
+    runtime = _load_mlx_runtime()
+    try:
+        model_path = runtime.snapshot_download(
+            repo_id=model_spec.repository,
+            revision=model_spec.revision,
+        )
+    except TranscriptionCancelled:
+        raise
+    except Exception as exc:
+        raise MLXModelAcquisitionError(
+            f"failed to acquire {model_spec.repository}@{model_spec.revision}"
+        ) from exc
+
+    print("Loading MLX model...")
+    try:
+        runtime.load_model(str(model_path), runtime.float16)
+    except TranscriptionCancelled:
+        raise
+    except Exception as exc:
+        raise MLXModelLoadError(
+            f"failed to load {model_spec.repository}@{model_spec.revision}"
+        ) from exc
+
+    print("Transcribing with MLX (this may take a while on long videos)...")
+    try:
+        result = runtime.transcribe(
+            str(video),
+            path_or_hf_repo=str(model_path),
+            verbose=False,
+            word_timestamps=False,
+        )
+        return _normalize_mlx_result(result)
+    except TranscriptionCancelled:
+        raise
+    except Exception as exc:
+        raise MLXInferenceError(
+            f"MLX inference failed for {model_spec.repository}@{model_spec.revision}"
+        ) from exc
+
+
 def _extract_with_whisper(video: Path, model_name: str) -> tuple[tuple[TranscriptSegment, ...], str]:
     try:
         import whisper
@@ -338,6 +579,28 @@ def _extract_with_whisper(video: Path, model_name: str) -> tuple[tuple[Transcrip
     )
 
     return transcript_segments(result["segments"]), result.get("language", "unknown")
+
+
+def _extract_with_transcription_backend(
+    video: Path,
+    model_name: str,
+    requested_backend: str,
+    runtime_platform: RuntimePlatform | None = None,
+) -> tuple[tuple[TranscriptSegment, ...], str]:
+    runtime_platform = runtime_platform or current_runtime_platform()
+    effective_backend = resolve_transcription_backend(requested_backend, runtime_platform)
+    print(
+        "Transcription backend: "
+        f"requested={requested_backend}, effective={effective_backend}"
+    )
+    if effective_backend == "mlx":
+        model_spec = MLX_MODEL_SPECS[model_name]
+        print(
+            "MLX model: "
+            f"{model_spec.repository}@{model_spec.revision}"
+        )
+        return _extract_with_mlx(video, model_name, runtime_platform)
+    return _extract_with_whisper(video, model_name)
 
 
 def _detect_speakers(video: Path, hf_token: str) -> tuple[DiarizationRow, ...]:
@@ -380,6 +643,7 @@ def extract_transcript(
     output=None,
     fmt="txt",
     speaker_detection=True,
+    transcription_backend="whisper",
 ):
     """
     Run Whisper on a video file and save the timestamped transcript.
@@ -391,6 +655,8 @@ def extract_transcript(
         fmt:         Output format: txt, srt, vtt, json
         speaker_detection:
                      Attempt pyannote speaker detection when HF_TOKEN is set
+        transcription_backend:
+                     Transcription backend: auto, mlx, or whisper
 
     Returns:
         (segments, language) tuple
@@ -411,7 +677,11 @@ def extract_transcript(
     print(f"Video: {video_path}")
     print(f"Model: {model_name}")
 
-    segments, language = _extract_with_whisper(video, model_name)
+    segments, language = _extract_with_transcription_backend(
+        video,
+        model_name,
+        transcription_backend,
+    )
 
     if speaker_detection and segments:
         hf_token = (os.environ.get("HF_TOKEN") or "").strip()
