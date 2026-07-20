@@ -1,5 +1,6 @@
 import json
 import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -208,6 +209,53 @@ def test_atomic_checkpoint_replace_uses_unique_sibling_and_cleans_on_failure(
     assert json.loads(staged_payload) == [{"start": 0.0, "end": 1.0, "text": "new"}]
     assert path.read_text(encoding="utf-8") == "previous"
     assert not temporary.exists()
+
+
+def test_atomic_writer_honors_umask_for_new_outputs(tmp_path):
+    path = tmp_path / "new.txt"
+    previous_umask = os.umask(0o027)
+    try:
+        artifacts.atomic_write_text(path, "new")
+    finally:
+        os.umask(previous_umask)
+
+    assert stat.S_IMODE(path.stat().st_mode) == 0o640
+
+
+def test_atomic_writer_preserves_existing_output_mode(tmp_path):
+    path = tmp_path / "existing.txt"
+    path.write_text("old", encoding="utf-8")
+    path.chmod(0o604)
+
+    artifacts.atomic_write_text(path, "new")
+
+    assert path.read_text(encoding="utf-8") == "new"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o604
+
+
+def test_huge_integer_writer_failure_uses_checkpoint_validation_contract(tmp_path):
+    path = tmp_path / "transcript.raw.json"
+    path.write_text("previous", encoding="utf-8")
+
+    with pytest.raises(transcript.CheckpointValidationError, match="finite number"):
+        transcript.write_raw_transcript_checkpoint(
+            [{"start": 10**400, "end": 10**400, "text": "huge"}],
+            path,
+        )
+
+    assert path.read_text(encoding="utf-8") == "previous"
+
+
+def test_huge_integer_reader_failure_uses_checkpoint_validation_contract(tmp_path):
+    path = tmp_path / "transcript.raw.json"
+    huge = "1" + ("0" * 400)
+    path.write_text(
+        f'[{{"start": {huge}, "end": {huge}, "text": "huge"}}]',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(transcript.CheckpointValidationError, match="finite number"):
+        transcript.read_raw_transcript_checkpoint(path)
 
 
 @pytest.mark.parametrize(

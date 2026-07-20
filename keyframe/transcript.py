@@ -325,7 +325,12 @@ def _strict_checkpoint_seconds(
         raise CheckpointValidationError(
             f"checkpoint row {row_index} field {field!r} must be a number"
         )
-    seconds = float(value)
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise CheckpointValidationError(
+            f"checkpoint row {row_index} field {field!r} must be a finite number"
+        ) from exc
     if not math.isfinite(seconds):
         raise CheckpointValidationError(
             f"checkpoint row {row_index} field {field!r} must be finite"

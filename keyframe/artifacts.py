@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 import os
 import re
-import tempfile
+import secrets
+import stat
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -91,6 +92,30 @@ def reject_path_aliases(
             )
 
 
+def _open_unique_sibling(target: Path) -> tuple[int, Path]:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_BINARY", 0)
+    for _attempt in range(100):
+        temporary_path = target.parent / f"{target.name}.tmp-{secrets.token_hex(8)}"
+        try:
+            descriptor = os.open(temporary_path, flags, 0o666)
+        except FileExistsError:
+            continue
+        try:
+            try:
+                existing_mode = stat.S_IMODE(target.stat().st_mode)
+            except FileNotFoundError:
+                pass
+            else:
+                os.fchmod(descriptor, existing_mode)
+        except BaseException:
+            os.close(descriptor)
+            temporary_path.unlink(missing_ok=True)
+            raise
+        return descriptor, temporary_path
+    raise FileExistsError(f"could not create a unique sibling for {target}")
+
+
 def atomic_write_text(
     path: str | Path,
     payload: str,
@@ -102,11 +127,7 @@ def atomic_write_text(
     temporary_path: Path | None = None
     descriptor: int | None = None
     try:
-        descriptor, temporary_name = tempfile.mkstemp(
-            dir=target.parent,
-            prefix=f"{target.name}.tmp-",
-        )
-        temporary_path = Path(temporary_name)
+        descriptor, temporary_path = _open_unique_sibling(target)
         with os.fdopen(descriptor, "w", encoding=encoding) as handle:
             descriptor = None
             handle.write(payload)
