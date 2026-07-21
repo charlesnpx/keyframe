@@ -14,6 +14,10 @@ ROOT = Path(__file__).parents[1]
 SUPPORTED_MAC = transcript.RuntimePlatform("Darwin", "arm64", 14, 23)
 
 
+class FakeLocalEntryNotFoundError(Exception):
+    pass
+
+
 @pytest.mark.parametrize(
     ("runtime_platform", "supported"),
     [
@@ -65,7 +69,8 @@ def test_non_mlx_auto_backend_never_requests_mlx_weights(monkeypatch, tmp_path):
     monkeypatch.setattr(
         transcript,
         "_extract_with_whisper",
-        lambda path, model: calls.append((path, model)) or ((), "en"),
+        lambda path, model: calls.append((path, model))
+        or transcript.TranscriptionResult((), "en", {}),
     )
 
     result = transcript._extract_with_transcription_backend(
@@ -75,7 +80,9 @@ def test_non_mlx_auto_backend_never_requests_mlx_weights(monkeypatch, tmp_path):
         transcript.RuntimePlatform("Windows", "AMD64", None, 10),
     )
 
-    assert result == ((), "en")
+    assert result.segments == ()
+    assert result.language == "en"
+    assert result.metadata == {}
     assert calls == [(video, "medium")]
 
 
@@ -104,9 +111,10 @@ def test_model_sizes_map_to_immutable_mlx_revisions():
     }
 
 
-def test_mlx_adapter_downloads_pinned_snapshot_loads_once_and_preserves_precision(
+def test_mlx_adapter_resolves_cached_pinned_snapshot_and_preserves_precision(
     monkeypatch,
     tmp_path,
+    capsys,
 ):
     calls = []
     model_dir = tmp_path / "model"
@@ -139,10 +147,11 @@ def test_mlx_adapter_downloads_pinned_snapshot_loads_once_and_preserves_precisio
         load_model=load_model,
         transcribe=transcribe_mlx,
         float16="float16",
+        local_entry_not_found_error=FakeLocalEntryNotFoundError,
     )
     monkeypatch.setattr(transcript, "_load_mlx_runtime", lambda: runtime)
 
-    segments, language = transcript._extract_with_mlx(
+    result = transcript._extract_with_mlx(
         tmp_path / "recording.mp4",
         "medium",
         SUPPORTED_MAC,
@@ -152,7 +161,11 @@ def test_mlx_adapter_downloads_pinned_snapshot_loads_once_and_preserves_precisio
     assert calls == [
         (
             "download",
-            {"repo_id": spec.repository, "revision": spec.revision},
+            {
+                "repo_id": spec.repository,
+                "revision": spec.revision,
+                "local_files_only": True,
+            },
         ),
         ("load", str(model_dir), "float16"),
         (
@@ -165,15 +178,139 @@ def test_mlx_adapter_downloads_pinned_snapshot_loads_once_and_preserves_precisio
             },
         ),
     ]
-    assert language == "fr"
-    assert segments == (
+    assert result.language == "fr"
+    assert result.segments == (
         transcript.TranscriptSegment(0.123456789, 1.987654321, "déjà vu"),
     )
-    assert segments[0].to_dict() == {
+    assert result.segments[0].to_dict() == {
         "start": 0.123456789,
         "end": 1.987654321,
         "text": "déjà vu",
     }
+    assert result.metadata["model_repository"] == spec.repository
+    assert result.metadata["model_revision"] == spec.revision
+    assert result.metadata["model_resolution_source"] == "local-hit"
+    assert 0 <= result.metadata["model_resolution_seconds"] < 1
+    with pytest.raises(TypeError):
+        result.metadata["model_resolution_source"] = "changed"
+    output = capsys.readouterr().out
+    assert "Importing MLX runtime" in output
+    assert "Resolving cached MLX model" in output
+    assert "downloading pinned snapshot" not in output
+    assert output.index("Resolving cached MLX model") < output.index(
+        "Loading MLX model"
+    )
+    assert output.index("Loading MLX model") < output.index("Transcribing with MLX")
+
+
+def test_mlx_cache_miss_permits_one_online_resolution(monkeypatch, tmp_path, capsys):
+    calls = []
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+
+    def snapshot_download(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get("local_files_only"):
+            raise FakeLocalEntryNotFoundError("not cached")
+        return str(model_dir)
+
+    runtime = transcript.MLXRuntime(
+        snapshot_download=snapshot_download,
+        load_model=lambda *_args: None,
+        transcribe=lambda *_args, **_kwargs: {"segments": [], "language": "en"},
+        float16="float16",
+        local_entry_not_found_error=FakeLocalEntryNotFoundError,
+    )
+    monkeypatch.setattr(transcript, "_load_mlx_runtime", lambda: runtime)
+
+    result = transcript._extract_with_mlx(
+        tmp_path / "recording.mp4",
+        "medium",
+        SUPPORTED_MAC,
+    )
+
+    spec = transcript.MLX_MODEL_SPECS["medium"]
+    assert calls == [
+        {
+            "repo_id": spec.repository,
+            "revision": spec.revision,
+            "local_files_only": True,
+        },
+        {"repo_id": spec.repository, "revision": spec.revision},
+    ]
+    assert result.metadata["model_resolution_source"] == "downloaded"
+    assert 0 <= result.metadata["model_resolution_seconds"] < 1
+    output = capsys.readouterr().out
+    assert output.index("Resolving cached MLX model") < output.index(
+        "downloading pinned snapshot"
+    )
+
+
+@pytest.mark.parametrize("failure", [PermissionError("denied"), OSError("broken cache")])
+def test_mlx_local_resolution_failures_do_not_retry_online(
+    monkeypatch,
+    tmp_path,
+    failure,
+):
+    calls = []
+
+    def snapshot_download(**kwargs):
+        calls.append(kwargs)
+        raise failure
+
+    runtime = transcript.MLXRuntime(
+        snapshot_download=snapshot_download,
+        load_model=lambda *_args: pytest.fail("invalid snapshots must not load"),
+        transcribe=lambda *_args, **_kwargs: pytest.fail("invalid snapshots must not run"),
+        float16="float16",
+        local_entry_not_found_error=FakeLocalEntryNotFoundError,
+    )
+    monkeypatch.setattr(transcript, "_load_mlx_runtime", lambda: runtime)
+
+    with pytest.raises(transcript.MLXModelAcquisitionError) as raised:
+        transcript._extract_with_mlx(
+            tmp_path / "recording.mp4",
+            "medium",
+            SUPPORTED_MAC,
+        )
+
+    assert raised.value.__cause__ is failure
+    assert len(calls) == 1
+    assert calls[0]["local_files_only"] is True
+
+
+@pytest.mark.parametrize("resolved_kind", ["none", "missing", "file"])
+def test_mlx_rejects_malformed_or_non_directory_snapshot_paths(
+    monkeypatch,
+    tmp_path,
+    resolved_kind,
+):
+    if resolved_kind == "none":
+        resolved = None
+    elif resolved_kind == "missing":
+        resolved = tmp_path / "missing"
+    else:
+        resolved = tmp_path / "model-file"
+        resolved.write_text("not a model directory", encoding="utf-8")
+    calls = []
+    runtime = transcript.MLXRuntime(
+        snapshot_download=lambda **kwargs: calls.append(kwargs) or resolved,
+        load_model=lambda *_args: pytest.fail("invalid snapshots must not load"),
+        transcribe=lambda *_args, **_kwargs: pytest.fail("invalid snapshots must not run"),
+        float16="float16",
+        local_entry_not_found_error=FakeLocalEntryNotFoundError,
+    )
+    monkeypatch.setattr(transcript, "_load_mlx_runtime", lambda: runtime)
+
+    with pytest.raises(transcript.MLXModelAcquisitionError):
+        transcript._extract_with_mlx(
+            tmp_path / "recording.mp4",
+            "medium",
+            SUPPORTED_MAC,
+        )
+
+    assert len(calls) == 1
+    assert calls[0]["local_files_only"] is True
 
 
 @pytest.mark.parametrize(
@@ -191,19 +328,23 @@ def test_mlx_failures_are_typed_and_auto_fallback_eligible(
     failing_stage,
     expected_error,
 ):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+
     def fail_if(stage, value):
         if failing_stage == stage:
             raise RuntimeError(stage)
         return value
 
     runtime = transcript.MLXRuntime(
-        snapshot_download=lambda **_kwargs: fail_if("acquire", str(tmp_path / "model")),
+        snapshot_download=lambda **_kwargs: fail_if("acquire", str(model_dir)),
         load_model=lambda *_args: fail_if("load", None),
         transcribe=lambda *_args, **_kwargs: fail_if(
             "infer",
             {"segments": "malformed"} if failing_stage == "normalize" else {"segments": []},
         ),
         float16="float16",
+        local_entry_not_found_error=FakeLocalEntryNotFoundError,
     )
     monkeypatch.setattr(transcript, "_load_mlx_runtime", lambda: runtime)
 
@@ -233,11 +374,14 @@ def test_cancellation_and_output_failures_are_not_auto_fallback_eligible(
     tmp_path,
 ):
     cancelled = transcript.TranscriptionCancelled("stop")
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
     runtime = transcript.MLXRuntime(
-        snapshot_download=lambda **_kwargs: str(tmp_path / "model"),
+        snapshot_download=lambda **_kwargs: str(model_dir),
         load_model=lambda *_args: None,
         transcribe=lambda *_args, **_kwargs: (_ for _ in ()).throw(cancelled),
         float16="float16",
+        local_entry_not_found_error=FakeLocalEntryNotFoundError,
     )
     monkeypatch.setattr(transcript, "_load_mlx_runtime", lambda: runtime)
 
@@ -256,7 +400,7 @@ def test_requested_and_effective_backend_are_logged(monkeypatch, tmp_path, capsy
     monkeypatch.setattr(
         transcript,
         "_extract_with_whisper",
-        lambda *_args, **_kwargs: ((), "en"),
+        lambda *_args, **_kwargs: transcript.TranscriptionResult((), "en", {}),
     )
 
     transcript._extract_with_transcription_backend(

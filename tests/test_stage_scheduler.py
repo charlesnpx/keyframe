@@ -388,9 +388,10 @@ def test_cancellation_and_checkpoint_write_failures_are_not_worker_fallbacks(
         monkeypatch.setattr(
             transcript,
             "_extract_with_transcription_backend",
-            lambda *_args, **_kwargs: (
+            lambda *_args, **_kwargs: transcript.TranscriptionResult(
                 (transcript.TranscriptSegment(0.0, 1.0, "done"),),
                 "en",
+                {},
             ),
         )
         monkeypatch.setattr(

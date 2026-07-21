@@ -309,12 +309,13 @@ def transcription_worker_entry(
             progress_queue,
             StageProgress("transcription", "inference", effective_backend),
         )
-        segments, language = transcript_module._extract_with_transcription_backend(
+        result = transcript_module._extract_with_transcription_backend(
             Path(request.video_path),
             request.model_name,
             request.requested_backend,
             runtime_platform,
         )
+        segments, language = result.segments, result.language
         if cancellation_event.is_set():
             raise RuntimeError("transcription cancelled")
         emit_stage_progress(
@@ -326,16 +327,13 @@ def transcription_worker_entry(
             request.checkpoint_path,
             final_output_paths=request.final_output_paths,
         )
-        metadata: dict[str, Any] = {
+        metadata: dict[str, Any] = dict(result.metadata)
+        metadata.update({
             "language": language,
             "segment_count": len(segments),
             "requested_backend": request.requested_backend,
             "effective_backend": effective_backend,
-        }
-        if effective_backend == "mlx":
-            model_spec = transcript_module.MLX_MODEL_SPECS[request.model_name]
-            metadata["model_repository"] = model_spec.repository
-            metadata["model_revision"] = model_spec.revision
+        })
         return metadata
 
     _execute_worker(

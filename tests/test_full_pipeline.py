@@ -173,17 +173,28 @@ class _FakeSupervisor:
                 self.segments,
                 self.public.transcript_raw,
             )
+            effective_backend = (
+                "whisper"
+                if handle.requested_backend == "whisper"
+                else self.effective_backend
+            )
+            metadata = {
+                "language": "en",
+                "effective_backend": effective_backend,
+            }
+            if effective_backend == "mlx":
+                metadata.update(
+                    {
+                        "model_repository": "mlx-community/whisper-medium-mlx",
+                        "model_revision": "immutable-revision",
+                        "model_resolution_source": "local-hit",
+                        "model_resolution_seconds": 0.125,
+                    }
+                )
             handle.completion = StageCompletion(
                 "transcription",
                 self.public.transcript_raw,
-                {
-                    "language": "en",
-                    "effective_backend": (
-                        "whisper"
-                        if handle.requested_backend == "whisper"
-                        else self.effective_backend
-                    ),
-                },
+                metadata,
                 self.segments,
             )
         else:
@@ -360,6 +371,11 @@ def test_accelerated_frames_overlap_running_cpu_diarization_after_transcription(
     assert result.frame_schedule.parallel
     assert result.critical_path == "max(T + F, D) + M + E"
     assert result.transcript.segments[0].speaker == "SPEAKER_00"
+    if preflight.effective_backend == "mlx":
+        assert result.transcript.metadata["model_resolution_source"] == "local-hit"
+    else:
+        assert "model_resolution_source" not in result.transcript.metadata
+    assert result.transcription_metadata == result.transcript.metadata
 
 
 def test_shared_cuda_stages_remain_serial_through_diarization_and_frames(tmp_path):

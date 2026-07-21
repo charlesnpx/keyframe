@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import queue
 import signal
 import stat
 import sys
@@ -60,6 +61,11 @@ class _FakeProgressQueue:
 
     def cancel_join_thread(self):
         self.cancelled = True
+
+
+class _DroppingProgressQueue(_FakeProgressQueue):
+    def put_nowait(self, event):
+        raise queue.Full
 
 
 class _FakeEvent:
@@ -733,10 +739,13 @@ def test_interrupted_completed_promotion_is_reconciled_on_retry(tmp_path, monkey
         assert handle.wait() == recovered
 
 
-def test_transcription_worker_entry_keeps_bulk_result_on_disk(tmp_path, monkeypatch):
+def test_transcription_worker_keeps_result_on_disk_and_metadata_off_progress_channel(
+    tmp_path,
+    monkeypatch,
+):
     checkpoint = tmp_path / "transcript.raw.json"
     terminal = _FakeTerminal()
-    progress = _FakeProgressQueue()
+    progress = _DroppingProgressQueue()
     cancellation = _FakeEvent()
     runtime_platform = transcript.RuntimePlatform("Linux", "x86_64", None, 6)
     monkeypatch.setattr(transcript, "current_runtime_platform", lambda: runtime_platform)
@@ -748,9 +757,15 @@ def test_transcription_worker_entry_keeps_bulk_result_on_disk(tmp_path, monkeypa
     monkeypatch.setattr(
         transcript,
         "_extract_with_transcription_backend",
-        lambda *_args, **_kwargs: (
+        lambda *_args, **_kwargs: transcript.TranscriptionResult(
             (transcript.TranscriptSegment(0.1, 2.3, "disk backed"),),
             "en",
+            {
+                "model_repository": "mlx-community/whisper-medium-mlx",
+                "model_revision": "immutable-revision",
+                "model_resolution_source": "local-hit",
+                "model_resolution_seconds": 0.125,
+            },
         ),
     )
     request = TranscriptionWorkerRequest(
@@ -771,6 +786,10 @@ def test_transcription_worker_entry_keeps_bulk_result_on_disk(tmp_path, monkeypa
         "segment_count": 1,
         "requested_backend": "auto",
         "effective_backend": "whisper",
+        "model_repository": "mlx-community/whisper-medium-mlx",
+        "model_revision": "immutable-revision",
+        "model_resolution_source": "local-hit",
+        "model_resolution_seconds": 0.125,
     }
     assert not hasattr(terminal.messages[0], "segments")
     assert terminal.closed

@@ -78,6 +78,7 @@ class TranscriptRunResult:
     fallback_used: bool
     initial_schedule: ScheduleDecision
     timings: Mapping[str, float]
+    metadata: Mapping[str, Any]
 
 
 class TranscriptOutputError(OutputSessionError):
@@ -483,6 +484,7 @@ def run_supervised_transcript(
                 fallback_used=execution.fallback_used,
                 initial_schedule=decision,
                 timings=dict(timings),
+                metadata=dict(execution.completion.metadata),
             )
 
         if preflight.missing_hf_token:
@@ -531,4 +533,5 @@ def run_supervised_transcript(
             fallback_used=execution.fallback_used,
             initial_schedule=decision,
             timings=dict(timings),
+            metadata=dict(execution.completion.metadata),
         )

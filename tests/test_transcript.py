@@ -14,6 +14,10 @@ def _video(tmp_path):
     return video
 
 
+def _result(segments=(), language="en"):
+    return transcript.TranscriptionResult(tuple(segments), language, {})
+
+
 def test_transcript_segment_is_immutable():
     segment = transcript.TranscriptSegment(0, 1, "hello", "SPEAKER_00")
 
@@ -95,7 +99,7 @@ def test_no_speaker_detection_runs_whisper_only_and_emits_no_speaker_warnings(
 
     def fake_whisper(video_path, model_name):
         calls.append((video_path, model_name))
-        return (transcript.TranscriptSegment(0, 1, "hello"),), "en"
+        return _result((transcript.TranscriptSegment(0, 1, "hello"),))
 
     monkeypatch.setattr(transcript, "_extract_with_whisper", fake_whisper)
 
@@ -129,7 +133,9 @@ def test_missing_or_blank_hf_token_warns_after_whisper(tmp_path, monkeypatch, ca
     monkeypatch.setattr(
         transcript,
         "_extract_with_whisper",
-        lambda *_args, **_kwargs: ((transcript.TranscriptSegment(0, 1, "hello"),), "en"),
+        lambda *_args, **_kwargs: _result(
+            (transcript.TranscriptSegment(0, 1, "hello"),)
+        ),
     )
 
     transcript.extract_transcript(video, output=tmp_path / "out.json", fmt="json")
@@ -148,7 +154,11 @@ def test_empty_whisper_output_skips_diarization_and_speaker_warnings(tmp_path, m
         "_detect_speakers",
         lambda *_args, **_kwargs: pytest.fail("speaker detection should not run for empty transcript"),
     )
-    monkeypatch.setattr(transcript, "_extract_with_whisper", lambda *_args, **_kwargs: ((), "en"))
+    monkeypatch.setattr(
+        transcript,
+        "_extract_with_whisper",
+        lambda *_args, **_kwargs: _result(),
+    )
 
     segments, language = transcript.extract_transcript(video, output=tmp_path / "out.json", fmt="json")
 
@@ -169,7 +179,7 @@ def test_valid_hf_token_runs_whisper_then_diarization_with_stripped_token(tmp_pa
 
     def fake_whisper(video_path, model_name):
         calls.append(("whisper", video_path, model_name))
-        return whisper_segments, "en"
+        return _result(whisper_segments)
 
     def fake_detect(video_path, hf_token):
         calls.append(("detect", video_path, hf_token))
@@ -211,7 +221,9 @@ def test_speaker_detection_failure_warns_and_keeps_whisper_output(
     monkeypatch.setattr(
         transcript,
         "_extract_with_whisper",
-        lambda *_args, **_kwargs: ((transcript.TranscriptSegment(0, 1, "fallback"),), "en"),
+        lambda *_args, **_kwargs: _result(
+            (transcript.TranscriptSegment(0, 1, "fallback"),)
+        ),
     )
     monkeypatch.setattr(
         transcript,
@@ -233,7 +245,9 @@ def test_empty_diarization_warns_and_keeps_whisper_output(tmp_path, monkeypatch,
     monkeypatch.setattr(
         transcript,
         "_extract_with_whisper",
-        lambda *_args, **_kwargs: ((transcript.TranscriptSegment(0, 1, "fallback"),), "en"),
+        lambda *_args, **_kwargs: _result(
+            (transcript.TranscriptSegment(0, 1, "fallback"),)
+        ),
     )
     monkeypatch.setattr(transcript, "_detect_speakers", lambda *_args, **_kwargs: ())
 
