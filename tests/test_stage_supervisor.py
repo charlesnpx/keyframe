@@ -853,6 +853,64 @@ def test_diarization_worker_entry_keeps_bulk_result_on_disk(tmp_path, monkeypatc
     assert terminal_message.ended_at > 0
 
 
+def test_mps_worker_disables_implicit_pytorch_cpu_fallback(
+    tmp_path,
+    monkeypatch,
+):
+    checkpoint = tmp_path / "diarization.json"
+    terminal = _FakeTerminal()
+    progress = _FakeProgressQueue()
+    cancellation = _FakeEvent()
+    observed = []
+    monkeypatch.setenv("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
+    def configure(_thread_budget, *, torch_threads):
+        observed.append(
+            (
+                "configure",
+                torch_threads,
+                os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK"),
+            )
+        )
+
+    def fake_detect(_video_path, _hf_token, *, device):
+        observed.append(
+            (
+                "detect",
+                device,
+                os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK"),
+            )
+        )
+        return (transcript.DiarizationRow(0.1, 2.3, "SPEAKER_00"),)
+
+    monkeypatch.setattr(
+        supervisor_module,
+        "configure_worker_thread_budget",
+        configure,
+    )
+    monkeypatch.setattr(transcript, "_detect_speakers", fake_detect)
+    request = DiarizationWorkerRequest(
+        video_path=str(tmp_path / "video.mp4"),
+        hf_token="hf_test",
+        checkpoint_path=str(checkpoint),
+        device="mps",
+    )
+
+    diarization_worker_entry(request, terminal, progress, cancellation)
+
+    assert observed == [
+        ("configure", True, "0"),
+        ("detect", "mps", "0"),
+    ]
+    metadata = dict(terminal.messages[0].metadata)
+    metadata.pop("process_tree_peak_rss_bytes")
+    assert metadata == {
+        "row_count": 1,
+        "device": "mps",
+        "pytorch_mps_fallback_enabled": False,
+    }
+
+
 def test_worker_error_has_reliable_terminal_metadata(tmp_path, monkeypatch):
     terminal = _FakeTerminal()
     progress = _FakeProgressQueue()

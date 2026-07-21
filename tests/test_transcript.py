@@ -435,7 +435,42 @@ def test_detect_speakers_reports_monotonic_progress_and_closes_bar(monkeypatch, 
             RuntimeError("MPS kernel failed"),
             transcript.MPSDiarizationInferenceError,
         ),
+        (
+            "infer",
+            RuntimeError("MPS backend connection lost"),
+            transcript.MPSDiarizationInferenceError,
+        ),
         ("init", RuntimeError("checkpoint protocol mismatch"), RuntimeError),
+        (
+            "init",
+            RuntimeError("MPS authentication failed"),
+            RuntimeError,
+        ),
+        (
+            "init",
+            RuntimeError("MPS model acquisition download failed"),
+            RuntimeError,
+        ),
+        (
+            "infer",
+            RuntimeError("MPS checkpoint protocol rejected malformed timestamps"),
+            RuntimeError,
+        ),
+        (
+            "infer",
+            RuntimeError("checkpoint contains malformed timestamps"),
+            RuntimeError,
+        ),
+        (
+            "infer",
+            RuntimeError("MPS input has invalid shape"),
+            RuntimeError,
+        ),
+        (
+            "infer",
+            RuntimeError("MPS audio decoding failed"),
+            RuntimeError,
+        ),
         ("init", ValueError("gated model"), ValueError),
     ],
 )
@@ -479,8 +514,9 @@ def test_detect_speakers_classifies_only_mps_compute_failures(
         lambda *_args, **_kwargs: ("mps", "float32"),
     )
 
-    with pytest.raises(expected_type):
+    with pytest.raises(expected_type) as raised:
         transcript._detect_speakers(_video(tmp_path), "hf_test", device="mps")
+    assert type(raised.value) is expected_type
 
 
 def test_expected_pyannote_warnings_are_condensed_once_per_fingerprint(

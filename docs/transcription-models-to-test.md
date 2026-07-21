@@ -82,7 +82,9 @@ available, and CPU otherwise. Explicit unavailable MPS and CUDA requests fail
 during preflight. If an automatic MPS attempt fails during model initialization
 or inference with an eligible compute error, Keyframe exits that worker and
 retries once on CPU. Explicit MPS, authentication, acquisition, audio decoding,
-protocol, and checkpoint failures do not trigger fallback.
+protocol, and checkpoint failures do not trigger fallback. MPS workers force
+PyTorch's implicit CPU fallback off, so CPU work cannot bypass resource
+admission or attempted-device evidence.
 
 Automatic scheduling overlaps stages using independent resources only when
 model-aware memory admission with 10% headroom succeeds. On macOS, admission

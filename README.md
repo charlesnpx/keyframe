@@ -118,7 +118,8 @@ worker and starting a fresh OpenAI Whisper CPU worker. Explicit
 unavailable. Automatic MPS diarization retries once on CPU only for a typed MPS
 model-initialization or inference compute failure; explicit MPS is strict, and
 authentication, acquisition, decoding, and checkpoint failures do not trigger
-that fallback.
+that fallback. MPS workers force PyTorch's implicit CPU fallback off so every
+CPU retry is admitted and reported by Keyframe.
 
 ### As a Claude Code skill
 
@@ -187,6 +188,8 @@ prefers CUDA when available and then CPU. Explicit unavailable MPS or CUDA
 requests fail during preflight. An automatic MPS compute failure retries once
 in a fresh CPU worker after a new scheduler admission decision. Explicit MPS
 requests and non-compute failures remain strict.
+MPS workers disable PyTorch's implicit CPU fallback so unsupported kernels
+cannot bypass scheduler admission or fallback evidence.
 If `HF_TOKEN` is missing or speaker detection fails, Keyframe warns and keeps
 the unlabeled Whisper transcript. The two known harmless pyannote warnings
 about unavailable TorchCodec decoding and a too-short pooling window are

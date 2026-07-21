@@ -24,6 +24,7 @@ import json
 import math
 import os
 import platform
+import re
 import sys
 import time
 import warnings
@@ -903,20 +904,51 @@ def is_auto_diarization_fallback_eligible(exc: BaseException) -> bool:
     return isinstance(exc, MPSDiarizationError)
 
 
+_MPS_NON_COMPUTE_FAILURE_MARKERS = (
+    "access token",
+    "acquisition",
+    "authenticat",
+    "authoriz",
+    "checkpoint",
+    "codec",
+    "data shape",
+    "decod",
+    "download",
+    "ffmpeg",
+    "forbidden",
+    "gated",
+    "hf token",
+    "hf_token",
+    "hugging face",
+    "invalid shape",
+    "malformed shape",
+    "protocol",
+    "repository",
+    "revision",
+    "shape mismatch",
+    "tensor shape",
+    "timestamp",
+    "unauthorized",
+)
+_MPS_COMPUTE_FAILURE_PATTERNS = (
+    re.compile(r"\bmps\b"),
+    re.compile(r"\bmpsgraph\b"),
+    re.compile(r"\bmetal\b"),
+)
+
+
 def _is_mps_compute_failure(exc: BaseException) -> bool:
     """Exclude authentication, acquisition, decoding, and data-shape failures."""
 
     if not isinstance(exc, (RuntimeError, NotImplementedError, MemoryError)):
         return False
     message = " ".join(str(exc).lower().split())
-    return any(
-        marker in message
-        for marker in (
-            "mps",
-            "metal",
-            "placeholder storage",
-            "invalid buffer size",
-        )
+    if any(marker in message for marker in _MPS_NON_COMPUTE_FAILURE_MARKERS):
+        return False
+    return (
+        any(pattern.search(message) for pattern in _MPS_COMPUTE_FAILURE_PATTERNS)
+        or "placeholder storage" in message
+        or "invalid buffer size" in message
     )
 
 

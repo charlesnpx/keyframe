@@ -171,6 +171,9 @@ def test_release_contracts_compare_cpu_reference_to_mps_candidate():
         "mps"
     ]
     assert benchmark.CANDIDATE_CONTRACT["diarization_fallback_used"] is False
+    assert benchmark.CANDIDATE_CONTRACT[
+        "pytorch_mps_fallback_enabled"
+    ] is False
 
 
 def _set_process_tree_peak(report: dict, gibibytes: float) -> None:
@@ -827,6 +830,12 @@ def test_report_evaluation_rejects_inconsistent_reliable_topology(
         ),
         (
             lambda report: report["candidate"].update(
+                pytorch_mps_fallback_enabled=True
+            ),
+            "candidate pytorch_mps_fallback_enabled",
+        ),
+        (
+            lambda report: report["candidate"].update(
                 schedule_policy="parallel"
             ),
             "candidate schedule_policy",
@@ -1278,6 +1287,10 @@ def test_candidate_case_uses_and_verifies_automatic_apple_scheduling(
                 "diarization": 1 * benchmark.GIB,
             }
 
+        def completed_stage_metadata(self, stage):
+            assert stage == "diarization"
+            return ({"pytorch_mps_fallback_enabled": False},)
+
     monkeypatch.setattr(benchmark.cli, "_parse_extract_args", parse_args)
     monkeypatch.setattr(benchmark.cli, "_transcript_config", lambda _args: object())
     monkeypatch.setattr(benchmark, "preflight_transcript_run", lambda _config: preflight)
@@ -1323,6 +1336,7 @@ def test_candidate_case_uses_and_verifies_automatic_apple_scheduling(
     assert result["fallback_used"] is False
     assert result["diarization_attempted_devices"] == ["mps"]
     assert result["diarization_fallback_used"] is False
+    assert result["pytorch_mps_fallback_enabled"] is False
     assert result["critical_path"] == "T + D + F + M + E"
     assert result["fallback_waited_for_diarization"] is False
     assert result["pipeline_evidence"]["frames"]["launch_wave"] == (

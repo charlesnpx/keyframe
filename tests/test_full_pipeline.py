@@ -114,6 +114,7 @@ class _FakeSupervisor:
         effective_backend="mlx",
         fail_first_mlx=False,
         fail_first_mps=False,
+        mps_exits_before_transcription=False,
     ):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -134,6 +135,7 @@ class _FakeSupervisor:
         self.effective_backend = effective_backend
         self.fail_first_mlx = fail_first_mlx
         self.fail_first_mps = fail_first_mps
+        self.mps_exits_before_transcription = mps_exits_before_transcription
         self.transcription_attempts = 0
         self.diarization_attempts = 0
         self.handles = {}
@@ -212,6 +214,11 @@ class _FakeSupervisor:
                 metadata,
                 self.segments,
             )
+            if self.mps_exits_before_transcription:
+                diarization = self.handles.get("diarization")
+                if diarization is not None:
+                    diarization.process.alive = False
+                    diarization.process.exitcode = 1
         else:
             if self.fail_first_mps and handle.attempt == 1:
                 handle.process.exitcode = 1
@@ -685,6 +692,47 @@ def test_initial_wave_mps_failure_uses_max_t_r_retry_critical_path(tmp_path):
         "diarization_retry"
     ).launch_wave == "initial"
     assert result.critical_path == "max(T, R) + max(D, F) + M + E"
+
+
+def test_empty_transcript_does_not_retry_an_already_failed_mps_worker(tmp_path):
+    events = []
+    output = tmp_path / "out"
+    preflight = _preflight(
+        backend="whisper",
+        requested_backend="whisper",
+        transcription_device="cpu",
+        diarization_device="mps",
+        requested_diarization_device="auto",
+    )
+    supervisor = _FakeSupervisor(
+        output,
+        events,
+        segments=(),
+        effective_backend="whisper",
+        fail_first_mps=True,
+        mps_exits_before_transcription=True,
+    )
+
+    result = run_supervised_full_pipeline(
+        tmp_path / "recording.mp4",
+        output,
+        preflight,
+        supervisor=supervisor,
+        frame_device="mps",
+        frame_runner=_frame_runner(supervisor, output, events),
+        scheduler=_scheduler(),
+    )
+
+    starts = [
+        detail for name, detail in events if name == "start-diarization"
+    ]
+    assert [start["device"] for start in starts] == ["mps"]
+    assert result.transcript.segments == ()
+    assert result.diarization_attempted_devices == ("mps",)
+    assert not result.diarization_fallback_used
+    assert result.pipeline_evidence.interval("diarization_retry") is None
+    assert result.pipeline_evidence.interval("diarization").outcome == "failed"
+    assert (output / "frames" / "current.txt").read_text() == "current"
 
 
 @pytest.mark.parametrize(

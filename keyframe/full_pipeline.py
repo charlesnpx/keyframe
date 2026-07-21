@@ -470,7 +470,7 @@ def run_supervised_full_pipeline(
         )
         timings[diarization_evidence_stage] = interval.duration_seconds
 
-    def settle_diarization() -> Any | None:
+    def settle_diarization(*, allow_fallback: bool = True) -> Any | None:
         nonlocal diarization_completion, diarization_settled
         nonlocal diarization_handle, diarization_started
         nonlocal diarization_stage, diarization_evidence_stage
@@ -487,7 +487,8 @@ def run_supervised_full_pipeline(
             )
             supervisor.public.diarization.unlink(missing_ok=True)
             eligible_mps_fallback = (
-                isinstance(exc, StageWorkerError)
+                allow_fallback
+                and isinstance(exc, StageWorkerError)
                 and config.diarization_device == "auto"
                 and diarization_stage is not None
                 and diarization_stage.device == "mps"
@@ -661,7 +662,7 @@ def run_supervised_full_pipeline(
                 diarization_settled = True
                 finish_diarization("cancelled")
             else:
-                settle_diarization()
+                settle_diarization(allow_fallback=False)
             supervisor.public.diarization.unlink(missing_ok=True)
         diarization_stage = None
     elif preflight.missing_hf_token:

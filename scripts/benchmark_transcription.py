@@ -57,7 +57,7 @@ from keyframe.validation import (
 
 
 GIB = 1024**3
-REPORT_SCHEMA_VERSION = 5
+REPORT_SCHEMA_VERSION = 6
 DEFAULT_TIMESTAMP_TOLERANCE_SECONDS = 0.05
 DEFAULT_CRITICAL_PATH_TOLERANCE_SECONDS = 5.0
 PROCESS_TREE_PEAK_METHOD = "conservative-kernel-high-water-bound"
@@ -89,6 +89,7 @@ CANDIDATE_CONTRACT = {
     "diarization_device": "mps",
     "diarization_attempted_devices": ["mps"],
     "diarization_fallback_used": False,
+    "pytorch_mps_fallback_enabled": False,
     "frame_device": "mps",
     "schedule_policy": "auto",
     "schedule_mode": "serial",
@@ -240,6 +241,7 @@ def _run_candidate_case(request: _CaseRequest) -> dict[str, Any]:
             "with MPS diarization"
         )
     stage_peak_rss_bytes = supervisor.completed_stage_peak_rss_bytes()
+    diarization_metadata = supervisor.completed_stage_metadata("diarization")
     current_case_peak = resource_peak_rss_bytes("self")
     case_process_phase_peaks.setdefault("initial-wave", current_case_peak)
     case_process_phase_peaks.setdefault("second-wave", current_case_peak)
@@ -267,6 +269,14 @@ def _run_candidate_case(request: _CaseRequest) -> dict[str, Any]:
         raise BenchmarkError(
             "the release candidate did not make exactly one MPS diarization attempt"
         )
+    if (
+        len(diarization_metadata) != 1
+        or diarization_metadata[0].get("pytorch_mps_fallback_enabled") is not False
+    ):
+        raise BenchmarkError(
+            "the release candidate did not prove that implicit PyTorch MPS "
+            "fallback was disabled"
+        )
     missing_peak_stages = {"transcription", "diarization"} - set(
         stage_peak_rss_bytes
     )
@@ -291,6 +301,7 @@ def _run_candidate_case(request: _CaseRequest) -> dict[str, Any]:
             result.diarization_attempted_devices
         ),
         "diarization_fallback_used": result.diarization_fallback_used,
+        "pytorch_mps_fallback_enabled": False,
         "frame_device": result.frame_device,
         "model_repository": metadata.get("model_repository"),
         "model_revision": metadata.get("model_revision"),
