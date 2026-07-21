@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from typing import Any
 
-from keyframe.transcript import DiarizationRow
+from keyframe.transcript import DiarizationRow, TranscriptSegment
 
 
 @dataclass(frozen=True)
@@ -20,6 +22,203 @@ class DiarizationPartitionComparison:
     max_timestamp_delta_seconds: float
     reference_row_count: int
     candidate_row_count: int
+
+
+@dataclass(frozen=True)
+class TranscriptQualityComparison:
+    """Deterministic transcript agreement metrics used by release benchmarks."""
+
+    reference_word_count: int
+    candidate_word_count: int
+    normalized_word_agreement: float
+    normalized_word_edit_distance: int
+    normalized_word_error_rate: float
+    character_agreement: float
+    reference_duplicate_ngrams: int
+    candidate_duplicate_ngrams: int
+    exact_opening_segments: int
+    segment_count_relative_delta: float
+    reference_end_seconds: float
+    candidate_end_seconds: float
+
+
+_WORD_PATTERN = re.compile(r"[^\W_]+(?:['’][^\W_]+)*", re.UNICODE)
+
+
+def _segment_text(value: TranscriptSegment | Mapping[str, Any]) -> str:
+    if isinstance(value, TranscriptSegment):
+        return value.text
+    if not isinstance(value, Mapping):
+        raise TypeError(f"transcript comparison row must be a segment or mapping: {value!r}")
+    text = value.get("text")
+    if not isinstance(text, str):
+        raise ValueError(f"transcript comparison row has invalid text: {value!r}")
+    return text
+
+
+def _segment_end(value: TranscriptSegment | Mapping[str, Any]) -> float:
+    raw_end = value.end if isinstance(value, TranscriptSegment) else value.get("end")
+    try:
+        end = float(raw_end)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"transcript comparison row has invalid end: {value!r}") from exc
+    if not math.isfinite(end) or end < 0:
+        raise ValueError(f"transcript comparison row has invalid end: {value!r}")
+    return end
+
+
+def normalize_transcript_words(text: str) -> tuple[str, ...]:
+    """Normalize case, apostrophes, and punctuation into comparison words."""
+
+    if not isinstance(text, str):
+        raise TypeError("transcript text must be a string")
+    return tuple(
+        match.group(0).replace("’", "'").casefold()
+        for match in _WORD_PATTERN.finditer(text)
+    )
+
+
+def _edit_distance(reference: tuple[str, ...], candidate: tuple[str, ...]) -> int:
+    if len(reference) < len(candidate):
+        reference, candidate = candidate, reference
+    previous = list(range(len(candidate) + 1))
+    for row_index, reference_word in enumerate(reference, 1):
+        current = [row_index]
+        for column_index, candidate_word in enumerate(candidate, 1):
+            current.append(
+                min(
+                    current[-1] + 1,
+                    previous[column_index] + 1,
+                    previous[column_index - 1]
+                    + (reference_word != candidate_word),
+                )
+            )
+        previous = current
+    return previous[-1]
+
+
+def _duplicate_ngrams(words: tuple[str, ...], size: int) -> int:
+    if size < 1:
+        raise ValueError("ngram size must be at least one")
+    counts: dict[tuple[str, ...], int] = {}
+    for index in range(max(0, len(words) - size + 1)):
+        ngram = words[index : index + size]
+        counts[ngram] = counts.get(ngram, 0) + 1
+    return sum(count - 1 for count in counts.values() if count > 1)
+
+
+def compare_transcript_quality(
+    reference: Iterable[TranscriptSegment | Mapping[str, Any]],
+    candidate: Iterable[TranscriptSegment | Mapping[str, Any]],
+    *,
+    duplicate_ngram_size: int = 5,
+) -> TranscriptQualityComparison:
+    """Compare normalized text while retaining segment and coverage signals."""
+
+    reference_segments = tuple(reference)
+    candidate_segments = tuple(candidate)
+    reference_segment_words = tuple(
+        normalize_transcript_words(_segment_text(segment))
+        for segment in reference_segments
+    )
+    candidate_segment_words = tuple(
+        normalize_transcript_words(_segment_text(segment))
+        for segment in candidate_segments
+    )
+    reference_words = tuple(
+        word for segment in reference_segment_words for word in segment
+    )
+    candidate_words = tuple(
+        word for segment in candidate_segment_words for word in segment
+    )
+    edit_distance = _edit_distance(reference_words, candidate_words)
+    word_error_rate = edit_distance / max(1, len(reference_words))
+    normalized_reference = " ".join(reference_words)
+    normalized_candidate = " ".join(candidate_words)
+    opening_matches = 0
+    for expected, actual in zip(reference_segment_words, candidate_segment_words):
+        if expected != actual:
+            break
+        opening_matches += 1
+    segment_delta = abs(len(candidate_segments) - len(reference_segments)) / max(
+        1,
+        len(reference_segments),
+    )
+
+    return TranscriptQualityComparison(
+        reference_word_count=len(reference_words),
+        candidate_word_count=len(candidate_words),
+        normalized_word_agreement=SequenceMatcher(
+            None,
+            reference_words,
+            candidate_words,
+            autojunk=False,
+        ).ratio(),
+        normalized_word_edit_distance=edit_distance,
+        normalized_word_error_rate=word_error_rate,
+        character_agreement=SequenceMatcher(
+            None,
+            normalized_reference,
+            normalized_candidate,
+            autojunk=False,
+        ).ratio(),
+        reference_duplicate_ngrams=_duplicate_ngrams(
+            reference_words,
+            duplicate_ngram_size,
+        ),
+        candidate_duplicate_ngrams=_duplicate_ngrams(
+            candidate_words,
+            duplicate_ngram_size,
+        ),
+        exact_opening_segments=opening_matches,
+        segment_count_relative_delta=segment_delta,
+        reference_end_seconds=(
+            max(_segment_end(segment) for segment in reference_segments)
+            if reference_segments
+            else 0.0
+        ),
+        candidate_end_seconds=(
+            max(_segment_end(segment) for segment in candidate_segments)
+            if candidate_segments
+            else 0.0
+        ),
+    )
+
+
+CRITICAL_PATH_EXPRESSIONS = frozenset(
+    {
+        "max(T + F, D) + M + E",
+        "max(T, D) + F + M + E",
+        "T + D + F + M + E",
+    }
+)
+
+
+def expected_critical_path_seconds(
+    expression: str,
+    timings: Mapping[str, float],
+) -> float:
+    """Evaluate one documented full-pipeline dependency expression."""
+
+    if expression not in CRITICAL_PATH_EXPRESSIONS:
+        raise ValueError(f"unsupported critical-path expression: {expression!r}")
+    try:
+        transcription = float(timings["transcription"])
+        diarization = float(timings["diarization"])
+        frames = float(timings["frames"])
+        merge = float(timings["merge"])
+        enrichment = float(timings["manifest"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("critical-path timings are incomplete or invalid") from exc
+    values = (transcription, diarization, frames, merge, enrichment)
+    if any(not math.isfinite(value) or value < 0 for value in values):
+        raise ValueError("critical-path timings must be finite and non-negative")
+
+    if expression == "max(T + F, D) + M + E":
+        return max(transcription + frames, diarization) + merge + enrichment
+    if expression == "max(T, D) + F + M + E":
+        return max(transcription, diarization) + frames + merge + enrichment
+    return transcription + diarization + frames + merge + enrichment
 
 
 def _comparison_row(value: DiarizationRow | Mapping[str, Any]) -> DiarizationRow:

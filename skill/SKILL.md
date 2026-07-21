@@ -36,10 +36,15 @@ Extract key frames and/or a timestamped transcript from a video or audio file.
    - `--transcript-only` — skip frame extraction
    - `--no-speaker-detection` — skip pyannote speaker detection
    - `--whisper-model medium` — transcription model (default: medium)
+   - `--transcription-backend auto|mlx|whisper` — automatic MLX/Whisper selection or an explicit backend
+   - `--diarization-device auto|cpu|cuda` — speaker-detection device
+   - `--stage-concurrency auto|serial|parallel` — model-stage scheduling policy
    - `--pass1-clusters 20` — more candidate frames before merging (default: 15)
    - `--similarity-threshold` — deprecated no-op; do not tune with this flag
 
-   Whisper always provides transcript text and segment timing. Speaker detection is attempted by default when `HF_TOKEN` exists; pyannote then adds segment-level labels to Whisper segments. To enable it, accept the pyannote model terms at `https://huggingface.co/pyannote/speaker-diarization-community-1`, create a Hugging Face token at `https://huggingface.co/settings/tokens`, and export it as `HF_TOKEN`. If `HF_TOKEN` is missing or pyannote access fails, Keyframe warns and keeps the unlabeled Whisper transcript.
+   The automatic backend uses pinned MLX-Whisper on Apple Silicon running macOS 14 or newer and OpenAI Whisper elsewhere. Unsupported platforms neither install MLX nor download its weights. Eligible automatic MLX failures retry OpenAI Whisper in a fresh CPU worker. Speaker detection is attempted by default when `HF_TOKEN` exists; pyannote then adds segment-level labels to Whisper segments. To enable it, accept the pyannote model terms at `https://huggingface.co/pyannote/speaker-diarization-community-1`, create a Hugging Face token at `https://huggingface.co/settings/tokens`, and export it as `HF_TOKEN`. If `HF_TOKEN` is missing or pyannote access fails, Keyframe warns and keeps the unlabeled Whisper transcript.
+
+   In automatic concurrency mode, accelerator transcription can overlap CPU diarization. CPU transcription and diarization overlap only after CPU-count and memory admission; stages sharing one accelerator remain serialized. A full run waits for transcription to release MPS/CUDA before starting frames.
 
 4. **Present the results.** After extraction completes:
    - Read the transcript first; treat it as narrative authority for what was said
@@ -58,6 +63,8 @@ Extract key frames and/or a timestamped transcript from a video or audio file.
     ...
     captions.json              # Florence-2 captions + merge metadata
     manifest.json              # Deterministic frame triage index
+  transcript.raw.json          # Durable raw transcript before speaker assignment
+  diarization.json             # Current successful pyannote checkpoint, when run
   transcript.txt               # Timestamped transcript, speaker-labeled when available
   transcript.json              # Machine-readable transcript; includes speaker when available
 ```
@@ -68,6 +75,7 @@ Extract key frames and/or a timestamped transcript from a video or audio file.
 - For long videos, the frame extraction takes ~20-30s regardless of length (it samples at 0.5s intervals)
 - Whisper defaults to `medium`; use `large` only when accuracy is worth the extra time and download
 - Speaker labels use raw pyannote labels such as `SPEAKER_00`; JSON includes `speaker` only on labeled segments
+- `transcript.raw.json` remains available if a later independent stage fails
 - The transcript.json file contains structured `[{start, end, text}]` segments for programmatic use when speaker detection is unavailable or disabled
 - Audio-only files (.m4a, .mp3) automatically skip frame extraction even without `--transcript-only`
 

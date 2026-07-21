@@ -232,6 +232,9 @@ def promote_frame_generation(
         try:
             public_mode = stat.S_IMODE(public.stat().st_mode)
             staged.chmod(public_mode | stat.S_IRWXU)
+            # macOS requires the source directory itself to be owner-writable
+            # before it can be renamed, even when its parent is writable.
+            public.chmod(public_mode | stat.S_IRWXU)
         except OSError as exc:
             raise FrameGenerationPromotionError(
                 f"failed to preserve public frame directory permissions: {exc}"
@@ -249,14 +252,37 @@ def promote_frame_generation(
     try:
         os.replace(public, backup)
     except OSError as exc:
-        raise FrameGenerationPromotionError(
+        error = FrameGenerationPromotionError(
             f"failed to back up previous frame generation at {public}: {exc}"
-        ) from exc
+        )
+        try:
+            assert public_mode is not None
+            public.chmod(public_mode)
+        except OSError as restore_error:
+            error.add_note(
+                "failed to restore public frame directory permissions after "
+                f"backup failure: {restore_error}"
+            )
+        raise error from exc
 
     try:
         os.replace(staged, public)
     except BaseException as promotion_error:
         rollback_error = _rollback_previous_generation(backup, public)
+        previous_generation = (
+            public
+            if os.path.lexists(public) and not os.path.lexists(backup)
+            else backup
+        )
+        try:
+            assert public_mode is not None
+            if os.path.lexists(previous_generation):
+                previous_generation.chmod(public_mode)
+        except OSError as mode_error:
+            promotion_error.add_note(
+                "failed to restore previous frame directory permissions: "
+                f"{mode_error}"
+            )
         if os.path.lexists(public) and not os.path.lexists(backup):
             if not isinstance(promotion_error, Exception):
                 if rollback_error is not None:
