@@ -26,7 +26,9 @@ import os
 import platform
 import sys
 import time
-from collections.abc import Iterable, Mapping, Sequence
+import warnings
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -40,12 +42,102 @@ TRANSCRIPTION_BACKENDS = ("auto", "mlx", "whisper")
 DIARIZATION_DEVICES = ("auto", "cpu", "cuda")
 MLX_MINIMUM_MACOS_MAJOR = 14
 MLX_MINIMUM_DARWIN_MAJOR = 23
+DIARIZATION_SOURCE_IGNORED_FIELDS = frozenset({"label", "segment"})
 SPEAKER_DETECTION_SETUP_WARNING = """Warning: no HF_TOKEN found; falling back to transcript without speaker detection.
 To enable speaker detection, accept the pyannote model terms at:
 https://huggingface.co/pyannote/speaker-diarization-community-1
 Then create a Hugging Face access token at:
 https://huggingface.co/settings/tokens
 and export it as HF_TOKEN."""
+
+
+@dataclass(frozen=True)
+class _PyannoteWarningFingerprint:
+    message_prefix: str
+    origin_suffix: str
+    concise_message: str
+
+
+_PYANNOTE_WARNING_FINGERPRINTS = (
+    _PyannoteWarningFingerprint(
+        message_prefix=(
+            "torchcodec is not installed correctly so built-in audio decoding "
+            "will fail. Solutions are:"
+        ),
+        origin_suffix="pyannote/audio/core/io.py",
+        concise_message=(
+            "[diarization] pyannote TorchCodec decoding is unavailable; "
+            "Keyframe supplies preloaded audio instead."
+        ),
+    ),
+    _PyannoteWarningFingerprint(
+        message_prefix=(
+            "std(): degrees of freedom is <= 0. Correction should be strictly "
+            "less than the reduction factor"
+        ),
+        origin_suffix="pyannote/audio/models/blocks/pooling.py",
+        concise_message=(
+            "[diarization] pyannote encountered a too-short pooling window; "
+            "continuing diarization."
+        ),
+    ),
+)
+
+
+def _normalized_warning_message(message: Warning | str) -> str:
+    return " ".join(str(message).split())
+
+
+def _warning_origin_matches(filename: str, suffix: str) -> bool:
+    normalized = str(filename).replace("\\", "/")
+    return normalized == suffix or normalized.endswith(f"/{suffix}")
+
+
+@contextmanager
+def _condense_expected_pyannote_warnings() -> Iterator[None]:
+    """Condense two exact pyannote warnings and delegate every other warning."""
+
+    emitted: set[_PyannoteWarningFingerprint] = set()
+    with warnings.catch_warnings():
+        active_showwarning = warnings.showwarning
+
+        def route_warning(
+            message: Warning | str,
+            category: type[Warning],
+            filename: str,
+            lineno: int,
+            file: Any = None,
+            line: str | None = None,
+        ) -> None:
+            normalized_message = _normalized_warning_message(message)
+            for fingerprint in _PYANNOTE_WARNING_FINGERPRINTS:
+                if (
+                    category is UserWarning
+                    and normalized_message.startswith(fingerprint.message_prefix)
+                    and _warning_origin_matches(
+                        filename,
+                        fingerprint.origin_suffix,
+                    )
+                ):
+                    if fingerprint not in emitted:
+                        emitted.add(fingerprint)
+                        print(
+                            fingerprint.concise_message,
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    return
+            active_showwarning(
+                message,
+                category,
+                filename,
+                lineno,
+                file,
+                line,
+            )
+
+        warnings.showwarning = route_warning
+        yield
 
 
 @dataclass(frozen=True)
@@ -144,6 +236,8 @@ class MLXRuntime:
     transcribe: Callable[..., Mapping[str, Any]]
     float16: Any
     local_entry_not_found_error: type[Exception]
+    reset_peak_memory: Callable[[], None]
+    get_peak_memory: Callable[[], int]
 
 
 @dataclass(frozen=True)
@@ -581,6 +675,83 @@ def _valid_diarization_rows(diarization: Any) -> tuple[DiarizationRow, ...]:
     return tuple(normalized_rows)
 
 
+def _strict_diarization_rows(diarization: Any) -> tuple[DiarizationRow, ...]:
+    """Convert every pyannote row or reject the complete diarization result."""
+
+    if (
+        isinstance(diarization, tuple)
+        and len(diarization) == 2
+        and not isinstance(diarization[0], Mapping)
+        and (
+            hasattr(diarization[0], "to_dict")
+            or isinstance(diarization[0], Sequence)
+        )
+        and (diarization[1] is None or isinstance(diarization[1], Mapping))
+    ):
+        diarization = diarization[0]
+
+    if diarization is None:
+        records: Sequence[Any] = ()
+    elif isinstance(diarization, DiarizationRow):
+        records = (diarization,)
+    elif hasattr(diarization, "to_dict"):
+        try:
+            converted = diarization.to_dict("records")
+        except Exception as exc:
+            raise CheckpointValidationError(
+                f"could not convert diarization rows: {exc}"
+            ) from exc
+        if not isinstance(converted, Sequence) or isinstance(
+            converted,
+            (str, bytes),
+        ):
+            raise CheckpointValidationError(
+                "diarization conversion must return a row sequence"
+            )
+        records = converted
+    elif isinstance(diarization, Mapping):
+        records = (diarization,)
+    elif isinstance(diarization, Sequence) and not isinstance(
+        diarization,
+        (str, bytes),
+    ):
+        records = diarization
+    else:
+        raise CheckpointValidationError(
+            "diarization result must contain a row sequence"
+        )
+
+    normalized_rows = []
+    accepted_fields = DIARIZATION_FIELDS | DIARIZATION_SOURCE_IGNORED_FIELDS
+    for index, record in enumerate(records):
+        if isinstance(record, DiarizationRow):
+            normalized = _diarization_checkpoint_row(record, index)
+        elif isinstance(record, Mapping):
+            fields = set(record)
+            missing = DIARIZATION_FIELDS - fields
+            unexpected = fields - accepted_fields
+            if missing:
+                raise CheckpointValidationError(
+                    f"diarization row {index} is missing fields: "
+                    + ", ".join(sorted(str(field) for field in missing))
+                )
+            if unexpected:
+                raise CheckpointValidationError(
+                    f"diarization row {index} has unknown fields: "
+                    + ", ".join(sorted(str(field) for field in unexpected))
+                )
+            normalized = _diarization_checkpoint_row(
+                {field: record[field] for field in DIARIZATION_FIELDS},
+                index,
+            )
+        else:
+            raise CheckpointValidationError(
+                f"diarization row {index} must be an object"
+            )
+        normalized_rows.append(DiarizationRow(**normalized))
+    return tuple(normalized_rows)
+
+
 def _assign_speakers(
     segments: Iterable[Mapping[str, Any] | TranscriptSegment],
     diarization: Any,
@@ -724,7 +895,9 @@ def _load_mlx_runtime() -> MLXRuntime:
         import mlx.core as mx
         import mlx_whisper
         from mlx_whisper.transcribe import ModelHolder
-    except (ImportError, OSError) as exc:
+        reset_peak_memory = mx.reset_peak_memory
+        get_peak_memory = mx.get_peak_memory
+    except (AttributeError, ImportError, OSError) as exc:
         raise MLXImportError(
             "the pinned MLX runtime could not be imported; reinstall keyframe on a "
             "supported Apple Silicon Mac"
@@ -736,6 +909,8 @@ def _load_mlx_runtime() -> MLXRuntime:
         transcribe=mlx_whisper.transcribe,
         float16=mx.float16,
         local_entry_not_found_error=LocalEntryNotFoundError,
+        reset_peak_memory=reset_peak_memory,
+        get_peak_memory=get_peak_memory,
     )
 
 
@@ -837,6 +1012,7 @@ def _extract_with_mlx(
 
     print("Loading MLX model...")
     try:
+        runtime.reset_peak_memory()
         runtime.load_model(str(model_path), runtime.float16)
     except TranscriptionCancelled:
         raise
@@ -854,7 +1030,17 @@ def _extract_with_mlx(
             word_timestamps=False,
         )
         segments, language = _normalize_mlx_result(result)
-        return TranscriptionResult(segments, language, execution_metadata)
+        peak_memory_bytes = runtime.get_peak_memory()
+        if isinstance(peak_memory_bytes, bool) or not isinstance(
+            peak_memory_bytes,
+            int,
+        ):
+            raise TypeError("MLX peak memory counter did not return an integer")
+        if peak_memory_bytes < 0:
+            raise ValueError("MLX peak memory counter returned a negative value")
+        metadata = dict(execution_metadata)
+        metadata["mlx_peak_memory_bytes"] = peak_memory_bytes
+        return TranscriptionResult(segments, language, metadata)
     except TranscriptionCancelled:
         raise
     except Exception as exc:
@@ -918,40 +1104,49 @@ def _detect_speakers(
     *,
     device: str = "auto",
 ) -> tuple[DiarizationRow, ...]:
-    import whisperx
-    from whisperx.diarize import DiarizationPipeline
-    from tqdm import tqdm
+    with _condense_expected_pyannote_warnings():
+        import whisperx
+        from whisperx.diarize import DiarizationPipeline
+        from tqdm import tqdm
 
-    if device == "auto":
-        device, _compute_type = _select_whisperx_device()
-    else:
-        device, _compute_type = _select_whisperx_device(device)
-    audio = whisperx.load_audio(str(video))
+        if device == "auto":
+            device, _compute_type = _select_whisperx_device()
+        else:
+            device, _compute_type = _select_whisperx_device(device)
+        audio = whisperx.load_audio(str(video))
 
-    print("Detecting speakers with pyannote...")
-    diarize_model = DiarizationPipeline(PYANNOTE_MODEL, token=hf_token, device=device)
-    progress = tqdm(
-        total=100,
-        desc="Detecting speakers",
-        unit="%",
-        leave=False,
-    )
-    last_progress = 0.0
+        print("Detecting speakers with pyannote...")
+        diarize_model = DiarizationPipeline(
+            PYANNOTE_MODEL,
+            token=hf_token,
+            device=device,
+        )
+        progress = tqdm(
+            total=100,
+            desc="Detecting speakers",
+            unit="%",
+            leave=False,
+        )
+        last_progress = 0.0
 
-    def update_progress(percent: float) -> None:
-        nonlocal last_progress
+        def update_progress(percent: float) -> None:
+            nonlocal last_progress
+            try:
+                bounded = min(100.0, max(last_progress, float(percent)))
+            except (TypeError, ValueError):
+                return
+            if bounded > last_progress:
+                progress.update(bounded - last_progress)
+            last_progress = bounded
+
         try:
-            bounded = min(100.0, max(last_progress, float(percent)))
-        except (TypeError, ValueError):
-            return
-        if bounded > last_progress:
-            progress.update(bounded - last_progress)
-        last_progress = bounded
-
-    try:
-        return _valid_diarization_rows(diarize_model(audio, progress_callback=update_progress))
-    finally:
-        progress.close()
+            detected = diarize_model(
+                audio,
+                progress_callback=update_progress,
+            )
+            return _strict_diarization_rows(detected)
+        finally:
+            progress.close()
 
 
 def extract_transcript(

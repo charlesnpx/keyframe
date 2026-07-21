@@ -1,5 +1,6 @@
 import json
 import sys
+import warnings
 from dataclasses import FrozenInstanceError
 from types import ModuleType, SimpleNamespace
 
@@ -353,6 +354,143 @@ def test_detect_speakers_reports_monotonic_progress_and_closes_bar(monkeypatch, 
     assert rows == (transcript.DiarizationRow(0, 1, "SPEAKER_00"),)
     assert updates == [20.0, 60.0, 20.0]
     assert closed == [True]
+
+
+def test_expected_pyannote_warnings_are_condensed_once_per_fingerprint(
+    monkeypatch,
+    capsys,
+):
+    delegated = []
+
+    def delegate(*args, **kwargs):
+        delegated.append((args, kwargs))
+
+    monkeypatch.setattr(warnings, "showwarning", delegate)
+    torchcodec_message = """
+        torchcodec is not installed correctly so built-in audio decoding will
+        fail. Solutions are: use preloaded audio instead.
+    """
+    pooling_message = (
+        "std(): degrees of freedom is <= 0. Correction should be strictly less "
+        "than the reduction factor (input numel divided by output numel)."
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("always")
+        with transcript._condense_expected_pyannote_warnings():
+            for _ in range(2):
+                warnings.warn_explicit(
+                    torchcodec_message,
+                    UserWarning,
+                    "/runtime/pyannote/audio/core/io.py",
+                    48,
+                )
+                warnings.warn_explicit(
+                    pooling_message,
+                    UserWarning,
+                    "/runtime/pyannote/audio/models/blocks/pooling.py",
+                    103,
+                )
+
+    assert delegated == []
+    error_output = capsys.readouterr().err
+    assert error_output.count("pyannote TorchCodec decoding is unavailable") == 1
+    assert error_output.count("pyannote encountered a too-short pooling window") == 1
+
+
+@pytest.mark.parametrize(
+    ("message", "category", "filename"),
+    [
+        (
+            "torchcodec decoding behavior changed",
+            UserWarning,
+            "/runtime/pyannote/audio/core/io.py",
+        ),
+        (
+            "torchcodec is not installed correctly so built-in audio decoding "
+            "will fail. Solutions are:",
+            RuntimeWarning,
+            "/runtime/pyannote/audio/core/io.py",
+        ),
+        (
+            "std(): degrees of freedom is <= 0. Correction should be strictly "
+            "less than the reduction factor",
+            UserWarning,
+            "/runtime/not-pyannote/pooling.py",
+        ),
+    ],
+)
+def test_pyannote_warning_near_misses_delegate_to_the_active_handler(
+    monkeypatch,
+    message,
+    category,
+    filename,
+):
+    delegated = []
+
+    def delegate(*args, **kwargs):
+        delegated.append((args, kwargs))
+
+    monkeypatch.setattr(warnings, "showwarning", delegate)
+    with warnings.catch_warnings():
+        warnings.simplefilter("always")
+        with transcript._condense_expected_pyannote_warnings():
+            warnings.warn_explicit(message, category, filename, 1)
+
+    assert len(delegated) == 1
+    assert str(delegated[0][0][0]) == message
+    assert delegated[0][0][1] is category
+    assert delegated[0][0][2] == filename
+
+
+def test_strict_diarization_rows_ignore_only_known_source_columns():
+    source_segment = object()
+
+    class FakeDataFrame:
+        def to_dict(self, orientation):
+            assert orientation == "records"
+            return [
+                {
+                    "segment": source_segment,
+                    "label": "track",
+                    "speaker": " SPEAKER_00 ",
+                    "start": 0,
+                    "end": 1.5,
+                }
+            ]
+
+    assert transcript._strict_diarization_rows(FakeDataFrame()) == (
+        transcript.DiarizationRow(0.0, 1.5, "SPEAKER_00"),
+    )
+    assert transcript._strict_diarization_rows([]) == ()
+
+
+@pytest.mark.parametrize(
+    "invalid_row",
+    [
+        {"start": 0, "end": 1},
+        {"start": -1, "end": 1, "speaker": "SPEAKER_00"},
+        {"start": 0, "end": float("nan"), "speaker": "SPEAKER_00"},
+        {"start": 1, "end": 1, "speaker": "SPEAKER_00"},
+        {"start": 0, "end": 1, "speaker": " "},
+        {"start": 0, "end": 1, "speaker": "SPEAKER_00", "extra": True},
+        "not a row",
+    ],
+)
+def test_malformed_diarization_rejects_the_whole_uncommitted_checkpoint(
+    tmp_path,
+    invalid_row,
+):
+    checkpoint = tmp_path / "diarization.json"
+    previous = (transcript.DiarizationRow(10, 11, "SPEAKER_PREVIOUS"),)
+    transcript.write_diarization_checkpoint(previous, checkpoint)
+    valid_row = {"start": 0, "end": 1, "speaker": "SPEAKER_00"}
+
+    with pytest.raises(transcript.CheckpointValidationError):
+        rows = transcript._strict_diarization_rows([valid_row, invalid_row])
+        transcript.write_diarization_checkpoint(rows, checkpoint)
+
+    assert transcript.read_diarization_checkpoint(checkpoint) == previous
 
 
 def test_assign_speakers_uses_largest_summed_overlap():

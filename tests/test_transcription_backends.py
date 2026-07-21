@@ -142,12 +142,21 @@ def test_mlx_adapter_resolves_cached_pinned_snapshot_and_preserves_precision(
             ],
         }
 
+    def reset_peak_memory():
+        calls.append(("reset-peak-memory",))
+
+    def get_peak_memory():
+        calls.append(("get-peak-memory",))
+        return 123456789
+
     runtime = transcript.MLXRuntime(
         snapshot_download=snapshot_download,
         load_model=load_model,
         transcribe=transcribe_mlx,
         float16="float16",
         local_entry_not_found_error=FakeLocalEntryNotFoundError,
+        reset_peak_memory=reset_peak_memory,
+        get_peak_memory=get_peak_memory,
     )
     monkeypatch.setattr(transcript, "_load_mlx_runtime", lambda: runtime)
 
@@ -167,6 +176,7 @@ def test_mlx_adapter_resolves_cached_pinned_snapshot_and_preserves_precision(
                 "local_files_only": True,
             },
         ),
+        ("reset-peak-memory",),
         ("load", str(model_dir), "float16"),
         (
             "transcribe",
@@ -177,6 +187,7 @@ def test_mlx_adapter_resolves_cached_pinned_snapshot_and_preserves_precision(
                 "word_timestamps": False,
             },
         ),
+        ("get-peak-memory",),
     ]
     assert result.language == "fr"
     assert result.segments == (
@@ -191,6 +202,7 @@ def test_mlx_adapter_resolves_cached_pinned_snapshot_and_preserves_precision(
     assert result.metadata["model_revision"] == spec.revision
     assert result.metadata["model_resolution_source"] == "local-hit"
     assert 0 <= result.metadata["model_resolution_seconds"] < 1
+    assert result.metadata["mlx_peak_memory_bytes"] == 123456789
     with pytest.raises(TypeError):
         result.metadata["model_resolution_source"] = "changed"
     output = capsys.readouterr().out
@@ -220,6 +232,8 @@ def test_mlx_cache_miss_permits_one_online_resolution(monkeypatch, tmp_path, cap
         transcribe=lambda *_args, **_kwargs: {"segments": [], "language": "en"},
         float16="float16",
         local_entry_not_found_error=FakeLocalEntryNotFoundError,
+        reset_peak_memory=lambda: None,
+        get_peak_memory=lambda: 0,
     )
     monkeypatch.setattr(transcript, "_load_mlx_runtime", lambda: runtime)
 
@@ -264,6 +278,8 @@ def test_mlx_local_resolution_failures_do_not_retry_online(
         transcribe=lambda *_args, **_kwargs: pytest.fail("invalid snapshots must not run"),
         float16="float16",
         local_entry_not_found_error=FakeLocalEntryNotFoundError,
+        reset_peak_memory=lambda: None,
+        get_peak_memory=lambda: 0,
     )
     monkeypatch.setattr(transcript, "_load_mlx_runtime", lambda: runtime)
 
@@ -299,6 +315,8 @@ def test_mlx_rejects_malformed_or_non_directory_snapshot_paths(
         transcribe=lambda *_args, **_kwargs: pytest.fail("invalid snapshots must not run"),
         float16="float16",
         local_entry_not_found_error=FakeLocalEntryNotFoundError,
+        reset_peak_memory=lambda: None,
+        get_peak_memory=lambda: 0,
     )
     monkeypatch.setattr(transcript, "_load_mlx_runtime", lambda: runtime)
 
@@ -317,9 +335,11 @@ def test_mlx_rejects_malformed_or_non_directory_snapshot_paths(
     ("failing_stage", "expected_error"),
     [
         ("acquire", transcript.MLXModelAcquisitionError),
+        ("reset", transcript.MLXModelLoadError),
         ("load", transcript.MLXModelLoadError),
         ("infer", transcript.MLXInferenceError),
         ("normalize", transcript.MLXInferenceError),
+        ("peak", transcript.MLXInferenceError),
     ],
 )
 def test_mlx_failures_are_typed_and_auto_fallback_eligible(
@@ -345,6 +365,8 @@ def test_mlx_failures_are_typed_and_auto_fallback_eligible(
         ),
         float16="float16",
         local_entry_not_found_error=FakeLocalEntryNotFoundError,
+        reset_peak_memory=lambda: fail_if("reset", None),
+        get_peak_memory=lambda: fail_if("peak", 0),
     )
     monkeypatch.setattr(transcript, "_load_mlx_runtime", lambda: runtime)
 
@@ -382,6 +404,8 @@ def test_cancellation_and_output_failures_are_not_auto_fallback_eligible(
         transcribe=lambda *_args, **_kwargs: (_ for _ in ()).throw(cancelled),
         float16="float16",
         local_entry_not_found_error=FakeLocalEntryNotFoundError,
+        reset_peak_memory=lambda: None,
+        get_peak_memory=lambda: 0,
     )
     monkeypatch.setattr(transcript, "_load_mlx_runtime", lambda: runtime)
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import multiprocessing as mp
 import os
 import queue
 import signal
@@ -106,6 +107,9 @@ def _spawn_test_worker(request, terminal_send, progress_queue, cancellation_even
                 progress_queue,
                 StageProgress(request["stage"], "progress", str(index)),
             )
+        callback_observed = request.get("callback_observed")
+        if callback_observed is not None and not callback_observed.wait(15.0):
+            raise RuntimeError("progress callback was not observed")
         terminal = StageTerminal.succeeded(
             request["stage"],
             {"record_count": 1, "language": "en"},
@@ -239,6 +243,7 @@ def test_spawned_worker_is_non_daemon_validated_and_promoted(tmp_path):
         progress_callback=progress.append,
         run_id="success",
     ) as supervisor:
+        before_launch = time.monotonic()
         handle = _start_test_stage(
             supervisor,
             progress_events=3,
@@ -246,6 +251,7 @@ def test_spawned_worker_is_non_daemon_validated_and_promoted(tmp_path):
         assert handle.process.daemon is False
 
         completion = supervisor.complete(handle)
+        after_completion = time.monotonic()
 
         assert completion.stage == "transcription"
         assert completion.checkpoint_path == output / "transcript.raw.json"
@@ -256,6 +262,7 @@ def test_spawned_worker_is_non_daemon_validated_and_promoted(tmp_path):
             transcript.TranscriptSegment(0.123456789, 1.987654321, "worker"),
         )
         assert not handle.process.is_alive()
+        assert before_launch <= handle.ended_at <= after_completion
         assert completion.checkpoint_path.exists()
         assert not supervisor.staging.transcript_raw.exists()
 
@@ -287,21 +294,27 @@ def test_lossy_progress_cannot_block_reliable_terminal_during_parent_work(tmp_pa
 def test_slow_progress_callback_cannot_delay_reliable_terminal(tmp_path):
     output = tmp_path / "output"
     callback_started = threading.Event()
+    callback_observed = mp.get_context("spawn").Event()
     release_callback = threading.Event()
 
     def block_progress(_event):
         callback_started.set()
+        callback_observed.set()
         release_callback.wait()
 
     try:
         with StageSupervisor(
             output,
             progress_callback=block_progress,
-            progress_capacity=20_000,
+            progress_capacity=1,
             run_id="slow-progress",
         ) as supervisor:
-            handle = _start_test_stage(supervisor, progress_events=30_000)
-            assert callback_started.wait(timeout=5.0)
+            handle = _start_test_stage(
+                supervisor,
+                progress_events=1,
+                callback_observed=callback_observed,
+            )
+            assert callback_started.wait(timeout=15.0)
 
             completion = handle.wait(timeout=15.0)
             promoted = supervisor.complete(handle)
@@ -767,6 +780,7 @@ def test_transcription_worker_keeps_result_on_disk_and_metadata_off_progress_cha
                 "model_revision": "immutable-revision",
                 "model_resolution_source": "local-hit",
                 "model_resolution_seconds": 0.125,
+                "mlx_peak_memory_bytes": 123456789,
             },
         ),
     )
@@ -783,7 +797,10 @@ def test_transcription_worker_keeps_result_on_disk_and_metadata_off_progress_cha
         transcript.TranscriptSegment(0.1, 2.3, "disk backed"),
     )
     assert len(terminal.messages) == 1
-    assert terminal.messages[0].metadata == {
+    terminal_message = terminal.messages[0]
+    terminal_metadata = dict(terminal_message.metadata)
+    assert terminal_metadata.pop("process_tree_peak_rss_bytes") > 0
+    assert terminal_metadata == {
         "language": "en",
         "segment_count": 1,
         "requested_backend": "auto",
@@ -792,7 +809,9 @@ def test_transcription_worker_keeps_result_on_disk_and_metadata_off_progress_cha
         "model_revision": "immutable-revision",
         "model_resolution_source": "local-hit",
         "model_resolution_seconds": 0.125,
+        "mlx_peak_memory_bytes": 123456789,
     }
+    assert terminal_message.ended_at > 0
     assert not hasattr(terminal.messages[0], "segments")
     assert terminal.closed
     assert progress.closed
@@ -826,9 +845,12 @@ def test_diarization_worker_entry_keeps_bulk_result_on_disk(tmp_path, monkeypatc
         transcript.DiarizationRow(0.1, 2.3, "SPEAKER_00"),
     )
     assert calls == [(tmp_path / "video.mp4", "hf_test", "cpu")]
-    assert terminal.messages == [
-        StageTerminal.succeeded("diarization", {"row_count": 1})
-    ]
+    assert len(terminal.messages) == 1
+    terminal_message = terminal.messages[0]
+    terminal_metadata = dict(terminal_message.metadata)
+    assert terminal_metadata.pop("process_tree_peak_rss_bytes") > 0
+    assert terminal_metadata == {"row_count": 1}
+    assert terminal_message.ended_at > 0
 
 
 def test_worker_error_has_reliable_terminal_metadata(tmp_path, monkeypatch):
