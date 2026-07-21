@@ -24,6 +24,7 @@ from keyframe.artifacts import (
     run_staging_paths,
     transcript_checkpoint_paths,
 )
+from keyframe.stage_scheduler import configure_worker_thread_budget
 from keyframe.transcript import (
     DiarizationRow,
     TranscriptSegment,
@@ -58,10 +59,12 @@ class StageWorkerError(StageSupervisorError):
         *,
         exitcode: int | None,
         error_type: str | None = None,
+        fallback_eligible: bool = False,
     ) -> None:
         self.stage = stage
         self.exitcode = exitcode
         self.error_type = error_type
+        self.fallback_eligible = bool(fallback_eligible)
         prefix = f"{error_type}: " if error_type else ""
         super().__init__(f"{stage} worker failed (status {exitcode}): {prefix}{message}")
 
@@ -96,19 +99,27 @@ class StageTerminal:
     metadata: Mapping[str, Any]
     error_type: str | None = None
     error_message: str | None = None
+    fallback_eligible: bool = False
 
     @classmethod
     def succeeded(cls, stage: str, metadata: Mapping[str, Any]) -> StageTerminal:
         return cls(stage=stage, status="success", metadata=dict(metadata))
 
     @classmethod
-    def failed(cls, stage: str, exc: BaseException) -> StageTerminal:
+    def failed(
+        cls,
+        stage: str,
+        exc: BaseException,
+        *,
+        fallback_eligible: bool = False,
+    ) -> StageTerminal:
         return cls(
             stage=stage,
             status="error",
             metadata={},
             error_type=type(exc).__name__,
             error_message=str(exc),
+            fallback_eligible=fallback_eligible,
         )
 
 
@@ -119,6 +130,7 @@ class TranscriptionWorkerRequest:
     requested_backend: str
     checkpoint_path: str
     final_output_paths: tuple[str, ...] = ()
+    thread_budget: int | None = None
 
 
 @dataclass(frozen=True)
@@ -127,6 +139,7 @@ class DiarizationWorkerRequest:
     hf_token: str
     checkpoint_path: str
     final_output_paths: tuple[str, ...] = ()
+    thread_budget: int | None = None
 
 
 @dataclass(frozen=True)
@@ -177,6 +190,7 @@ def _execute_worker(
     progress_queue: Any,
     cancellation_event: Any,
     operation: Callable[[], Mapping[str, Any]],
+    fallback_classifier: Callable[[BaseException], bool] | None = None,
 ) -> None:
     try:
         emit_stage_progress(progress_queue, StageProgress(stage, "started"))
@@ -188,7 +202,20 @@ def _execute_worker(
         _send_terminal(terminal_send, StageTerminal.succeeded(stage, metadata))
         emit_stage_progress(progress_queue, StageProgress(stage, "completed"))
     except BaseException as exc:
-        _send_terminal(terminal_send, StageTerminal.failed(stage, exc))
+        fallback_eligible = False
+        if fallback_classifier is not None:
+            try:
+                fallback_eligible = fallback_classifier(exc)
+            except Exception:
+                fallback_eligible = False
+        _send_terminal(
+            terminal_send,
+            StageTerminal.failed(
+                stage,
+                exc,
+                fallback_eligible=fallback_eligible,
+            ),
+        )
         raise
     finally:
         _close_worker_ipc(terminal_send, progress_queue)
@@ -207,6 +234,10 @@ def transcription_worker_entry(
         effective_backend = transcript_module.resolve_transcription_backend(
             request.requested_backend,
             runtime_platform,
+        )
+        configure_worker_thread_budget(
+            request.thread_budget,
+            torch_threads=effective_backend == "whisper",
         )
         emit_stage_progress(
             progress_queue,
@@ -247,6 +278,8 @@ def transcription_worker_entry(
         progress_queue,
         cancellation_event,
         transcribe,
+        lambda exc: request.requested_backend == "auto"
+        and transcript_module.is_auto_fallback_eligible(exc),
     )
 
 
@@ -261,6 +294,7 @@ def diarization_worker_entry(
     def diarize() -> Mapping[str, Any]:
         if not request.hf_token.strip():
             raise ValueError("diarization requires a non-empty Hugging Face token")
+        configure_worker_thread_budget(request.thread_budget, torch_threads=True)
         emit_stage_progress(
             progress_queue,
             StageProgress("diarization", "inference"),
@@ -376,6 +410,7 @@ class StageHandle:
         checkpoint_path: Path,
         validator: Callable[[Path], tuple[Any, ...]],
         progress_callback: Callable[[StageProgress], None] | None,
+        thread_budget: int | None,
     ) -> None:
         self.stage = stage
         self.process = process
@@ -385,6 +420,7 @@ class StageHandle:
         self._cancellation_event = cancellation_event
         self._validator = validator
         self._progress_callback = progress_callback
+        self.thread_budget = thread_budget
         self._terminal_messages: list[Any] = []
         self._progress_callback_errors: list[Exception] = []
         self._control_done = threading.Event()
@@ -592,6 +628,9 @@ class StageHandle:
                 error_terminal.error_message if error_terminal else "exited unexpectedly",
                 exitcode=exitcode,
                 error_type=error_terminal.error_type if error_terminal else None,
+                fallback_eligible=(
+                    error_terminal.fallback_eligible if error_terminal else False
+                ),
             )
         if len(self._terminal_messages) != 1:
             raise StageProtocolError(
@@ -606,6 +645,7 @@ class StageHandle:
                 terminal.error_message or "worker reported failure",
                 exitcode=exitcode,
                 error_type=terminal.error_type,
+                fallback_eligible=terminal.fallback_eligible,
             )
         try:
             records = self._validator(self.checkpoint_path)
@@ -760,6 +800,7 @@ class StageSupervisor:
                 checkpoint_path=checkpoint_path,
                 validator=validator,
                 progress_callback=self.progress_callback,
+                thread_budget=getattr(request, "thread_budget", None),
             )
             self._handles.append(handle)
             process.start()
@@ -787,6 +828,7 @@ class StageSupervisor:
         model_name: str,
         requested_backend: str,
         final_output_paths: Iterable[str | Path] = (),
+        thread_budget: int | None = None,
     ) -> StageHandle:
         staging, public = self._require_entered()
         final_paths = tuple(str(Path(path)) for path in final_output_paths)
@@ -797,6 +839,7 @@ class StageSupervisor:
             requested_backend=requested_backend,
             checkpoint_path=str(staging.transcript_raw),
             final_output_paths=final_paths,
+            thread_budget=thread_budget,
         )
         return self._start_stage(
             stage="transcription",
@@ -815,6 +858,7 @@ class StageSupervisor:
         *,
         hf_token: str,
         final_output_paths: Iterable[str | Path] = (),
+        thread_budget: int | None = None,
     ) -> StageHandle:
         staging, public = self._require_entered()
         final_paths = tuple(str(Path(path)) for path in final_output_paths)
@@ -824,6 +868,7 @@ class StageSupervisor:
             hf_token=hf_token,
             checkpoint_path=str(staging.diarization),
             final_output_paths=final_paths,
+            thread_budget=thread_budget,
         )
         return self._start_stage(
             stage="diarization",
