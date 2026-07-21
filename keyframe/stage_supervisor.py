@@ -376,22 +376,35 @@ class StageHandle:
         self._progress_callback = progress_callback
         self._terminal_messages: list[Any] = []
         self._progress_callback_errors: list[Exception] = []
-        self._monitor_done = threading.Event()
+        self._control_done = threading.Event()
+        self._progress_done = threading.Event()
+        self._progress_stop = threading.Event()
         self._ipc_closed = False
         self._completion: StageCompletion | None = None
         self._failure: BaseException | None = None
-        self._monitor_thread = threading.Thread(
-            target=self._monitor,
-            name=f"keyframe-{stage}-monitor",
+        self._control_thread = threading.Thread(
+            target=self._monitor_control,
+            name=f"keyframe-{stage}-control",
             daemon=True,
         )
-        self._monitor_thread.start()
+        self._progress_thread = threading.Thread(
+            target=self._monitor_progress,
+            name=f"keyframe-{stage}-progress",
+            daemon=True,
+        )
+
+    def start_monitors(self) -> None:
+        """Start independent reliable-control and best-effort progress drains."""
+        self._control_thread.start()
+        self._progress_thread.start()
 
     def _drain_progress(self) -> None:
         while True:
             try:
                 event = self._progress_queue.get_nowait()
             except (queue.Empty, EOFError, OSError, ValueError):
+                return
+            if self._progress_stop.is_set():
                 return
             if isinstance(event, StageProgress) and self._progress_callback is not None:
                 try:
@@ -408,17 +421,32 @@ class StageHandle:
             except (EOFError, OSError):
                 return
 
-    def _monitor(self) -> None:
+    def _monitor_control(self) -> None:
         try:
             while self.process.is_alive():
-                self._drain_progress()
                 self._drain_terminal()
                 try:
                     self._terminal_receive.poll(0.05)
                 except (OSError, ValueError):
                     break
-            self.process.join()
             self._drain_terminal()
+        finally:
+            self._control_done.set()
+
+    def _monitor_progress(self) -> None:
+        try:
+            while self.process.is_alive() and not self._progress_stop.is_set():
+                try:
+                    event = self._progress_queue.get(timeout=0.05)
+                except (queue.Empty, EOFError, OSError, ValueError):
+                    continue
+                if isinstance(event, StageProgress) and self._progress_callback is not None:
+                    try:
+                        self._progress_callback(event)
+                    except Exception as exc:
+                        self._progress_callback_errors.append(exc)
+            if self._progress_stop.is_set():
+                return
             try:
                 event = self._progress_queue.get(timeout=0.05)
             except (queue.Empty, EOFError, OSError, ValueError):
@@ -431,12 +459,24 @@ class StageHandle:
                         self._progress_callback_errors.append(exc)
             self._drain_progress()
         finally:
-            self._monitor_done.set()
+            self._progress_done.set()
+
+    @staticmethod
+    def _thread_started(thread: threading.Thread) -> bool:
+        return thread.ident is not None
+
+    def _finish_control_monitor(self) -> None:
+        if self._thread_started(self._control_thread):
+            self._control_done.wait()
+            self._control_thread.join()
+        else:
+            self._drain_terminal()
 
     def _close_ipc(self) -> None:
         if self._ipc_closed:
             return
         self._ipc_closed = True
+        self._progress_stop.set()
         try:
             self._terminal_receive.close()
         except (OSError, AttributeError):
@@ -458,8 +498,7 @@ class StageHandle:
             raise StageWaitTimeout(
                 f"{self.stage} worker did not exit within {float(timeout):.1f}s"
             )
-        self._monitor_done.wait(timeout=2.0)
-        self._monitor_thread.join(timeout=0)
+        self._finish_control_monitor()
         self._close_ipc()
 
         try:
@@ -515,19 +554,19 @@ class StageHandle:
         )
 
     def cancel(self, grace_seconds: float = 1.0) -> None:
-        if self.process.is_alive():
-            self._cancellation_event.set()
-            self.process.join(max(0.0, grace_seconds))
-        if self.process.is_alive():
-            self.process.terminate()
-            self.process.join(max(0.0, grace_seconds))
-        if self.process.is_alive():
-            self.process.kill()
-            self.process.join()
-        else:
-            self.process.join()
-        self._monitor_done.wait(timeout=max(2.0, grace_seconds))
-        self._monitor_thread.join(timeout=0)
+        if self.process.pid is not None:
+            if self.process.is_alive():
+                self._cancellation_event.set()
+                self.process.join(max(0.0, grace_seconds))
+            if self.process.is_alive():
+                self.process.terminate()
+                self.process.join(max(0.0, grace_seconds))
+            if self.process.is_alive():
+                self.process.kill()
+                self.process.join()
+            else:
+                self.process.join()
+        self._finish_control_monitor()
         self._close_ipc()
 
 
@@ -563,19 +602,36 @@ class StageSupervisor:
         self.output_dir = self.output_dir.resolve()
         self.lock = OutputDirectoryLock(self.output_dir)
         self.lock.acquire()
+        staging_root_was_absent = False
         try:
             self._cleanup_stale_runs()
             self.staging = run_staging_paths(self.output_dir, self.run_id)
+            staging_root_was_absent = not os.path.lexists(self.staging.root)
             self.staging.root.mkdir()
             self.public = transcript_checkpoint_paths(self.output_dir)
             self._install_sigterm_handler()
             self._entered = True
             return self
-        except BaseException:
-            self._restore_sigterm_handler()
-            if self.staging is not None and self.staging.root.exists():
-                shutil.rmtree(self.staging.root)
-            self.lock.release()
+        except BaseException as exc:
+            try:
+                try:
+                    self._restore_sigterm_handler()
+                except BaseException as cleanup_exc:
+                    exc.add_note(f"failed to restore SIGTERM handler: {cleanup_exc}")
+                if (
+                    staging_root_was_absent
+                    and self.staging is not None
+                    and self.staging.root.is_dir()
+                    and not self.staging.root.is_symlink()
+                ):
+                    try:
+                        shutil.rmtree(self.staging.root)
+                    except BaseException as cleanup_exc:
+                        exc.add_note(
+                            f"failed to remove run staging directory: {cleanup_exc}"
+                        )
+            finally:
+                self.lock.release()
             raise
 
     def _install_sigterm_handler(self) -> None:
@@ -627,27 +683,36 @@ class StageSupervisor:
             name=f"keyframe-{stage}-{self.run_id[:8]}",
             daemon=False,
         )
+        handle: StageHandle | None = None
         try:
+            handle = StageHandle(
+                stage=stage,
+                process=process,
+                terminal_receive=terminal_receive,
+                progress_queue=progress_queue,
+                cancellation_event=cancellation_event,
+                checkpoint_path=checkpoint_path,
+                validator=validator,
+                progress_callback=self.progress_callback,
+            )
+            self._handles.append(handle)
             process.start()
-        except BaseException:
-            terminal_receive.close()
             terminal_send.close()
-            progress_queue.close()
-            progress_queue.join_thread()
+            handle.start_monitors()
+            return handle
+        except BaseException:
+            if handle is not None:
+                self._handles[:] = [owned for owned in self._handles if owned is not handle]
+                handle.cancel(self.cancellation_grace_seconds)
+            else:
+                terminal_receive.close()
+                progress_queue.close()
+                progress_queue.join_thread()
+            try:
+                terminal_send.close()
+            except (OSError, AttributeError):
+                pass
             raise
-        terminal_send.close()
-        handle = StageHandle(
-            stage=stage,
-            process=process,
-            terminal_receive=terminal_receive,
-            progress_queue=progress_queue,
-            cancellation_event=cancellation_event,
-            checkpoint_path=checkpoint_path,
-            validator=validator,
-            progress_callback=self.progress_callback,
-        )
-        self._handles.append(handle)
-        return handle
 
     def start_transcription(
         self,
@@ -706,18 +771,28 @@ class StageSupervisor:
         )
 
     def complete(self, handle: StageHandle) -> StageCompletion:
-        _staging, public = self._require_entered()
-        completion = handle.wait()
-        if completion.stage == "transcription":
+        staging, public = self._require_entered()
+        if not any(owned is handle for owned in self._handles):
+            raise StageProtocolError("stage handle does not belong to this supervisor")
+        if handle.stage == "transcription":
+            expected_staged_path = staging.transcript_raw
             public_path = public.transcript_raw
-        elif completion.stage == "diarization":
+        elif handle.stage == "diarization":
+            expected_staged_path = staging.diarization
             public_path = public.diarization
         else:
-            raise StageProtocolError(f"unknown stage cannot be promoted: {completion.stage}")
+            raise StageProtocolError(f"unknown stage cannot be promoted: {handle.stage}")
+        if handle.checkpoint_path != expected_staged_path:
+            raise StageProtocolError(
+                f"{handle.stage} handle checkpoint does not match this run"
+            )
+        completion = handle.wait()
         atomic_promote_file(completion.checkpoint_path, public_path)
         return replace(completion, checkpoint_path=public_path)
 
     def cancel(self, handle: StageHandle) -> None:
+        if not any(owned is handle for owned in self._handles):
+            raise StageProtocolError("stage handle does not belong to this supervisor")
         handle.cancel(self.cancellation_grace_seconds)
 
     def close(self) -> None:

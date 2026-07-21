@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import signal
+import threading
 import time
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from keyframe.stage_supervisor import (
     DiarizationWorkerRequest,
     OutputDirectoryLockedError,
     StageCheckpointError,
+    StageHandle,
     StageProgress,
     StageProtocolError,
     StageSupervisor,
@@ -186,6 +188,32 @@ def test_lossy_progress_cannot_block_reliable_terminal_during_parent_work(tmp_pa
     assert len(progress) < 10_000
 
 
+def test_slow_progress_callback_cannot_delay_reliable_terminal(tmp_path):
+    output = tmp_path / "output"
+    callback_started = threading.Event()
+    release_callback = threading.Event()
+
+    def block_progress(_event):
+        callback_started.set()
+        release_callback.wait(timeout=5.0)
+
+    try:
+        with StageSupervisor(
+            output,
+            progress_callback=block_progress,
+            progress_capacity=1,
+            run_id="slow-progress",
+        ) as supervisor:
+            handle = _start_test_stage(supervisor, progress_events=10_000)
+            assert callback_started.wait(timeout=5.0)
+
+            completion = supervisor.complete(handle)
+
+            assert completion.metadata["record_count"] == 1
+    finally:
+        release_callback.set()
+
+
 def test_second_supervisor_fails_nonblocking_without_touching_artifacts(tmp_path):
     output = tmp_path / "output"
     output.mkdir()
@@ -301,7 +329,37 @@ def test_parent_exception_joins_live_worker_and_cleans_current_run(tmp_path):
     assert not (output / "keyframe-run-parent-error").exists()
 
 
-@pytest.mark.skipif(not hasattr(signal, "SIGTERM"), reason="SIGTERM is unavailable")
+@pytest.mark.parametrize("failure", [RuntimeError("registration failed"), KeyboardInterrupt()])
+def test_failure_after_spawn_joins_unregistered_worker(tmp_path, monkeypatch, failure):
+    output = tmp_path / "output"
+    processes = []
+
+    def fail_monitor_start(handle):
+        processes.append(handle.process)
+        raise failure
+
+    monkeypatch.setattr(StageHandle, "start_monitors", fail_monitor_start)
+
+    with StageSupervisor(
+        output,
+        cancellation_grace_seconds=0.05,
+        run_id="registration-failure",
+    ) as supervisor:
+        with pytest.raises(type(failure), match=str(failure) or None):
+            _start_test_stage(supervisor, mode="block")
+
+        assert supervisor._handles == []
+
+    assert len(processes) == 1
+    assert not processes[0].is_alive()
+    assert processes[0].exitcode is not None
+    assert not (output / "keyframe-run-registration-failure").exists()
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or not hasattr(signal, "SIGTERM"),
+    reason="Python cannot intercept os.kill(SIGTERM) on Windows",
+)
 def test_sigterm_unwinds_joins_worker_and_restores_handler(tmp_path):
     output = tmp_path / "output"
     started = tmp_path / "signal-worker.pid"
@@ -374,6 +432,46 @@ def test_stale_run_cleanup_is_scoped_and_does_not_follow_symlinks(tmp_path):
     assert unrelated.exists()
     assert run_symlink.is_symlink()
     assert external.exists()
+
+
+def test_failed_entry_preserves_collision_and_releases_output_lock(tmp_path):
+    output = tmp_path / "output"
+    output.mkdir()
+    collision = output / "keyframe-run-collision"
+    collision.write_text("not a run directory", encoding="utf-8")
+
+    with pytest.raises(FileExistsError):
+        with StageSupervisor(output, run_id="collision"):
+            pytest.fail("a run directory must not replace an existing file")
+
+    assert collision.read_text(encoding="utf-8") == "not a run directory"
+    with StageSupervisor(output, run_id="after-collision") as supervisor:
+        assert supervisor.staging is not None
+        assert supervisor.staging.root.exists()
+
+
+def test_complete_rejects_foreign_handle_and_mismatched_checkpoint(tmp_path):
+    first_output = tmp_path / "first"
+    second_output = tmp_path / "second"
+
+    with (
+        StageSupervisor(first_output, run_id="first") as first,
+        StageSupervisor(second_output, run_id="second") as second,
+    ):
+        handle = _start_test_stage(first)
+
+        with pytest.raises(StageProtocolError, match="does not belong"):
+            second.complete(handle)
+        assert not (second_output / "transcript.raw.json").exists()
+
+        expected_checkpoint = handle.checkpoint_path
+        handle.checkpoint_path = first_output / "wrong.json"
+        with pytest.raises(StageProtocolError, match="does not match"):
+            first.complete(handle)
+        handle.checkpoint_path = expected_checkpoint
+
+        completion = first.complete(handle)
+        assert completion.checkpoint_path == first_output / "transcript.raw.json"
 
 
 def test_transcription_worker_entry_keeps_bulk_result_on_disk(tmp_path, monkeypatch):
