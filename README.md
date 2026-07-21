@@ -51,11 +51,15 @@ export SSL_CERT_FILE=/path/to/corporate-ca-bundle.crt
 
 ### Model downloads (first run)
 
-These download automatically and are cached:
+These download automatically on first use and are cached:
 - **CLIP ViT-B-32** (~350MB) — image/text embeddings
 - **Florence-2-base** (~450MB) — frame captioning
-- **Whisper medium** (~1.4GB) — speech transcription and segment timing
+- **Whisper medium** (~1.4GB) — MLX-Whisper on supported Apple Silicon Macs, OpenAI Whisper elsewhere
 - **pyannote speaker diarization** — segment-level speaker labels when `HF_TOKEN` is configured
+
+MLX dependencies and weights are gated to Apple Silicon running macOS 14 or
+newer. Linux, Windows, Intel Macs, and older macOS releases do not install MLX
+and do not request MLX model weights.
 
 ## Usage
 
@@ -86,6 +90,24 @@ Speaker detection is enabled by default when `HF_TOKEN` is present. To keep the 
 ```bash
 keyframe recording.m4a --transcript-only --no-speaker-detection
 ```
+
+### Backend and concurrency controls
+
+```bash
+# Automatic: MLX on a supported Mac, OpenAI Whisper elsewhere
+keyframe recording.m4a --transcript-only --transcription-backend auto
+
+# Force the portable OpenAI Whisper backend
+keyframe recording.m4a --transcript-only --transcription-backend whisper
+
+# Force serial stages for a memory-constrained machine
+keyframe recording.m4a --transcript-only --stage-concurrency serial
+```
+
+Explicit `--transcription-backend mlx` fails during preflight on unsupported
+machines, before importing MLX or acquiring a model. `auto` can recover from an
+eligible MLX load or inference failure by exiting that worker and starting a
+fresh OpenAI Whisper CPU worker.
 
 ### As a Claude Code skill
 
@@ -139,7 +161,32 @@ Scrolling a data table (visually different but semantically identical) gets coll
 
 ### Transcript extraction
 
-Whisper always provides the transcript text and segment boundaries. When `HF_TOKEN` is set, pyannote detects speakers with `pyannote/speaker-diarization-community-1`, and Keyframe assigns a dominant speaker label to each Whisper segment based on diarization overlap. Speaker detection shows a single 0–100% progress bar after model loading and audio decoding. If `HF_TOKEN` is missing or speaker detection fails, Keyframe warns and keeps the unlabeled Whisper transcript.
+Whisper always provides the transcript text and segment boundaries. `auto`
+selects pinned MLX-Whisper weights on Apple Silicon running macOS 14 or newer;
+other machines use OpenAI Whisper on CUDA when available and CPU otherwise.
+PyTorch MPS is not used for transcription because it was only marginally faster
+and materially changed the tested transcript.
+
+When `HF_TOKEN` is set, pyannote detects speakers with
+`pyannote/speaker-diarization-community-1`, and Keyframe assigns a dominant
+speaker label to each Whisper segment based on diarization overlap. Speaker
+detection shows stage-prefixed progress after model loading and audio decoding.
+If `HF_TOKEN` is missing or speaker detection fails, Keyframe warns and keeps
+the unlabeled Whisper transcript.
+
+Each model stage runs in a disposable spawned process. In `auto` concurrency
+mode, MLX or CUDA transcription overlaps CPU diarization. CPU transcription and
+CPU diarization overlap only when at least four CPUs and the model-aware memory
+check (including 25% headroom) admit both. Stages sharing an accelerator are
+always serialized. In a full run, MPS/CUDA frame extraction starts only after
+transcription releases that accelerator and may then overlap the remaining CPU
+diarization. `parallel` may override CPU-count and memory admission with a
+warning, but never shared-accelerator exclusion.
+
+The raw transcript checkpoint is atomically published as soon as transcription
+finishes, before speaker assignment. A later diarization or frame failure does
+not erase that completed checkpoint. Final transcript formats retain their
+existing schemas and millisecond formatting.
 
 Speaker labels use raw pyannote labels such as `SPEAKER_00`. TXT output places the label after the timestamp, SRT/VTT prefix each caption, and JSON includes `speaker` only on labeled segments.
 
@@ -153,14 +200,22 @@ output_dir/
     ...
     captions.json           # Florence-2 captions + merge metadata
     manifest.json           # Deterministic frame triage index
+  transcript.raw.json       # Full-precision start/end/text checkpoint
+  diarization.json          # Full-precision start/end/speaker checkpoint, when run
   transcript.txt            # Timestamped transcript, speaker-labeled when available
   transcript.json           # Machine-readable transcript, includes speaker when available
 ```
 
+`transcript.raw.json` is durable once transcription succeeds.
+`diarization.json` is published only for the current successful speaker-detection
+run. In full extraction, frames, captions, and the manifest are staged as one
+generation and replace the public `frames/` directory only after validation and
+transcript-window enrichment complete.
+
 ## Tips
 
 - For UI recordings with many important states: try `--pass1-clusters 20`
-- Default transcription uses `--whisper-model medium`
+- Default transcription uses `--whisper-model medium` and `--transcription-backend auto`
 - Use `--no-speaker-detection` when you want an unlabeled transcript or do not want to use `HF_TOKEN`
 - Florence-2 uses `florence-community/Florence-2-base` (native transformers support). The original `microsoft/Florence-2-base` weights are broken with transformers 4.50+.
 - CLIP model is used for image embedding; deterministic OCR/dHash merge logic handles final dedupe.

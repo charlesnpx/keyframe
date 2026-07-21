@@ -52,6 +52,65 @@ The adopted medium model is `mlx-community/whisper-medium-mlx` at revision `7fc0
 
 MLX-Whisper supports Python 3.8 or newer, WhisperX supports Python 3.10 through 3.13, and the benchmark ran on Keyframe's Python 3.12.13 runtime. The shared environment uses WhisperX's stricter compatible matrix: `torch~=2.8.0`, `torchaudio~=2.8.0`, `torchvision~=0.23.0`, `whisperx==3.8.6`, `huggingface-hub>=0.34,<1`, and `transformers>=4.50,<5`.
 
+Keyframe 0.6.0 supports Python 3.11 through 3.13. Its clean-install
+matrix covers macOS ARM64 and Linux x86-64 on all three versions. MLX and
+MLX-Whisper use Darwin ARM64/macOS 14+ environment markers; the Linux jobs
+assert that neither distribution is installed. Import validation does not load
+models or touch a Hugging Face cache.
+
+### Adopted runtime behavior
+
+The CLI is the supported product surface. `--transcription-backend auto`
+selects MLX on supported Macs and OpenAI Whisper elsewhere. Explicit MLX fails
+during preflight on unsupported machines, before imports or model acquisition.
+An eligible automatic MLX load or inference failure exits that process before a
+fresh CPU Whisper fallback starts.
+
+`transcript.raw.json` is atomically published immediately after transcription,
+before pyannote speaker assignment. A successful diarization pass separately
+publishes `diarization.json`; final TXT, SRT, VTT, and JSON output behavior is
+unchanged. A completed raw checkpoint survives failure in a later independent
+stage.
+
+Automatic scheduling overlaps MLX/CUDA transcription with CPU diarization.
+CPU transcription and CPU diarization overlap only when at least four CPUs and
+model-aware memory admission with 25% headroom succeed. Shared accelerators
+remain serialized, and a full run starts MPS/CUDA frames only after
+transcription releases that accelerator. Diarization remains holistic; Keyframe
+does not split recordings or reconcile per-chunk speaker identities.
+
+### Release pipeline benchmark: 2026-07-21
+
+The 0.6.0 release gate used the same 988.75-second meeting on a 10-core Apple
+M4 MacBook Pro with 32 GB unified memory and macOS 26.5.2. Dependencies, model
+snapshots, and short hardware paths were prewarmed. The serial reference ran
+OpenAI Whisper CPU transcription followed by CPU diarization. The candidate ran
+the complete pipeline: MLX transcription and CPU diarization began together,
+then MPS frame extraction overlapped the remaining diarization after MLX exited.
+
+| Run | Wall time | Transcription | Diarization | Frames | Peak resident memory |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Serial CPU transcript + diarization reference | 902.37s | 202.99s | 699.37s | — | 5.12 GiB |
+| Concurrent MLX + diarization + full frames candidate | 613.89s | 107.85s | 613.82s | 194.20s | 5.30 GiB |
+
+The candidate completed 288.48 seconds sooner (31.97% lower wall time, 1.47x
+throughput) despite also producing and enriching a 16-frame generation. Speaker
+merge took 0.012 seconds and manifest enrichment/promotion took 0.035 seconds.
+Its predicted critical path was 613.863 seconds and measured wall time was
+613.889 seconds, a 0.026-second delta within the fixed five-second process and
+scheduler tolerance. MLX and MPS never overlapped.
+
+The raw candidate transcript retained 99.443% normalized word agreement with
+the CPU reference: 21 edits across 2,513 reference words (0.836% word error
+rate), 99.699% normalized character agreement, two additional words, and a
+0.727% segment-count delta. Both transcripts contained 17 duplicate
+five-grams, the first 138 normalized segments matched, and both covered through
+987.76 seconds. Diarization was exactly equivalent across all 253 rows after
+speaker-label reconciliation, with zero timestamp delta. Both raw and
+diarization checkpoints, final TXT/JSON speaker-labeled transcripts, and the
+candidate frame manifest were present; the machine-readable report passed all
+checked-in thresholds with no failures.
+
 ## 2. WhisperKit and SpeakerKit
 
 [WhisperKit](https://github.com/argmaxinc/argmax-oss-swift) runs Whisper through Core ML. The same project includes SpeakerKit, which runs pyannote Community-1 diarization through Core ML.
@@ -105,3 +164,24 @@ Run every backend against the same source recording and retain:
 - Timestamp coverage and manual review of representative disagreement windows.
 
 A backend passes only if it has no systematic opening loss, repeated passages, long-form drift, or material timestamp regression. The CPU transcript is a comparison baseline rather than ground truth, so material disagreements must be reviewed against the audio.
+
+The release benchmark is parameterized and keeps user-specific paths out of the
+repository:
+
+```bash
+python scripts/benchmark_transcription.py \
+  --input /path/to/meeting.mp4 \
+  --baseline tests/fixtures/transcription-benchmark-baseline.json \
+  --output /tmp/keyframe-release-benchmark
+```
+
+It runs the CPU Whisper/CPU diarization reference serially, explicitly requests
+the supported parallel policy for the complete MLX/CPU-diarization/frame
+candidate, and records package and model revisions,
+stage timings, maximum resident memory, transcript agreement, checkpoint/final
+artifacts, and diarization partition equivalence modulo speaker-label renaming.
+The candidate wall clock is checked against its logged dependency expression:
+`max(T + F, D) + M + E`, `max(T, D) + F + M + E`, or
+`T + D + F + M + E`. Existing reports can be revalidated with
+`--replay-report`; replay binds the report hash and duration to the explicitly
+supplied recording.
