@@ -53,10 +53,16 @@ from keyframe.validation import (
 
 
 GIB = 1024**3
-REPORT_SCHEMA_VERSION = 2
+REPORT_SCHEMA_VERSION = 3
 DEFAULT_TIMESTAMP_TOLERANCE_SECONDS = 0.05
 DEFAULT_CRITICAL_PATH_TOLERANCE_SECONDS = 5.0
 MEMORY_SAMPLE_INTERVAL_SECONDS = 1.0
+HISTORICAL_CANDIDATE_WALL_SECONDS = 613.67
+MAX_HISTORICAL_WALL_MULTIPLIER = 1.15
+MAX_SERIAL_REFERENCE_WALL_MULTIPLIER = 0.85
+MAX_PROCESS_TREE_RSS_GIB = 6.60
+MAX_MLX_ALLOCATOR_PEAK_GIB = 5.96
+MAX_LOCAL_MODEL_RESOLUTION_SECONDS = 1.0
 EXPECTED_RUNTIME_PACKAGES = {
     "keyframe": "0.6.0",
     "mlx": "0.32.0",
@@ -64,18 +70,28 @@ EXPECTED_RUNTIME_PACKAGES = {
     "whisperx": "3.8.6",
 }
 REFERENCE_CONTRACT = {
+    "requested_backend": "whisper",
     "backend": "whisper",
     "device": "cpu",
     "diarization_device": "cpu",
+    "schedule_policy": "serial",
     "schedule_mode": "serial",
 }
 CANDIDATE_CONTRACT = {
+    "requested_backend": "auto",
     "backend": "mlx",
     "device": "mlx",
     "diarization_device": "cpu",
     "frame_device": "mps",
+    "schedule_policy": "auto",
     "schedule_mode": "parallel",
+    "schedule_source": "macos-memory-pressure",
+    "frame_schedule_policy": "auto",
     "frame_schedule_mode": "parallel",
+    "frame_schedule_source": "macos-memory-pressure",
+    "fallback_used": False,
+    "fallback_waited_for_diarization": False,
+    "model_resolution_source": "local-hit",
 }
 
 
@@ -173,9 +189,11 @@ def _run_reference_case(request: _CaseRequest) -> dict[str, Any]:
     wall_time = time.monotonic() - started
     return {
         "name": request.name,
+        "requested_backend": config.transcription_backend,
         "backend": result.effective_backend,
         "device": preflight.transcription_device,
         "diarization_device": preflight.effective_diarization_device,
+        "schedule_policy": result.initial_schedule.policy,
         "schedule_mode": result.initial_schedule.mode,
         "schedule_reason": result.initial_schedule.reason,
         "wall_time_seconds": wall_time,
@@ -201,7 +219,7 @@ def _run_candidate_case(request: _CaseRequest) -> dict[str, Any]:
             "--diarization-device",
             "cpu",
             "--stage-concurrency",
-            "parallel",
+            "auto",
         ]
     )
     preflight = preflight_transcript_run(cli._transcript_config(args))
@@ -212,7 +230,6 @@ def _run_candidate_case(request: _CaseRequest) -> dict[str, Any]:
         )
     if preflight.hf_token is None:
         raise BenchmarkError("the concurrent diarization run requires HF_TOKEN")
-    model_spec = transcript.MLX_MODEL_SPECS[args.whisper_model]
     frame_device = resolve_frame_device(preflight)
     started = time.monotonic()
     with StageSupervisor(
@@ -239,22 +256,50 @@ def _run_candidate_case(request: _CaseRequest) -> dict[str, Any]:
             "the controlled release candidate did not overlap MLX transcription "
             "with CPU diarization"
         )
+    for label, schedule in (
+        ("initial", result.initial_schedule),
+        ("second-wave", result.frame_schedule),
+    ):
+        if schedule.policy != "auto":
+            raise BenchmarkError(
+                f"the {label} candidate schedule did not use automatic policy"
+            )
+        if schedule.mode != "parallel":
+            raise BenchmarkError(
+                f"the {label} automatic schedule did not admit parallel work"
+            )
+        if schedule.resources.source != "macos-memory-pressure":
+            raise BenchmarkError(
+                f"the {label} automatic schedule did not use macOS pressure evidence"
+            )
+    if result.transcript.fallback_used:
+        raise BenchmarkError("the release candidate fell back from pinned MLX")
     if result.critical_path != "max(T + F, D) + M + E":
         raise BenchmarkError(
             "the controlled Apple release candidate reported an unexpected "
             f"critical path: {result.critical_path}"
         )
+    metadata = result.transcript.metadata
     return {
         "name": request.name,
+        "requested_backend": preflight.config.transcription_backend,
         "backend": result.transcript.effective_backend,
         "device": preflight.transcription_device,
         "diarization_device": preflight.effective_diarization_device,
         "frame_device": result.frame_device,
-        "model_repository": model_spec.repository,
-        "model_revision": model_spec.revision,
+        "model_repository": metadata.get("model_repository"),
+        "model_revision": metadata.get("model_revision"),
+        "model_resolution_source": metadata.get("model_resolution_source"),
+        "model_resolution_seconds": metadata.get("model_resolution_seconds"),
+        "mlx_peak_memory_bytes": metadata.get("mlx_peak_memory_bytes"),
+        "fallback_used": result.transcript.fallback_used,
+        "schedule_policy": result.initial_schedule.policy,
         "schedule_mode": result.initial_schedule.mode,
+        "schedule_source": result.initial_schedule.resources.source,
         "schedule_reason": result.initial_schedule.reason,
+        "frame_schedule_policy": result.frame_schedule.policy,
         "frame_schedule_mode": result.frame_schedule.mode,
+        "frame_schedule_source": result.frame_schedule.resources.source,
         "frame_schedule_reason": result.frame_schedule.reason,
         "critical_path": result.critical_path,
         "pipeline_evidence": result.pipeline_evidence.to_dict(),
@@ -428,7 +473,7 @@ def _mapping(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
 
 
-def _critical_path_from_reported_evidence(candidate: dict[str, Any]) -> str:
+def _pipeline_evidence_from_report(candidate: dict[str, Any]) -> PipelineEvidence:
     raw_evidence = candidate.get("pipeline_evidence")
     if not isinstance(raw_evidence, dict):
         raise ValueError("candidate.pipeline_evidence must be an object")
@@ -516,6 +561,11 @@ def _critical_path_from_reported_evidence(candidate: dict[str, Any]) -> str:
                 f"candidate.timings.{interval.stage} does not match its interval"
             )
 
+    return evidence
+
+
+def _critical_path_from_reported_evidence(candidate: dict[str, Any]) -> str:
+    evidence = _pipeline_evidence_from_report(candidate)
     waited = candidate.get("fallback_waited_for_diarization")
     if not isinstance(waited, bool):
         raise ValueError(
@@ -567,15 +617,112 @@ def _release_contract_failures(report: dict[str, Any]) -> list[str]:
         failures.append("runtime Python must be a supported 3.11 through 3.13 release")
 
     try:
-        topology_expression = _critical_path_from_reported_evidence(candidate)
+        evidence = _pipeline_evidence_from_report(candidate)
     except ValueError as exc:
         failures.append(f"candidate pipeline evidence is invalid: {exc}")
     else:
+        transcription_interval = evidence.interval("transcription")
+        diarization_interval = evidence.interval("diarization")
+        frame_interval = evidence.interval("frames")
+        assert transcription_interval is not None
+        assert frame_interval is not None
+        if diarization_interval is None:
+            failures.append("candidate pipeline evidence is missing diarization")
+        else:
+            if diarization_interval.outcome != "completed":
+                failures.append("candidate diarization interval must be completed")
+            if not transcription_interval.overlaps(diarization_interval):
+                failures.append(
+                    "candidate transcription and diarization intervals must overlap"
+                )
+            if not frame_interval.overlaps(diarization_interval):
+                failures.append("candidate frames and diarization intervals must overlap")
+        if transcription_interval.ended_at > frame_interval.started_at:
+            failures.append(
+                "candidate frames must not start before transcription completes"
+            )
+        try:
+            topology_expression = _critical_path_from_reported_evidence(candidate)
+        except ValueError as exc:
+            failures.append(f"candidate pipeline evidence is invalid: {exc}")
+            return failures
         if candidate.get("critical_path") != topology_expression:
             failures.append(
                 "candidate critical path does not match its pipeline evidence: "
                 f"expected {topology_expression!r}"
             )
+    return failures
+
+
+def _performance_contract_failures(report: dict[str, Any]) -> list[str]:
+    failures = []
+    reference = _mapping(report.get("reference"))
+    candidate = _mapping(report.get("candidate"))
+    try:
+        reference_wall = _finite_number(
+            reference.get("wall_time_seconds"),
+            "reference.wall_time_seconds",
+        )
+        candidate_wall = _finite_number(
+            candidate.get("wall_time_seconds"),
+            "candidate.wall_time_seconds",
+        )
+        process_peak_gib = _finite_number(
+            candidate.get("peak_memory_gib"),
+            "candidate.peak_memory_gib",
+        )
+        resolution_seconds = _finite_number(
+            candidate.get("model_resolution_seconds"),
+            "candidate.model_resolution_seconds",
+        )
+        mlx_peak_bytes = candidate.get("mlx_peak_memory_bytes")
+        if isinstance(mlx_peak_bytes, bool) or not isinstance(mlx_peak_bytes, int):
+            raise ValueError("candidate.mlx_peak_memory_bytes must be an integer")
+        if mlx_peak_bytes < 0:
+            raise ValueError(
+                "candidate.mlx_peak_memory_bytes must be non-negative"
+            )
+        if min(
+            reference_wall,
+            candidate_wall,
+            process_peak_gib,
+            resolution_seconds,
+        ) < 0:
+            raise ValueError("performance measurements must be non-negative")
+        if reference_wall == 0:
+            raise ValueError("reference.wall_time_seconds must be positive")
+    except ValueError as exc:
+        return [f"performance measurements are invalid: {exc}"]
+
+    historical_limit = (
+        HISTORICAL_CANDIDATE_WALL_SECONDS * MAX_HISTORICAL_WALL_MULTIPLIER
+    )
+    same_run_limit = reference_wall * MAX_SERIAL_REFERENCE_WALL_MULTIPLIER
+    if candidate_wall > historical_limit:
+        failures.append("candidate wall time exceeds the historical runtime limit")
+    if candidate_wall > same_run_limit:
+        failures.append(
+            "candidate is not at least 15 percent faster than the serial reference"
+        )
+    if process_peak_gib > MAX_PROCESS_TREE_RSS_GIB:
+        failures.append("candidate process-tree peak RSS exceeds 6.60 GiB")
+    if mlx_peak_bytes > MAX_MLX_ALLOCATOR_PEAK_GIB * GIB:
+        failures.append("candidate MLX allocator peak exceeds 5.96 GiB")
+    if resolution_seconds >= MAX_LOCAL_MODEL_RESOLUTION_SECONDS:
+        failures.append("candidate cached MLX resolution did not finish under one second")
+
+    report["performance_validation"] = {
+        "historical_candidate_wall_seconds": HISTORICAL_CANDIDATE_WALL_SECONDS,
+        "historical_multiplier": MAX_HISTORICAL_WALL_MULTIPLIER,
+        "same_run_serial_reference_multiplier": (
+            MAX_SERIAL_REFERENCE_WALL_MULTIPLIER
+        ),
+        "process_tree_rss_ceiling_gib": MAX_PROCESS_TREE_RSS_GIB,
+        "mlx_allocator_peak_ceiling_gib": MAX_MLX_ALLOCATOR_PEAK_GIB,
+        "local_resolution_ceiling_seconds": MAX_LOCAL_MODEL_RESOLUTION_SECONDS,
+        "historical_wall_limit_seconds": historical_limit,
+        "same_run_wall_limit_seconds": same_run_limit,
+    }
     return failures
 
 
@@ -656,6 +803,7 @@ def evaluate_report(
 
     failures = _quality_failures(report, baseline)
     failures.extend(_release_contract_failures(report))
+    failures.extend(_performance_contract_failures(report))
     try:
         critical_path_tolerance = _finite_number(
             critical_path_tolerance_seconds,

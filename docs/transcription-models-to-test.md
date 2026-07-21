@@ -63,22 +63,35 @@ models or touch a Hugging Face cache.
 The CLI is the supported product surface. `--transcription-backend auto`
 selects MLX on supported Macs and OpenAI Whisper elsewhere. Explicit MLX fails
 during preflight on unsupported machines, before imports or model acquisition.
-An eligible automatic MLX load or inference failure exits that process before a
-fresh CPU Whisper fallback starts.
+An eligible automatic MLX import, acquisition, load, or inference failure exits
+that process before a fresh CPU Whisper fallback starts. On supported Macs, the
+exact immutable model revision is first resolved with local-only cache access;
+network resolution is attempted only for a genuine cache miss. Reliable worker
+metadata records the resolution source and duration.
 
 `transcript.raw.json` is atomically published immediately after transcription,
 before pyannote speaker assignment. A successful diarization pass separately
 publishes `diarization.json`; final TXT, SRT, VTT, and JSON output behavior is
 unchanged. A completed raw checkpoint survives failure in a later independent
-stage.
+stage. Only the two exact known pyannote UserWarnings (unavailable TorchCodec
+decoding and a too-short pooling window) are condensed. All near misses remain
+visible, and every diarization row must pass strict checkpoint validation.
 
 Automatic scheduling may overlap MLX/CUDA transcription with CPU diarization
-only when model-aware memory admission with 25% headroom succeeds. CPU
-transcription and CPU diarization additionally require at least four CPUs.
-Shared accelerators remain serialized, and a full run starts MPS/CUDA frames
-only after transcription releases that accelerator and repeats memory
-admission. Diarization remains holistic; Keyframe does not split recordings or
-reconcile per-chunk speaker identities.
+only when model-aware memory admission with 10% headroom succeeds. On macOS,
+admission uses bounded `memory_pressure -Q` and `sysctl hw.memsize` probes, with
+physical-page `vm_stat` fallback and no swap. CPU transcription and CPU
+diarization additionally require at least four CPUs. Shared accelerators remain
+serialized. After transcription, a fresh decision may overlap MPS/CUDA frames
+with a still-running CPU diarization worker. Diarization remains holistic;
+Keyframe does not split recordings or reconcile per-chunk speaker identities.
+
+Reliable intervals support five dependency expressions:
+`max(T + F, D) + M + E`, `max(T, D) + F + M + E`,
+`T + max(D, F) + M + E`, `T + D + F + M + E`, and
+`T + F + M + E`. `T`, `D`, and `F` are the stage intervals, `M` is transcript
+merge/output, and `E` is frame-manifest enrichment/promotion. The last path
+also covers a serialized MLX fallback wait already included inside `T`.
 
 ### Release pipeline benchmark: 2026-07-21
 
@@ -176,13 +189,19 @@ python scripts/benchmark_transcription.py \
   --output /tmp/keyframe-release-benchmark
 ```
 
-It runs the CPU Whisper/CPU diarization reference serially, explicitly requests
-the supported parallel policy for the complete MLX/CPU-diarization/frame
-candidate, and records package and model revisions,
-stage timings, maximum resident memory, transcript agreement, checkpoint/final
-artifacts, and diarization partition equivalence modulo speaker-label renaming.
-The candidate wall clock is checked against its logged dependency expression:
-`max(T + F, D) + M + E`, `max(T, D) + F + M + E`, or
-`T + D + F + M + E`. Existing reports can be revalidated with
+It runs the CPU Whisper/CPU diarization reference serially and uses automatic
+scheduling for the complete MLX/CPU-diarization/frame candidate. The candidate
+must obtain parallel initial and second-wave decisions from macOS pressure
+evidence, use a local pinned-model cache hit in under one second, avoid
+fallback, and prove non-empty transcription/diarization and
+frames/diarization intersections. The report records reliable intervals,
+process-tree RSS, MLX allocator peak, transcript agreement, checkpoint/final
+artifacts, and diarization equivalence modulo speaker-label renaming.
+
+The release limits are named in the validator: no more than 115% of the
+historical 613.67-second candidate, at least 15% faster than the same-run serial
+reference, at most 6.60 GiB process-tree RSS, at most 5.96 GiB MLX allocator
+peak, and at most five seconds between the interval-derived prediction and wall
+clock. Existing reports can be revalidated with
 `--replay-report`; replay binds the report hash and duration to the explicitly
 supplied recording.

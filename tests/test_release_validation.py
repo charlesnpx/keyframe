@@ -78,12 +78,16 @@ def _passing_report(input_path: Path) -> dict:
         },
         "reference": {
             **benchmark.REFERENCE_CONTRACT,
+            "wall_time_seconds": 10.0,
             "artifacts": _artifacts(frames=False),
         },
         "candidate": {
             **benchmark.CANDIDATE_CONTRACT,
             "model_repository": baseline["model"]["mlx_repository"],
             "model_revision": baseline["model"]["mlx_revision"],
+            "model_resolution_seconds": 0.125,
+            "mlx_peak_memory_bytes": 5 * benchmark.GIB,
+            "peak_memory_gib": 5.0,
             "critical_path": "max(T + F, D) + M + E",
             "pipeline_evidence": {
                 "transcription": _stage_interval(
@@ -293,6 +297,30 @@ def test_process_tree_rss_sums_only_the_root_and_its_descendants():
     )
 
 
+def test_performance_thresholds_are_named_exact_and_finite():
+    thresholds = {
+        "historical": benchmark.HISTORICAL_CANDIDATE_WALL_SECONDS,
+        "historical_multiplier": benchmark.MAX_HISTORICAL_WALL_MULTIPLIER,
+        "same_run_multiplier": benchmark.MAX_SERIAL_REFERENCE_WALL_MULTIPLIER,
+        "process_rss": benchmark.MAX_PROCESS_TREE_RSS_GIB,
+        "mlx_peak": benchmark.MAX_MLX_ALLOCATOR_PEAK_GIB,
+        "resolution": benchmark.MAX_LOCAL_MODEL_RESOLUTION_SECONDS,
+    }
+
+    assert thresholds == {
+        "historical": 613.67,
+        "historical_multiplier": 1.15,
+        "same_run_multiplier": 0.85,
+        "process_rss": 6.60,
+        "mlx_peak": 5.96,
+        "resolution": 1.0,
+    }
+    assert all(
+        isinstance(value, float) and value > 0 and value < float("inf")
+        for value in thresholds.values()
+    )
+
+
 def test_report_evaluation_passes_and_records_critical_path(tmp_path):
     input_path = tmp_path / "recording.mp4"
     input_path.write_bytes(b"benchmark recording")
@@ -311,6 +339,16 @@ def test_report_evaluation_passes_and_records_critical_path(tmp_path):
         "measured_wall_seconds": 7.0,
         "absolute_delta_seconds": 0.0,
         "tolerance_seconds": 0.01,
+    }
+    assert report["performance_validation"] == {
+        "historical_candidate_wall_seconds": 613.67,
+        "historical_multiplier": 1.15,
+        "same_run_serial_reference_multiplier": 0.85,
+        "process_tree_rss_ceiling_gib": 6.6,
+        "mlx_allocator_peak_ceiling_gib": 5.96,
+        "local_resolution_ceiling_seconds": 1.0,
+        "historical_wall_limit_seconds": pytest.approx(705.7205),
+        "same_run_wall_limit_seconds": 8.5,
     }
 
 
@@ -396,7 +434,7 @@ def test_report_evaluation_passes_and_records_critical_path(tmp_path):
         ),
     ],
 )
-def test_report_evaluation_derives_each_path_from_pipeline_evidence(
+def test_reported_evidence_derives_each_supported_critical_path(
     tmp_path,
     evidence,
     fallback_waited,
@@ -416,17 +454,14 @@ def test_report_evaluation_derives_each_path_from_pipeline_evidence(
     } | {"merge": 0.5, "manifest": 0.5}
     candidate["wall_time_seconds"] = wall_time
 
-    failures = benchmark.evaluate_report(
-        report,
-        _baseline(),
-        critical_path_tolerance_seconds=0.01,
-    )
-
-    assert failures == []
-    assert report["critical_path_validation"]["expression"] == expression
+    assert benchmark._critical_path_from_reported_evidence(candidate) == expression
+    assert expected_critical_path_seconds(
+        expression,
+        candidate["timings"],
+    ) == pytest.approx(wall_time)
 
 
-def test_report_evaluation_uses_fallback_wait_evidence_without_double_counting(
+def test_reported_evidence_uses_fallback_wait_without_double_counting(
     tmp_path,
 ):
     input_path = tmp_path / "recording.mp4"
@@ -449,13 +484,13 @@ def test_report_evaluation_uses_fallback_wait_evidence_without_double_counting(
     candidate["timings"].update(transcription=4.0, diarization=2.0)
     candidate["wall_time_seconds"] = 9.0
 
-    failures = benchmark.evaluate_report(
-        report,
-        _baseline(),
-        critical_path_tolerance_seconds=0.01,
+    assert benchmark._critical_path_from_reported_evidence(candidate) == (
+        "T + F + M + E"
     )
-
-    assert failures == []
+    assert expected_critical_path_seconds(
+        candidate["critical_path"],
+        candidate["timings"],
+    ) == pytest.approx(9.0)
 
 
 def test_report_evaluation_rejects_path_that_disagrees_with_pipeline_evidence(
@@ -539,6 +574,58 @@ def test_report_evaluation_rejects_inconsistent_reliable_topology(
             lambda report: report["candidate"].update(wall_time_seconds=20.0),
             "candidate wall time exceeds critical-path tolerance",
         ),
+        (
+            lambda report: report["candidate"].update(
+                model_resolution_source="downloaded"
+            ),
+            "candidate model_resolution_source",
+        ),
+        (
+            lambda report: report["candidate"].update(
+                model_resolution_seconds=1.0
+            ),
+            "candidate cached MLX resolution did not finish under one second",
+        ),
+        (
+            lambda report: report["candidate"].update(fallback_used=True),
+            "candidate fallback_used",
+        ),
+        (
+            lambda report: report["candidate"].update(
+                schedule_policy="parallel"
+            ),
+            "candidate schedule_policy",
+        ),
+        (
+            lambda report: report["candidate"].update(
+                schedule_source="macos-vm-stat"
+            ),
+            "candidate schedule_source",
+        ),
+        (
+            lambda report: report["candidate"].update(
+                frame_schedule_source="macos-vm-stat"
+            ),
+            "candidate frame_schedule_source",
+        ),
+        (
+            lambda report: report["candidate"].update(wall_time_seconds=800.0),
+            "candidate wall time exceeds the historical runtime limit",
+        ),
+        (
+            lambda report: report["reference"].update(wall_time_seconds=8.0),
+            "candidate is not at least 15 percent faster",
+        ),
+        (
+            lambda report: report["candidate"].update(peak_memory_gib=6.61),
+            "candidate process-tree peak RSS exceeds 6.60 GiB",
+        ),
+        (
+            lambda report: report["candidate"].update(
+                mlx_peak_memory_bytes=int(5.97 * benchmark.GIB)
+            ),
+            "candidate MLX allocator peak exceeds 5.96 GiB",
+        ),
     ],
 )
 def test_report_evaluation_surfaces_release_threshold_failures(
@@ -573,8 +660,12 @@ def test_report_evaluation_rejects_release_configuration_drift(tmp_path):
         device="cpu",
         diarization_device="cuda",
         frame_device="cpu",
+        schedule_policy="parallel",
         schedule_mode="serial",
+        schedule_source="macos-vm-stat",
+        frame_schedule_policy="parallel",
         frame_schedule_mode="serial",
+        frame_schedule_source="macos-vm-stat",
     )
     report["runtime"].update(
         python="3.14.0",
@@ -592,10 +683,63 @@ def test_report_evaluation_rejects_release_configuration_drift(tmp_path):
     assert any("candidate device" in failure for failure in failures)
     assert any("candidate diarization_device" in failure for failure in failures)
     assert any("candidate frame_device" in failure for failure in failures)
+    assert any("candidate schedule_policy" in failure for failure in failures)
+    assert any("candidate schedule_source" in failure for failure in failures)
+    assert any("candidate frame_schedule_policy" in failure for failure in failures)
+    assert any("candidate frame_schedule_source" in failure for failure in failures)
     assert any("runtime keyframe" in failure for failure in failures)
     assert any("runtime mlx" in failure for failure in failures)
     assert any("runtime Python" in failure for failure in failures)
-    assert not any("logged schedules" in failure for failure in failures)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_failure"),
+    [
+        (
+            lambda candidate: candidate["pipeline_evidence"]["diarization"].update(
+                started_at=2.0,
+            ),
+            "transcription and diarization intervals must overlap",
+        ),
+        (
+            lambda candidate: candidate["pipeline_evidence"]["diarization"].update(
+                ended_at=2.0,
+                duration_seconds=2.0,
+            ),
+            "frames and diarization intervals must overlap",
+        ),
+        (
+            lambda candidate: candidate["pipeline_evidence"]["frames"].update(
+                started_at=1.0,
+                duration_seconds=5.0,
+            ),
+            "frames must not start before transcription completes",
+        ),
+    ],
+)
+def test_report_evaluation_rejects_required_candidate_overlap_failures(
+    tmp_path,
+    mutation,
+    expected_failure,
+):
+    input_path = tmp_path / "recording.mp4"
+    input_path.write_bytes(b"benchmark recording")
+    report = _passing_report(input_path)
+    candidate = report["candidate"]
+    mutation(candidate)
+    for stage, interval in candidate["pipeline_evidence"].items():
+        interval["duration_seconds"] = (
+            interval["ended_at"] - interval["started_at"]
+        )
+        candidate["timings"][stage] = interval["duration_seconds"]
+
+    failures = benchmark.evaluate_report(
+        report,
+        _baseline(),
+        critical_path_tolerance_seconds=5.0,
+    )
+
+    assert any(expected_failure in failure for failure in failures)
 
 
 @pytest.mark.parametrize("tolerance", [float("nan"), float("inf"), float("-inf"), -1.0])
@@ -613,6 +757,36 @@ def test_report_evaluation_rejects_nonfinite_or_negative_tolerance(
     )
 
     assert any("critical-path tolerance is invalid" in failure for failure in failures)
+
+
+@pytest.mark.parametrize(
+    ("case_name", "field", "value"),
+    [
+        ("reference", "wall_time_seconds", float("nan")),
+        ("candidate", "wall_time_seconds", float("inf")),
+        ("candidate", "peak_memory_gib", -1.0),
+        ("candidate", "model_resolution_seconds", "slow"),
+        ("candidate", "mlx_peak_memory_bytes", 1.5),
+    ],
+)
+def test_report_evaluation_rejects_invalid_performance_measurements(
+    tmp_path,
+    case_name,
+    field,
+    value,
+):
+    input_path = tmp_path / "recording.mp4"
+    input_path.write_bytes(b"benchmark recording")
+    report = _passing_report(input_path)
+    report[case_name][field] = value
+
+    failures = benchmark.evaluate_report(
+        report,
+        _baseline(),
+        critical_path_tolerance_seconds=5.0,
+    )
+
+    assert any("performance measurements are invalid" in item for item in failures)
 
 
 def test_report_evaluation_returns_failures_for_malformed_schema(tmp_path):
@@ -638,7 +812,7 @@ def test_replay_rejects_previous_report_schema_version(monkeypatch, tmp_path):
     input_path = tmp_path / "recording.mp4"
     input_path.write_bytes(b"benchmark recording")
     report = _passing_report(input_path)
-    report["schema_version"] = 1
+    report["schema_version"] = 2
     replay_path = tmp_path / "replay-v1.json"
     replay_path.write_text(json.dumps(report), encoding="utf-8")
     output_path = tmp_path / "validated-report.json"
@@ -777,7 +951,7 @@ def test_report_rejects_protected_path_aliases_before_model_work(
     assert protected.read_bytes() == original
 
 
-def test_candidate_case_forces_and_verifies_the_parallel_apple_schedule(
+def test_candidate_case_uses_and_verifies_automatic_apple_scheduling(
     monkeypatch,
     tmp_path,
 ):
@@ -792,14 +966,31 @@ def test_candidate_case_forces_and_verifies_the_parallel_apple_schedule(
         hf_token="hf_test",
         transcription_device="mlx",
         effective_diarization_device="cpu",
+        config=SimpleNamespace(transcription_backend="auto"),
     )
     schedule = SimpleNamespace(
         parallel=True,
+        policy="auto",
         mode="parallel",
-        reason="explicit parallel override",
+        reason="automatic memory admission succeeded",
+        resources=SimpleNamespace(source="macos-memory-pressure"),
     )
     pipeline_result = SimpleNamespace(
-        transcript=SimpleNamespace(effective_backend="mlx"),
+        transcript=SimpleNamespace(
+            effective_backend="mlx",
+            fallback_used=False,
+            metadata={
+                "model_repository": (
+                    "mlx-community/whisper-medium-mlx"
+                ),
+                "model_revision": (
+                    "7fc08c4eac4c316526498f147dfdee6f6303f975"
+                ),
+                "model_resolution_source": "local-hit",
+                "model_resolution_seconds": 0.125,
+                "mlx_peak_memory_bytes": 123456789,
+            },
+        ),
         frame_device="mps",
         initial_schedule=schedule,
         frame_schedule=schedule,
@@ -864,9 +1055,18 @@ def test_candidate_case_forces_and_verifies_the_parallel_apple_schedule(
     )
 
     policy_index = parsed_argv.index("--stage-concurrency")
-    assert parsed_argv[policy_index + 1] == "parallel"
+    assert parsed_argv[policy_index + 1] == "auto"
+    assert result["requested_backend"] == "auto"
+    assert result["schedule_policy"] == "auto"
     assert result["schedule_mode"] == "parallel"
+    assert result["schedule_source"] == "macos-memory-pressure"
+    assert result["frame_schedule_policy"] == "auto"
     assert result["frame_schedule_mode"] == "parallel"
+    assert result["frame_schedule_source"] == "macos-memory-pressure"
+    assert result["model_resolution_source"] == "local-hit"
+    assert result["model_resolution_seconds"] == pytest.approx(0.125)
+    assert result["mlx_peak_memory_bytes"] == 123456789
+    assert result["fallback_used"] is False
     assert result["critical_path"] == "max(T + F, D) + M + E"
     assert result["fallback_waited_for_diarization"] is False
     assert result["pipeline_evidence"]["frames"]["launch_wave"] == (
@@ -880,6 +1080,7 @@ def test_candidate_case_rejects_a_nonparallel_result(monkeypatch, tmp_path):
         hf_token="hf_test",
         transcription_device="mlx",
         effective_diarization_device="cpu",
+        config=SimpleNamespace(transcription_backend="auto"),
     )
     result = SimpleNamespace(
         initial_schedule=SimpleNamespace(parallel=False),

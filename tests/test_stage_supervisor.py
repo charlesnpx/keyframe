@@ -767,6 +767,7 @@ def test_transcription_worker_keeps_result_on_disk_and_metadata_off_progress_cha
                 "model_revision": "immutable-revision",
                 "model_resolution_source": "local-hit",
                 "model_resolution_seconds": 0.125,
+                "mlx_peak_memory_bytes": 123456789,
             },
         ),
     )
@@ -792,6 +793,7 @@ def test_transcription_worker_keeps_result_on_disk_and_metadata_off_progress_cha
         "model_revision": "immutable-revision",
         "model_resolution_source": "local-hit",
         "model_resolution_seconds": 0.125,
+        "mlx_peak_memory_bytes": 123456789,
     }
     assert not hasattr(terminal.messages[0], "segments")
     assert terminal.closed

@@ -59,7 +59,10 @@ These download automatically on first use and are cached:
 
 MLX dependencies and weights are gated to Apple Silicon running macOS 14 or
 newer. Linux, Windows, Intel Macs, and older macOS releases do not install MLX
-and do not request MLX model weights.
+and do not request MLX model weights. On a supported Mac, Keyframe resolves the
+exact pinned MLX revision from the local Hugging Face cache first. It permits a
+network download only when that exact snapshot is genuinely absent, so a warm
+run does not wait on online model resolution.
 
 ## Usage
 
@@ -106,8 +109,8 @@ keyframe recording.m4a --transcript-only --stage-concurrency serial
 
 Explicit `--transcription-backend mlx` fails during preflight on unsupported
 machines, before importing MLX or acquiring a model. `auto` can recover from an
-eligible MLX load or inference failure by exiting that worker and starting a
-fresh OpenAI Whisper CPU worker.
+eligible MLX import, acquisition, load, or inference failure by exiting that
+worker and starting a fresh OpenAI Whisper CPU worker.
 
 ### As a Claude Code skill
 
@@ -172,17 +175,32 @@ When `HF_TOKEN` is set, pyannote detects speakers with
 speaker label to each Whisper segment based on diarization overlap. Speaker
 detection shows stage-prefixed progress after model loading and audio decoding.
 If `HF_TOKEN` is missing or speaker detection fails, Keyframe warns and keeps
-the unlabeled Whisper transcript.
+the unlabeled Whisper transcript. The two known harmless pyannote warnings
+about unavailable TorchCodec decoding and a too-short pooling window are
+condensed; changed or unrelated warnings remain visible. Every pyannote row is
+validated for finite, non-negative timestamps, positive duration, and a
+non-empty speaker before the diarization checkpoint can be published.
 
 Each model stage runs in a disposable spawned process. In `auto` concurrency
 mode, MLX or CUDA transcription may overlap CPU diarization only when the
-model-aware memory check (including 25% headroom) admits both. CPU transcription
-and CPU diarization additionally require at least four CPUs. Stages sharing an
-accelerator are always serialized. In a full run, MPS/CUDA frame extraction
-starts only after transcription releases that accelerator and may then overlap
-the remaining CPU diarization after a fresh memory check. `parallel` may
-override CPU-count and memory admission with a warning, but never
-shared-accelerator exclusion.
+model-aware memory check (including 10% headroom) admits both. On macOS,
+automatic admission uses `memory_pressure -Q` with physical memory from
+`sysctl`; a bounded `vm_stat` calculation is the fallback, and swap is never
+counted. CPU transcription and CPU diarization additionally require at least
+four CPUs. Stages sharing an accelerator are always serialized. In a full run,
+MPS/CUDA frame extraction starts only after transcription releases that
+accelerator. Keyframe then makes a fresh second-wave decision, allowing frames
+to overlap a still-running CPU diarization worker when current pressure admits
+it. `parallel` may override CPU-count and memory admission with a warning, but
+never shared-accelerator exclusion.
+
+Reliable parent-monotonic intervals select one of five full-run critical paths:
+`max(T + F, D) + M + E`, `max(T, D) + F + M + E`,
+`T + max(D, F) + M + E`, `T + D + F + M + E`, or
+`T + F + M + E`. Here `T`, `D`, and `F` are transcription, diarization, and
+frame intervals; `M` is speaker merge/output writing and `E` is manifest
+enrichment/promotion. The last form covers absent or cancelled diarization and
+an MLX fallback whose required diarization wait is already contained in `T`.
 
 The raw transcript checkpoint is atomically published as soon as transcription
 finishes, before speaker assignment. A later diarization or frame failure does
