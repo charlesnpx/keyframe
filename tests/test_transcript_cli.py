@@ -531,6 +531,8 @@ def test_parallel_run_promotes_current_checkpoints_before_speaker_assignment(
     )
     assert result.metadata["model_resolution_source"] == "local-hit"
     assert result.metadata["model_resolution_seconds"] == 0.125
+    with pytest.raises(TypeError):
+        result.metadata["model_resolution_source"] = "changed"
     assert supervisor.events.index("start-diarization") < supervisor.events.index(
         "complete-transcription-1"
     )

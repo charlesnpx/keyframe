@@ -13,6 +13,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, replace
 from multiprocessing.connection import wait as wait_for_connections
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from keyframe import transcript as transcript_module
@@ -150,6 +151,9 @@ class StageCompletion:
     checkpoint_path: Path
     metadata: Mapping[str, Any]
     records: tuple[TranscriptSegment, ...] | tuple[DiarizationRow, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
 
 
 @dataclass(frozen=True)

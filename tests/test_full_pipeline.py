@@ -375,7 +375,7 @@ def test_accelerated_frames_overlap_running_cpu_diarization_after_transcription(
         assert result.transcript.metadata["model_resolution_source"] == "local-hit"
     else:
         assert "model_resolution_source" not in result.transcript.metadata
-    assert result.transcription_metadata == result.transcript.metadata
+    assert result.transcription_metadata is result.transcript.metadata
 
 
 def test_shared_cuda_stages_remain_serial_through_diarization_and_frames(tmp_path):

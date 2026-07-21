@@ -11,6 +11,7 @@ from collections.abc import Callable, Iterable, Mapping
 from contextlib import nullcontext, redirect_stdout
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from keyframe import transcript
@@ -79,6 +80,9 @@ class TranscriptRunResult:
     initial_schedule: ScheduleDecision
     timings: Mapping[str, float]
     metadata: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
 
 
 class TranscriptOutputError(OutputSessionError):

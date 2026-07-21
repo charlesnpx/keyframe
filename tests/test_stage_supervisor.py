@@ -250,6 +250,8 @@ def test_spawned_worker_is_non_daemon_validated_and_promoted(tmp_path):
         assert completion.stage == "transcription"
         assert completion.checkpoint_path == output / "transcript.raw.json"
         assert completion.metadata == {"record_count": 1, "language": "en"}
+        with pytest.raises(TypeError):
+            completion.metadata["language"] = "changed"
         assert completion.records == (
             transcript.TranscriptSegment(0.123456789, 1.987654321, "worker"),
         )

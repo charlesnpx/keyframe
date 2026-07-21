@@ -44,7 +44,10 @@ class FullPipelineRunResult:
     frame_schedule: ScheduleDecision
     critical_path: str
     timings: Mapping[str, float]
-    transcription_metadata: Mapping[str, Any]
+
+    @property
+    def transcription_metadata(self) -> Mapping[str, Any]:
+        return self.transcript.metadata
 
 
 def resolve_frame_device(preflight: TranscriptPreflight) -> str:
@@ -358,5 +361,4 @@ def run_supervised_full_pipeline(
         frame_schedule=frame_schedule,
         critical_path=critical_path,
         timings=dict(timings),
-        transcription_metadata=dict(execution.completion.metadata),
     )
