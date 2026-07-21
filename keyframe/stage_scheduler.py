@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,8 +19,19 @@ from typing import Any
 LOGGER = logging.getLogger(__name__)
 
 GIB = 1024**3
-MEMORY_HEADROOM = 0.25
+MEMORY_HEADROOM_PERCENT = 10
 CONCURRENCY_POLICIES = ("auto", "serial", "parallel")
+RESOURCE_SOURCES = frozenset(
+    {
+        "macos-memory-pressure",
+        "macos-vm-stat",
+        "linux-proc-meminfo",
+        "windows-global-memory-status",
+        "posix-sysconf",
+        "unavailable",
+        "injected",
+    }
+)
 TRANSCRIPTION_MEMORY_GIB = {
     "tiny": 3,
     "base": 3,
@@ -47,12 +59,15 @@ class RuntimeResources:
 
     cpu_count: int
     available_memory_bytes: int | None
+    source: str = "injected"
 
     def __post_init__(self) -> None:
         if self.cpu_count < 1:
             raise ValueError("cpu_count must be at least one")
         if self.available_memory_bytes is not None and self.available_memory_bytes < 0:
             raise ValueError("available_memory_bytes cannot be negative")
+        if self.source not in RESOURCE_SOURCES:
+            raise ValueError(f"unknown runtime resource source: {self.source!r}")
 
 
 @dataclass(frozen=True)
@@ -135,6 +150,8 @@ class TranscriptionExecution:
     handle: Any
     fallback_used: bool
     fallback_schedule: ScheduleDecision | None = None
+    waited_for_active_stages: bool = False
+    settled_active_stages: tuple[tuple[str, float, str], ...] = ()
 
 
 def transcription_demand(
@@ -197,7 +214,7 @@ def _linux_available_memory() -> int | None:
     return None
 
 
-def _macos_available_memory() -> int | None:
+def _macos_vm_stat_available_memory() -> int | None:
     try:
         result = subprocess.run(
             ["vm_stat"],
@@ -212,7 +229,10 @@ def _macos_available_memory() -> int | None:
     if page_match is None:
         return None
     page_size = int(page_match.group(1))
+    if page_size <= 0:
+        return None
     available_pages = 0
+    matched_labels = 0
     labels = {
         "Pages free",
         "Pages inactive",
@@ -223,9 +243,53 @@ def _macos_available_memory() -> int | None:
         if separator and label in labels:
             try:
                 available_pages += int(value.strip().rstrip("."))
+                matched_labels += 1
             except ValueError:
                 return None
-    return available_pages * page_size if available_pages else None
+    return available_pages * page_size if matched_labels else None
+
+
+def _macos_memory_pressure_available_memory() -> int | None:
+    pressure_result = None
+    total_result = None
+    try:
+        pressure_result = subprocess.run(
+            ["memory_pressure", "-Q"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        total_result = subprocess.run(
+            ["sysctl", "-n", "hw.memsize"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if pressure_result is None or total_result is None:
+        return None
+
+    percentage_match = re.search(
+        r"System-wide\s+memory\s+free\s+percentage\s*:\s*([+-]?\d+)\s*%",
+        pressure_result.stdout,
+        flags=re.IGNORECASE,
+    )
+    if percentage_match is None:
+        return None
+    try:
+        percentage = int(percentage_match.group(1))
+        total_physical_bytes = int(total_result.stdout.strip())
+    except (TypeError, ValueError):
+        return None
+    if not 0 <= percentage <= 100 or total_physical_bytes <= 0:
+        return None
+    return total_physical_bytes * percentage // 100
 
 
 def _windows_available_memory() -> int | None:
@@ -265,28 +329,63 @@ def _sysconf_available_memory() -> int | None:
     return None
 
 
+def _probe_available_memory() -> tuple[int | None, str]:
+    if sys.platform.startswith("linux"):
+        available = _linux_available_memory()
+        if available is not None:
+            return available, "linux-proc-meminfo"
+        available = _sysconf_available_memory()
+        return (
+            (available, "posix-sysconf")
+            if available is not None
+            else (None, "unavailable")
+        )
+    if sys.platform == "darwin":
+        available = _macos_memory_pressure_available_memory()
+        if available is not None:
+            return available, "macos-memory-pressure"
+        available = _macos_vm_stat_available_memory()
+        return (
+            (available, "macos-vm-stat")
+            if available is not None
+            else (None, "unavailable")
+        )
+    if os.name == "nt":
+        available = _windows_available_memory()
+        return (
+            (available, "windows-global-memory-status")
+            if available is not None
+            else (None, "unavailable")
+        )
+    available = _sysconf_available_memory()
+    return (
+        (available, "posix-sysconf")
+        if available is not None
+        else (None, "unavailable")
+    )
+
+
 def probe_available_memory_bytes() -> int | None:
     """Return currently available physical memory without importing model stacks."""
 
-    if sys.platform.startswith("linux"):
-        return _linux_available_memory() or _sysconf_available_memory()
-    if sys.platform == "darwin":
-        return _macos_available_memory() or _sysconf_available_memory()
-    if os.name == "nt":
-        return _windows_available_memory()
-    return _sysconf_available_memory()
+    available, _source = _probe_available_memory()
+    return available
 
 
 def probe_runtime_resources() -> RuntimeResources:
+    available_memory_bytes, source = _probe_available_memory()
     return RuntimeResources(
         cpu_count=max(1, os.cpu_count() or 1),
-        available_memory_bytes=probe_available_memory_bytes(),
+        available_memory_bytes=available_memory_bytes,
+        source=source,
     )
 
 
 def required_memory_with_headroom(stages: Iterable[StageDemand]) -> int:
     estimated = sum(stage.memory_bytes for stage in stages)
-    return math.ceil(estimated * (1.0 + MEMORY_HEADROOM))
+    return (
+        estimated * (100 + MEMORY_HEADROOM_PERCENT) + 99
+    ) // 100
 
 
 def _shared_accelerator(stages: Sequence[StageDemand]) -> str | None:
@@ -331,7 +430,11 @@ class StageScheduler:
             if not isinstance(resources, RuntimeResources):
                 raise TypeError("resource probe did not return RuntimeResources")
         except Exception as exc:
-            resources = RuntimeResources(max(1, os.cpu_count() or 1), None)
+            resources = RuntimeResources(
+                max(1, os.cpu_count() or 1),
+                None,
+                source="unavailable",
+            )
             probe_warning = (
                 "resource admission probe failed; memory admission is unavailable: "
                 f"{type(exc).__name__}: {exc}"
@@ -474,6 +577,18 @@ def _handle_is_running(handle: Any) -> bool:
     return process.pid is not None and process.is_alive()
 
 
+def _handle_ended_at(handle: Any, clock: Callable[[], float]) -> float:
+    ended_at = getattr(handle, "ended_at", None)
+    if (
+        isinstance(ended_at, (int, float))
+        and not isinstance(ended_at, bool)
+        and math.isfinite(float(ended_at))
+        and float(ended_at) >= 0
+    ):
+        return float(ended_at)
+    return clock()
+
+
 def complete_transcription_with_auto_fallback(
     supervisor: Any,
     transcription_handle: Any,
@@ -485,6 +600,7 @@ def complete_transcription_with_auto_fallback(
     effective_backend: str,
     active_stages: Iterable[ActiveStage] = (),
     final_output_paths: Iterable[str | Path] = (),
+    clock: Callable[[], float] = time.monotonic,
 ) -> TranscriptionExecution:
     """Complete MLX auto mode, relaunching eligible failures in a fresh worker.
 
@@ -525,33 +641,51 @@ def complete_transcription_with_auto_fallback(
         fallback_schedule = scheduler.decide(
             (fallback, *(active.demand for active in still_running))
         )
-        if not fallback_schedule.parallel:
+        waited_for_active_stages = bool(still_running) and not fallback_schedule.parallel
+        settled_active_stages: list[tuple[str, float, str]] = []
+        if waited_for_active_stages:
             for active in still_running:
+                outcome = "completed"
                 try:
                     active.handle.wait()
                 except StageSupervisorError:
+                    outcome = "failed"
                     # Preserve the companion's cached failure for its owner. A
                     # diarization failure must not suppress a valid transcript.
                     pass
+                finally:
+                    settled_active_stages.append(
+                        (
+                            active.demand.stage,
+                            _handle_ended_at(active.handle, clock),
+                            outcome,
+                        )
+                    )
 
         scheduler.logger.warning(
             "Eligible MLX failure (%s); starting fresh CPU Whisper worker with %s threads",
             exc.error_type or type(exc).__name__,
             fallback_schedule.cpu_threads_for("transcription"),
         )
-        fallback_handle = supervisor.start_transcription(
-            video_path,
-            model_name=model_name,
-            requested_backend="whisper",
-            final_output_paths=final_output_paths,
-            thread_budget=fallback_schedule.cpu_threads_for("transcription"),
-        )
-        fallback_completion = supervisor.complete(fallback_handle)
+        try:
+            fallback_handle = supervisor.start_transcription(
+                video_path,
+                model_name=model_name,
+                requested_backend="whisper",
+                final_output_paths=final_output_paths,
+                thread_budget=fallback_schedule.cpu_threads_for("transcription"),
+            )
+            fallback_completion = supervisor.complete(fallback_handle)
+        except BaseException as fallback_exc:
+            fallback_exc.settled_active_stages = tuple(settled_active_stages)
+            raise
         return TranscriptionExecution(
             completion=fallback_completion,
             handle=fallback_handle,
             fallback_used=True,
             fallback_schedule=fallback_schedule,
+            waited_for_active_stages=waited_for_active_stages,
+            settled_active_stages=tuple(settled_active_stages),
         )
     return TranscriptionExecution(
         completion=completion,

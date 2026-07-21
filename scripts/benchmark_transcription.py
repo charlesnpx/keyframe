@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run and replay the Keyframe 0.6.0 transcription release benchmark."""
+"""Run and replay the Keyframe 0.6.1 transcription release benchmark."""
 
 from __future__ import annotations
 
@@ -30,7 +30,17 @@ from keyframe.artifacts import (
     atomic_write_json,
     reject_path_aliases,
 )
-from keyframe.full_pipeline import resolve_frame_device, run_supervised_full_pipeline
+from keyframe.full_pipeline import (
+    PipelineEvidence,
+    StageInterval,
+    critical_path_from_pipeline_evidence,
+    resolve_frame_device,
+    run_supervised_full_pipeline,
+)
+from keyframe.process_memory import (
+    conservative_process_tree_high_water,
+    resource_peak_rss_bytes,
+)
 from keyframe.stage_supervisor import StageSupervisor
 from keyframe.transcript_cli import (
     TranscriptRunConfig,
@@ -47,29 +57,45 @@ from keyframe.validation import (
 
 
 GIB = 1024**3
-REPORT_SCHEMA_VERSION = 1
+REPORT_SCHEMA_VERSION = 4
 DEFAULT_TIMESTAMP_TOLERANCE_SECONDS = 0.05
 DEFAULT_CRITICAL_PATH_TOLERANCE_SECONDS = 5.0
-MEMORY_SAMPLE_INTERVAL_SECONDS = 1.0
+PROCESS_TREE_PEAK_METHOD = "conservative-kernel-high-water-bound"
+HISTORICAL_CANDIDATE_WALL_SECONDS = 613.67
+MAX_HISTORICAL_WALL_MULTIPLIER = 1.15
+MAX_SERIAL_REFERENCE_WALL_MULTIPLIER = 0.85
+MAX_PROCESS_TREE_RSS_GIB = 6.60
+MAX_MLX_ALLOCATOR_PEAK_GIB = 5.96
+MAX_LOCAL_MODEL_RESOLUTION_SECONDS = 1.0
 EXPECTED_RUNTIME_PACKAGES = {
-    "keyframe": "0.6.0",
+    "keyframe": "0.6.1",
     "mlx": "0.32.0",
     "mlx_whisper": "0.4.3",
     "whisperx": "3.8.6",
 }
 REFERENCE_CONTRACT = {
+    "requested_backend": "whisper",
     "backend": "whisper",
     "device": "cpu",
     "diarization_device": "cpu",
+    "schedule_policy": "serial",
     "schedule_mode": "serial",
 }
 CANDIDATE_CONTRACT = {
+    "requested_backend": "auto",
     "backend": "mlx",
     "device": "mlx",
     "diarization_device": "cpu",
     "frame_device": "mps",
+    "schedule_policy": "auto",
     "schedule_mode": "parallel",
+    "schedule_source": "macos-memory-pressure",
+    "frame_schedule_policy": "auto",
     "frame_schedule_mode": "parallel",
+    "frame_schedule_source": "macos-memory-pressure",
+    "fallback_used": False,
+    "fallback_waited_for_diarization": False,
+    "model_resolution_source": "local-hit",
 }
 
 
@@ -82,48 +108,6 @@ class _CaseRequest:
     name: str
     input_path: str
     output_dir: str
-
-
-def _process_tree_rss_gib(ps_output: str, root_pid: int) -> float:
-    """Sum one process tree's RSS from portable ``ps`` KiB rows."""
-
-    processes: dict[int, tuple[int, int]] = {}
-    for line in ps_output.splitlines():
-        fields = line.split()
-        if len(fields) != 3:
-            continue
-        try:
-            pid, parent_pid, rss_kib = map(int, fields)
-        except ValueError:
-            continue
-        if pid > 0 and rss_kib >= 0:
-            processes[pid] = (parent_pid, rss_kib)
-
-    tree = {root_pid}
-    changed = True
-    while changed:
-        changed = False
-        for pid, (parent_pid, _rss_kib) in processes.items():
-            if pid not in tree and parent_pid in tree:
-                tree.add(pid)
-                changed = True
-    aggregate_kib = sum(
-        processes[pid][1] for pid in tree if pid in processes
-    )
-    return aggregate_kib * 1024 / GIB
-
-
-def _sample_process_tree_rss_gib(root_pid: int) -> float:
-    try:
-        result = subprocess.run(
-            ["ps", "-axo", "pid=,ppid=,rss="],
-            check=True,
-            text=True,
-            capture_output=True,
-        )
-    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
-        raise BenchmarkError(f"could not sample benchmark process memory: {exc}") from exc
-    return _process_tree_rss_gib(result.stdout, root_pid)
 
 
 def _artifact_summary(output_dir: Path) -> dict[str, bool]:
@@ -167,9 +151,11 @@ def _run_reference_case(request: _CaseRequest) -> dict[str, Any]:
     wall_time = time.monotonic() - started
     return {
         "name": request.name,
+        "requested_backend": config.transcription_backend,
         "backend": result.effective_backend,
         "device": preflight.transcription_device,
         "diarization_device": preflight.effective_diarization_device,
+        "schedule_policy": result.initial_schedule.policy,
         "schedule_mode": result.initial_schedule.mode,
         "schedule_reason": result.initial_schedule.reason,
         "wall_time_seconds": wall_time,
@@ -195,7 +181,7 @@ def _run_candidate_case(request: _CaseRequest) -> dict[str, Any]:
             "--diarization-device",
             "cpu",
             "--stage-concurrency",
-            "parallel",
+            "auto",
         ]
     )
     preflight = preflight_transcript_run(cli._transcript_config(args))
@@ -206,8 +192,26 @@ def _run_candidate_case(request: _CaseRequest) -> dict[str, Any]:
         )
     if preflight.hf_token is None:
         raise BenchmarkError("the concurrent diarization run requires HF_TOKEN")
-    model_spec = transcript.MLX_MODEL_SPECS[args.whisper_model]
     frame_device = resolve_frame_device(preflight)
+    case_process_phase_peaks: dict[str, int] = {}
+
+    def run_frames(supervisor: StageSupervisor) -> Any:
+        case_process_phase_peaks["initial-wave"] = resource_peak_rss_bytes(
+            "self"
+        )
+        try:
+            return cli._run_frame_generation(
+                video,
+                output_dir,
+                args,
+                supervisor,
+                frame_device=frame_device,
+            )
+        finally:
+            case_process_phase_peaks["second-wave"] = resource_peak_rss_bytes(
+                "self"
+            )
+
     started = time.monotonic()
     with StageSupervisor(
         output_dir,
@@ -219,13 +223,7 @@ def _run_candidate_case(request: _CaseRequest) -> dict[str, Any]:
             preflight,
             supervisor=supervisor,
             frame_device=frame_device,
-            frame_runner=lambda: cli._run_frame_generation(
-                video,
-                output_dir,
-                args,
-                supervisor,
-                frame_device=frame_device,
-            ),
+            frame_runner=lambda: run_frames(supervisor),
         )
     wall_time = time.monotonic() - started
     if not result.initial_schedule.parallel:
@@ -233,24 +231,70 @@ def _run_candidate_case(request: _CaseRequest) -> dict[str, Any]:
             "the controlled release candidate did not overlap MLX transcription "
             "with CPU diarization"
         )
+    stage_peak_rss_bytes = supervisor.completed_stage_peak_rss_bytes()
+    current_case_peak = resource_peak_rss_bytes("self")
+    case_process_phase_peaks.setdefault("initial-wave", current_case_peak)
+    case_process_phase_peaks.setdefault("second-wave", current_case_peak)
+    for label, schedule in (
+        ("initial", result.initial_schedule),
+        ("second-wave", result.frame_schedule),
+    ):
+        if schedule.policy != "auto":
+            raise BenchmarkError(
+                f"the {label} candidate schedule did not use automatic policy"
+            )
+        if schedule.mode != "parallel":
+            raise BenchmarkError(
+                f"the {label} automatic schedule did not admit parallel work"
+            )
+        if schedule.resources.source != "macos-memory-pressure":
+            raise BenchmarkError(
+                f"the {label} automatic schedule did not use macOS pressure evidence"
+            )
+    if result.transcript.fallback_used:
+        raise BenchmarkError("the release candidate fell back from pinned MLX")
+    missing_peak_stages = {"transcription", "diarization"} - set(
+        stage_peak_rss_bytes
+    )
+    if missing_peak_stages:
+        raise BenchmarkError(
+            "the release candidate is missing worker high-water evidence for: "
+            + ", ".join(sorted(missing_peak_stages))
+        )
     if result.critical_path != "max(T + F, D) + M + E":
         raise BenchmarkError(
             "the controlled Apple release candidate reported an unexpected "
             f"critical path: {result.critical_path}"
         )
+    metadata = result.transcript.metadata
     return {
         "name": request.name,
+        "requested_backend": preflight.config.transcription_backend,
         "backend": result.transcript.effective_backend,
         "device": preflight.transcription_device,
         "diarization_device": preflight.effective_diarization_device,
         "frame_device": result.frame_device,
-        "model_repository": model_spec.repository,
-        "model_revision": model_spec.revision,
+        "model_repository": metadata.get("model_repository"),
+        "model_revision": metadata.get("model_revision"),
+        "model_resolution_source": metadata.get("model_resolution_source"),
+        "model_resolution_seconds": metadata.get("model_resolution_seconds"),
+        "mlx_peak_memory_bytes": metadata.get("mlx_peak_memory_bytes"),
+        "stage_process_tree_peak_rss_bytes": stage_peak_rss_bytes,
+        "case_process_phase_peak_rss_bytes": case_process_phase_peaks,
+        "fallback_used": result.transcript.fallback_used,
+        "schedule_policy": result.initial_schedule.policy,
         "schedule_mode": result.initial_schedule.mode,
+        "schedule_source": result.initial_schedule.resources.source,
         "schedule_reason": result.initial_schedule.reason,
+        "frame_schedule_policy": result.frame_schedule.policy,
         "frame_schedule_mode": result.frame_schedule.mode,
+        "frame_schedule_source": result.frame_schedule.resources.source,
         "frame_schedule_reason": result.frame_schedule.reason,
         "critical_path": result.critical_path,
+        "pipeline_evidence": result.pipeline_evidence.to_dict(),
+        "fallback_waited_for_diarization": (
+            result.fallback_waited_for_diarization
+        ),
         "wall_time_seconds": wall_time,
         "timings": dict(result.timings),
         "artifacts": _artifact_summary(output_dir),
@@ -265,6 +309,34 @@ def _case_worker(request: _CaseRequest, terminal_send: Any) -> None:
             else _run_candidate_case
         )
         result = runner(request)
+        case_process_peak = resource_peak_rss_bytes("self")
+        stage_peaks = result.get("stage_process_tree_peak_rss_bytes", {})
+        case_phase_peaks = dict(
+            result.get("case_process_phase_peak_rss_bytes", {})
+        )
+        if case_phase_peaks:
+            case_phase_peaks["finalization"] = case_process_peak
+            transcription_peak = stage_peaks.get("transcription", 0)
+            diarization_peak = stage_peaks.get("diarization", 0)
+            phase_stage_peaks = {
+                "initial-wave": (transcription_peak, diarization_peak),
+                "second-wave": (diarization_peak,),
+                "finalization": (),
+            }
+        else:
+            case_phase_peaks = {"complete": case_process_peak}
+            phase_stage_peaks = {"complete": tuple(stage_peaks.values())}
+        result["case_process_phase_peak_rss_bytes"] = case_phase_peaks
+        memory_evidence = conservative_process_tree_high_water(
+            case_process_bytes=max(case_phase_peaks.values()),
+            max_reaped_child_bytes=resource_peak_rss_bytes("children"),
+            concurrent_stage_peaks=stage_peaks,
+            case_phase_peaks=case_phase_peaks,
+            phase_stage_peaks=phase_stage_peaks,
+        )
+        result["peak_memory_method"] = PROCESS_TREE_PEAK_METHOD
+        result["peak_memory_components_bytes"] = memory_evidence.to_dict()
+        result["peak_memory_gib"] = memory_evidence.tree_upper_bound_bytes / GIB
         atomic_write_json(
             Path(request.output_dir) / "benchmark-case.json",
             result,
@@ -304,19 +376,8 @@ def _run_isolated_case(request: _CaseRequest) -> dict[str, Any]:
         raise
     terminal_send.close()
     message: dict[str, Any] | None = None
-    peak_memory_gib = 0.0
-    next_memory_sample = 0.0
-    process_pid = process.pid
-    assert process_pid is not None
     try:
         while True:
-            now = time.monotonic()
-            if now >= next_memory_sample:
-                peak_memory_gib = max(
-                    peak_memory_gib,
-                    _sample_process_tree_rss_gib(process_pid),
-                )
-                next_memory_sample = now + MEMORY_SAMPLE_INTERVAL_SECONDS
             if terminal_receive.poll(0.2):
                 try:
                     message = terminal_receive.recv()
@@ -348,7 +409,6 @@ def _run_isolated_case(request: _CaseRequest) -> dict[str, Any]:
         detail = message.get("traceback") or message.get("error_message") or "unknown error"
         raise BenchmarkError(f"benchmark case {request.name} failed:\n{detail}")
     result = dict(message["result"])
-    result["peak_memory_gib"] = peak_memory_gib
     atomic_write_json(
         Path(request.output_dir) / "benchmark-case.json",
         result,
@@ -405,10 +465,9 @@ def _package_version(name: str) -> str | None:
 
 
 def _finite_number(value: Any, label: str) -> float:
-    try:
-        number = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{label} must be a number") from exc
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{label} must be a number")
+    number = float(value)
     if not math.isfinite(number):
         raise ValueError(f"{label} must be finite")
     return number
@@ -416,6 +475,113 @@ def _finite_number(value: Any, label: str) -> float:
 
 def _mapping(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
+
+
+def _pipeline_evidence_from_report(candidate: dict[str, Any]) -> PipelineEvidence:
+    raw_evidence = candidate.get("pipeline_evidence")
+    if not isinstance(raw_evidence, dict):
+        raise ValueError("candidate.pipeline_evidence must be an object")
+    unexpected = set(raw_evidence) - {"transcription", "diarization", "frames"}
+    if unexpected:
+        raise ValueError(
+            "candidate.pipeline_evidence has unknown stages: "
+            + ", ".join(sorted(str(stage) for stage in unexpected))
+        )
+
+    intervals = []
+    for stage, raw_interval in raw_evidence.items():
+        if not isinstance(raw_interval, dict):
+            raise ValueError(
+                f"candidate.pipeline_evidence.{stage} must be an object"
+            )
+        if raw_interval.get("stage") != stage:
+            raise ValueError(
+                f"candidate.pipeline_evidence.{stage}.stage must be {stage!r}"
+            )
+        try:
+            interval = StageInterval(
+                stage=stage,
+                launch_wave=raw_interval["launch_wave"],
+                started_at=raw_interval["started_at"],
+                ended_at=raw_interval["ended_at"],
+                outcome=raw_interval["outcome"],
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"candidate.pipeline_evidence.{stage} is invalid: {exc}"
+            ) from exc
+        try:
+            reported_duration = _finite_number(
+                raw_interval["duration_seconds"],
+                f"candidate.pipeline_evidence.{stage}.duration_seconds",
+            )
+        except KeyError as exc:
+            raise ValueError(
+                f"candidate.pipeline_evidence.{stage} is missing duration_seconds"
+            ) from exc
+        if not math.isclose(
+            reported_duration,
+            interval.duration_seconds,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError(
+                f"candidate.pipeline_evidence.{stage}.duration_seconds "
+                "does not match its interval"
+            )
+        intervals.append(interval)
+
+    evidence = PipelineEvidence(tuple(intervals))
+    transcription_interval = evidence.interval("transcription")
+    frame_interval = evidence.interval("frames")
+    if transcription_interval is None or frame_interval is None:
+        raise ValueError(
+            "candidate.pipeline_evidence must include transcription and frames"
+        )
+    if transcription_interval.outcome != "completed":
+        raise ValueError("candidate transcription interval must be completed")
+    if frame_interval.outcome != "completed":
+        raise ValueError("candidate frame interval must be completed")
+    timings = candidate.get("timings")
+    if not isinstance(timings, dict):
+        raise ValueError("candidate.timings must be an object")
+    for interval in intervals:
+        try:
+            reported_timing = _finite_number(
+                timings[interval.stage],
+                f"candidate.timings.{interval.stage}",
+            )
+        except KeyError as exc:
+            raise ValueError(
+                f"candidate.timings is missing {interval.stage}"
+            ) from exc
+        if not math.isclose(
+            reported_timing,
+            interval.duration_seconds,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError(
+                f"candidate.timings.{interval.stage} does not match its interval"
+            )
+
+    return evidence
+
+
+def _critical_path_from_reported_evidence(candidate: dict[str, Any]) -> str:
+    evidence = _pipeline_evidence_from_report(candidate)
+    waited = candidate.get("fallback_waited_for_diarization")
+    if not isinstance(waited, bool):
+        raise ValueError(
+            "candidate.fallback_waited_for_diarization must be a boolean"
+        )
+    try:
+        return critical_path_from_pipeline_evidence(
+            evidence,
+            fallback_waited_for_diarization=waited,
+        )
+    except RuntimeError as exc:
+        raise ValueError(f"candidate pipeline topology is invalid: {exc}") from exc
 
 
 def _release_contract_failures(report: dict[str, Any]) -> list[str]:
@@ -454,18 +620,232 @@ def _release_contract_failures(report: dict[str, Any]) -> list[str]:
     if python_parts not in {(3, 11), (3, 12), (3, 13)}:
         failures.append("runtime Python must be a supported 3.11 through 3.13 release")
 
-    schedule_expression = {
-        ("parallel", "parallel"): "max(T + F, D) + M + E",
-        ("parallel", "serial"): "max(T, D) + F + M + E",
-        ("serial", "serial"): "T + D + F + M + E",
-    }.get((candidate.get("schedule_mode"), candidate.get("frame_schedule_mode")))
-    if schedule_expression is None:
-        failures.append("candidate schedule modes do not describe a supported run")
-    elif candidate.get("critical_path") != schedule_expression:
-        failures.append(
-            "candidate critical path does not match its logged schedules: "
-            f"expected {schedule_expression!r}"
+    try:
+        evidence = _pipeline_evidence_from_report(candidate)
+    except ValueError as exc:
+        failures.append(f"candidate pipeline evidence is invalid: {exc}")
+    else:
+        transcription_interval = evidence.interval("transcription")
+        diarization_interval = evidence.interval("diarization")
+        frame_interval = evidence.interval("frames")
+        assert transcription_interval is not None
+        assert frame_interval is not None
+        if diarization_interval is None:
+            failures.append("candidate pipeline evidence is missing diarization")
+        else:
+            if diarization_interval.outcome != "completed":
+                failures.append("candidate diarization interval must be completed")
+            if not transcription_interval.overlaps(diarization_interval):
+                failures.append(
+                    "candidate transcription and diarization intervals must overlap"
+                )
+            if not frame_interval.overlaps(diarization_interval):
+                failures.append("candidate frames and diarization intervals must overlap")
+        if transcription_interval.ended_at > frame_interval.started_at:
+            failures.append(
+                "candidate frames must not start before transcription completes"
+            )
+        try:
+            topology_expression = _critical_path_from_reported_evidence(candidate)
+        except ValueError as exc:
+            failures.append(f"candidate pipeline evidence is invalid: {exc}")
+            return failures
+        if candidate.get("critical_path") != topology_expression:
+            failures.append(
+                "candidate critical path does not match its pipeline evidence: "
+                f"expected {topology_expression!r}"
+            )
+    return failures
+
+
+def _performance_contract_failures(report: dict[str, Any]) -> list[str]:
+    failures = []
+    reference = _mapping(report.get("reference"))
+    candidate = _mapping(report.get("candidate"))
+    try:
+        reference_wall = _finite_number(
+            reference.get("wall_time_seconds"),
+            "reference.wall_time_seconds",
         )
+        candidate_wall = _finite_number(
+            candidate.get("wall_time_seconds"),
+            "candidate.wall_time_seconds",
+        )
+        process_peak_gib = _finite_number(
+            candidate.get("peak_memory_gib"),
+            "candidate.peak_memory_gib",
+        )
+        resolution_seconds = _finite_number(
+            candidate.get("model_resolution_seconds"),
+            "candidate.model_resolution_seconds",
+        )
+        mlx_peak_bytes = candidate.get("mlx_peak_memory_bytes")
+        if isinstance(mlx_peak_bytes, bool) or not isinstance(mlx_peak_bytes, int):
+            raise ValueError("candidate.mlx_peak_memory_bytes must be an integer")
+        if mlx_peak_bytes < 0:
+            raise ValueError(
+                "candidate.mlx_peak_memory_bytes must be non-negative"
+            )
+        if min(
+            reference_wall,
+            candidate_wall,
+            process_peak_gib,
+            resolution_seconds,
+        ) < 0:
+            raise ValueError("performance measurements must be non-negative")
+        if reference_wall == 0:
+            raise ValueError("reference.wall_time_seconds must be positive")
+        if candidate.get("peak_memory_method") != PROCESS_TREE_PEAK_METHOD:
+            raise ValueError(
+                "candidate.peak_memory_method must use kernel high-water evidence"
+            )
+        raw_components = candidate.get("peak_memory_components_bytes")
+        if not isinstance(raw_components, dict):
+            raise ValueError(
+                "candidate.peak_memory_components_bytes must be an object"
+            )
+        scalar_component_names = {
+            "case_process_bytes",
+            "max_reaped_child_bytes",
+            "concurrent_stage_sum_bytes",
+            "descendant_bound_bytes",
+            "tree_upper_bound_bytes",
+        }
+        if set(raw_components) != scalar_component_names | {
+            "phase_upper_bound_bytes"
+        }:
+            raise ValueError(
+                "candidate.peak_memory_components_bytes has invalid fields"
+            )
+        components: dict[str, int] = {}
+        for name in scalar_component_names:
+            value = raw_components[name]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(
+                    f"candidate.peak_memory_components_bytes.{name} "
+                    "must be a non-negative integer"
+                )
+            components[name] = value
+        raw_phase_bounds = raw_components["phase_upper_bound_bytes"]
+        raw_case_phases = candidate.get("case_process_phase_peak_rss_bytes")
+        phase_names = {"initial-wave", "second-wave", "finalization"}
+        if (
+            not isinstance(raw_phase_bounds, dict)
+            or set(raw_phase_bounds) != phase_names
+            or not isinstance(raw_case_phases, dict)
+            or set(raw_case_phases) != phase_names
+        ):
+            raise ValueError("candidate process high-water phases are invalid")
+        phase_bounds: dict[str, int] = {}
+        case_phases: dict[str, int] = {}
+        for name in phase_names:
+            for source, target, label in (
+                (raw_phase_bounds, phase_bounds, "phase bound"),
+                (raw_case_phases, case_phases, "case phase"),
+            ):
+                value = source[name]
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value < 0
+                ):
+                    raise ValueError(
+                        f"candidate {label} {name!r} must be a "
+                        "non-negative integer"
+                    )
+                target[name] = value
+        raw_stage_peaks = candidate.get("stage_process_tree_peak_rss_bytes")
+        if not isinstance(raw_stage_peaks, dict):
+            raise ValueError(
+                "candidate.stage_process_tree_peak_rss_bytes must be an object"
+            )
+        if set(raw_stage_peaks) != {"transcription", "diarization"}:
+            raise ValueError("candidate worker high-water evidence is incomplete")
+        stage_peaks: dict[str, int] = {}
+        for stage, value in raw_stage_peaks.items():
+            if (
+                stage not in {"transcription", "diarization"}
+                or isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+            ):
+                raise ValueError("candidate worker high-water evidence is invalid")
+            stage_peaks[stage] = value
+        stage_peak_sum = sum(stage_peaks.values())
+        expected_phase_stage_sums = {
+            "initial-wave": stage_peak_sum,
+            "second-wave": stage_peaks["diarization"],
+            "finalization": 0,
+        }
+        expected_phase_bounds = {
+            name: case_phases[name]
+            + max(
+                components["max_reaped_child_bytes"],
+                expected_phase_stage_sums[name],
+            )
+            for name in phase_names
+        }
+        if phase_bounds != expected_phase_bounds:
+            raise ValueError("candidate phase high-water bounds are inconsistent")
+        expected_descendant_bound = max(
+            components["max_reaped_child_bytes"],
+            max(expected_phase_stage_sums.values()),
+        )
+        expected_tree_bound = max(expected_phase_bounds.values())
+        if components["case_process_bytes"] != max(case_phases.values()):
+            raise ValueError("candidate case-process high-water peak is inconsistent")
+        if components["concurrent_stage_sum_bytes"] != stage_peak_sum:
+            raise ValueError(
+                "candidate worker high-water sum disagrees with memory evidence"
+            )
+        if components["descendant_bound_bytes"] != expected_descendant_bound:
+            raise ValueError("candidate descendant high-water bound is inconsistent")
+        if components["tree_upper_bound_bytes"] != expected_tree_bound:
+            raise ValueError("candidate process-tree high-water bound is inconsistent")
+        if not math.isclose(
+            process_peak_gib,
+            expected_tree_bound / GIB,
+            rel_tol=0.0,
+            abs_tol=1 / GIB,
+        ):
+            raise ValueError(
+                "candidate.peak_memory_gib disagrees with high-water evidence"
+            )
+    except ValueError as exc:
+        return [f"performance measurements are invalid: {exc}"]
+
+    historical_limit = (
+        HISTORICAL_CANDIDATE_WALL_SECONDS * MAX_HISTORICAL_WALL_MULTIPLIER
+    )
+    same_run_limit = reference_wall * MAX_SERIAL_REFERENCE_WALL_MULTIPLIER
+    if candidate_wall > historical_limit:
+        failures.append("candidate wall time exceeds the historical runtime limit")
+    if candidate_wall > same_run_limit:
+        failures.append(
+            "candidate is not at least 15 percent faster than the serial reference"
+        )
+    if process_peak_gib > MAX_PROCESS_TREE_RSS_GIB:
+        failures.append(
+            "candidate process-tree RSS high-water bound exceeds 6.60 GiB"
+        )
+    if mlx_peak_bytes > MAX_MLX_ALLOCATOR_PEAK_GIB * GIB:
+        failures.append("candidate MLX allocator peak exceeds 5.96 GiB")
+    if resolution_seconds >= MAX_LOCAL_MODEL_RESOLUTION_SECONDS:
+        failures.append("candidate cached MLX resolution did not finish under one second")
+
+    report["performance_validation"] = {
+        "historical_candidate_wall_seconds": HISTORICAL_CANDIDATE_WALL_SECONDS,
+        "historical_multiplier": MAX_HISTORICAL_WALL_MULTIPLIER,
+        "same_run_serial_reference_multiplier": (
+            MAX_SERIAL_REFERENCE_WALL_MULTIPLIER
+        ),
+        "process_tree_rss_ceiling_gib": MAX_PROCESS_TREE_RSS_GIB,
+        "process_tree_peak_method": PROCESS_TREE_PEAK_METHOD,
+        "mlx_allocator_peak_ceiling_gib": MAX_MLX_ALLOCATOR_PEAK_GIB,
+        "local_resolution_ceiling_seconds": MAX_LOCAL_MODEL_RESOLUTION_SECONDS,
+        "historical_wall_limit_seconds": historical_limit,
+        "same_run_wall_limit_seconds": same_run_limit,
+    }
     return failures
 
 
@@ -546,6 +926,7 @@ def evaluate_report(
 
     failures = _quality_failures(report, baseline)
     failures.extend(_release_contract_failures(report))
+    failures.extend(_performance_contract_failures(report))
     try:
         critical_path_tolerance = _finite_number(
             critical_path_tolerance_seconds,

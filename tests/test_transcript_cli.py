@@ -22,6 +22,7 @@ from keyframe.transcript_cli import (
     TranscriptOutputError,
     TranscriptPreflight,
     TranscriptRunConfig,
+    _print_schedule,
     _write_final_outputs,
     preflight_transcript_run,
     print_stage_progress,
@@ -446,10 +447,20 @@ class _FakeSupervisor:
             )
             requested = self.started[handle.attempt - 1][2]["requested_backend"]
             effective = "whisper" if requested == "whisper" else "mlx"
+            metadata = {"language": "en", "effective_backend": effective}
+            if effective == "mlx":
+                metadata.update(
+                    {
+                        "model_repository": "mlx-community/whisper-medium-mlx",
+                        "model_revision": "immutable-revision",
+                        "model_resolution_source": "local-hit",
+                        "model_resolution_seconds": 0.125,
+                    }
+                )
             return StageCompletion(
                 "transcription",
                 self.public.transcript_raw,
-                {"language": "en", "effective_backend": effective},
+                metadata,
                 self.transcript_segments,
             )
         if self.diarization_error is not None:
@@ -519,6 +530,10 @@ def test_parallel_run_promotes_current_checkpoints_before_speaker_assignment(
     assert result.segments == (
         transcript.TranscriptSegment(0.0, 2.0, "hello", "SPEAKER_00"),
     )
+    assert result.metadata["model_resolution_source"] == "local-hit"
+    assert result.metadata["model_resolution_seconds"] == 0.125
+    with pytest.raises(TypeError):
+        result.metadata["model_resolution_source"] = "changed"
     assert supervisor.events.index("start-diarization") < supervisor.events.index(
         "complete-transcription-1"
     )
@@ -775,6 +790,28 @@ def test_progress_output_is_stably_stage_prefixed(capsys):
     print_stage_progress(StageProgress("diarization", "inference", "cpu"))
 
     assert capsys.readouterr().out == "[diarization] inference: cpu\n"
+
+
+def test_schedule_output_includes_resource_probe_source(capsys):
+    decision = StageScheduler(
+        resource_probe=lambda: RuntimeResources(
+            8,
+            16 * GIB,
+            source="macos-memory-pressure",
+        )
+    ).decide(
+        (
+            transcript_cli_module.transcription_demand(
+                "medium",
+                backend="mlx",
+            ),
+            transcript_cli_module.diarization_demand("cpu"),
+        )
+    )
+
+    _print_schedule(decision)
+
+    assert "source=macos-memory-pressure" in capsys.readouterr().out
 
 
 def test_cmd_extract_preflight_failure_happens_before_output_creation(

@@ -11,6 +11,7 @@ from collections.abc import Callable, Iterable, Mapping
 from contextlib import nullcontext, redirect_stdout
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from keyframe import transcript
@@ -78,6 +79,10 @@ class TranscriptRunResult:
     fallback_used: bool
     initial_schedule: ScheduleDecision
     timings: Mapping[str, float]
+    metadata: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
 
 
 class TranscriptOutputError(OutputSessionError):
@@ -194,7 +199,8 @@ def _print_schedule(decision: ScheduleDecision) -> None:
     print(f"Worker thread budgets: {budgets}")
     print(
         "Memory admission: "
-        f"required={decision.required_memory_bytes}, available={available}"
+        f"required={decision.required_memory_bytes}, available={available}, "
+        f"source={decision.resources.source}"
     )
 
 
@@ -450,6 +456,7 @@ def run_supervised_transcript(
             effective_backend=preflight.effective_backend,
             active_stages=active_stages,
             final_output_paths=final_paths,
+            clock=clock,
         )
         timings["transcription"] = clock() - transcription_started
         if execution.fallback_schedule is not None:
@@ -483,6 +490,7 @@ def run_supervised_transcript(
                 fallback_used=execution.fallback_used,
                 initial_schedule=decision,
                 timings=dict(timings),
+                metadata=dict(execution.completion.metadata),
             )
 
         if preflight.missing_hf_token:
@@ -531,4 +539,5 @@ def run_supervised_transcript(
             fallback_used=execution.fallback_used,
             initial_schedule=decision,
             timings=dict(timings),
+            metadata=dict(execution.completion.metadata),
         )
