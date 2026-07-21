@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import math
 import os
 import re
 import subprocess
@@ -576,6 +577,18 @@ def _handle_is_running(handle: Any) -> bool:
     return process.pid is not None and process.is_alive()
 
 
+def _handle_ended_at(handle: Any, clock: Callable[[], float]) -> float:
+    ended_at = getattr(handle, "ended_at", None)
+    if (
+        isinstance(ended_at, (int, float))
+        and not isinstance(ended_at, bool)
+        and math.isfinite(float(ended_at))
+        and float(ended_at) >= 0
+    ):
+        return float(ended_at)
+    return clock()
+
+
 def complete_transcription_with_auto_fallback(
     supervisor: Any,
     transcription_handle: Any,
@@ -642,7 +655,11 @@ def complete_transcription_with_auto_fallback(
                     pass
                 finally:
                     settled_active_stages.append(
-                        (active.demand.stage, clock(), outcome)
+                        (
+                            active.demand.stage,
+                            _handle_ended_at(active.handle, clock),
+                            outcome,
+                        )
                     )
 
         scheduler.logger.warning(

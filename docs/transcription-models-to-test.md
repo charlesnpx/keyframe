@@ -195,13 +195,16 @@ must obtain parallel initial and second-wave decisions from macOS pressure
 evidence, use a local pinned-model cache hit in under one second, avoid
 fallback, and prove non-empty transcription/diarization and
 frames/diarization intersections. The report records reliable intervals,
-process-tree RSS, MLX allocator peak, transcript agreement, checkpoint/final
-artifacts, and diarization equivalence modulo speaker-label renaming.
+kernel-recorded per-process RSS high-water marks, MLX allocator peak,
+transcript agreement, checkpoint/final artifacts, and diarization equivalence
+modulo speaker-label renaming. Its phase-aware conservative tree bound sums
+workers that can overlap and retains reaped-child peaks, so a short-lived
+allocation cannot disappear between polling samples.
 
 The release limits are named in the validator: no more than 115% of the
 historical 613.67-second candidate, at least 15% faster than the same-run serial
-reference, at most 6.60 GiB process-tree RSS, at most 5.96 GiB MLX allocator
-peak, and at most five seconds between the interval-derived prediction and wall
-clock. Existing reports can be revalidated with
-`--replay-report`; replay binds the report hash and duration to the explicitly
-supplied recording.
+reference, at most 6.60 GiB for the conservative process-tree RSS high-water
+bound, at most 5.96 GiB MLX allocator peak, and at most five seconds between the
+interval-derived prediction and wall clock. Existing reports can be revalidated
+with `--replay-report`; replay binds the report hash and duration to the
+explicitly supplied recording.

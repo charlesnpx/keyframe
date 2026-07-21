@@ -239,6 +239,7 @@ def test_spawned_worker_is_non_daemon_validated_and_promoted(tmp_path):
         progress_callback=progress.append,
         run_id="success",
     ) as supervisor:
+        before_launch = time.monotonic()
         handle = _start_test_stage(
             supervisor,
             progress_events=3,
@@ -246,6 +247,7 @@ def test_spawned_worker_is_non_daemon_validated_and_promoted(tmp_path):
         assert handle.process.daemon is False
 
         completion = supervisor.complete(handle)
+        after_completion = time.monotonic()
 
         assert completion.stage == "transcription"
         assert completion.checkpoint_path == output / "transcript.raw.json"
@@ -256,6 +258,7 @@ def test_spawned_worker_is_non_daemon_validated_and_promoted(tmp_path):
             transcript.TranscriptSegment(0.123456789, 1.987654321, "worker"),
         )
         assert not handle.process.is_alive()
+        assert before_launch <= handle.ended_at <= after_completion
         assert completion.checkpoint_path.exists()
         assert not supervisor.staging.transcript_raw.exists()
 
@@ -784,7 +787,10 @@ def test_transcription_worker_keeps_result_on_disk_and_metadata_off_progress_cha
         transcript.TranscriptSegment(0.1, 2.3, "disk backed"),
     )
     assert len(terminal.messages) == 1
-    assert terminal.messages[0].metadata == {
+    terminal_message = terminal.messages[0]
+    terminal_metadata = dict(terminal_message.metadata)
+    assert terminal_metadata.pop("process_tree_peak_rss_bytes") > 0
+    assert terminal_metadata == {
         "language": "en",
         "segment_count": 1,
         "requested_backend": "auto",
@@ -795,6 +801,7 @@ def test_transcription_worker_keeps_result_on_disk_and_metadata_off_progress_cha
         "model_resolution_seconds": 0.125,
         "mlx_peak_memory_bytes": 123456789,
     }
+    assert terminal_message.ended_at > 0
     assert not hasattr(terminal.messages[0], "segments")
     assert terminal.closed
     assert progress.closed
@@ -828,9 +835,12 @@ def test_diarization_worker_entry_keeps_bulk_result_on_disk(tmp_path, monkeypatc
         transcript.DiarizationRow(0.1, 2.3, "SPEAKER_00"),
     )
     assert calls == [(tmp_path / "video.mp4", "hf_test", "cpu")]
-    assert terminal.messages == [
-        StageTerminal.succeeded("diarization", {"row_count": 1})
-    ]
+    assert len(terminal.messages) == 1
+    terminal_message = terminal.messages[0]
+    terminal_metadata = dict(terminal_message.metadata)
+    assert terminal_metadata.pop("process_tree_peak_rss_bytes") > 0
+    assert terminal_metadata == {"row_count": 1}
+    assert terminal_message.ended_at > 0
 
 
 def test_worker_error_has_reliable_terminal_metadata(tmp_path, monkeypatch):

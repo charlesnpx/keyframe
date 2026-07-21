@@ -88,6 +88,7 @@ class _FakeHandle:
         self.attempt = attempt
         self.requested_backend = requested_backend
         self.process = _FakeProcess()
+        self.ended_at = None
         self.completion = None
         self.failure = None
 
@@ -385,6 +386,42 @@ def test_accelerated_frames_overlap_running_cpu_diarization_after_transcription(
     assert frame_interval.launch_wave == "post-transcription"
     assert transcription_interval.ended_at <= frame_interval.started_at
     assert diarization_interval.overlaps(frame_interval)
+
+
+def test_diarization_exit_before_frame_start_does_not_fake_second_wave_overlap(
+    tmp_path,
+):
+    events = []
+    output = tmp_path / "out"
+    supervisor = _FakeSupervisor(output, events)
+    ticks = iter((0.0, 0.0, 2.0, 4.0, 6.0, 7.0, 8.0, 9.0, 10.0))
+
+    def frame_runner():
+        diarization = supervisor.handles["diarization"]
+        # The worker was alive at admission, then exited before frame inference.
+        # Settlement happens after frames, so only its reliable terminal time can
+        # distinguish this race from real overlap.
+        diarization.ended_at = 3.0
+        diarization.process.alive = False
+        return _frame_runner(supervisor, output, events)()
+
+    result = run_supervised_full_pipeline(
+        tmp_path / "recording.mp4",
+        output,
+        _preflight(),
+        supervisor=supervisor,
+        frame_device="mps",
+        frame_runner=frame_runner,
+        scheduler=_scheduler(),
+        clock=lambda: next(ticks),
+    )
+
+    diarization_interval = result.pipeline_evidence.interval("diarization")
+    frame_interval = result.pipeline_evidence.interval("frames")
+    assert diarization_interval.ended_at == 3.0
+    assert frame_interval.started_at == 4.0
+    assert not diarization_interval.overlaps(frame_interval)
+    assert result.critical_path == "max(T, D) + F + M + E"
 
 
 def test_initial_serial_run_re_admits_post_transcription_diarization_and_frames(

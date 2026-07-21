@@ -176,6 +176,14 @@ def _handle_is_running(handle: Any) -> bool:
     return process.pid is not None and process.is_alive()
 
 
+def _handle_ended_at(handle: Any) -> float | None:
+    ended_at = getattr(handle, "ended_at", None)
+    if isinstance(ended_at, bool) or not isinstance(ended_at, (int, float)):
+        return None
+    rendered = float(ended_at)
+    return rendered if math.isfinite(rendered) and rendered >= 0 else None
+
+
 def _partial_frame_error(
     error: BaseException,
     output_dir: Path,
@@ -376,7 +384,10 @@ def run_supervised_full_pipeline(
             transcript._print_speaker_detection_failure(exc)
             diarization_completion = None
         finally:
-            finish_diarization(outcome)
+            finish_diarization(
+                outcome,
+                ended_at=_handle_ended_at(diarization_handle),
+            )
         return diarization_completion
 
     def cancel_diarization_after_error(
@@ -400,7 +411,10 @@ def run_supervised_full_pipeline(
             )
         finally:
             diarization_settled = True
-            finish_diarization("cancelled")
+            finish_diarization(
+                "cancelled",
+                ended_at=_handle_ended_at(diarization_handle),
+            )
 
     transcription_started = clock()
     evidence_builder.start("transcription", "initial", transcription_started)

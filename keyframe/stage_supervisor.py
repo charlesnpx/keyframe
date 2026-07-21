@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import multiprocessing as mp
+import math
 import os
 import queue
 import signal
 import threading
+import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import redirect_stderr, redirect_stdout
@@ -34,6 +36,7 @@ from keyframe.output_session import (
     cleanup_stale_run_directories,
     remove_keyframe_owned_directory,
 )
+from keyframe.process_memory import process_tree_high_water_rss_bytes
 from keyframe.stage_scheduler import configure_worker_thread_budget
 from keyframe.transcript import (
     DiarizationRow,
@@ -101,13 +104,25 @@ class StageTerminal:
     stage: str
     status: str
     metadata: Mapping[str, Any]
+    ended_at: float
     error_type: str | None = None
     error_message: str | None = None
     fallback_eligible: bool = False
 
     @classmethod
-    def succeeded(cls, stage: str, metadata: Mapping[str, Any]) -> StageTerminal:
-        return cls(stage=stage, status="success", metadata=dict(metadata))
+    def succeeded(
+        cls,
+        stage: str,
+        metadata: Mapping[str, Any],
+        *,
+        ended_at: float | None = None,
+    ) -> StageTerminal:
+        return cls(
+            stage=stage,
+            status="success",
+            metadata=dict(metadata),
+            ended_at=time.monotonic() if ended_at is None else float(ended_at),
+        )
 
     @classmethod
     def failed(
@@ -116,11 +131,13 @@ class StageTerminal:
         exc: BaseException,
         *,
         fallback_eligible: bool = False,
+        ended_at: float | None = None,
     ) -> StageTerminal:
         return cls(
             stage=stage,
             status="error",
             metadata={},
+            ended_at=time.monotonic() if ended_at is None else float(ended_at),
             error_type=type(exc).__name__,
             error_message=str(exc),
             fallback_eligible=fallback_eligible,
@@ -268,7 +285,15 @@ def _execute_worker(
         emit_stage_progress(progress_queue, StageProgress(stage, "started"))
         if cancellation_event.is_set():
             raise RuntimeError("cancelled before stage start")
-        metadata = _run_with_routed_output(stage, progress_queue, operation)
+        metadata = dict(_run_with_routed_output(stage, progress_queue, operation))
+        try:
+            metadata["process_tree_peak_rss_bytes"] = (
+                process_tree_high_water_rss_bytes()
+            )
+        except OSError:
+            # The release benchmark requires this on Darwin, but unsupported
+            # platforms must retain functional stage workers.
+            pass
         if cancellation_event.is_set():
             raise RuntimeError("cancelled before checkpoint commit")
         _send_terminal(terminal_send, StageTerminal.succeeded(stage, metadata))
@@ -437,6 +462,7 @@ class StageHandle:
         self._completion: StageCompletion | None = None
         self._failure: BaseException | None = None
         self._promotion_attempt: _PromotionAttempt | None = None
+        self._process_ended_at: float | None = None
         self._control_thread = threading.Thread(
             target=self._monitor_control,
             name=f"keyframe-{stage}-control",
@@ -515,6 +541,8 @@ class StageHandle:
                     break
             self._drain_terminal()
         finally:
+            if self._process_exited():
+                self._process_ended_at = time.monotonic()
             self._control_done.set()
 
     def _monitor_progress(self) -> None:
@@ -605,6 +633,8 @@ class StageHandle:
             raise StageWaitTimeout(
                 f"{self.stage} worker did not exit within {float(timeout):.1f}s"
             )
+        if self._process_ended_at is None:
+            self._process_ended_at = time.monotonic()
         self.process.join()
         self._finish_control_monitor()
         self._close_ipc()
@@ -616,6 +646,26 @@ class StageHandle:
             raise
         self._completion = completion
         return completion
+
+    @property
+    def ended_at(self) -> float | None:
+        """Reliable worker terminal time on the shared monotonic clock."""
+
+        terminals = tuple(
+            message
+            for message in self._terminal_messages
+            if isinstance(message, StageTerminal) and message.stage == self.stage
+        )
+        if len(terminals) == 1:
+            ended_at = terminals[0].ended_at
+            if (
+                isinstance(ended_at, (int, float))
+                and not isinstance(ended_at, bool)
+                and math.isfinite(float(ended_at))
+                and float(ended_at) >= 0
+            ):
+                return float(ended_at)
+        return self._process_ended_at
 
     def _validated_completion(self) -> StageCompletion:
         exitcode = self.process.exitcode
@@ -644,6 +694,15 @@ class StageHandle:
         terminal = self._terminal_messages[0]
         if not isinstance(terminal, StageTerminal) or terminal.stage != self.stage:
             raise StageProtocolError(f"{self.stage} worker emitted an invalid terminal message")
+        if (
+            isinstance(terminal.ended_at, bool)
+            or not isinstance(terminal.ended_at, (int, float))
+            or not math.isfinite(float(terminal.ended_at))
+            or float(terminal.ended_at) < 0
+        ):
+            raise StageProtocolError(
+                f"{self.stage} worker emitted an invalid terminal timestamp"
+            )
         if terminal.status != "success":
             raise StageWorkerError(
                 self.stage,
@@ -676,6 +735,8 @@ class StageHandle:
             if not self._process_exited():
                 self.process.kill()
                 self._process_exited(None)
+            if self._process_ended_at is None:
+                self._process_ended_at = time.monotonic()
             self.process.join()
         self._finish_control_monitor()
         self._close_ipc()
@@ -958,6 +1019,20 @@ class StageSupervisor:
         if not any(owned is handle for owned in self._handles):
             raise StageProtocolError("stage handle does not belong to this supervisor")
         handle.cancel(self.cancellation_grace_seconds)
+
+    def completed_stage_peak_rss_bytes(self) -> dict[str, int]:
+        """Return conservative high-water reports from completed stage workers."""
+
+        peaks: dict[str, int] = {}
+        for handle in self._handles:
+            completion = handle._completion
+            if completion is None:
+                continue
+            value = completion.metadata.get("process_tree_peak_rss_bytes")
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                continue
+            peaks[handle.stage] = max(peaks.get(handle.stage, 0), value)
+        return peaks
 
     def close(self) -> None:
         if not self._entered:

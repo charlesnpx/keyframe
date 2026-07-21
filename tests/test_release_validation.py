@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing as mp
 import os
+import subprocess
+import sys
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,6 +23,21 @@ from scripts import benchmark_transcription as benchmark
 
 ROOT = Path(__file__).resolve().parents[1]
 BASELINE_PATH = ROOT / "tests/fixtures/transcription-benchmark-baseline.json"
+
+
+def _short_lived_child_peak_worker(terminal_send):
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "payload = bytearray(64 * 1024 * 1024); len(payload)",
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    terminal_send.send(benchmark.resource_peak_rss_bytes("children"))
+    terminal_send.close()
 
 
 def _baseline() -> dict:
@@ -88,6 +106,28 @@ def _passing_report(input_path: Path) -> dict:
             "model_resolution_seconds": 0.125,
             "mlx_peak_memory_bytes": 5 * benchmark.GIB,
             "peak_memory_gib": 5.0,
+            "peak_memory_method": benchmark.PROCESS_TREE_PEAK_METHOD,
+            "stage_process_tree_peak_rss_bytes": {
+                "transcription": 3 * benchmark.GIB,
+                "diarization": 1 * benchmark.GIB,
+            },
+            "case_process_phase_peak_rss_bytes": {
+                "initial-wave": 1 * benchmark.GIB,
+                "second-wave": 1 * benchmark.GIB,
+                "finalization": 1 * benchmark.GIB,
+            },
+            "peak_memory_components_bytes": {
+                "case_process_bytes": 1 * benchmark.GIB,
+                "max_reaped_child_bytes": 3 * benchmark.GIB,
+                "concurrent_stage_sum_bytes": 4 * benchmark.GIB,
+                "descendant_bound_bytes": 4 * benchmark.GIB,
+                "tree_upper_bound_bytes": 5 * benchmark.GIB,
+                "phase_upper_bound_bytes": {
+                    "initial-wave": 5 * benchmark.GIB,
+                    "second-wave": 4 * benchmark.GIB,
+                    "finalization": 4 * benchmark.GIB,
+                },
+            },
             "critical_path": "max(T + F, D) + M + E",
             "pipeline_evidence": {
                 "transcription": _stage_interval(
@@ -121,6 +161,24 @@ def _passing_report(input_path: Path) -> dict:
             "reason": "partitions are equivalent",
         },
     }
+
+
+def _set_process_tree_peak(report: dict, gibibytes: float) -> None:
+    candidate = report["candidate"]
+    components = candidate["peak_memory_components_bytes"]
+    tree_upper_bound = int(gibibytes * benchmark.GIB)
+    descendant_bound = max(
+        components["max_reaped_child_bytes"],
+        components["concurrent_stage_sum_bytes"],
+    )
+    components["case_process_bytes"] = tree_upper_bound - descendant_bound
+    report["candidate"]["case_process_phase_peak_rss_bytes"][
+        "initial-wave"
+    ] = tree_upper_bound - descendant_bound
+    components["descendant_bound_bytes"] = descendant_bound
+    components["tree_upper_bound_bytes"] = tree_upper_bound
+    components["phase_upper_bound_bytes"]["initial-wave"] = tree_upper_bound
+    candidate["peak_memory_gib"] = tree_upper_bound / benchmark.GIB
 
 
 def test_transcript_quality_normalizes_text_and_records_regression_signals():
@@ -283,18 +341,42 @@ def test_benchmark_cli_rejects_nonfinite_tolerances_before_model_work(
         )
 
 
-def test_process_tree_rss_sums_only_the_root_and_its_descendants():
-    ps_output = """
-        100 1 1024
-        101 100 2048
-        102 101 4096
-        200 1 8192
-        malformed row
-    """
-
-    assert benchmark._process_tree_rss_gib(ps_output, 100) == pytest.approx(
-        7 * 1024 * 1024 / benchmark.GIB
+def test_kernel_high_water_survives_a_short_lived_child_between_observations():
+    context = mp.get_context("spawn")
+    terminal_receive, terminal_send = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_short_lived_child_peak_worker,
+        args=(terminal_send,),
     )
+    process.start()
+    terminal_send.close()
+    try:
+        assert terminal_receive.poll(15.0)
+        peak_bytes = terminal_receive.recv()
+    finally:
+        terminal_receive.close()
+        process.join(timeout=15.0)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5.0)
+
+    assert process.exitcode == 0
+    assert peak_bytes >= 64 * 1024 * 1024
+
+
+def test_process_tree_high_water_sums_concurrent_stages_conservatively():
+    evidence = benchmark.conservative_process_tree_high_water(
+        case_process_bytes=1 * benchmark.GIB,
+        max_reaped_child_bytes=3 * benchmark.GIB,
+        concurrent_stage_peaks={
+            "transcription": 4 * benchmark.GIB,
+            "diarization": 2 * benchmark.GIB,
+        },
+    )
+
+    assert evidence.concurrent_stage_sum_bytes == 6 * benchmark.GIB
+    assert evidence.descendant_bound_bytes == 6 * benchmark.GIB
+    assert evidence.tree_upper_bound_bytes == 7 * benchmark.GIB
 
 
 def test_performance_thresholds_are_named_exact_and_finite():
@@ -345,6 +427,7 @@ def test_report_evaluation_passes_and_records_critical_path(tmp_path):
         "historical_multiplier": 1.15,
         "same_run_serial_reference_multiplier": 0.85,
         "process_tree_rss_ceiling_gib": 6.6,
+        "process_tree_peak_method": benchmark.PROCESS_TREE_PEAK_METHOD,
         "mlx_allocator_peak_ceiling_gib": 5.96,
         "local_resolution_ceiling_seconds": 1.0,
         "historical_wall_limit_seconds": pytest.approx(705.7205),
@@ -617,8 +700,8 @@ def test_report_evaluation_rejects_inconsistent_reliable_topology(
             "candidate is not at least 15 percent faster",
         ),
         (
-            lambda report: report["candidate"].update(peak_memory_gib=6.61),
-            "candidate process-tree peak RSS exceeds 6.60 GiB",
+            lambda report: _set_process_tree_peak(report, 6.61),
+            "candidate process-tree RSS high-water bound exceeds 6.60 GiB",
         ),
         (
             lambda report: report["candidate"].update(
@@ -765,7 +848,9 @@ def test_report_evaluation_rejects_nonfinite_or_negative_tolerance(
         ("reference", "wall_time_seconds", float("nan")),
         ("candidate", "wall_time_seconds", float("inf")),
         ("candidate", "peak_memory_gib", -1.0),
+        ("candidate", "peak_memory_gib", False),
         ("candidate", "model_resolution_seconds", "slow"),
+        ("candidate", "model_resolution_seconds", False),
         ("candidate", "mlx_peak_memory_bytes", 1.5),
     ],
 )
@@ -812,7 +897,7 @@ def test_replay_rejects_previous_report_schema_version(monkeypatch, tmp_path):
     input_path = tmp_path / "recording.mp4"
     input_path.write_bytes(b"benchmark recording")
     report = _passing_report(input_path)
-    report["schema_version"] = 2
+    report["schema_version"] = benchmark.REPORT_SCHEMA_VERSION - 1
     replay_path = tmp_path / "replay-v1.json"
     replay_path.write_text(json.dumps(report), encoding="utf-8")
     output_path = tmp_path / "validated-report.json"
@@ -1028,6 +1113,12 @@ def test_candidate_case_uses_and_verifies_automatic_apple_scheduling(
         def __exit__(self, *_args):
             return False
 
+        def completed_stage_peak_rss_bytes(self):
+            return {
+                "transcription": 3 * benchmark.GIB,
+                "diarization": 1 * benchmark.GIB,
+            }
+
     monkeypatch.setattr(benchmark.cli, "_parse_extract_args", parse_args)
     monkeypatch.setattr(benchmark.cli, "_transcript_config", lambda _args: object())
     monkeypatch.setattr(benchmark, "preflight_transcript_run", lambda _config: preflight)
@@ -1066,6 +1157,10 @@ def test_candidate_case_uses_and_verifies_automatic_apple_scheduling(
     assert result["model_resolution_source"] == "local-hit"
     assert result["model_resolution_seconds"] == pytest.approx(0.125)
     assert result["mlx_peak_memory_bytes"] == 123456789
+    assert result["stage_process_tree_peak_rss_bytes"] == {
+        "transcription": 3 * benchmark.GIB,
+        "diarization": 1 * benchmark.GIB,
+    }
     assert result["fallback_used"] is False
     assert result["critical_path"] == "max(T + F, D) + M + E"
     assert result["fallback_waited_for_diarization"] is False
