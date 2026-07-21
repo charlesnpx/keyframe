@@ -46,6 +46,8 @@ from keyframe.transcript import (
 class StageSupervisorError(OutputSessionError):
     """Base class for controlled parent-side stage failures."""
 
+    pipeline_evidence: Any | None = None
+
 
 class StageProtocolError(StageSupervisorError):
     """A worker exited without one valid terminal status message."""

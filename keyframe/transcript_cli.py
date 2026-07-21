@@ -199,7 +199,8 @@ def _print_schedule(decision: ScheduleDecision) -> None:
     print(f"Worker thread budgets: {budgets}")
     print(
         "Memory admission: "
-        f"required={decision.required_memory_bytes}, available={available}"
+        f"required={decision.required_memory_bytes}, available={available}, "
+        f"source={decision.resources.source}"
     )
 
 
@@ -455,6 +456,7 @@ def run_supervised_transcript(
             effective_backend=preflight.effective_backend,
             active_stages=active_stages,
             final_output_paths=final_paths,
+            clock=clock,
         )
         timings["transcription"] = clock() - transcription_started
         if execution.fallback_schedule is not None:

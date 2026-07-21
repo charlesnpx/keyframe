@@ -30,7 +30,13 @@ from keyframe.artifacts import (
     atomic_write_json,
     reject_path_aliases,
 )
-from keyframe.full_pipeline import resolve_frame_device, run_supervised_full_pipeline
+from keyframe.full_pipeline import (
+    PipelineEvidence,
+    StageInterval,
+    critical_path_from_pipeline_evidence,
+    resolve_frame_device,
+    run_supervised_full_pipeline,
+)
 from keyframe.stage_supervisor import StageSupervisor
 from keyframe.transcript_cli import (
     TranscriptRunConfig,
@@ -47,7 +53,7 @@ from keyframe.validation import (
 
 
 GIB = 1024**3
-REPORT_SCHEMA_VERSION = 1
+REPORT_SCHEMA_VERSION = 2
 DEFAULT_TIMESTAMP_TOLERANCE_SECONDS = 0.05
 DEFAULT_CRITICAL_PATH_TOLERANCE_SECONDS = 5.0
 MEMORY_SAMPLE_INTERVAL_SECONDS = 1.0
@@ -251,6 +257,10 @@ def _run_candidate_case(request: _CaseRequest) -> dict[str, Any]:
         "frame_schedule_mode": result.frame_schedule.mode,
         "frame_schedule_reason": result.frame_schedule.reason,
         "critical_path": result.critical_path,
+        "pipeline_evidence": result.pipeline_evidence.to_dict(),
+        "fallback_waited_for_diarization": (
+            result.fallback_waited_for_diarization
+        ),
         "wall_time_seconds": wall_time,
         "timings": dict(result.timings),
         "artifacts": _artifact_summary(output_dir),
@@ -418,6 +428,108 @@ def _mapping(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
 
 
+def _critical_path_from_reported_evidence(candidate: dict[str, Any]) -> str:
+    raw_evidence = candidate.get("pipeline_evidence")
+    if not isinstance(raw_evidence, dict):
+        raise ValueError("candidate.pipeline_evidence must be an object")
+    unexpected = set(raw_evidence) - {"transcription", "diarization", "frames"}
+    if unexpected:
+        raise ValueError(
+            "candidate.pipeline_evidence has unknown stages: "
+            + ", ".join(sorted(str(stage) for stage in unexpected))
+        )
+
+    intervals = []
+    for stage, raw_interval in raw_evidence.items():
+        if not isinstance(raw_interval, dict):
+            raise ValueError(
+                f"candidate.pipeline_evidence.{stage} must be an object"
+            )
+        if raw_interval.get("stage") != stage:
+            raise ValueError(
+                f"candidate.pipeline_evidence.{stage}.stage must be {stage!r}"
+            )
+        try:
+            interval = StageInterval(
+                stage=stage,
+                launch_wave=raw_interval["launch_wave"],
+                started_at=raw_interval["started_at"],
+                ended_at=raw_interval["ended_at"],
+                outcome=raw_interval["outcome"],
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"candidate.pipeline_evidence.{stage} is invalid: {exc}"
+            ) from exc
+        try:
+            reported_duration = _finite_number(
+                raw_interval["duration_seconds"],
+                f"candidate.pipeline_evidence.{stage}.duration_seconds",
+            )
+        except KeyError as exc:
+            raise ValueError(
+                f"candidate.pipeline_evidence.{stage} is missing duration_seconds"
+            ) from exc
+        if not math.isclose(
+            reported_duration,
+            interval.duration_seconds,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError(
+                f"candidate.pipeline_evidence.{stage}.duration_seconds "
+                "does not match its interval"
+            )
+        intervals.append(interval)
+
+    evidence = PipelineEvidence(tuple(intervals))
+    transcription_interval = evidence.interval("transcription")
+    frame_interval = evidence.interval("frames")
+    if transcription_interval is None or frame_interval is None:
+        raise ValueError(
+            "candidate.pipeline_evidence must include transcription and frames"
+        )
+    if transcription_interval.outcome != "completed":
+        raise ValueError("candidate transcription interval must be completed")
+    if frame_interval.outcome != "completed":
+        raise ValueError("candidate frame interval must be completed")
+    timings = candidate.get("timings")
+    if not isinstance(timings, dict):
+        raise ValueError("candidate.timings must be an object")
+    for interval in intervals:
+        try:
+            reported_timing = _finite_number(
+                timings[interval.stage],
+                f"candidate.timings.{interval.stage}",
+            )
+        except KeyError as exc:
+            raise ValueError(
+                f"candidate.timings is missing {interval.stage}"
+            ) from exc
+        if not math.isclose(
+            reported_timing,
+            interval.duration_seconds,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError(
+                f"candidate.timings.{interval.stage} does not match its interval"
+            )
+
+    waited = candidate.get("fallback_waited_for_diarization")
+    if not isinstance(waited, bool):
+        raise ValueError(
+            "candidate.fallback_waited_for_diarization must be a boolean"
+        )
+    try:
+        return critical_path_from_pipeline_evidence(
+            evidence,
+            fallback_waited_for_diarization=waited,
+        )
+    except RuntimeError as exc:
+        raise ValueError(f"candidate pipeline topology is invalid: {exc}") from exc
+
+
 def _release_contract_failures(report: dict[str, Any]) -> list[str]:
     failures = []
     reference = _mapping(report.get("reference"))
@@ -454,18 +566,16 @@ def _release_contract_failures(report: dict[str, Any]) -> list[str]:
     if python_parts not in {(3, 11), (3, 12), (3, 13)}:
         failures.append("runtime Python must be a supported 3.11 through 3.13 release")
 
-    schedule_expression = {
-        ("parallel", "parallel"): "max(T + F, D) + M + E",
-        ("parallel", "serial"): "max(T, D) + F + M + E",
-        ("serial", "serial"): "T + D + F + M + E",
-    }.get((candidate.get("schedule_mode"), candidate.get("frame_schedule_mode")))
-    if schedule_expression is None:
-        failures.append("candidate schedule modes do not describe a supported run")
-    elif candidate.get("critical_path") != schedule_expression:
-        failures.append(
-            "candidate critical path does not match its logged schedules: "
-            f"expected {schedule_expression!r}"
-        )
+    try:
+        topology_expression = _critical_path_from_reported_evidence(candidate)
+    except ValueError as exc:
+        failures.append(f"candidate pipeline evidence is invalid: {exc}")
+    else:
+        if candidate.get("critical_path") != topology_expression:
+            failures.append(
+                "candidate critical path does not match its pipeline evidence: "
+                f"expected {topology_expression!r}"
+            )
     return failures
 
 
