@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import multiprocessing as mp
 import os
 import queue
 import signal
@@ -106,6 +107,9 @@ def _spawn_test_worker(request, terminal_send, progress_queue, cancellation_even
                 progress_queue,
                 StageProgress(request["stage"], "progress", str(index)),
             )
+        callback_observed = request.get("callback_observed")
+        if callback_observed is not None and not callback_observed.wait(15.0):
+            raise RuntimeError("progress callback was not observed")
         terminal = StageTerminal.succeeded(
             request["stage"],
             {"record_count": 1, "language": "en"},
@@ -290,21 +294,27 @@ def test_lossy_progress_cannot_block_reliable_terminal_during_parent_work(tmp_pa
 def test_slow_progress_callback_cannot_delay_reliable_terminal(tmp_path):
     output = tmp_path / "output"
     callback_started = threading.Event()
+    callback_observed = mp.get_context("spawn").Event()
     release_callback = threading.Event()
 
     def block_progress(_event):
         callback_started.set()
+        callback_observed.set()
         release_callback.wait()
 
     try:
         with StageSupervisor(
             output,
             progress_callback=block_progress,
-            progress_capacity=20_000,
+            progress_capacity=1,
             run_id="slow-progress",
         ) as supervisor:
-            handle = _start_test_stage(supervisor, progress_events=30_000)
-            assert callback_started.wait(timeout=5.0)
+            handle = _start_test_stage(
+                supervisor,
+                progress_events=1,
+                callback_observed=callback_observed,
+            )
+            assert callback_started.wait(timeout=15.0)
 
             completion = handle.wait(timeout=15.0)
             promoted = supervisor.complete(handle)
