@@ -858,7 +858,7 @@ def test_parent_interruption_cancels_overlap_and_discards_current_frame_stage(
         events.append(("interrupt-frames", None))
         raise KeyboardInterrupt("parent interrupted")
 
-    with pytest.raises(KeyboardInterrupt, match="parent interrupted"):
+    with pytest.raises(KeyboardInterrupt, match="parent interrupted") as raised:
         with supervisor:
             run_supervised_full_pipeline(
                 tmp_path / "recording.mp4",
@@ -882,6 +882,91 @@ def test_parent_interruption_cancels_overlap_and_discards_current_frame_stage(
         output / "transcript.raw.json"
     )[0].text == "hello"
     assert not (output / "diarization.json").exists()
+    assert raised.value.pipeline_evidence.interval("transcription").outcome == (
+        "completed"
+    )
+    assert raised.value.pipeline_evidence.interval("diarization").outcome == (
+        "cancelled"
+    )
+    assert raised.value.pipeline_evidence.interval("frames").outcome == "cancelled"
+
+
+def test_transcription_launch_failure_closes_and_attaches_pipeline_evidence(
+    tmp_path,
+    monkeypatch,
+):
+    events = []
+    output = tmp_path / "out"
+    supervisor = _FakeSupervisor(output, events)
+    failure = OSError("injected transcription launch failure")
+
+    def fail_transcription_launch(*_args, **_kwargs):
+        events.append(("fail-transcription-launch", None))
+        raise failure
+
+    monkeypatch.setattr(
+        supervisor,
+        "start_transcription",
+        fail_transcription_launch,
+    )
+
+    with pytest.raises(OSError, match="transcription launch") as raised:
+        run_supervised_full_pipeline(
+            tmp_path / "recording.mp4",
+            output,
+            _preflight(),
+            supervisor=supervisor,
+            frame_device="mps",
+            frame_runner=lambda: pytest.fail("frames must not start"),
+            scheduler=_scheduler(),
+        )
+
+    assert raised.value is failure
+    assert raised.value.pipeline_evidence.interval("transcription").outcome == "failed"
+    assert raised.value.pipeline_evidence.interval("diarization") is None
+    assert _event_names(events) == ["fail-transcription-launch"]
+
+
+def test_diarization_launch_failure_cancels_transcription_and_attaches_evidence(
+    tmp_path,
+    monkeypatch,
+):
+    events = []
+    output = tmp_path / "out"
+    supervisor = _FakeSupervisor(output, events)
+    failure = OSError("injected diarization launch failure")
+
+    def fail_diarization_launch(*_args, **_kwargs):
+        events.append(("fail-diarization-launch", None))
+        raise failure
+
+    monkeypatch.setattr(
+        supervisor,
+        "start_diarization",
+        fail_diarization_launch,
+    )
+
+    with pytest.raises(OSError, match="diarization launch") as raised:
+        run_supervised_full_pipeline(
+            tmp_path / "recording.mp4",
+            output,
+            _preflight(),
+            supervisor=supervisor,
+            frame_device="mps",
+            frame_runner=lambda: pytest.fail("frames must not start"),
+            scheduler=_scheduler(),
+        )
+
+    assert raised.value is failure
+    assert raised.value.pipeline_evidence.interval("transcription").outcome == (
+        "cancelled"
+    )
+    assert raised.value.pipeline_evidence.interval("diarization").outcome == "failed"
+    assert _event_names(events) == [
+        "start-transcription",
+        "fail-diarization-launch",
+        "cancel-transcription",
+    ]
 
 
 def test_transcription_failure_cancels_diarization_and_never_starts_frames(

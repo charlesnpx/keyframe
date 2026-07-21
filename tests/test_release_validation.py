@@ -630,8 +630,41 @@ def test_report_evaluation_returns_failures_for_malformed_schema(tmp_path):
         critical_path_tolerance_seconds=0.01,
     )
 
-    assert "report schema_version must be 1" in failures
+    assert f"report schema_version must be {benchmark.REPORT_SCHEMA_VERSION}" in failures
     assert any("metrics or thresholds are invalid" in failure for failure in failures)
+
+
+def test_replay_rejects_previous_report_schema_version(monkeypatch, tmp_path):
+    input_path = tmp_path / "recording.mp4"
+    input_path.write_bytes(b"benchmark recording")
+    report = _passing_report(input_path)
+    report["schema_version"] = 1
+    replay_path = tmp_path / "replay-v1.json"
+    replay_path.write_text(json.dumps(report), encoding="utf-8")
+    output_path = tmp_path / "validated-report.json"
+    monkeypatch.setattr(benchmark, "_probe_duration_seconds", lambda _path: 988.75)
+
+    result = benchmark.main(
+        [
+            "--input",
+            str(input_path),
+            "--baseline",
+            str(BASELINE_PATH),
+            "--replay-report",
+            str(replay_path),
+            "--report",
+            str(output_path),
+        ]
+    )
+
+    assert result == 1
+    written = json.loads(output_path.read_text(encoding="utf-8"))
+    assert written["validation"] == {
+        "passed": False,
+        "failures": [
+            f"report schema_version must be {benchmark.REPORT_SCHEMA_VERSION}"
+        ],
+    }
 
 
 def test_replay_validates_explicit_recording_and_writes_result(

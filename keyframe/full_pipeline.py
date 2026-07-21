@@ -323,20 +323,26 @@ def run_supervised_full_pipeline(
         decision: ScheduleDecision,
         launch_wave: str,
     ) -> Any:
-        nonlocal diarization_handle, diarization_started
+        nonlocal diarization_handle, diarization_settled, diarization_started
         if diarization_stage is None:
             raise RuntimeError("diarization is disabled")
         if diarization_handle is not None:
             return diarization_handle
         diarization_started = clock()
         evidence_builder.start("diarization", launch_wave, diarization_started)
-        diarization_handle = supervisor.start_diarization(
-            video,
-            hf_token=preflight.hf_token or "",
-            final_output_paths=final_paths,
-            thread_budget=decision.cpu_threads_for("diarization"),
-            device=preflight.effective_diarization_device,
-        )
+        try:
+            diarization_handle = supervisor.start_diarization(
+                video,
+                hf_token=preflight.hf_token or "",
+                final_output_paths=final_paths,
+                thread_budget=decision.cpu_threads_for("diarization"),
+                device=preflight.effective_diarization_device,
+            )
+        except BaseException as exc:
+            diarization_settled = True
+            finish_diarization("failed")
+            _attach_pipeline_evidence(exc, evidence_builder.snapshot())
+            raise
         return diarization_handle
 
     def finish_diarization(
@@ -373,17 +379,66 @@ def run_supervised_full_pipeline(
             finish_diarization(outcome)
         return diarization_completion
 
+    def cancel_diarization_after_error(
+        error: BaseException,
+        *,
+        context: str,
+    ) -> None:
+        nonlocal diarization_settled
+        if diarization_started is None or diarization_settled:
+            return
+        if diarization_handle is None:
+            diarization_settled = True
+            finish_diarization("failed")
+            return
+        try:
+            supervisor.cancel(diarization_handle)
+        except BaseException as cancel_error:
+            error.add_note(
+                f"failed to cancel diarization {context}: "
+                f"{type(cancel_error).__name__}: {cancel_error}"
+            )
+        finally:
+            diarization_settled = True
+            finish_diarization("cancelled")
+
     transcription_started = clock()
     evidence_builder.start("transcription", "initial", transcription_started)
-    transcription_handle = supervisor.start_transcription(
-        video,
-        model_name=config.model_name,
-        requested_backend=config.transcription_backend,
-        final_output_paths=final_paths,
-        thread_budget=initial_schedule.cpu_threads_for("transcription"),
-    )
-    if initial_schedule.parallel and diarization_stage is not None:
-        start_diarization(initial_schedule, "initial")
+    transcription_handle = None
+    try:
+        transcription_handle = supervisor.start_transcription(
+            video,
+            model_name=config.model_name,
+            requested_backend=config.transcription_backend,
+            final_output_paths=final_paths,
+            thread_budget=initial_schedule.cpu_threads_for("transcription"),
+        )
+        if initial_schedule.parallel and diarization_stage is not None:
+            start_diarization(initial_schedule, "initial")
+    except BaseException as exc:
+        transcription_outcome = "failed"
+        if transcription_handle is not None:
+            transcription_outcome = "cancelled"
+            try:
+                supervisor.cancel(transcription_handle)
+            except BaseException as cancel_error:
+                exc.add_note(
+                    "failed to cancel transcription after worker launch failure: "
+                    f"{type(cancel_error).__name__}: {cancel_error}"
+                )
+        transcription_interval = evidence_builder.finish(
+            "transcription",
+            clock(),
+            transcription_outcome,
+        )
+        timings["transcription"] = transcription_interval.duration_seconds
+        cancel_diarization_after_error(
+            exc,
+            context="after worker launch failure",
+        )
+        supervisor.public.diarization.unlink(missing_ok=True)
+        _attach_pipeline_evidence(exc, evidence_builder.snapshot())
+        raise
 
     active_stages = ()
     if diarization_handle is not None and diarization_stage is not None:
@@ -421,16 +476,11 @@ def run_supervised_full_pipeline(
             ended_at, outcome = settled_active_stages["diarization"]
             diarization_settled = True
             finish_diarization(outcome, ended_at=ended_at)
-        elif diarization_handle is not None:
-            try:
-                supervisor.cancel(diarization_handle)
-                diarization_settled = True
-                finish_diarization("cancelled")
-            except BaseException as cancel_error:
-                exc.add_note(
-                    "failed to cancel diarization after transcription failure: "
-                    f"{type(cancel_error).__name__}: {cancel_error}"
-                )
+        else:
+            cancel_diarization_after_error(
+                exc,
+                context="after transcription failure",
+            )
         supervisor.public.diarization.unlink(missing_ok=True)
         _attach_pipeline_evidence(exc, evidence_builder.snapshot())
         raise
@@ -502,31 +552,40 @@ def run_supervised_full_pipeline(
     evidence_builder.start("frames", "post-transcription", frame_started)
     frame_outcome = "completed"
     try:
-        configure_worker_thread_budget(
-            frame_schedule.cpu_threads_for("frames"),
-            torch_threads=True,
-        )
-        frame_generation = frame_runner()
-    except SystemExit as exc:
-        if exc.code in (None, 0):
+        try:
+            configure_worker_thread_budget(
+                frame_schedule.cpu_threads_for("frames"),
+                torch_threads=True,
+            )
+            frame_generation = frame_runner()
+        except SystemExit as exc:
+            if exc.code in (None, 0):
+                frame_outcome = "cancelled"
+                raise
+            frame_outcome = "failed"
+            frame_error = exc
+        except Exception as exc:
+            frame_outcome = "failed"
+            frame_error = exc
+        except BaseException:
             frame_outcome = "cancelled"
             raise
-        frame_outcome = "failed"
-        frame_error = exc
-    except Exception as exc:
-        frame_outcome = "failed"
-        frame_error = exc
-    except BaseException:
-        frame_outcome = "cancelled"
-        raise
-    finally:
-        frame_ended = clock()
-        frame_interval = evidence_builder.finish(
-            "frames",
-            frame_ended,
-            frame_outcome,
+        finally:
+            frame_ended = clock()
+            frame_interval = evidence_builder.finish(
+                "frames",
+                frame_ended,
+                frame_outcome,
+            )
+            timings["frames"] = frame_interval.duration_seconds
+    except BaseException as exc:
+        cancel_diarization_after_error(
+            exc,
+            context="after parent interruption",
         )
-        timings["frames"] = frame_interval.duration_seconds
+        supervisor.public.diarization.unlink(missing_ok=True)
+        _attach_pipeline_evidence(exc, evidence_builder.snapshot())
+        raise
 
     if diarization_handle is not None and not diarization_settled:
         settle_diarization()
