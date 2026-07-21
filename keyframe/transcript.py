@@ -35,6 +35,7 @@ from keyframe.artifacts import atomic_write_json, atomic_write_text, reject_path
 
 PYANNOTE_MODEL = "pyannote/speaker-diarization-community-1"
 TRANSCRIPTION_BACKENDS = ("auto", "mlx", "whisper")
+DIARIZATION_DEVICES = ("auto", "cpu", "cuda")
 MLX_MINIMUM_MACOS_MAJOR = 14
 MLX_MINIMUM_DARWIN_MAJOR = 23
 SPEAKER_DETECTION_SETUP_WARNING = """Warning: no HF_TOKEN found; falling back to transcript without speaker detection.
@@ -100,6 +101,10 @@ class TranscriptionError(RuntimeError):
 
 class UnsupportedTranscriptionBackendError(TranscriptionError):
     """The requested backend cannot run on the current platform."""
+
+
+class UnsupportedDiarizationDeviceError(TranscriptionError):
+    """The requested diarization device cannot run in the current environment."""
 
 
 class TranscriptionCancelled(TranscriptionError):
@@ -591,12 +596,45 @@ def _assign_speakers(
     return tuple(labeled_segments)
 
 
-def _select_whisperx_device() -> tuple[str, str]:
-    import torch
+def cuda_is_available() -> bool:
+    try:
+        import torch
+    except (ImportError, OSError):
+        return False
+    try:
+        return bool(torch.cuda.is_available())
+    except (AttributeError, RuntimeError):
+        return False
 
-    if torch.cuda.is_available():
-        return "cuda", "float16"
-    return "cpu", "int8"
+
+def resolve_diarization_device(
+    requested: str,
+    *,
+    cuda_available: bool | None = None,
+) -> str:
+    if requested not in DIARIZATION_DEVICES:
+        choices = ", ".join(DIARIZATION_DEVICES)
+        raise ValueError(f"unknown diarization device {requested!r}; choose from: {choices}")
+    if requested == "cpu":
+        return "cpu"
+    available = cuda_is_available() if cuda_available is None else bool(cuda_available)
+    if requested == "cuda" and not available:
+        raise UnsupportedDiarizationDeviceError(
+            "CUDA diarization was requested, but Torch reports no available CUDA device"
+        )
+    return "cuda" if available else "cpu"
+
+
+def _select_whisperx_device(
+    requested: str = "auto",
+    *,
+    cuda_available: bool | None = None,
+) -> tuple[str, str]:
+    device = resolve_diarization_device(
+        requested,
+        cuda_available=cuda_available,
+    )
+    return (device, "float16" if device == "cuda" else "int8")
 
 
 def _print_missing_hf_token_warning() -> None:
@@ -808,12 +846,20 @@ def _extract_with_transcription_backend(
     return _extract_with_whisper(video, model_name)
 
 
-def _detect_speakers(video: Path, hf_token: str) -> tuple[DiarizationRow, ...]:
+def _detect_speakers(
+    video: Path,
+    hf_token: str,
+    *,
+    device: str = "auto",
+) -> tuple[DiarizationRow, ...]:
     import whisperx
     from whisperx.diarize import DiarizationPipeline
     from tqdm import tqdm
 
-    device, _compute_type = _select_whisperx_device()
+    if device == "auto":
+        device, _compute_type = _select_whisperx_device()
+    else:
+        device, _compute_type = _select_whisperx_device(device)
     audio = whisperx.load_audio(str(video))
 
     print("Detecting speakers with pyannote...")

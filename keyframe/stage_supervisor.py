@@ -140,6 +140,7 @@ class DiarizationWorkerRequest:
     checkpoint_path: str
     final_output_paths: tuple[str, ...] = ()
     thread_budget: int | None = None
+    device: str | None = None
 
 
 @dataclass(frozen=True)
@@ -299,9 +300,16 @@ def diarization_worker_entry(
             progress_queue,
             StageProgress("diarization", "inference"),
         )
-        rows = transcript_module._detect_speakers(
-            Path(request.video_path), request.hf_token.strip()
-        )
+        if request.device is None:
+            rows = transcript_module._detect_speakers(
+                Path(request.video_path), request.hf_token.strip()
+            )
+        else:
+            rows = transcript_module._detect_speakers(
+                Path(request.video_path),
+                request.hf_token.strip(),
+                device=request.device,
+            )
         if cancellation_event.is_set():
             raise RuntimeError("diarization cancelled")
         emit_stage_progress(
@@ -859,6 +867,7 @@ class StageSupervisor:
         hf_token: str,
         final_output_paths: Iterable[str | Path] = (),
         thread_budget: int | None = None,
+        device: str | None = None,
     ) -> StageHandle:
         staging, public = self._require_entered()
         final_paths = tuple(str(Path(path)) for path in final_output_paths)
@@ -869,6 +878,7 @@ class StageSupervisor:
             checkpoint_path=str(staging.diarization),
             final_output_paths=final_paths,
             thread_budget=thread_budget,
+            device=device,
         )
         return self._start_stage(
             stage="diarization",

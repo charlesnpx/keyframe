@@ -665,17 +665,20 @@ def test_diarization_worker_entry_keeps_bulk_result_on_disk(tmp_path, monkeypatc
     terminal = _FakeTerminal()
     progress = _FakeProgressQueue()
     cancellation = _FakeEvent()
-    monkeypatch.setattr(
-        transcript,
-        "_detect_speakers",
-        lambda *_args, **_kwargs: (
+    calls = []
+
+    def fake_detect(video_path, hf_token, *, device):
+        calls.append((video_path, hf_token, device))
+        return (
             transcript.DiarizationRow(0.1, 2.3, "SPEAKER_00"),
-        ),
-    )
+        )
+
+    monkeypatch.setattr(transcript, "_detect_speakers", fake_detect)
     request = DiarizationWorkerRequest(
         video_path=str(tmp_path / "video.mp4"),
         hf_token=" hf_test ",
         checkpoint_path=str(checkpoint),
+        device="cpu",
     )
 
     diarization_worker_entry(request, terminal, progress, cancellation)
@@ -683,6 +686,7 @@ def test_diarization_worker_entry_keeps_bulk_result_on_disk(tmp_path, monkeypatc
     assert transcript.read_diarization_checkpoint(checkpoint) == (
         transcript.DiarizationRow(0.1, 2.3, "SPEAKER_00"),
     )
+    assert calls == [(tmp_path / "video.mp4", "hf_test", "cpu")]
     assert terminal.messages == [
         StageTerminal.succeeded("diarization", {"row_count": 1})
     ]

@@ -85,7 +85,6 @@ Speaker detection is enabled by default when `HF_TOKEN` is present. To force the
 
 ```bash
 keyframe recording.m4a --transcript-only --no-speaker-detection
-python keyframe/transcript.py recording.m4a --no-speaker-detection
 ```
 
 ### As a Claude Code skill
@@ -123,6 +122,9 @@ $keyframe ~/Downloads/meeting-recording.mp4
 | `-t, --similarity-threshold` | `0.85` | Deprecated no-op; deterministic merge vetoes are used |
 | `-w, --whisper-model` | `medium` | Whisper model: tiny/base/small/medium/large |
 | `--transcript-format` | `txt` | Output format: txt/srt/vtt/json |
+| `--transcription-backend` | `auto` | Transcription backend: auto/mlx/whisper |
+| `--diarization-device` | `auto` | Speaker-detection device: auto/cpu/cuda |
+| `--stage-concurrency` | `auto` | Transcript-stage policy: auto/serial/parallel |
 | `--no-speaker-detection` | | Force Whisper-only transcription and skip pyannote speaker detection |
 
 ## How it works
