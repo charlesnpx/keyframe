@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from keyframe import full_pipeline as full_pipeline_module
 from keyframe import transcript
 from keyframe.artifacts import transcript_checkpoint_paths
 from keyframe.full_pipeline import (
@@ -376,6 +377,100 @@ def test_accelerated_frames_overlap_running_cpu_diarization_after_transcription(
     else:
         assert "model_resolution_source" not in result.transcript.metadata
     assert result.transcription_metadata is result.transcript.metadata
+    transcription_interval = result.pipeline_evidence.interval("transcription")
+    diarization_interval = result.pipeline_evidence.interval("diarization")
+    frame_interval = result.pipeline_evidence.interval("frames")
+    assert transcription_interval.launch_wave == "initial"
+    assert diarization_interval.launch_wave == "initial"
+    assert frame_interval.launch_wave == "post-transcription"
+    assert transcription_interval.ended_at <= frame_interval.started_at
+    assert diarization_interval.overlaps(frame_interval)
+
+
+def test_initial_serial_run_re_admits_post_transcription_diarization_and_frames(
+    tmp_path,
+    monkeypatch,
+):
+    events = []
+    frame_budget_calls = []
+    output = tmp_path / "out"
+    supervisor = _FakeSupervisor(output, events)
+    probes = (
+        RuntimeResources(10, 11 * GIB - 1),
+        RuntimeResources(8, 11 * GIB),
+    )
+    monkeypatch.setattr(
+        full_pipeline_module,
+        "configure_worker_thread_budget",
+        lambda budget, *, torch_threads: frame_budget_calls.append(
+            (budget, torch_threads)
+        ),
+    )
+
+    result = run_supervised_full_pipeline(
+        tmp_path / "recording.mp4",
+        output,
+        _preflight(),
+        supervisor=supervisor,
+        frame_device="mps",
+        frame_runner=_frame_runner(supervisor, output, events),
+        scheduler=_scheduler(probes=probes),
+    )
+
+    names = _event_names(events)
+    assert not result.initial_schedule.parallel
+    assert result.frame_schedule.parallel
+    assert names.index("complete-transcription") < names.index("start-diarization")
+    assert events[names.index("start-frames")][1] is True
+    assert names.index("finish-frames") < names.index("complete-diarization")
+    diarization_start = next(
+        detail for name, detail in events if name == "start-diarization"
+    )
+    assert diarization_start["thread_budget"] == 4
+    assert frame_budget_calls == [(4, True)]
+    diarization_interval = result.pipeline_evidence.interval("diarization")
+    frame_interval = result.pipeline_evidence.interval("frames")
+    assert diarization_interval.launch_wave == "post-transcription"
+    assert diarization_interval.overlaps(frame_interval)
+    assert result.critical_path == "T + max(D, F) + M + E"
+
+
+def test_running_diarization_keeps_initial_budget_while_frames_use_second_wave_budget(
+    tmp_path,
+    monkeypatch,
+):
+    events = []
+    frame_budget_calls = []
+    output = tmp_path / "out"
+    supervisor = _FakeSupervisor(output, events)
+    probes = (
+        RuntimeResources(10, AMPLE_MEMORY),
+        RuntimeResources(8, AMPLE_MEMORY),
+    )
+    monkeypatch.setattr(
+        full_pipeline_module,
+        "configure_worker_thread_budget",
+        lambda budget, *, torch_threads: frame_budget_calls.append(
+            (budget, torch_threads)
+        ),
+    )
+
+    result = run_supervised_full_pipeline(
+        tmp_path / "recording.mp4",
+        output,
+        _preflight(),
+        supervisor=supervisor,
+        frame_device="mps",
+        frame_runner=_frame_runner(supervisor, output, events),
+        scheduler=_scheduler(probes=probes),
+    )
+
+    diarization_start = next(
+        detail for name, detail in events if name == "start-diarization"
+    )
+    assert diarization_start["thread_budget"] == 5
+    assert result.frame_schedule.cpu_threads_for("diarization") == 4
+    assert frame_budget_calls == [(4, True)]
 
 
 def test_shared_cuda_stages_remain_serial_through_diarization_and_frames(tmp_path):
@@ -405,6 +500,33 @@ def test_shared_cuda_stages_remain_serial_through_diarization_and_frames(tmp_pat
     assert names.index("complete-diarization") < names.index("start-frames")
     assert result.critical_path == "T + D + F + M + E"
     assert not result.initial_schedule.parallel
+    assert not result.pipeline_evidence.interval("diarization").overlaps(
+        result.pipeline_evidence.interval("frames")
+    )
+
+
+def test_explicit_serial_keeps_post_transcription_wave_serial(tmp_path):
+    events = []
+    output = tmp_path / "out"
+    preflight = _preflight(policy="serial")
+    supervisor = _FakeSupervisor(output, events)
+
+    result = run_supervised_full_pipeline(
+        tmp_path / "recording.mp4",
+        output,
+        preflight,
+        supervisor=supervisor,
+        frame_device="mps",
+        frame_runner=_frame_runner(supervisor, output, events),
+        scheduler=_scheduler("serial"),
+    )
+
+    names = _event_names(events)
+    assert not result.initial_schedule.parallel
+    assert not result.frame_schedule.parallel
+    assert names.index("complete-transcription") < names.index("start-diarization")
+    assert names.index("complete-diarization") < names.index("start-frames")
+    assert result.critical_path == "T + D + F + M + E"
 
 
 def test_cpu_frames_wait_for_parallel_cpu_transcription_and_diarization(tmp_path):
@@ -524,6 +646,10 @@ def test_serialized_mlx_fallback_does_not_double_count_diarization_in_path(
 
     assert result.transcript.fallback_used
     assert result.critical_path == "T + F + M + E"
+    assert (
+        result.pipeline_evidence.interval("diarization").ended_at
+        <= result.pipeline_evidence.interval("transcription").ended_at
+    )
     assert _event_names(events).index("complete-diarization") < (
         _event_names(events).index("start-frames")
     )
@@ -585,8 +711,31 @@ def test_empty_serial_transcript_skips_unstarted_diarization_but_keeps_frames(
     assert "start-diarization" not in names
     assert "start-frames" in names
     assert result.transcript.segments == ()
+    assert result.critical_path == "T + F + M + E"
+    assert result.pipeline_evidence.interval("diarization") is None
     assert json.loads((output / "transcript.json").read_text(encoding="utf-8")) == []
     assert (output / "frames" / "current.txt").exists()
+
+
+def test_empty_parallel_transcript_cancels_diarization_and_records_topology(tmp_path):
+    events = []
+    output = tmp_path / "out"
+    supervisor = _FakeSupervisor(output, events, segments=())
+
+    result = run_supervised_full_pipeline(
+        tmp_path / "recording.mp4",
+        output,
+        _preflight(),
+        supervisor=supervisor,
+        frame_device="mps",
+        frame_runner=_frame_runner(supervisor, output, events),
+        scheduler=_scheduler(),
+    )
+
+    assert "cancel-diarization" in _event_names(events)
+    assert result.critical_path == "T + F + M + E"
+    assert result.pipeline_evidence.interval("diarization").outcome == "cancelled"
+    assert result.pipeline_evidence.interval("frames").outcome == "completed"
 
 
 @pytest.mark.parametrize("fmt", ["txt", "srt", "vtt", "json"])
@@ -657,7 +806,7 @@ def test_frame_failure_finishes_independent_transcript_and_preserves_prior_frame
         else SystemExit(1)
     )
 
-    with pytest.raises(FullPipelineFrameError, match="partial output"):
+    with pytest.raises(FullPipelineFrameError, match="partial output") as raised:
         run_supervised_full_pipeline(
             tmp_path / "recording.mp4",
             output,
@@ -686,6 +835,7 @@ def test_frame_failure_finishes_independent_transcript_and_preserves_prior_frame
     assert json.loads((output / "transcript.json").read_text(encoding="utf-8"))[0][
         "speaker"
     ] == "SPEAKER_00"
+    assert raised.value.pipeline_evidence.interval("frames").outcome == "failed"
 
 
 def test_parent_interruption_cancels_overlap_and_discards_current_frame_stage(
@@ -771,6 +921,8 @@ def test_transcription_failure_cancels_diarization_and_never_starts_frames(
         )
 
     assert raised.value is failure
+    assert raised.value.pipeline_evidence.interval("transcription").outcome == "failed"
+    assert raised.value.pipeline_evidence.interval("diarization").outcome == "cancelled"
     names = _event_names(events)
     assert "start-diarization" in names
     assert "cancel-diarization" in names

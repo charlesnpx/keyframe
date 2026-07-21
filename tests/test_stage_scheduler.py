@@ -1,9 +1,11 @@
 import logging
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from keyframe import stage_scheduler as scheduler_module
 from keyframe import transcript
 from keyframe.stage_scheduler import (
     ActiveStage,
@@ -41,6 +43,12 @@ def _scheduler(*, policy="auto", cpus=8, memory=AMPLE_MEMORY):
         policy,
         resource_probe=lambda: _resources(cpus, memory),
     )
+
+
+def test_injected_runtime_resources_have_stable_default_source():
+    assert RuntimeResources(8, AMPLE_MEMORY).source == "injected"
+    with pytest.raises(ValueError, match="resource source"):
+        RuntimeResources(8, AMPLE_MEMORY, source="mystery")
 
 
 def test_stage_memory_estimates_match_admission_contract():
@@ -148,24 +156,213 @@ def test_explicit_parallel_cannot_force_cpu_frames_over_cpu_diarization(caplog):
 @pytest.mark.parametrize(
     ("available_memory", "parallel"),
     [
-        (int(12.5 * GIB) - 1, False),
-        (int(12.5 * GIB), True),
+        (11 * GIB - 1, False),
+        (11 * GIB, True),
         (None, False),
     ],
 )
-def test_auto_memory_admission_requires_25_percent_headroom(
+@pytest.mark.parametrize(
+    "stages",
+    [
+        (
+            transcription_demand("medium", backend="mlx"),
+            diarization_demand("cpu"),
+        ),
+        (diarization_demand("cpu"), frame_demand("mps")),
+    ],
+)
+def test_auto_memory_admission_requires_exactly_ten_percent_headroom(
     available_memory,
     parallel,
+    stages,
 ):
-    decision = _scheduler(memory=available_memory).decide(
-        (
-            transcription_demand("medium", backend="whisper", device="cpu"),
-            diarization_demand("cpu"),
-        )
+    decision = _scheduler(memory=available_memory).decide(stages)
+
+    assert decision.required_memory_bytes == 11 * GIB
+    assert decision.parallel is parallel
+
+
+@pytest.mark.parametrize(
+    ("percentage", "total", "expected"),
+    [
+        (0, 16 * GIB, 0),
+        (100, 16 * GIB, 16 * GIB),
+        (37, 101, 37),
+    ],
+)
+def test_macos_memory_pressure_probe_parses_bounded_percentage_with_flooring(
+    monkeypatch,
+    percentage,
+    total,
+    expected,
+):
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append((args, kwargs))
+        if args[0] == "memory_pressure":
+            return SimpleNamespace(
+                stdout=(
+                    "header\n  System-wide   memory free percentage :  "
+                    f"{percentage} %  \n"
+                )
+            )
+        if args[0] == "sysctl":
+            return SimpleNamespace(stdout=f" {total} \n")
+        pytest.fail("a valid pressure result must not invoke vm_stat")
+
+    monkeypatch.setattr(scheduler_module.subprocess, "run", run)
+    monkeypatch.setattr(scheduler_module.sys, "platform", "darwin")
+
+    assert scheduler_module._probe_available_memory() == (
+        expected,
+        "macos-memory-pressure",
+    )
+    assert [call[0] for call in calls] == [
+        ["memory_pressure", "-Q"],
+        ["sysctl", "-n", "hw.memsize"],
+    ]
+    assert all(call[1]["timeout"] == 2.0 for call in calls)
+    assert all(call[1]["check"] is True for call in calls)
+
+
+@pytest.mark.parametrize(
+    "failure_kind",
+    [
+        "pressure-missing",
+        "pressure-timeout",
+        "pressure-nonzero",
+        "pressure-malformed",
+        "pressure-out-of-range",
+        "sysctl-missing",
+        "sysctl-timeout",
+        "sysctl-nonzero",
+        "sysctl-malformed",
+        "sysctl-invalid-size",
+    ],
+)
+def test_macos_pressure_failures_fall_back_to_physical_vm_stat(
+    monkeypatch,
+    failure_kind,
+):
+    calls = []
+    vm_stat_output = """Mach Virtual Memory Statistics: (page size of 4096 bytes)
+Pages free:                               10.
+Pages active:                             999.
+Pages inactive:                           20.
+Pages speculative:                        5.
+Pages occupied by compressor:             500.
+"""
+
+    def run(args, **kwargs):
+        calls.append((args, kwargs))
+        command = args[0]
+        if command == "memory_pressure":
+            if failure_kind == "pressure-missing":
+                raise FileNotFoundError("memory_pressure")
+            if failure_kind == "pressure-timeout":
+                raise scheduler_module.subprocess.TimeoutExpired(args, 2.0)
+            if failure_kind == "pressure-nonzero":
+                raise scheduler_module.subprocess.CalledProcessError(1, args)
+            if failure_kind == "pressure-malformed":
+                return SimpleNamespace(stdout="free percentage unknown")
+            if failure_kind == "pressure-out-of-range":
+                return SimpleNamespace(
+                    stdout="System-wide memory free percentage: 101%"
+                )
+            return SimpleNamespace(
+                stdout="System-wide memory free percentage: 50%"
+            )
+        if command == "sysctl":
+            if failure_kind == "sysctl-missing":
+                raise FileNotFoundError("sysctl")
+            if failure_kind == "sysctl-timeout":
+                raise scheduler_module.subprocess.TimeoutExpired(args, 2.0)
+            if failure_kind == "sysctl-nonzero":
+                raise scheduler_module.subprocess.CalledProcessError(1, args)
+            if failure_kind == "sysctl-malformed":
+                return SimpleNamespace(stdout="sixteen gibibytes")
+            if failure_kind == "sysctl-invalid-size":
+                return SimpleNamespace(stdout="0")
+            return SimpleNamespace(stdout=str(16 * GIB))
+        assert command == "vm_stat"
+        return SimpleNamespace(stdout=vm_stat_output)
+
+    monkeypatch.setattr(scheduler_module.subprocess, "run", run)
+    monkeypatch.setattr(scheduler_module.sys, "platform", "darwin")
+
+    available, source = scheduler_module._probe_available_memory()
+
+    assert available == 35 * 4096
+    assert source == "macos-vm-stat"
+    assert [call[0][0] for call in calls] == [
+        "memory_pressure",
+        "sysctl",
+        "vm_stat",
+    ]
+    assert all(call[1]["timeout"] == 2.0 for call in calls)
+    assert not any("swap" in argument for call, _kwargs in calls for argument in call)
+
+
+def test_macos_probe_reports_unavailable_when_pressure_and_vm_stat_fail(monkeypatch):
+    monkeypatch.setattr(scheduler_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        scheduler_module.subprocess,
+        "run",
+        lambda args, **_kwargs: (_ for _ in ()).throw(FileNotFoundError(args[0])),
     )
 
-    assert decision.required_memory_bytes == int(12.5 * GIB)
-    assert decision.parallel is parallel
+    assert scheduler_module._probe_available_memory() == (None, "unavailable")
+
+
+@pytest.mark.parametrize(
+    ("platform", "os_name", "primary", "sysconf", "expected"),
+    [
+        (
+            "linux",
+            "posix",
+            123,
+            456,
+            (123, "linux-proc-meminfo"),
+        ),
+        (
+            "linux",
+            "posix",
+            None,
+            456,
+            (456, "posix-sysconf"),
+        ),
+        (
+            "win32",
+            "nt",
+            123,
+            456,
+            (123, "windows-global-memory-status"),
+        ),
+        (
+            "freebsd",
+            "posix",
+            None,
+            456,
+            (456, "posix-sysconf"),
+        ),
+    ],
+)
+def test_non_macos_probes_retain_physical_memory_behavior_and_report_source(
+    monkeypatch,
+    platform,
+    os_name,
+    primary,
+    sysconf,
+    expected,
+):
+    monkeypatch.setattr(scheduler_module.sys, "platform", platform)
+    monkeypatch.setattr(scheduler_module.os, "name", os_name)
+    monkeypatch.setattr(scheduler_module, "_linux_available_memory", lambda: primary)
+    monkeypatch.setattr(scheduler_module, "_windows_available_memory", lambda: primary)
+    monkeypatch.setattr(scheduler_module, "_sysconf_available_memory", lambda: sysconf)
+
+    assert scheduler_module._probe_available_memory() == expected
 
 
 def test_serial_policy_uses_full_cpu_budget():
@@ -497,6 +694,7 @@ def test_auto_fallback_reprobes_waits_when_cpu_overlap_is_rejected_and_relaunche
         requested_backend="auto",
         effective_backend="mlx",
         active_stages=(ActiveStage(diarization_demand("cpu"), companion),),
+        clock=lambda: 12.5,
     )
 
     assert initial_schedule.parallel
@@ -512,6 +710,10 @@ def test_auto_fallback_reprobes_waits_when_cpu_overlap_is_rejected_and_relaunche
     assert supervisor.started[0][1]["requested_backend"] == "whisper"
     assert supervisor.started[0][1]["thread_budget"] == 2
     assert result.handle is not initial
+    assert result.waited_for_active_stages
+    assert result.settled_active_stages == (
+        ("diarization", 12.5, "completed"),
+    )
 
 
 def test_auto_fallback_overlaps_running_cpu_diarization_when_admitted():

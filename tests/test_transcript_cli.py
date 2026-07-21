@@ -22,6 +22,7 @@ from keyframe.transcript_cli import (
     TranscriptOutputError,
     TranscriptPreflight,
     TranscriptRunConfig,
+    _print_schedule,
     _write_final_outputs,
     preflight_transcript_run,
     print_stage_progress,
@@ -789,6 +790,28 @@ def test_progress_output_is_stably_stage_prefixed(capsys):
     print_stage_progress(StageProgress("diarization", "inference", "cpu"))
 
     assert capsys.readouterr().out == "[diarization] inference: cpu\n"
+
+
+def test_schedule_output_includes_resource_probe_source(capsys):
+    decision = StageScheduler(
+        resource_probe=lambda: RuntimeResources(
+            8,
+            16 * GIB,
+            source="macos-memory-pressure",
+        )
+    ).decide(
+        (
+            transcript_cli_module.transcription_demand(
+                "medium",
+                backend="mlx",
+            ),
+            transcript_cli_module.diarization_demand("cpu"),
+        )
+    )
+
+    _print_schedule(decision)
+
+    assert "source=macos-memory-pressure" in capsys.readouterr().out
 
 
 def test_cmd_extract_preflight_failure_happens_before_output_creation(

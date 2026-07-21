@@ -37,6 +37,24 @@ def _artifacts(*, frames: bool) -> dict[str, bool]:
     }
 
 
+def _stage_interval(
+    stage: str,
+    launch_wave: str,
+    started_at: float,
+    ended_at: float,
+    *,
+    outcome: str = "completed",
+) -> dict:
+    return {
+        "stage": stage,
+        "launch_wave": launch_wave,
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "duration_seconds": ended_at - started_at,
+        "outcome": outcome,
+    }
+
+
 def _passing_report(input_path: Path) -> dict:
     baseline = _baseline()
     timings = {
@@ -67,6 +85,18 @@ def _passing_report(input_path: Path) -> dict:
             "model_repository": baseline["model"]["mlx_repository"],
             "model_revision": baseline["model"]["mlx_revision"],
             "critical_path": "max(T + F, D) + M + E",
+            "pipeline_evidence": {
+                "transcription": _stage_interval(
+                    "transcription", "initial", 0.0, 2.0
+                ),
+                "diarization": _stage_interval(
+                    "diarization", "initial", 0.0, 3.0
+                ),
+                "frames": _stage_interval(
+                    "frames", "post-transcription", 2.0, 6.0
+                ),
+            },
+            "fallback_waited_for_diarization": False,
             "wall_time_seconds": 7.0,
             "timings": timings,
             "artifacts": _artifacts(frames=True),
@@ -140,8 +170,10 @@ def test_transcript_quality_rejects_invalid_rows_and_ngram_size():
 @pytest.mark.parametrize(
     ("expression", "expected"),
     [
+        ("T + F + M + E", 16.0),
         ("max(T + F, D) + M + E", 23.0),
         ("max(T, D) + F + M + E", 26.0),
+        ("T + max(D, F) + M + E", 33.0),
         ("T + D + F + M + E", 36.0),
     ],
 )
@@ -155,6 +187,18 @@ def test_expected_critical_path_supports_each_release_schedule(expression, expec
     }
 
     assert expected_critical_path_seconds(expression, timings) == expected
+
+
+def test_critical_path_without_diarization_does_not_require_a_d_timing():
+    assert expected_critical_path_seconds(
+        "T + F + M + E",
+        {
+            "transcription": 10.0,
+            "frames": 3.0,
+            "merge": 2.0,
+            "manifest": 1.0,
+        },
+    ) == 16.0
 
 
 @pytest.mark.parametrize(
@@ -271,6 +315,204 @@ def test_report_evaluation_passes_and_records_critical_path(tmp_path):
 
 
 @pytest.mark.parametrize(
+    ("evidence", "fallback_waited", "expression", "wall_time"),
+    [
+        (
+            {
+                "transcription": _stage_interval(
+                    "transcription", "initial", 0.0, 2.0
+                ),
+                "diarization": _stage_interval(
+                    "diarization", "initial", 0.0, 3.0
+                ),
+                "frames": _stage_interval(
+                    "frames", "post-transcription", 2.0, 6.0
+                ),
+            },
+            False,
+            "max(T + F, D) + M + E",
+            7.0,
+        ),
+        (
+            {
+                "transcription": _stage_interval(
+                    "transcription", "initial", 0.0, 2.0
+                ),
+                "diarization": _stage_interval(
+                    "diarization", "initial", 0.0, 2.0
+                ),
+                "frames": _stage_interval(
+                    "frames", "post-transcription", 2.0, 6.0
+                ),
+            },
+            False,
+            "max(T, D) + F + M + E",
+            7.0,
+        ),
+        (
+            {
+                "transcription": _stage_interval(
+                    "transcription", "initial", 0.0, 2.0
+                ),
+                "diarization": _stage_interval(
+                    "diarization", "post-transcription", 2.0, 5.0
+                ),
+                "frames": _stage_interval(
+                    "frames", "post-transcription", 2.0, 6.0
+                ),
+            },
+            False,
+            "T + max(D, F) + M + E",
+            7.0,
+        ),
+        (
+            {
+                "transcription": _stage_interval(
+                    "transcription", "initial", 0.0, 2.0
+                ),
+                "diarization": _stage_interval(
+                    "diarization", "post-transcription", 2.0, 5.0
+                ),
+                "frames": _stage_interval(
+                    "frames", "post-transcription", 5.0, 9.0
+                ),
+            },
+            False,
+            "T + D + F + M + E",
+            10.0,
+        ),
+        (
+            {
+                "transcription": _stage_interval(
+                    "transcription", "initial", 0.0, 2.0
+                ),
+                "frames": _stage_interval(
+                    "frames", "post-transcription", 2.0, 6.0
+                ),
+            },
+            False,
+            "T + F + M + E",
+            7.0,
+        ),
+    ],
+)
+def test_report_evaluation_derives_each_path_from_pipeline_evidence(
+    tmp_path,
+    evidence,
+    fallback_waited,
+    expression,
+    wall_time,
+):
+    input_path = tmp_path / "recording.mp4"
+    input_path.write_bytes(b"benchmark recording")
+    report = _passing_report(input_path)
+    candidate = report["candidate"]
+    candidate["pipeline_evidence"] = evidence
+    candidate["fallback_waited_for_diarization"] = fallback_waited
+    candidate["critical_path"] = expression
+    candidate["timings"] = {
+        stage: interval["duration_seconds"]
+        for stage, interval in evidence.items()
+    } | {"merge": 0.5, "manifest": 0.5}
+    candidate["wall_time_seconds"] = wall_time
+
+    failures = benchmark.evaluate_report(
+        report,
+        _baseline(),
+        critical_path_tolerance_seconds=0.01,
+    )
+
+    assert failures == []
+    assert report["critical_path_validation"]["expression"] == expression
+
+
+def test_report_evaluation_uses_fallback_wait_evidence_without_double_counting(
+    tmp_path,
+):
+    input_path = tmp_path / "recording.mp4"
+    input_path.write_bytes(b"benchmark recording")
+    report = _passing_report(input_path)
+    candidate = report["candidate"]
+    candidate["pipeline_evidence"] = {
+        "transcription": _stage_interval(
+            "transcription", "initial", 0.0, 4.0
+        ),
+        "diarization": _stage_interval(
+            "diarization", "initial", 0.0, 2.0
+        ),
+        "frames": _stage_interval(
+            "frames", "post-transcription", 4.0, 8.0
+        ),
+    }
+    candidate["fallback_waited_for_diarization"] = True
+    candidate["critical_path"] = "T + F + M + E"
+    candidate["timings"].update(transcription=4.0, diarization=2.0)
+    candidate["wall_time_seconds"] = 9.0
+
+    failures = benchmark.evaluate_report(
+        report,
+        _baseline(),
+        critical_path_tolerance_seconds=0.01,
+    )
+
+    assert failures == []
+
+
+def test_report_evaluation_rejects_path_that_disagrees_with_pipeline_evidence(
+    tmp_path,
+):
+    input_path = tmp_path / "recording.mp4"
+    input_path.write_bytes(b"benchmark recording")
+    report = _passing_report(input_path)
+    report["candidate"]["critical_path"] = "T + D + F + M + E"
+
+    failures = benchmark.evaluate_report(
+        report,
+        _baseline(),
+        critical_path_tolerance_seconds=5.0,
+    )
+
+    assert any(
+        "critical path does not match its pipeline evidence" in failure
+        for failure in failures
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda candidate: candidate["timings"].update(frames=3.5),
+            "timings.frames does not match its interval",
+        ),
+        (
+            lambda candidate: candidate.update(
+                fallback_waited_for_diarization=True
+            ),
+            "fallback wait evidence",
+        ),
+    ],
+)
+def test_report_evaluation_rejects_inconsistent_reliable_topology(
+    tmp_path,
+    mutate,
+    message,
+):
+    input_path = tmp_path / "recording.mp4"
+    input_path.write_bytes(b"benchmark recording")
+    report = _passing_report(input_path)
+    mutate(report["candidate"])
+
+    failures = benchmark.evaluate_report(
+        report,
+        _baseline(),
+        critical_path_tolerance_seconds=5.0,
+    )
+
+    assert any(message in failure for failure in failures)
+
+
+@pytest.mark.parametrize(
     ("mutation", "expected_failure"),
     [
         (
@@ -353,7 +595,7 @@ def test_report_evaluation_rejects_release_configuration_drift(tmp_path):
     assert any("runtime keyframe" in failure for failure in failures)
     assert any("runtime mlx" in failure for failure in failures)
     assert any("runtime Python" in failure for failure in failures)
-    assert any("critical path does not match its logged schedules" in failure for failure in failures)
+    assert not any("logged schedules" in failure for failure in failures)
 
 
 @pytest.mark.parametrize("tolerance", [float("nan"), float("inf"), float("-inf"), -1.0])
@@ -529,6 +771,20 @@ def test_candidate_case_forces_and_verifies_the_parallel_apple_schedule(
         initial_schedule=schedule,
         frame_schedule=schedule,
         critical_path="max(T + F, D) + M + E",
+        pipeline_evidence=SimpleNamespace(
+            to_dict=lambda: {
+                "transcription": _stage_interval(
+                    "transcription", "initial", 0.0, 1.0
+                ),
+                "diarization": _stage_interval(
+                    "diarization", "initial", 0.0, 2.0
+                ),
+                "frames": _stage_interval(
+                    "frames", "post-transcription", 1.0, 2.0
+                ),
+            }
+        ),
+        fallback_waited_for_diarization=False,
         timings={
             "transcription": 1.0,
             "diarization": 2.0,
@@ -579,6 +835,10 @@ def test_candidate_case_forces_and_verifies_the_parallel_apple_schedule(
     assert result["schedule_mode"] == "parallel"
     assert result["frame_schedule_mode"] == "parallel"
     assert result["critical_path"] == "max(T + F, D) + M + E"
+    assert result["fallback_waited_for_diarization"] is False
+    assert result["pipeline_evidence"]["frames"]["launch_wave"] == (
+        "post-transcription"
+    )
 
 
 def test_candidate_case_rejects_a_nonparallel_result(monkeypatch, tmp_path):

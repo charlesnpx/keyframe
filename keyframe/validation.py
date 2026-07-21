@@ -187,8 +187,10 @@ def compare_transcript_quality(
 
 CRITICAL_PATH_EXPRESSIONS = frozenset(
     {
+        "T + F + M + E",
         "max(T + F, D) + M + E",
         "max(T, D) + F + M + E",
+        "T + max(D, F) + M + E",
         "T + D + F + M + E",
     }
 )
@@ -204,20 +206,37 @@ def expected_critical_path_seconds(
         raise ValueError(f"unsupported critical-path expression: {expression!r}")
     try:
         transcription = float(timings["transcription"])
-        diarization = float(timings["diarization"])
         frames = float(timings["frames"])
         merge = float(timings["merge"])
         enrichment = float(timings["manifest"])
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError("critical-path timings are incomplete or invalid") from exc
-    values = (transcription, diarization, frames, merge, enrichment)
+    diarization = None
+    if "D" in expression:
+        try:
+            diarization = float(timings["diarization"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("critical-path timings are incomplete or invalid") from exc
+    values = tuple(
+        value
+        for value in (transcription, diarization, frames, merge, enrichment)
+        if value is not None
+    )
     if any(not math.isfinite(value) or value < 0 for value in values):
         raise ValueError("critical-path timings must be finite and non-negative")
 
+    if expression == "T + F + M + E":
+        return transcription + frames + merge + enrichment
     if expression == "max(T + F, D) + M + E":
+        assert diarization is not None
         return max(transcription + frames, diarization) + merge + enrichment
     if expression == "max(T, D) + F + M + E":
+        assert diarization is not None
         return max(transcription, diarization) + frames + merge + enrichment
+    if expression == "T + max(D, F) + M + E":
+        assert diarization is not None
+        return transcription + max(diarization, frames) + merge + enrichment
+    assert diarization is not None
     return transcription + diarization + frames + merge + enrichment
 
 
