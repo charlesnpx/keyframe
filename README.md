@@ -175,13 +175,14 @@ If `HF_TOKEN` is missing or speaker detection fails, Keyframe warns and keeps
 the unlabeled Whisper transcript.
 
 Each model stage runs in a disposable spawned process. In `auto` concurrency
-mode, MLX or CUDA transcription overlaps CPU diarization. CPU transcription and
-CPU diarization overlap only when at least four CPUs and the model-aware memory
-check (including 25% headroom) admit both. Stages sharing an accelerator are
-always serialized. In a full run, MPS/CUDA frame extraction starts only after
-transcription releases that accelerator and may then overlap the remaining CPU
-diarization. `parallel` may override CPU-count and memory admission with a
-warning, but never shared-accelerator exclusion.
+mode, MLX or CUDA transcription may overlap CPU diarization only when the
+model-aware memory check (including 25% headroom) admits both. CPU transcription
+and CPU diarization additionally require at least four CPUs. Stages sharing an
+accelerator are always serialized. In a full run, MPS/CUDA frame extraction
+starts only after transcription releases that accelerator and may then overlap
+the remaining CPU diarization after a fresh memory check. `parallel` may
+override CPU-count and memory admission with a warning, but never
+shared-accelerator exclusion.
 
 The raw transcript checkpoint is atomically published as soon as transcription
 finishes, before speaker assignment. A later diarization or frame failure does

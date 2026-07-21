@@ -72,12 +72,13 @@ publishes `diarization.json`; final TXT, SRT, VTT, and JSON output behavior is
 unchanged. A completed raw checkpoint survives failure in a later independent
 stage.
 
-Automatic scheduling overlaps MLX/CUDA transcription with CPU diarization.
-CPU transcription and CPU diarization overlap only when at least four CPUs and
-model-aware memory admission with 25% headroom succeed. Shared accelerators
-remain serialized, and a full run starts MPS/CUDA frames only after
-transcription releases that accelerator. Diarization remains holistic; Keyframe
-does not split recordings or reconcile per-chunk speaker identities.
+Automatic scheduling may overlap MLX/CUDA transcription with CPU diarization
+only when model-aware memory admission with 25% headroom succeeds. CPU
+transcription and CPU diarization additionally require at least four CPUs.
+Shared accelerators remain serialized, and a full run starts MPS/CUDA frames
+only after transcription releases that accelerator and repeats memory
+admission. Diarization remains holistic; Keyframe does not split recordings or
+reconcile per-chunk speaker identities.
 
 ### Release pipeline benchmark: 2026-07-21
 
@@ -90,14 +91,14 @@ then MPS frame extraction overlapped the remaining diarization after MLX exited.
 
 | Run | Wall time | Transcription | Diarization | Frames | Peak resident memory |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Serial CPU transcript + diarization reference | 902.37s | 202.99s | 699.37s | — | 5.12 GiB |
-| Concurrent MLX + diarization + full frames candidate | 613.89s | 107.85s | 613.82s | 194.20s | 5.30 GiB |
+| Serial CPU transcript + diarization reference | 847.22s | 204.67s | 642.53s | — | 4.93 GiB |
+| Concurrent MLX + diarization + full frames candidate | 613.67s | 89.39s | 613.62s | 189.23s | 5.28 GiB |
 
-The candidate completed 288.48 seconds sooner (31.97% lower wall time, 1.47x
+The candidate completed 233.55 seconds sooner (27.57% lower wall time, 1.38x
 throughput) despite also producing and enriching a 16-frame generation. Speaker
 merge took 0.012 seconds and manifest enrichment/promotion took 0.035 seconds.
-Its predicted critical path was 613.863 seconds and measured wall time was
-613.889 seconds, a 0.026-second delta within the fixed five-second process and
+Its predicted critical path was 613.666 seconds and measured wall time was
+613.675 seconds, a 0.009-second delta within the fixed five-second process and
 scheduler tolerance. MLX and MPS never overlapped.
 
 The raw candidate transcript retained 99.443% normalized word agreement with

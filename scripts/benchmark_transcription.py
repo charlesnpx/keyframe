@@ -8,8 +8,8 @@ import hashlib
 import json
 import math
 import multiprocessing as mp
+import os
 import platform
-import resource
 import subprocess
 import sys
 import tempfile
@@ -50,6 +50,27 @@ GIB = 1024**3
 REPORT_SCHEMA_VERSION = 1
 DEFAULT_TIMESTAMP_TOLERANCE_SECONDS = 0.05
 DEFAULT_CRITICAL_PATH_TOLERANCE_SECONDS = 5.0
+MEMORY_SAMPLE_INTERVAL_SECONDS = 1.0
+EXPECTED_RUNTIME_PACKAGES = {
+    "keyframe": "0.6.0",
+    "mlx": "0.32.0",
+    "mlx_whisper": "0.4.3",
+    "whisperx": "3.8.6",
+}
+REFERENCE_CONTRACT = {
+    "backend": "whisper",
+    "device": "cpu",
+    "diarization_device": "cpu",
+    "schedule_mode": "serial",
+}
+CANDIDATE_CONTRACT = {
+    "backend": "mlx",
+    "device": "mlx",
+    "diarization_device": "cpu",
+    "frame_device": "mps",
+    "schedule_mode": "parallel",
+    "frame_schedule_mode": "parallel",
+}
 
 
 class BenchmarkError(RuntimeError):
@@ -63,11 +84,46 @@ class _CaseRequest:
     output_dir: str
 
 
-def _maximum_resident_set_gib() -> float:
-    scale = 1 if sys.platform == "darwin" else 1024
-    own = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * scale
-    children = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss * scale
-    return (own + children) / GIB
+def _process_tree_rss_gib(ps_output: str, root_pid: int) -> float:
+    """Sum one process tree's RSS from portable ``ps`` KiB rows."""
+
+    processes: dict[int, tuple[int, int]] = {}
+    for line in ps_output.splitlines():
+        fields = line.split()
+        if len(fields) != 3:
+            continue
+        try:
+            pid, parent_pid, rss_kib = map(int, fields)
+        except ValueError:
+            continue
+        if pid > 0 and rss_kib >= 0:
+            processes[pid] = (parent_pid, rss_kib)
+
+    tree = {root_pid}
+    changed = True
+    while changed:
+        changed = False
+        for pid, (parent_pid, _rss_kib) in processes.items():
+            if pid not in tree and parent_pid in tree:
+                tree.add(pid)
+                changed = True
+    aggregate_kib = sum(
+        processes[pid][1] for pid in tree if pid in processes
+    )
+    return aggregate_kib * 1024 / GIB
+
+
+def _sample_process_tree_rss_gib(root_pid: int) -> float:
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,rss="],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        raise BenchmarkError(f"could not sample benchmark process memory: {exc}") from exc
+    return _process_tree_rss_gib(result.stdout, root_pid)
 
 
 def _artifact_summary(output_dir: Path) -> dict[str, bool]:
@@ -118,7 +174,6 @@ def _run_reference_case(request: _CaseRequest) -> dict[str, Any]:
         "schedule_reason": result.initial_schedule.reason,
         "wall_time_seconds": wall_time,
         "timings": dict(result.timings),
-        "peak_memory_gib": _maximum_resident_set_gib(),
         "artifacts": _artifact_summary(output_dir),
     }
 
@@ -198,7 +253,6 @@ def _run_candidate_case(request: _CaseRequest) -> dict[str, Any]:
         "critical_path": result.critical_path,
         "wall_time_seconds": wall_time,
         "timings": dict(result.timings),
-        "peak_memory_gib": _maximum_resident_set_gib(),
         "artifacts": _artifact_summary(output_dir),
     }
 
@@ -250,8 +304,19 @@ def _run_isolated_case(request: _CaseRequest) -> dict[str, Any]:
         raise
     terminal_send.close()
     message: dict[str, Any] | None = None
+    peak_memory_gib = 0.0
+    next_memory_sample = 0.0
+    process_pid = process.pid
+    assert process_pid is not None
     try:
         while True:
+            now = time.monotonic()
+            if now >= next_memory_sample:
+                peak_memory_gib = max(
+                    peak_memory_gib,
+                    _sample_process_tree_rss_gib(process_pid),
+                )
+                next_memory_sample = now + MEMORY_SAMPLE_INTERVAL_SECONDS
             if terminal_receive.poll(0.2):
                 try:
                     message = terminal_receive.recv()
@@ -282,7 +347,14 @@ def _run_isolated_case(request: _CaseRequest) -> dict[str, Any]:
     if exitcode != 0 or message.get("status") != "success":
         detail = message.get("traceback") or message.get("error_message") or "unknown error"
         raise BenchmarkError(f"benchmark case {request.name} failed:\n{detail}")
-    return dict(message["result"])
+    result = dict(message["result"])
+    result["peak_memory_gib"] = peak_memory_gib
+    atomic_write_json(
+        Path(request.output_dir) / "benchmark-case.json",
+        result,
+        allow_nan=False,
+    )
+    return result
 
 
 def _load_json(path: Path, label: str) -> dict[str, Any]:
@@ -344,6 +416,57 @@ def _finite_number(value: Any, label: str) -> float:
 
 def _mapping(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
+
+
+def _release_contract_failures(report: dict[str, Any]) -> list[str]:
+    failures = []
+    reference = _mapping(report.get("reference"))
+    candidate = _mapping(report.get("candidate"))
+    runtime = _mapping(report.get("runtime"))
+
+    for case_name, case, contract in (
+        ("reference", reference, REFERENCE_CONTRACT),
+        ("candidate", candidate, CANDIDATE_CONTRACT),
+    ):
+        for field, expected in contract.items():
+            if case.get(field) != expected:
+                failures.append(
+                    f"{case_name} {field} must be {expected!r}, "
+                    f"found {case.get(field)!r}"
+                )
+
+    for package, expected in EXPECTED_RUNTIME_PACKAGES.items():
+        if runtime.get(package) != expected:
+            failures.append(
+                f"runtime {package} must be {expected!r}, "
+                f"found {runtime.get(package)!r}"
+            )
+    if runtime.get("system") != "Darwin":
+        failures.append("runtime system must be 'Darwin'")
+    if str(runtime.get("machine", "")).lower() != "arm64":
+        failures.append("runtime machine must be 'arm64'")
+    try:
+        python_parts = tuple(
+            int(part) for part in str(runtime["python"]).split(".")[:2]
+        )
+    except (KeyError, TypeError, ValueError):
+        python_parts = ()
+    if python_parts not in {(3, 11), (3, 12), (3, 13)}:
+        failures.append("runtime Python must be a supported 3.11 through 3.13 release")
+
+    schedule_expression = {
+        ("parallel", "parallel"): "max(T + F, D) + M + E",
+        ("parallel", "serial"): "max(T, D) + F + M + E",
+        ("serial", "serial"): "T + D + F + M + E",
+    }.get((candidate.get("schedule_mode"), candidate.get("frame_schedule_mode")))
+    if schedule_expression is None:
+        failures.append("candidate schedule modes do not describe a supported run")
+    elif candidate.get("critical_path") != schedule_expression:
+        failures.append(
+            "candidate critical path does not match its logged schedules: "
+            f"expected {schedule_expression!r}"
+        )
+    return failures
 
 
 def _quality_failures(
@@ -422,14 +545,23 @@ def evaluate_report(
     """Return release-contract failures for a fresh or replayed report."""
 
     failures = _quality_failures(report, baseline)
+    failures.extend(_release_contract_failures(report))
+    try:
+        critical_path_tolerance = _finite_number(
+            critical_path_tolerance_seconds,
+            "critical_path_tolerance_seconds",
+        )
+        if critical_path_tolerance < 0:
+            raise ValueError("critical_path_tolerance_seconds must be non-negative")
+    except ValueError as exc:
+        failures.append(f"critical-path tolerance is invalid: {exc}")
+        critical_path_tolerance = None
     if report.get("schema_version") != REPORT_SCHEMA_VERSION:
         failures.append(
             f"report schema_version must be {REPORT_SCHEMA_VERSION}"
         )
     baseline_model = _mapping(baseline.get("model"))
     candidate = _mapping(report.get("candidate"))
-    if candidate.get("backend") != "mlx":
-        failures.append("candidate did not select the MLX backend")
     if candidate.get("model_repository") != baseline_model.get("mlx_repository"):
         failures.append("candidate MLX repository does not match the baseline")
     if candidate.get("model_revision") != baseline_model.get("mlx_revision"):
@@ -473,15 +605,16 @@ def evaluate_report(
         except (KeyError, TypeError, ValueError) as exc:
             failures.append(f"candidate critical path could not be evaluated: {exc}")
         else:
-            report["critical_path_validation"] = {
-                "expression": expression,
-                "predicted_seconds": predicted,
-                "measured_wall_seconds": measured,
-                "absolute_delta_seconds": abs(predicted - measured),
-                "tolerance_seconds": critical_path_tolerance_seconds,
-            }
-            if abs(predicted - measured) > critical_path_tolerance_seconds:
-                failures.append("candidate wall time exceeds critical-path tolerance")
+            if critical_path_tolerance is not None:
+                report["critical_path_validation"] = {
+                    "expression": expression,
+                    "predicted_seconds": predicted,
+                    "measured_wall_seconds": measured,
+                    "absolute_delta_seconds": abs(predicted - measured),
+                    "tolerance_seconds": critical_path_tolerance,
+                }
+                if abs(predicted - measured) > critical_path_tolerance:
+                    failures.append("candidate wall time exceeds critical-path tolerance")
     return failures
 
 
@@ -633,10 +766,13 @@ def main(argv: list[str] | None = None) -> int:
                 "benchmark report path must not alias the recording, baseline, "
                 f"or replay report: {exc}"
             ) from exc
-    if args.timestamp_tolerance_seconds < 0:
-        raise BenchmarkError("timestamp tolerance must be non-negative")
-    if args.critical_path_tolerance_seconds < 0:
-        raise BenchmarkError("critical-path tolerance must be non-negative")
+    if not math.isfinite(args.timestamp_tolerance_seconds) or args.timestamp_tolerance_seconds < 0:
+        raise BenchmarkError("timestamp tolerance must be finite and non-negative")
+    if (
+        not math.isfinite(args.critical_path_tolerance_seconds)
+        or args.critical_path_tolerance_seconds < 0
+    ):
+        raise BenchmarkError("critical-path tolerance must be finite and non-negative")
     baseline = _load_json(baseline_path, "baseline")
     duration_seconds = _probe_duration_seconds(input_path)
     expected_duration = float(baseline.get("recording", {}).get("duration_seconds", 0.0))

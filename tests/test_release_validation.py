@@ -52,9 +52,18 @@ def _passing_report(input_path: Path) -> dict:
             "duration_seconds": 988.75,
             "sha256": hashlib.sha256(input_path.read_bytes()).hexdigest(),
         },
-        "reference": {"artifacts": _artifacts(frames=False)},
+        "runtime": {
+            "python": "3.12.13",
+            "system": "Darwin",
+            "machine": "arm64",
+            **benchmark.EXPECTED_RUNTIME_PACKAGES,
+        },
+        "reference": {
+            **benchmark.REFERENCE_CONTRACT,
+            "artifacts": _artifacts(frames=False),
+        },
         "candidate": {
-            "backend": "mlx",
+            **benchmark.CANDIDATE_CONTRACT,
             "model_repository": baseline["model"]["mlx_repository"],
             "model_revision": baseline["model"]["mlx_revision"],
             "critical_path": "max(T + F, D) + M + E",
@@ -188,6 +197,58 @@ def test_benchmark_cli_requires_explicit_input_and_baseline(argv, missing, capsy
     assert missing in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    ("option", "value", "message"),
+    [
+        ("--timestamp-tolerance-seconds", "nan", "timestamp tolerance"),
+        ("--timestamp-tolerance-seconds", "inf", "timestamp tolerance"),
+        ("--timestamp-tolerance-seconds", "-inf", "timestamp tolerance"),
+        ("--critical-path-tolerance-seconds", "nan", "critical-path tolerance"),
+        ("--critical-path-tolerance-seconds", "inf", "critical-path tolerance"),
+        ("--critical-path-tolerance-seconds", "-inf", "critical-path tolerance"),
+    ],
+)
+def test_benchmark_cli_rejects_nonfinite_tolerances_before_model_work(
+    monkeypatch,
+    tmp_path,
+    option,
+    value,
+    message,
+):
+    input_path = tmp_path / "recording.mp4"
+    input_path.write_bytes(b"benchmark recording")
+    monkeypatch.setattr(
+        benchmark,
+        "_probe_duration_seconds",
+        lambda _path: pytest.fail("tolerance validation must precede model work"),
+    )
+
+    with pytest.raises(benchmark.BenchmarkError, match=message):
+        benchmark.main(
+            [
+                "--input",
+                str(input_path),
+                "--baseline",
+                str(BASELINE_PATH),
+                f"{option}={value}",
+            ]
+        )
+
+
+def test_process_tree_rss_sums_only_the_root_and_its_descendants():
+    ps_output = """
+        100 1 1024
+        101 100 2048
+        102 101 4096
+        200 1 8192
+        malformed row
+    """
+
+    assert benchmark._process_tree_rss_gib(ps_output, 100) == pytest.approx(
+        7 * 1024 * 1024 / benchmark.GIB
+    )
+
+
 def test_report_evaluation_passes_and_records_critical_path(tmp_path):
     input_path = tmp_path / "recording.mp4"
     input_path.write_bytes(b"benchmark recording")
@@ -255,6 +316,61 @@ def test_report_evaluation_surfaces_release_threshold_failures(
     )
 
     assert any(expected_failure in failure for failure in failures)
+
+
+def test_report_evaluation_rejects_release_configuration_drift(tmp_path):
+    input_path = tmp_path / "recording.mp4"
+    input_path.write_bytes(b"benchmark recording")
+    report = _passing_report(input_path)
+    report["reference"].update(
+        backend="mlx",
+        device="mps",
+        schedule_mode="parallel",
+    )
+    report["candidate"].update(
+        device="cpu",
+        diarization_device="cuda",
+        frame_device="cpu",
+        schedule_mode="serial",
+        frame_schedule_mode="serial",
+    )
+    report["runtime"].update(
+        python="3.14.0",
+        keyframe="0.5.2",
+        mlx="0.1.0",
+    )
+
+    failures = benchmark.evaluate_report(
+        report,
+        _baseline(),
+        critical_path_tolerance_seconds=0.01,
+    )
+
+    assert any("reference backend" in failure for failure in failures)
+    assert any("candidate device" in failure for failure in failures)
+    assert any("candidate diarization_device" in failure for failure in failures)
+    assert any("candidate frame_device" in failure for failure in failures)
+    assert any("runtime keyframe" in failure for failure in failures)
+    assert any("runtime mlx" in failure for failure in failures)
+    assert any("runtime Python" in failure for failure in failures)
+    assert any("critical path does not match its logged schedules" in failure for failure in failures)
+
+
+@pytest.mark.parametrize("tolerance", [float("nan"), float("inf"), float("-inf"), -1.0])
+def test_report_evaluation_rejects_nonfinite_or_negative_tolerance(
+    tmp_path,
+    tolerance,
+):
+    input_path = tmp_path / "recording.mp4"
+    input_path.write_bytes(b"benchmark recording")
+
+    failures = benchmark.evaluate_report(
+        _passing_report(input_path),
+        _baseline(),
+        critical_path_tolerance_seconds=tolerance,
+    )
+
+    assert any("critical-path tolerance is invalid" in failure for failure in failures)
 
 
 def test_report_evaluation_returns_failures_for_malformed_schema(tmp_path):
@@ -442,7 +558,6 @@ def test_candidate_case_forces_and_verifies_the_parallel_apple_schedule(
         "run_supervised_full_pipeline",
         lambda *_args, **_kwargs: pipeline_result,
     )
-    monkeypatch.setattr(benchmark, "_maximum_resident_set_gib", lambda: 5.0)
     monkeypatch.setattr(
         benchmark,
         "_artifact_summary",
