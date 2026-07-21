@@ -52,7 +52,7 @@ The adopted medium model is `mlx-community/whisper-medium-mlx` at revision `7fc0
 
 MLX-Whisper supports Python 3.8 or newer, WhisperX supports Python 3.10 through 3.13, and the benchmark ran on Keyframe's Python 3.12.13 runtime. The shared environment uses WhisperX's stricter compatible matrix: `torch~=2.8.0`, `torchaudio~=2.8.0`, `torchvision~=0.23.0`, `whisperx==3.8.6`, `huggingface-hub>=0.34,<1`, and `transformers>=4.50,<5`.
 
-Keyframe 0.6.0 supports Python 3.11 through 3.13. Its clean-install
+Keyframe 0.6.1 supports Python 3.11 through 3.13. Its clean-install
 matrix covers macOS ARM64 and Linux x86-64 on all three versions. MLX and
 MLX-Whisper use Darwin ARM64/macOS 14+ environment markers; the Linux jobs
 assert that neither distribution is installed. Import validation does not load

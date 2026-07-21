@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run and replay the Keyframe 0.6.0 transcription release benchmark."""
+"""Run and replay the Keyframe 0.6.1 transcription release benchmark."""
 
 from __future__ import annotations
 
@@ -68,7 +68,7 @@ MAX_PROCESS_TREE_RSS_GIB = 6.60
 MAX_MLX_ALLOCATOR_PEAK_GIB = 5.96
 MAX_LOCAL_MODEL_RESOLUTION_SECONDS = 1.0
 EXPECTED_RUNTIME_PACKAGES = {
-    "keyframe": "0.6.0",
+    "keyframe": "0.6.1",
     "mlx": "0.32.0",
     "mlx_whisper": "0.4.3",
     "whisperx": "3.8.6",
