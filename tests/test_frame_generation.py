@@ -156,6 +156,64 @@ def test_replacement_preserves_public_directory_permissions(tmp_path):
     assert stat.S_IMODE(public.stat().st_mode) == 0o700
 
 
+def test_replacement_of_read_only_generation_cleans_backup_and_allows_rerun(
+    tmp_path,
+):
+    output = tmp_path / "out"
+    with FrameGenerationSession(output, run_id="first") as session:
+        _stage(session, (_candidate(10, 1.0),)).promote()
+    public = output / "frames"
+    public.chmod(0o555)
+
+    with FrameGenerationSession(output, run_id="second") as session:
+        _stage(session, (_candidate(20, 2.0),)).promote()
+
+    assert stat.S_IMODE(public.stat().st_mode) == 0o555
+    assert not list(output.glob("keyframe-frame-backup-*"))
+
+    with FrameGenerationSession(output, run_id="third") as session:
+        assert session.staging is not None
+        assert session.staging.root.exists()
+
+
+def test_failed_read_only_replacement_cleans_staging_directory(
+    tmp_path,
+    monkeypatch,
+):
+    import keyframe.frame_generation as frame_generation
+
+    output = tmp_path / "out"
+    with FrameGenerationSession(output, run_id="previous") as session:
+        _stage(session, (_candidate(5, 0.5, "previous"),)).promote()
+    public = output / "frames"
+    public.chmod(0o555)
+    staging_root = output / "keyframe-run-replacement"
+
+    with pytest.raises(
+        FrameGenerationPromotionError,
+        match="previous generation was restored",
+    ):
+        with FrameGenerationSession(output, run_id="replacement") as session:
+            generation = _stage(session, (_candidate(10, 1.0, "new"),))
+            real_replace = frame_generation.os.replace
+
+            def fail_staged_promotion(source, target):
+                if Path(source) == generation.staged_dir:
+                    raise OSError("injected staged rename failure")
+                return real_replace(source, target)
+
+            monkeypatch.setattr(
+                frame_generation.os,
+                "replace",
+                fail_staged_promotion,
+            )
+            generation.promote()
+
+    assert stat.S_IMODE(public.stat().st_mode) == 0o555
+    assert not staging_root.exists()
+    assert not list(output.glob("keyframe-frame-backup-*"))
+
+
 def test_deferred_enrichment_keeps_public_generation_unchanged_until_promote(
     tmp_path,
 ):
@@ -343,6 +401,7 @@ def test_validation_rejects_corrupt_or_mismatched_generation(tmp_path, artifact)
 def test_full_cli_defers_publication_until_transcript_manifest_enrichment(
     tmp_path,
     monkeypatch,
+    capsys,
 ):
     import keyframe.pipeline as pipeline
 
@@ -359,6 +418,7 @@ def test_full_cli_defers_publication_until_transcript_manifest_enrichment(
 
     def fake_extract(_video, staged_dir, _config, **kwargs):
         calls.append((Path(staged_dir), kwargs))
+        print("Frame generation staged; awaiting validation and promotion.")
         return _write_result(staged_dir, (candidate,))
 
     def fake_transcript(_video, _output, _preflight, *, supervisor):
@@ -386,3 +446,15 @@ def test_full_cli_defers_publication_until_transcript_manifest_enrichment(
     assert (public / _filename(candidate)).exists()
     manifest = json.loads((public / "manifest.json").read_text())
     assert manifest["frames"][0]["transcript_window"] == "enriched"
+    output_lines = capsys.readouterr().out.splitlines()
+    staged_index = next(
+        index
+        for index, line in enumerate(output_lines)
+        if "awaiting validation and promotion" in line
+    )
+    saved_index = next(
+        index
+        for index, line in enumerate(output_lines)
+        if "Saved to:" in line and str(public.resolve()) in line
+    )
+    assert staged_index < saved_index

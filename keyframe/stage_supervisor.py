@@ -5,7 +5,6 @@ from __future__ import annotations
 import multiprocessing as mp
 import os
 import queue
-import shutil
 import signal
 import threading
 import uuid
@@ -32,6 +31,7 @@ from keyframe.output_session import (
     OutputDirectoryLockedError,
     OutputSessionError,
     cleanup_stale_run_directories,
+    remove_keyframe_owned_directory,
 )
 from keyframe.stage_scheduler import configure_worker_thread_budget
 from keyframe.transcript import (
@@ -732,7 +732,7 @@ class StageSupervisor:
                     and not self.staging.root.is_symlink()
                 ):
                     try:
-                        shutil.rmtree(self.staging.root)
+                        remove_keyframe_owned_directory(self.staging.root)
                     except BaseException as cleanup_exc:
                         exc.add_note(
                             f"failed to remove run staging directory: {cleanup_exc}"
@@ -967,7 +967,7 @@ class StageSupervisor:
                     remember_error(exc, f"failed to cancel {handle.stage} worker")
             if self.staging is not None and self.staging.root.exists():
                 try:
-                    shutil.rmtree(self.staging.root)
+                    remove_keyframe_owned_directory(self.staging.root)
                 except BaseException as exc:
                     remember_error(exc, "failed to remove run staging directory")
         finally:

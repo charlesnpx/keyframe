@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shutil
 import stat
 from collections import Counter
 from collections.abc import Iterable, Mapping
@@ -13,7 +12,11 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from keyframe.output_session import OutputRunSession, OutputSessionError
+from keyframe.output_session import (
+    OutputRunSession,
+    OutputSessionError,
+    remove_keyframe_owned_directory,
+)
 from keyframe.pipeline.config import KeyframeExtractionResult
 from keyframe.pipeline.contracts import CandidateRecord, candidate_to_manifest_row
 
@@ -224,9 +227,11 @@ def promote_frame_generation(
         raise FrameGenerationPromotionError(
             f"public frame path is not a replaceable directory: {public}"
         )
+    public_mode: int | None = None
     if public_exists:
         try:
-            staged.chmod(stat.S_IMODE(public.stat().st_mode))
+            public_mode = stat.S_IMODE(public.stat().st_mode)
+            staged.chmod(public_mode | stat.S_IRWXU)
         except OSError as exc:
             raise FrameGenerationPromotionError(
                 f"failed to preserve public frame directory permissions: {exc}"
@@ -286,7 +291,19 @@ def promote_frame_generation(
         raise error from promotion_error
 
     try:
-        shutil.rmtree(backup)
+        assert public_mode is not None
+        public.chmod(public_mode)
+    except OSError as exc:
+        LOGGER.warning(
+            "Published frame generation but could not restore directory mode %o "
+            "at %s: %s",
+            public_mode,
+            public,
+            exc,
+        )
+
+    try:
+        remove_keyframe_owned_directory(backup)
     except OSError as exc:
         LOGGER.warning(
             "Published frame generation but could not remove recovery backup %s: %s",

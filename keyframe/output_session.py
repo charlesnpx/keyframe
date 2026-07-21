@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 import uuid
 from pathlib import Path
 from typing import Any
@@ -96,6 +97,37 @@ class OutputDirectoryLock:
         self.release()
 
 
+def remove_keyframe_owned_directory(path: str | Path) -> None:
+    """Make one validated Keyframe-owned tree removable, then delete it."""
+
+    root = Path(path)
+    if not os.path.lexists(root):
+        return
+    if root.is_symlink() or not root.is_dir():
+        raise OutputSessionError(
+            f"refusing to recursively remove a non-directory artifact: {root}"
+        )
+
+    def make_writable(candidate: Path, *, directory: bool) -> None:
+        if candidate.is_symlink():
+            return
+        mode = stat.S_IMODE(candidate.stat().st_mode)
+        owner_bits = stat.S_IRUSR | stat.S_IWUSR
+        if directory:
+            owner_bits |= stat.S_IXUSR
+        candidate.chmod(mode | owner_bits)
+
+    make_writable(root, directory=True)
+    for current_root, directories, files in os.walk(root):
+        current = Path(current_root)
+        make_writable(current, directory=True)
+        for name in directories:
+            make_writable(current / name, directory=True)
+        for name in files:
+            make_writable(current / name, directory=False)
+    shutil.rmtree(root)
+
+
 def cleanup_stale_run_directories(output_dir: Path) -> None:
     public_frames = output_dir / "frames"
     backups = sorted(
@@ -105,20 +137,21 @@ def cleanup_stale_run_directories(output_dir: Path) -> None:
         and candidate.is_dir()
         and not candidate.is_symlink()
     )
-    if os.path.lexists(public_frames):
-        if public_frames.is_symlink() or not public_frames.is_dir():
+    if backups:
+        if os.path.lexists(public_frames):
+            if public_frames.is_symlink() or not public_frames.is_dir():
+                raise OutputSessionError(
+                    f"public frame path is not a recoverable directory: {public_frames}"
+                )
+            for backup in backups:
+                remove_keyframe_owned_directory(backup)
+        elif len(backups) == 1:
+            os.replace(backups[0], public_frames)
+        else:
             raise OutputSessionError(
-                f"public frame path is not a recoverable directory: {public_frames}"
+                "multiple frame-generation recovery backups exist while the public "
+                f"frames directory is missing: {[str(path) for path in backups]}"
             )
-        for backup in backups:
-            shutil.rmtree(backup)
-    elif len(backups) == 1:
-        os.replace(backups[0], public_frames)
-    elif len(backups) > 1:
-        raise OutputSessionError(
-            "multiple frame-generation recovery backups exist while the public "
-            f"frames directory is missing: {[str(path) for path in backups]}"
-        )
 
     for candidate in output_dir.iterdir():
         if (
@@ -126,7 +159,7 @@ def cleanup_stale_run_directories(output_dir: Path) -> None:
             and candidate.is_dir()
             and not candidate.is_symlink()
         ):
-            shutil.rmtree(candidate)
+            remove_keyframe_owned_directory(candidate)
 
 
 class OutputRunSession:
@@ -168,7 +201,7 @@ class OutputRunSession:
                     and not self.staging.root.is_symlink()
                 ):
                     try:
-                        shutil.rmtree(self.staging.root)
+                        remove_keyframe_owned_directory(self.staging.root)
                     except BaseException as cleanup_exc:
                         exc.add_note(
                             f"failed to remove run staging directory: {cleanup_exc}"
@@ -189,7 +222,7 @@ class OutputRunSession:
                 and not self.staging.root.is_symlink()
             ):
                 try:
-                    shutil.rmtree(self.staging.root)
+                    remove_keyframe_owned_directory(self.staging.root)
                 except BaseException as exc:
                     first_error = exc
         finally:
