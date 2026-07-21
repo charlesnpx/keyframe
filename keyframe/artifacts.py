@@ -168,5 +168,11 @@ def atomic_promote_file(staged_path: str | Path, public_path: str | Path) -> Pat
         raise OSError(
             f"cannot atomically promote {staged} to a different filesystem at {public}"
         )
+    try:
+        existing_mode = stat.S_IMODE(public.stat().st_mode)
+    except FileNotFoundError:
+        pass
+    else:
+        staged.chmod(existing_mode)
     os.replace(staged, public)
     return public

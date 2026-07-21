@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import signal
+import stat
 import threading
 import time
 from pathlib import Path
@@ -44,7 +45,7 @@ class _FakeProgressQueue:
     def __init__(self):
         self.events = []
         self.closed = False
-        self.joined = False
+        self.cancelled = False
 
     def put_nowait(self, event):
         self.events.append(event)
@@ -52,8 +53,8 @@ class _FakeProgressQueue:
     def close(self):
         self.closed = True
 
-    def join_thread(self):
-        self.joined = True
+    def cancel_join_thread(self):
+        self.cancelled = True
 
 
 class _FakeEvent:
@@ -195,21 +196,23 @@ def test_slow_progress_callback_cannot_delay_reliable_terminal(tmp_path):
 
     def block_progress(_event):
         callback_started.set()
-        release_callback.wait(timeout=5.0)
+        release_callback.wait()
 
     try:
         with StageSupervisor(
             output,
             progress_callback=block_progress,
-            progress_capacity=1,
+            progress_capacity=20_000,
             run_id="slow-progress",
         ) as supervisor:
-            handle = _start_test_stage(supervisor, progress_events=10_000)
+            handle = _start_test_stage(supervisor, progress_events=30_000)
             assert callback_started.wait(timeout=5.0)
 
-            completion = supervisor.complete(handle)
+            completion = handle.wait(timeout=15.0)
+            promoted = supervisor.complete(handle)
 
             assert completion.metadata["record_count"] == 1
+            assert promoted.checkpoint_path == output / "transcript.raw.json"
     finally:
         release_callback.set()
 
@@ -450,6 +453,35 @@ def test_failed_entry_preserves_collision_and_releases_output_lock(tmp_path):
         assert supervisor.staging.root.exists()
 
 
+def test_close_from_another_thread_releases_lock_and_can_restore_on_owner(tmp_path):
+    output = tmp_path / "output"
+    previous_handler = signal.getsignal(signal.SIGTERM)
+    supervisor = StageSupervisor(output, run_id="cross-thread-close")
+    supervisor.__enter__()
+    errors = []
+
+    def close_from_thread():
+        try:
+            supervisor.close()
+        except BaseException as exc:
+            errors.append(exc)
+
+    try:
+        close_thread = threading.Thread(target=close_from_thread)
+        close_thread.start()
+        close_thread.join(timeout=5.0)
+
+        assert not close_thread.is_alive()
+        assert len(errors) == 1
+        assert isinstance(errors[0], ValueError)
+        with StageSupervisor(output, run_id="after-cross-thread-close"):
+            pass
+    finally:
+        supervisor.close()
+
+    assert signal.getsignal(signal.SIGTERM) == previous_handler
+
+
 def test_complete_rejects_foreign_handle_and_mismatched_checkpoint(tmp_path):
     first_output = tmp_path / "first"
     second_output = tmp_path / "second"
@@ -472,6 +504,27 @@ def test_complete_rejects_foreign_handle_and_mismatched_checkpoint(tmp_path):
 
         completion = first.complete(handle)
         assert completion.checkpoint_path == first_output / "transcript.raw.json"
+
+
+def test_promotion_preserves_mode_and_repeated_completion_is_stable(tmp_path):
+    output = tmp_path / "output"
+    output.mkdir()
+    public = output / "transcript.raw.json"
+    transcript.write_raw_transcript_checkpoint(
+        [transcript.TranscriptSegment(0.0, 1.0, "previous")],
+        public,
+    )
+    public.chmod(0o600)
+
+    with StageSupervisor(output, run_id="mode") as supervisor:
+        handle = _start_test_stage(supervisor)
+
+        first = supervisor.complete(handle)
+        second = supervisor.complete(handle)
+
+        assert first == second
+        assert handle.wait() == first
+        assert stat.S_IMODE(public.stat().st_mode) == 0o600
 
 
 def test_transcription_worker_entry_keeps_bulk_result_on_disk(tmp_path, monkeypatch):
@@ -516,7 +569,7 @@ def test_transcription_worker_entry_keeps_bulk_result_on_disk(tmp_path, monkeypa
     assert not hasattr(terminal.messages[0], "segments")
     assert terminal.closed
     assert progress.closed
-    assert progress.joined
+    assert progress.cancelled
 
 
 def test_diarization_worker_entry_keeps_bulk_result_on_disk(tmp_path, monkeypatch):

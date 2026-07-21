@@ -11,6 +11,7 @@ import threading
 import uuid
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
+from multiprocessing.connection import wait as wait_for_connections
 from pathlib import Path
 from typing import Any
 
@@ -158,7 +159,7 @@ def _close_worker_ipc(terminal_send: Any, progress_queue: Any) -> None:
         pass
     try:
         progress_queue.close()
-        progress_queue.join_thread()
+        progress_queue.cancel_join_thread()
     except (AttributeError, OSError, ValueError):
         pass
 
@@ -378,7 +379,9 @@ class StageHandle:
         self._progress_callback_errors: list[Exception] = []
         self._control_done = threading.Event()
         self._progress_done = threading.Event()
+        self._callback_done = threading.Event()
         self._progress_stop = threading.Event()
+        self._callback_queue: queue.Queue[StageProgress] = queue.Queue(maxsize=1)
         self._ipc_closed = False
         self._completion: StageCompletion | None = None
         self._failure: BaseException | None = None
@@ -392,11 +395,39 @@ class StageHandle:
             name=f"keyframe-{stage}-progress",
             daemon=True,
         )
+        self._callback_thread = threading.Thread(
+            target=self._monitor_callback,
+            name=f"keyframe-{stage}-callback",
+            daemon=True,
+        )
 
     def start_monitors(self) -> None:
         """Start independent reliable-control and best-effort progress drains."""
         self._control_thread.start()
         self._progress_thread.start()
+        if self._progress_callback is not None:
+            self._callback_thread.start()
+
+    def _offer_progress(self, event: Any) -> None:
+        if (
+            not isinstance(event, StageProgress)
+            or self._progress_callback is None
+            or self._progress_stop.is_set()
+        ):
+            return
+        try:
+            self._callback_queue.put_nowait(event)
+            return
+        except queue.Full:
+            pass
+        try:
+            self._callback_queue.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            self._callback_queue.put_nowait(event)
+        except queue.Full:
+            pass
 
     def _drain_progress(self) -> None:
         while True:
@@ -406,11 +437,7 @@ class StageHandle:
                 return
             if self._progress_stop.is_set():
                 return
-            if isinstance(event, StageProgress) and self._progress_callback is not None:
-                try:
-                    self._progress_callback(event)
-                except Exception as exc:
-                    self._progress_callback_errors.append(exc)
+            self._offer_progress(event)
 
     def _drain_terminal(self) -> None:
         while True:
@@ -421,9 +448,14 @@ class StageHandle:
             except (EOFError, OSError):
                 return
 
+    def _process_exited(self, timeout: float | None = 0.0) -> bool:
+        if self.process.pid is None:
+            return False
+        return bool(wait_for_connections([self.process.sentinel], timeout=timeout))
+
     def _monitor_control(self) -> None:
         try:
-            while self.process.is_alive():
+            while not self._process_exited():
                 self._drain_terminal()
                 try:
                     self._terminal_receive.poll(0.05)
@@ -435,16 +467,12 @@ class StageHandle:
 
     def _monitor_progress(self) -> None:
         try:
-            while self.process.is_alive() and not self._progress_stop.is_set():
+            while not self._process_exited() and not self._progress_stop.is_set():
                 try:
                     event = self._progress_queue.get(timeout=0.05)
                 except (queue.Empty, EOFError, OSError, ValueError):
                     continue
-                if isinstance(event, StageProgress) and self._progress_callback is not None:
-                    try:
-                        self._progress_callback(event)
-                    except Exception as exc:
-                        self._progress_callback_errors.append(exc)
+                self._offer_progress(event)
             if self._progress_stop.is_set():
                 return
             try:
@@ -452,14 +480,30 @@ class StageHandle:
             except (queue.Empty, EOFError, OSError, ValueError):
                 pass
             else:
-                if isinstance(event, StageProgress) and self._progress_callback is not None:
-                    try:
-                        self._progress_callback(event)
-                    except Exception as exc:
-                        self._progress_callback_errors.append(exc)
+                self._offer_progress(event)
             self._drain_progress()
         finally:
             self._progress_done.set()
+
+    def _monitor_callback(self) -> None:
+        callback = self._progress_callback
+        if callback is None:
+            self._callback_done.set()
+            return
+        try:
+            while not self._progress_stop.is_set():
+                try:
+                    event = self._callback_queue.get(timeout=0.05)
+                except queue.Empty:
+                    continue
+                if self._progress_stop.is_set():
+                    return
+                try:
+                    callback(event)
+                except Exception as exc:
+                    self._progress_callback_errors.append(exc)
+        finally:
+            self._callback_done.set()
 
     @staticmethod
     def _thread_started(thread: threading.Thread) -> bool:
@@ -471,6 +515,17 @@ class StageHandle:
             self._control_thread.join()
         else:
             self._drain_terminal()
+
+    def _finish_progress_monitors(self) -> None:
+        if self._thread_started(self._progress_thread):
+            self._progress_done.wait(timeout=1.0)
+            if self._progress_done.is_set():
+                self._progress_thread.join()
+        if (
+            self._thread_started(self._callback_thread)
+            and self._callback_done.is_set()
+        ):
+            self._callback_thread.join()
 
     def _close_ipc(self) -> None:
         if self._ipc_closed:
@@ -486,6 +541,7 @@ class StageHandle:
             self._progress_queue.join_thread()
         except (OSError, AttributeError, ValueError):
             pass
+        self._finish_progress_monitors()
 
     def wait(self, timeout: float | None = None) -> StageCompletion:
         if self._completion is not None:
@@ -493,11 +549,11 @@ class StageHandle:
         if self._failure is not None:
             raise self._failure
 
-        self.process.join(timeout)
-        if self.process.is_alive():
+        if not self._process_exited(timeout):
             raise StageWaitTimeout(
                 f"{self.stage} worker did not exit within {float(timeout):.1f}s"
             )
+        self.process.join()
         self._finish_control_monitor()
         self._close_ipc()
 
@@ -555,17 +611,16 @@ class StageHandle:
 
     def cancel(self, grace_seconds: float = 1.0) -> None:
         if self.process.pid is not None:
-            if self.process.is_alive():
+            if not self._process_exited():
                 self._cancellation_event.set()
-                self.process.join(max(0.0, grace_seconds))
-            if self.process.is_alive():
+                self._process_exited(max(0.0, grace_seconds))
+            if not self._process_exited():
                 self.process.terminate()
-                self.process.join(max(0.0, grace_seconds))
-            if self.process.is_alive():
+                self._process_exited(max(0.0, grace_seconds))
+            if not self._process_exited():
                 self.process.kill()
-                self.process.join()
-            else:
-                self.process.join()
+                self._process_exited(None)
+            self.process.join()
         self._finish_control_monitor()
         self._close_ipc()
 
@@ -787,8 +842,12 @@ class StageSupervisor:
                 f"{handle.stage} handle checkpoint does not match this run"
             )
         completion = handle.wait()
+        if completion.checkpoint_path == public_path:
+            return completion
         atomic_promote_file(completion.checkpoint_path, public_path)
-        return replace(completion, checkpoint_path=public_path)
+        promoted = replace(completion, checkpoint_path=public_path)
+        handle._completion = promoted
+        return promoted
 
     def cancel(self, handle: StageHandle) -> None:
         if not any(owned is handle for owned in self._handles):
@@ -797,26 +856,40 @@ class StageSupervisor:
 
     def close(self) -> None:
         if not self._entered:
+            self._restore_sigterm_handler()
             return
         self._entered = False
         first_error: BaseException | None = None
+
+        def remember_error(exc: BaseException, context: str) -> None:
+            nonlocal first_error
+            if first_error is None:
+                first_error = exc
+            else:
+                first_error.add_note(f"{context}: {type(exc).__name__}: {exc}")
+
         try:
             for handle in self._handles:
                 try:
                     handle.cancel(self.cancellation_grace_seconds)
                 except BaseException as exc:
-                    if first_error is None:
-                        first_error = exc
+                    remember_error(exc, f"failed to cancel {handle.stage} worker")
             if self.staging is not None and self.staging.root.exists():
                 try:
                     shutil.rmtree(self.staging.root)
                 except BaseException as exc:
-                    if first_error is None:
-                        first_error = exc
+                    remember_error(exc, "failed to remove run staging directory")
         finally:
-            self._restore_sigterm_handler()
-            if self.lock is not None:
-                self.lock.release()
+            try:
+                self._restore_sigterm_handler()
+            except BaseException as exc:
+                remember_error(exc, "failed to restore SIGTERM handler")
+            finally:
+                if self.lock is not None:
+                    try:
+                        self.lock.release()
+                    except BaseException as exc:
+                        remember_error(exc, "failed to release output lock")
         if first_error is not None:
             raise first_error
 
