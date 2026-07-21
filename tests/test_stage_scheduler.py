@@ -65,6 +65,8 @@ def test_stage_memory_estimates_match_admission_contract():
     [
         (transcription_demand("medium", backend="mlx"), diarization_demand("cpu"), "parallel"),
         (transcription_demand("medium", backend="mlx"), frame_demand("mps"), "serial"),
+        (transcription_demand("medium", backend="mlx"), diarization_demand("mps"), "serial"),
+        (diarization_demand("mps"), frame_demand("mps"), "serial"),
         (
             transcription_demand("medium", backend="whisper", device="cuda"),
             diarization_demand("cpu"),
@@ -406,6 +408,17 @@ def test_explicit_parallel_never_bypasses_shared_accelerator(caplog):
 
     assert not decision.parallel
     assert "cannot override shared-accelerator" in caplog.text
+
+
+def test_cpu_transcription_may_overlap_mps_diarization():
+    decision = _scheduler().decide(
+        (
+            transcription_demand("medium", backend="whisper", device="cpu"),
+            diarization_demand("mps"),
+        )
+    )
+
+    assert decision.parallel
 
 
 def test_scheduler_reprobes_resources_for_every_decision():

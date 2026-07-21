@@ -184,10 +184,12 @@ def transcription_demand(
 
 def diarization_demand(device: str) -> StageDemand:
     effective_device = device.strip().lower()
-    if effective_device != "cpu" and not (
-        effective_device == "cuda" or effective_device.startswith("cuda:")
+    if (
+        effective_device not in {"cpu", "mps", "cuda"}
+        and not effective_device.startswith("mps:")
+        and not effective_device.startswith("cuda:")
     ):
-        raise ValueError("diarization device must be cpu or cuda")
+        raise ValueError("diarization device must be cpu, mps, or cuda")
     return StageDemand("diarization", effective_device, DIARIZATION_MEMORY_GIB * GIB)
 
 

@@ -52,7 +52,7 @@ The adopted medium model is `mlx-community/whisper-medium-mlx` at revision `7fc0
 
 MLX-Whisper supports Python 3.8 or newer, WhisperX supports Python 3.10 through 3.13, and the benchmark ran on Keyframe's Python 3.12.13 runtime. The shared environment uses WhisperX's stricter compatible matrix: `torch~=2.8.0`, `torchaudio~=2.8.0`, `torchvision~=0.23.0`, `whisperx==3.8.6`, `huggingface-hub>=0.34,<1`, and `transformers>=4.50,<5`.
 
-Keyframe 0.6.1 supports Python 3.11 through 3.13. Its clean-install
+Keyframe 0.6.2 supports Python 3.11 through 3.13. Its clean-install
 matrix covers macOS ARM64 and Linux x86-64 on all three versions. MLX and
 MLX-Whisper use Darwin ARM64/macOS 14+ environment markers; the Linux jobs
 assert that neither distribution is installed. Import validation does not load
@@ -77,21 +77,49 @@ stage. Only the two exact known pyannote UserWarnings (unavailable TorchCodec
 decoding and a too-short pooling window) are condensed. All near misses remain
 visible, and every diarization row must pass strict checkpoint validation.
 
-Automatic scheduling may overlap MLX/CUDA transcription with CPU diarization
-only when model-aware memory admission with 10% headroom succeeds. On macOS,
-admission uses bounded `memory_pressure -Q` and `sysctl hw.memsize` probes, with
-physical-page `vm_stat` fallback and no swap. CPU transcription and CPU
-diarization additionally require at least four CPUs. Shared accelerators remain
-serialized. After transcription, a fresh decision may overlap MPS/CUDA frames
-with a still-running CPU diarization worker. Diarization remains holistic;
-Keyframe does not split recordings or reconcile per-chunk speaker identities.
+Automatic diarization prefers MPS on Darwin ARM64, CUDA elsewhere when
+available, and CPU otherwise. Explicit unavailable MPS and CUDA requests fail
+during preflight. If an automatic MPS attempt fails during model initialization
+or inference with an eligible compute error, Keyframe exits that worker and
+retries once on CPU. Explicit MPS, authentication, acquisition, audio decoding,
+protocol, and checkpoint failures do not trigger fallback.
 
-Reliable intervals support five dependency expressions:
+Automatic scheduling overlaps stages using independent resources only when
+model-aware memory admission with 10% headroom succeeds. On macOS, admission
+uses bounded `memory_pressure -Q` and `sysctl hw.memsize` probes, with
+physical-page `vm_stat` fallback and no swap. CPU transcription and CPU
+diarization additionally require at least four CPUs. MLX transcription, MPS
+diarization, and MPS frames all claim the same Apple accelerator and remain
+serialized. Existing CPU-diarization overlap remains available, and an MPS to
+CPU fallback receives a fresh admission decision before frame work starts.
+Diarization remains holistic; Keyframe does not split recordings or reconcile
+per-chunk speaker identities.
+
+Without a diarization retry, reliable intervals support five dependency
+expressions:
 `max(T + F, D) + M + E`, `max(T, D) + F + M + E`,
 `T + max(D, F) + M + E`, `T + D + F + M + E`, and
 `T + F + M + E`. `T`, `D`, and `F` are the stage intervals, `M` is transcript
-merge/output, and `E` is frame-manifest enrichment/promotion. The last path
-also covers a serialized MLX fallback wait already included inside `T`.
+merge/output, and `E` is frame-manifest enrichment/promotion. Six additional
+expressions introduce `R` for a failed MPS attempt and distinguish serial from
+overlapping CPU fallback and frame work.
+
+### MPS diarization spike: 2026-07-21
+
+A strict-MPS long-form spike completed pyannote inference in 75.36 seconds and
+model initialization in 1.38 seconds. The MPS result contained the same 253
+speaker intervals as the CPU reference after label reconciliation, with zero
+timestamp delta. Peak Torch MPS driver allocation was 3.80 GiB and peak process
+RSS was 1.43 GiB. This established both the quality equivalence and the margin
+for the release gate's 335-second MPS diarization ceiling.
+
+The post-implementation full-pipeline candidate then completed in 332.6
+seconds with PyTorch's implicit MPS-to-CPU fallback disabled: 79.0 seconds for
+MLX transcription, 85.8 seconds for MPS diarization, and 167.1 seconds for MPS
+frame extraction.
+It used the expected serialized `T + D + F + M + E` path, published every
+checkpoint and final artifact, and did not use transcription or diarization
+fallback.
 
 ### Release pipeline benchmark: 2026-07-21
 
@@ -190,21 +218,21 @@ python scripts/benchmark_transcription.py \
 ```
 
 It runs the CPU Whisper/CPU diarization reference serially and uses automatic
-scheduling for the complete MLX/CPU-diarization/frame candidate. The candidate
-must obtain parallel initial and second-wave decisions from macOS pressure
-evidence, use a local pinned-model cache hit in under one second, avoid
-fallback, and prove non-empty transcription/diarization and
-frames/diarization intersections. The report records reliable intervals,
-kernel-recorded per-process RSS high-water marks, MLX allocator peak,
-transcript agreement, checkpoint/final artifacts, and diarization equivalence
-modulo speaker-label renaming. Its phase-aware conservative tree bound sums
-workers that can overlap and retains reaped-child peaks, so a short-lived
-allocation cannot disappear between polling samples.
+scheduling for the complete MLX/MPS-diarization/MPS-frame candidate. The
+candidate must obtain serial Apple-accelerator decisions from macOS pressure
+evidence, use a local pinned-model cache hit in under one second, make exactly
+one MPS diarization attempt, and avoid both transcription and diarization
+fallback. The report records reliable intervals, kernel-recorded per-process
+RSS high-water marks, MLX allocator peak, transcript agreement,
+checkpoint/final artifacts, and diarization equivalence modulo speaker-label
+renaming. Its phase-aware conservative tree bound uses the largest serialized
+worker in each phase and retains reaped-child peaks, so a short-lived allocation
+cannot disappear between polling samples.
 
 The release limits are named in the validator: no more than 115% of the
 historical 613.67-second candidate, at least 15% faster than the same-run serial
 reference, at most 6.60 GiB for the conservative process-tree RSS high-water
-bound, at most 5.96 GiB MLX allocator peak, and at most five seconds between the
-interval-derived prediction and wall clock. Existing reports can be revalidated
-with `--replay-report`; replay binds the report hash and duration to the
-explicitly supplied recording.
+bound, at most 5.96 GiB MLX allocator peak, no more than 335 seconds for MPS
+diarization, and at most five seconds between the interval-derived prediction
+and wall clock. Existing reports can be revalidated with `--replay-report`;
+replay binds the report hash and duration to the explicitly supplied recording.

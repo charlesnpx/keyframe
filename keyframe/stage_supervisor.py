@@ -392,7 +392,11 @@ def diarization_worker_entry(
         configure_worker_thread_budget(request.thread_budget, torch_threads=True)
         emit_stage_progress(
             progress_queue,
-            StageProgress("diarization", "inference"),
+            StageProgress(
+                "diarization",
+                "inference",
+                request.device or "auto",
+            ),
         )
         if request.device is None:
             rows = transcript_module._detect_speakers(
@@ -415,7 +419,10 @@ def diarization_worker_entry(
             request.checkpoint_path,
             final_output_paths=request.final_output_paths,
         )
-        return {"row_count": len(rows)}
+        return {
+            "row_count": len(rows),
+            "device": request.device or "auto",
+        }
 
     _execute_worker(
         "diarization",
@@ -423,6 +430,7 @@ def diarization_worker_entry(
         progress_queue,
         cancellation_event,
         diarize,
+        transcript_module.is_auto_diarization_fallback_eligible,
     )
 
 

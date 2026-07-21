@@ -39,7 +39,7 @@ from keyframe.artifacts import atomic_write_json, atomic_write_text, reject_path
 
 PYANNOTE_MODEL = "pyannote/speaker-diarization-community-1"
 TRANSCRIPTION_BACKENDS = ("auto", "mlx", "whisper")
-DIARIZATION_DEVICES = ("auto", "cpu", "cuda")
+DIARIZATION_DEVICES = ("auto", "cpu", "mps", "cuda")
 MLX_MINIMUM_MACOS_MAJOR = 14
 MLX_MINIMUM_DARWIN_MAJOR = 23
 DIARIZATION_SOURCE_IGNORED_FIELDS = frozenset({"label", "segment"})
@@ -199,6 +199,18 @@ class UnsupportedTranscriptionBackendError(TranscriptionError):
 
 class UnsupportedDiarizationDeviceError(TranscriptionError):
     """The requested diarization device cannot run in the current environment."""
+
+
+class MPSDiarizationError(TranscriptionError):
+    """An MPS compute failure for which automatic diarization may retry on CPU."""
+
+
+class MPSDiarizationModelLoadError(MPSDiarizationError):
+    """The pyannote model could not be initialized on MPS."""
+
+
+class MPSDiarizationInferenceError(MPSDiarizationError):
+    """The initialized pyannote model failed during MPS inference."""
 
 
 class TranscriptionCancelled(TranscriptionError):
@@ -795,34 +807,117 @@ def cuda_is_available() -> bool:
         return False
 
 
+def mps_is_available() -> bool:
+    """Return whether this Torch build can execute on the local MPS backend."""
+
+    try:
+        import torch
+    except (ImportError, OSError):
+        return False
+    try:
+        backend = torch.backends.mps
+        return bool(backend.is_built() and backend.is_available())
+    except (AttributeError, RuntimeError):
+        return False
+
+
 def resolve_diarization_device(
     requested: str,
     *,
     cuda_available: bool | None = None,
+    mps_available: bool | None = None,
+    runtime_platform: RuntimePlatform | None = None,
 ) -> str:
     if requested not in DIARIZATION_DEVICES:
         choices = ", ".join(DIARIZATION_DEVICES)
         raise ValueError(f"unknown diarization device {requested!r}; choose from: {choices}")
     if requested == "cpu":
         return "cpu"
-    available = cuda_is_available() if cuda_available is None else bool(cuda_available)
-    if requested == "cuda" and not available:
+
+    runtime_platform = runtime_platform or current_runtime_platform()
+    supports_mps = (
+        runtime_platform.system == "Darwin"
+        and runtime_platform.machine.lower() == "arm64"
+    )
+
+    def has_mps() -> bool:
+        if not supports_mps:
+            return False
+        return (
+            mps_is_available()
+            if mps_available is None
+            else bool(mps_available)
+        )
+
+    def has_cuda() -> bool:
+        return (
+            cuda_is_available()
+            if cuda_available is None
+            else bool(cuda_available)
+        )
+
+    if requested == "mps":
+        if not has_mps():
+            raise UnsupportedDiarizationDeviceError(
+                "MPS diarization was requested, but Torch reports no available "
+                "MPS device on Darwin ARM64"
+            )
+        return "mps"
+    if requested == "cuda" and not has_cuda():
         raise UnsupportedDiarizationDeviceError(
             "CUDA diarization was requested, but Torch reports no available CUDA device"
         )
-    return "cuda" if available else "cpu"
+    if requested == "cuda":
+        return "cuda"
+    if supports_mps:
+        return "mps" if has_mps() else "cpu"
+    return "cuda" if has_cuda() else "cpu"
 
 
 def _select_whisperx_device(
     requested: str = "auto",
     *,
     cuda_available: bool | None = None,
+    mps_available: bool | None = None,
+    runtime_platform: RuntimePlatform | None = None,
 ) -> tuple[str, str]:
     device = resolve_diarization_device(
         requested,
         cuda_available=cuda_available,
+        mps_available=mps_available,
+        runtime_platform=runtime_platform,
     )
-    return (device, "float16" if device == "cuda" else "int8")
+    compute_type = (
+        "float16"
+        if device == "cuda"
+        else "float32"
+        if device == "mps"
+        else "int8"
+    )
+    return (device, compute_type)
+
+
+def is_auto_diarization_fallback_eligible(exc: BaseException) -> bool:
+    """Return whether an automatic MPS attempt may be retried once on CPU."""
+
+    return isinstance(exc, MPSDiarizationError)
+
+
+def _is_mps_compute_failure(exc: BaseException) -> bool:
+    """Exclude authentication, acquisition, decoding, and data-shape failures."""
+
+    if not isinstance(exc, (RuntimeError, NotImplementedError, MemoryError)):
+        return False
+    message = " ".join(str(exc).lower().split())
+    return any(
+        marker in message
+        for marker in (
+            "mps",
+            "metal",
+            "placeholder storage",
+            "invalid buffer size",
+        )
+    )
 
 
 def _print_missing_hf_token_warning() -> None:
@@ -1116,11 +1211,18 @@ def _detect_speakers(
         audio = whisperx.load_audio(str(video))
 
         print("Detecting speakers with pyannote...")
-        diarize_model = DiarizationPipeline(
-            PYANNOTE_MODEL,
-            token=hf_token,
-            device=device,
-        )
+        try:
+            diarize_model = DiarizationPipeline(
+                PYANNOTE_MODEL,
+                token=hf_token,
+                device=device,
+            )
+        except Exception as exc:
+            if device == "mps" and _is_mps_compute_failure(exc):
+                raise MPSDiarizationModelLoadError(
+                    "pyannote model initialization failed on MPS"
+                ) from exc
+            raise
         progress = tqdm(
             total=100,
             desc="Detecting speakers",
@@ -1140,10 +1242,17 @@ def _detect_speakers(
             last_progress = bounded
 
         try:
-            detected = diarize_model(
-                audio,
-                progress_callback=update_progress,
-            )
+            try:
+                detected = diarize_model(
+                    audio,
+                    progress_callback=update_progress,
+                )
+            except Exception as exc:
+                if device == "mps" and _is_mps_compute_failure(exc):
+                    raise MPSDiarizationInferenceError(
+                        "pyannote inference failed on MPS"
+                    ) from exc
+                raise
             return _strict_diarization_rows(detected)
         finally:
             progress.close()

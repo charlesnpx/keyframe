@@ -849,7 +849,7 @@ def test_diarization_worker_entry_keeps_bulk_result_on_disk(tmp_path, monkeypatc
     terminal_message = terminal.messages[0]
     terminal_metadata = dict(terminal_message.metadata)
     assert terminal_metadata.pop("process_tree_peak_rss_bytes") > 0
-    assert terminal_metadata == {"row_count": 1}
+    assert terminal_metadata == {"row_count": 1, "device": "cpu"}
     assert terminal_message.ended_at > 0
 
 
@@ -875,3 +875,31 @@ def test_worker_error_has_reliable_terminal_metadata(tmp_path, monkeypatch):
     assert terminal.messages[0].status == "error"
     assert terminal.messages[0].error_type == "RuntimeError"
     assert terminal.messages[0].error_message == "model failed"
+    assert not terminal.messages[0].fallback_eligible
+
+
+def test_diarization_worker_marks_only_typed_mps_compute_failures_for_fallback(
+    tmp_path,
+    monkeypatch,
+):
+    terminal = _FakeTerminal()
+    progress = _FakeProgressQueue()
+    cancellation = _FakeEvent()
+    failure = transcript.MPSDiarizationInferenceError("MPS kernel failed")
+    monkeypatch.setattr(
+        transcript,
+        "_detect_speakers",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(failure),
+    )
+    request = DiarizationWorkerRequest(
+        video_path=str(tmp_path / "video.mp4"),
+        hf_token="hf_test",
+        checkpoint_path=str(tmp_path / "diarization.json"),
+        device="mps",
+    )
+
+    with pytest.raises(transcript.MPSDiarizationInferenceError):
+        diarization_worker_entry(request, terminal, progress, cancellation)
+
+    assert len(terminal.messages) == 1
+    assert terminal.messages[0].fallback_eligible

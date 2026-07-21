@@ -29,7 +29,7 @@ from keyframe.stage_scheduler import (
     diarization_demand,
     transcription_demand,
 )
-from keyframe.stage_supervisor import StageProgress, StageSupervisor
+from keyframe.stage_supervisor import StageProgress, StageSupervisor, StageWorkerError
 
 
 @dataclass(frozen=True)
@@ -80,9 +80,17 @@ class TranscriptRunResult:
     initial_schedule: ScheduleDecision
     timings: Mapping[str, float]
     metadata: Mapping[str, Any]
+    diarization_attempted_devices: tuple[str, ...] = ()
+    diarization_fallback_used: bool = False
+    diarization_fallback_schedule: ScheduleDecision | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
+        object.__setattr__(
+            self,
+            "diarization_attempted_devices",
+            tuple(self.diarization_attempted_devices),
+        )
 
 
 class TranscriptOutputError(OutputSessionError):
@@ -103,6 +111,7 @@ def preflight_transcript_run(
     environment: Mapping[str, str] | None = None,
     runtime_platform: transcript.RuntimePlatform | None = None,
     cuda_probe: Callable[[], bool] | None = None,
+    mps_probe: Callable[[], bool] | None = None,
 ) -> TranscriptPreflight:
     """Resolve backend and devices before creating outputs or loading models."""
 
@@ -113,7 +122,9 @@ def preflight_transcript_run(
         runtime_platform,
     )
     cuda_probe = cuda_probe or transcript.cuda_is_available
+    mps_probe = mps_probe or transcript.mps_is_available
     cuda_available: bool | None = None
+    mps_available: bool | None = None
 
     def has_cuda() -> bool:
         nonlocal cuda_available
@@ -124,6 +135,16 @@ def preflight_transcript_run(
                 False if runtime_platform.system == "Darwin" else bool(cuda_probe())
             )
         return cuda_available
+
+    def has_mps() -> bool:
+        nonlocal mps_available
+        if mps_available is None:
+            mps_available = bool(
+                runtime_platform.system == "Darwin"
+                and runtime_platform.machine.lower() == "arm64"
+                and mps_probe()
+            )
+        return mps_available
 
     transcription_device = (
         "mlx"
@@ -142,6 +163,8 @@ def preflight_transcript_run(
             effective_diarization_device = transcript.resolve_diarization_device(
                 requested_device,
                 cuda_available=has_cuda(),
+                mps_available=has_mps(),
+                runtime_platform=runtime_platform,
             )
 
     return TranscriptPreflight(
@@ -405,6 +428,9 @@ def run_supervised_transcript(
     timings: dict[str, float] = {}
     diarization_handle = None
     diarization_started: float | None = None
+    diarization_attempted_devices: list[str] = []
+    diarization_fallback_used = False
+    diarization_fallback_schedule: ScheduleDecision | None = None
     supervisor_context = (
         nullcontext(supervisor)
         if supervisor is not None
@@ -435,6 +461,7 @@ def run_supervised_transcript(
         )
         if decision.parallel and diarization_stage is not None:
             diarization_started = clock()
+            diarization_attempted_devices.append(diarization_stage.device)
             diarization_handle = active_supervisor.start_diarization(
                 video,
                 hf_token=preflight.hf_token or "",
@@ -491,6 +518,11 @@ def run_supervised_transcript(
                 initial_schedule=decision,
                 timings=dict(timings),
                 metadata=dict(execution.completion.metadata),
+                diarization_attempted_devices=tuple(
+                    diarization_attempted_devices
+                ),
+                diarization_fallback_used=diarization_fallback_used,
+                diarization_fallback_schedule=diarization_fallback_schedule,
             )
 
         if preflight.missing_hf_token:
@@ -499,6 +531,7 @@ def run_supervised_transcript(
         if diarization_stage is not None:
             if diarization_handle is None:
                 diarization_started = clock()
+                diarization_attempted_devices.append(diarization_stage.device)
                 diarization_handle = active_supervisor.start_diarization(
                     video,
                     hf_token=preflight.hf_token or "",
@@ -507,7 +540,50 @@ def run_supervised_transcript(
                     device=preflight.effective_diarization_device,
                 )
             try:
-                diarization_completion = active_supervisor.complete(diarization_handle)
+                try:
+                    diarization_completion = active_supervisor.complete(
+                        diarization_handle
+                    )
+                except StageWorkerError as exc:
+                    eligible_mps_fallback = (
+                        config.diarization_device == "auto"
+                        and diarization_stage.device == "mps"
+                        and not diarization_fallback_used
+                        and exc.fallback_eligible
+                    )
+                    if not eligible_mps_fallback:
+                        raise
+                    if diarization_started is not None:
+                        timings["diarization_retry"] = (
+                            clock() - diarization_started
+                        )
+                    active_supervisor.public.diarization.unlink(missing_ok=True)
+                    diarization_fallback_used = True
+                    diarization_stage = diarization_demand("cpu")
+                    diarization_fallback_schedule = scheduler.decide(
+                        (diarization_stage,)
+                    )
+                    print(
+                        "Automatic MPS diarization failed during compute; "
+                        "retrying once on CPU"
+                    )
+                    _print_schedule(diarization_fallback_schedule)
+                    diarization_started = clock()
+                    diarization_attempted_devices.append("cpu")
+                    diarization_handle = active_supervisor.start_diarization(
+                        video,
+                        hf_token=preflight.hf_token or "",
+                        final_output_paths=final_paths,
+                        thread_budget=(
+                            diarization_fallback_schedule.cpu_threads_for(
+                                "diarization"
+                            )
+                        ),
+                        device="cpu",
+                    )
+                    diarization_completion = active_supervisor.complete(
+                        diarization_handle
+                    )
                 if diarization_started is not None:
                     timings["diarization"] = clock() - diarization_started
                 labeled = transcript._assign_speakers(
@@ -540,4 +616,9 @@ def run_supervised_transcript(
             initial_schedule=decision,
             timings=dict(timings),
             metadata=dict(execution.completion.metadata),
+            diarization_attempted_devices=tuple(
+                diarization_attempted_devices
+            ),
+            diarization_fallback_used=diarization_fallback_used,
+            diarization_fallback_schedule=diarization_fallback_schedule,
         )
