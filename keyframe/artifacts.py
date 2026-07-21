@@ -158,3 +158,21 @@ def atomic_write_json(
         allow_nan=allow_nan,
     )
     return atomic_write_text(path, rendered)
+
+
+def atomic_promote_file(staged_path: str | Path, public_path: str | Path) -> Path:
+    """Atomically promote a validated staged file on the same filesystem."""
+    staged = Path(staged_path)
+    public = Path(public_path)
+    if staged.stat().st_dev != public.parent.stat().st_dev:
+        raise OSError(
+            f"cannot atomically promote {staged} to a different filesystem at {public}"
+        )
+    try:
+        existing_mode = stat.S_IMODE(public.stat().st_mode)
+    except FileNotFoundError:
+        pass
+    else:
+        staged.chmod(existing_mode)
+    os.replace(staged, public)
+    return public
