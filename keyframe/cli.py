@@ -18,6 +18,7 @@ import shutil
 import sys
 import time
 import tomllib
+from contextlib import nullcontext
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 
@@ -189,10 +190,75 @@ def _preflight_transcript(args):
     return preflight_transcript_run(_transcript_config(args))
 
 
-def _run_transcript(video: Path, out_dir: Path, preflight):
+def _run_transcript(video: Path, out_dir: Path, preflight, *, supervisor=None):
     from keyframe.transcript_cli import run_supervised_transcript
 
-    return run_supervised_transcript(video, out_dir, preflight)
+    if supervisor is None:
+        return run_supervised_transcript(video, out_dir, preflight)
+    return run_supervised_transcript(
+        video,
+        out_dir,
+        preflight,
+        supervisor=supervisor,
+    )
+
+
+def _frame_config(args):
+    from keyframe.pipeline import KeyframeExtractionConfig
+
+    return KeyframeExtractionConfig(
+        sample_interval=args.sample_interval,
+        pass1_clusters=args.pass1_clusters,
+        similarity_threshold=args.similarity_threshold,
+        max_output_frames=getattr(args, "max_output_frames", None),
+        max_clustering_memory_mb=getattr(args, "max_clustering_memory_mb", 2048),
+        max_frame_cache_mb=getattr(args, "max_frame_cache_mb", 8192),
+        frame_cache_dir=(
+            Path(args.frame_cache_dir)
+            if getattr(args, "frame_cache_dir", None)
+            else None
+        ),
+        verbose_trace=bool(getattr(args, "verbose_trace", False)),
+        debug_qa_targets_path=(
+            Path(args.debug_qa_targets)
+            if getattr(args, "debug_qa_targets", None)
+            else None
+        ),
+    )
+
+
+def _run_frame_generation(video: Path, out_dir: Path, args, session):
+    from keyframe.frame_generation import StagedFrameGeneration
+    from keyframe.pipeline import extract_keyframes
+
+    if session.staging is None:
+        raise RuntimeError("frame generation session did not initialize staging paths")
+    result = extract_keyframes(
+        video,
+        session.staging.frames,
+        _frame_config(args),
+        report_output_dir=out_dir / "frames",
+    )
+    return StagedFrameGeneration.from_extraction(session, result)
+
+
+def _frame_session(out_dir: Path, *, with_transcript: bool):
+    if with_transcript:
+        from keyframe.stage_supervisor import StageSupervisor
+        from keyframe.transcript_cli import print_stage_progress
+
+        return StageSupervisor(
+            out_dir,
+            progress_callback=print_stage_progress,
+        )
+    from keyframe.frame_generation import FrameGenerationSession
+
+    return FrameGenerationSession(out_dir)
+
+
+def _print_frame_result(result) -> None:
+    print(f"\n  {result.final_frame_count} key frames")
+    print(f"  Saved to: {result.output_dir.resolve()}")
 
 
 def cmd_extract(args):
@@ -217,81 +283,61 @@ def cmd_extract(args):
     print(f"Output: {out_dir.resolve()}\n")
 
     t0 = time.time()
-    manifest_frames = None
-    manifest_dir = None
-    manifest_run_metadata = None
+    frame_generation = None
+    session_context = (
+        _frame_session(out_dir, with_transcript=do_transcript)
+        if do_frames
+        else nullcontext(None)
+    )
+    from keyframe.output_session import OutputSessionError
 
-    # ── Key frames ──────────────────────────────────────────────────────
-    if do_frames:
-        print("=" * 60)
-        print("KEY FRAME EXTRACTION")
-        print("=" * 60)
-
-        frames_dir = out_dir / "frames"
-        from keyframe.pipeline import KeyframeExtractionConfig, extract_keyframes
-
-        result = extract_keyframes(
-            video,
-            frames_dir,
-            KeyframeExtractionConfig(
-                sample_interval=args.sample_interval,
-                pass1_clusters=args.pass1_clusters,
-                similarity_threshold=args.similarity_threshold,
-                max_output_frames=getattr(args, "max_output_frames", None),
-                max_clustering_memory_mb=getattr(args, "max_clustering_memory_mb", 2048),
-                max_frame_cache_mb=getattr(args, "max_frame_cache_mb", 8192),
-                frame_cache_dir=(
-                    Path(args.frame_cache_dir)
-                    if getattr(args, "frame_cache_dir", None)
-                    else None
-                ),
-                verbose_trace=bool(getattr(args, "verbose_trace", False)),
-                debug_qa_targets_path=(
-                    Path(args.debug_qa_targets)
-                    if getattr(args, "debug_qa_targets", None)
-                    else None
-                ),
-            ),
-        )
-        manifest_frames = result.final
-        manifest_dir = frames_dir
-        manifest_run_metadata = result.manifest_metadata
-
-        print(f"\n  {result.final_frame_count} key frames")
-        print(f"  Saved to: {frames_dir.resolve()}")
-
-    # ── Transcript ──────────────────────────────────────────────────────
-    if do_transcript:
-        print(f"\n{'=' * 60}")
-        print("TRANSCRIPT EXTRACTION")
-        print("=" * 60)
-
-        if transcript_preflight is None:
-            raise RuntimeError("transcript preflight was not initialized")
-        from keyframe.stage_supervisor import StageSupervisorError
-
-        try:
-            transcript_result = _run_transcript(video, out_dir, transcript_preflight)
-        except StageSupervisorError as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            raise SystemExit(1) from None
-        segments = transcript_result.segments
-        language = transcript_result.language
-
-        if manifest_frames is not None and manifest_dir is not None:
-            from keyframe.manifest import write_manifest
-            from keyframe.pipeline.contracts import CandidateRecord, candidate_to_manifest_row
-
-            manifest_rows = [
-                candidate_to_manifest_row(
-                    frame,
-                    filename=f"frame_{frame.frame_idx:06d}_{frame.timestamp:.2f}s.png",
+    try:
+        with session_context as session:
+            # ── Key frames ──────────────────────────────────────────────
+            if do_frames:
+                print("=" * 60)
+                print("KEY FRAME EXTRACTION")
+                print("=" * 60)
+                if session is None:
+                    raise RuntimeError("frame generation session was not initialized")
+                frame_generation = _run_frame_generation(
+                    video,
+                    out_dir,
+                    args,
+                    session,
                 )
-                if isinstance(frame, CandidateRecord)
-                else dict(frame)
-                for frame in manifest_frames
-            ]
-            write_manifest(manifest_rows, manifest_dir, segments, metadata=manifest_run_metadata)
+                if not do_transcript:
+                    _print_frame_result(frame_generation.promote())
+
+            # ── Transcript ──────────────────────────────────────────────
+            if do_transcript:
+                print(f"\n{'=' * 60}")
+                print("TRANSCRIPT EXTRACTION")
+                print("=" * 60)
+
+                if transcript_preflight is None:
+                    raise RuntimeError("transcript preflight was not initialized")
+                if do_frames:
+                    transcript_result = _run_transcript(
+                        video,
+                        out_dir,
+                        transcript_preflight,
+                        supervisor=session,
+                    )
+                else:
+                    transcript_result = _run_transcript(
+                        video,
+                        out_dir,
+                        transcript_preflight,
+                    )
+                segments = transcript_result.segments
+
+                if frame_generation is not None:
+                    frame_generation.enrich_manifest(segments)
+                    _print_frame_result(frame_generation.promote())
+    except OutputSessionError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from None
 
     # ── Summary ─────────────────────────────────────────────────────────
     elapsed = time.time() - t0

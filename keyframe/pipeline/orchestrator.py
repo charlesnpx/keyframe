@@ -763,6 +763,7 @@ def extract_keyframes(
     config: KeyframeExtractionConfig | None = None,
     *,
     trace_sink: TraceSink | None = None,
+    report_output_dir: str | Path | None = None,
 ) -> KeyframeExtractionResult:
     """Run the shared key-frame extraction pipeline and write frame artifacts."""
     from keyframe.frames import ModelPreloader
@@ -770,6 +771,9 @@ def extract_keyframes(
     cfg = config or KeyframeExtractionConfig()
     video_path = Path(video_path)
     output_dir = Path(output_dir)
+    reported_output_dir = (
+        Path(report_output_dir) if report_output_dir is not None else output_dir
+    )
     device = cfg.device or _default_device()
     trace = _build_trace_sink(cfg, trace_sink)
     ctx = make_context(cfg, trace)
@@ -878,13 +882,13 @@ def extract_keyframes(
         print(f"Frame extraction done in {elapsed:.1f}s")
         print(f"Pass 1: {sampling.samples.sample_count} sampled -> {post_rescue_candidate_count} CLIP candidates")
         print(f"Pass 2: {post_rescue_candidate_count} captioned -> {len(final)} final frames")
-        print(f"Saved to: {Path(output_dir).resolve()}")
-        print(f"Caption log: {artifacts.caption_log_path}")
-        print(f"Manifest: {artifacts.manifest_path}")
+        print(f"Saved to: {reported_output_dir.resolve()}")
+        print(f"Caption log: {reported_output_dir / 'captions.json'}")
+        print(f"Manifest: {reported_output_dir / 'manifest.json'}")
         if pipeline_trace_path:
-            print(f"Pipeline trace: {pipeline_trace_path}")
+            print(f"Pipeline trace: {reported_output_dir / pipeline_trace_path.name}")
         if debug_qa_trace_path:
-            print(f"Debug QA trace: {debug_qa_trace_path}")
+            print(f"Debug QA trace: {reported_output_dir / debug_qa_trace_path.name}")
 
         return KeyframeExtractionResult(
             final=final,

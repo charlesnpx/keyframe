@@ -27,6 +27,8 @@ class RunStagingPaths:
     root: Path
     transcript_raw: Path
     diarization: Path
+    frames: Path
+    frame_backup: Path
 
 
 @dataclass(frozen=True)
@@ -62,6 +64,8 @@ def run_staging_paths(output_dir: str | Path, run_id: str) -> RunStagingPaths:
         root=root,
         transcript_raw=root / "transcript.raw.json",
         diarization=root / "diarization.json",
+        frames=root / "frames",
+        frame_backup=output_dir / f"keyframe-frame-backup-{run_id}",
     )
 
 
