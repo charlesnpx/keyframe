@@ -338,6 +338,12 @@ class StageScheduler:
             )
         required_memory = required_memory_with_headroom(stage_tuple)
         shared_accelerator = _shared_accelerator(stage_tuple)
+        cpu_stages = tuple(stage for stage in stage_tuple if stage.is_cpu)
+        cpu_overlap_supported = len(cpu_stages) < 2 or (
+            len(stage_tuple) == 2
+            and {stage.stage for stage in cpu_stages}
+            == {"transcription", "diarization"}
+        )
         warnings: list[str] = [probe_warning] if probe_warning else []
 
         if len(stage_tuple) == 1:
@@ -350,18 +356,19 @@ class StageScheduler:
                 warnings.append(
                     "stage-concurrency=parallel cannot override shared-accelerator exclusion"
                 )
+        elif len(cpu_stages) >= 2 and not cpu_overlap_supported:
+            mode = "serial"
+            reason = "CPU frame work cannot overlap another CPU stage"
+            if self.policy == "parallel":
+                warnings.append(
+                    "stage-concurrency=parallel cannot override CPU frame-stage exclusion"
+                )
         elif self.policy == "serial":
             mode = "serial"
             reason = "stage-concurrency=serial was requested"
         else:
             available = resources.available_memory_bytes
             memory_admitted = available is not None and available >= required_memory
-            cpu_stages = tuple(stage for stage in stage_tuple if stage.is_cpu)
-            cpu_overlap_supported = len(cpu_stages) < 2 or (
-                len(stage_tuple) == 2
-                and {stage.stage for stage in cpu_stages}
-                == {"transcription", "diarization"}
-            )
             cpu_pair_admitted = (
                 cpu_overlap_supported
                 and (len(cpu_stages) < 2 or resources.cpu_count >= 4)
@@ -382,9 +389,6 @@ class StageScheduler:
                     f"{details}; shared accelerators remain exclusive"
                 )
                 reason = "explicit parallel override"
-            elif len(cpu_stages) >= 2 and not cpu_overlap_supported:
-                mode = "serial"
-                reason = "automatic CPU overlap is limited to transcription and diarization"
             elif len(cpu_stages) >= 2 and not cpu_pair_admitted:
                 mode = "serial"
                 reason = (

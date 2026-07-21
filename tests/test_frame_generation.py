@@ -421,19 +421,32 @@ def test_full_cli_defers_publication_until_transcript_manifest_enrichment(
         print("Frame generation staged; awaiting validation and promotion.")
         return _write_result(staged_dir, (candidate,))
 
-    def fake_transcript(_video, _output, _preflight, *, supervisor):
+    def fake_full_pipeline(
+        video_path,
+        out_dir,
+        call_args,
+        _preflight,
+        supervisor,
+    ):
+        generation = cli._run_frame_generation(
+            video_path,
+            out_dir,
+            call_args,
+            supervisor,
+            frame_device="cpu",
+        )
         assert supervisor.staging is not None
         assert supervisor.staging.frames.exists()
         assert (public / "old.png").exists()
         assert not (public / _filename(candidate)).exists()
-        return SimpleNamespace(
-            segments=[{"start": 2.5, "end": 3.5, "text": "enriched"}],
-            language="en",
+        generation.enrich_manifest(
+            [{"start": 2.5, "end": 3.5, "text": "enriched"}]
         )
+        return SimpleNamespace(frames=generation.promote())
 
     monkeypatch.setattr(pipeline, "extract_keyframes", fake_extract)
     monkeypatch.setattr(cli, "_preflight_transcript", lambda _args: object())
-    monkeypatch.setattr(cli, "_run_transcript", fake_transcript)
+    monkeypatch.setattr(cli, "_run_full_pipeline", fake_full_pipeline)
     args = _frames_only_args(video, output)
     args.frames_only = False
 
