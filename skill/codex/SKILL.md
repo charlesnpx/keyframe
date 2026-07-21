@@ -27,7 +27,7 @@ Extract key frames and/or a timestamped transcript from a video or audio file.
    Flags:
    - `--frames-only` — skip transcript
    - `--transcript-only` — skip frames
-   - `--no-speaker-detection` — force Whisper-only transcription
+   - `--no-speaker-detection` — skip pyannote speaker detection
    - `--whisper-model medium` — transcription model (default: medium)
    - `--pass1-clusters 20` — more candidate frames (default: 15)
    - `--similarity-threshold` — deprecated no-op; do not tune with this flag

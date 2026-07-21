@@ -408,7 +408,7 @@ def _add_extract_args(parser):
                         choices=["auto", "serial", "parallel"],
                         help="Transcript-stage concurrency policy (default: auto)")
     parser.add_argument("--no-speaker-detection", action="store_true",
-                        help="Use Whisper-only transcription even when HF_TOKEN is set")
+                        help="Skip pyannote speaker detection even when HF_TOKEN is set")
 
 
 if __name__ == "__main__":

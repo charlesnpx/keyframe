@@ -79,9 +79,9 @@ keyframe video.mp4 --transcript-only
 keyframe recording.m4a --transcript-only
 ```
 
-### Whisper-only transcript
+### Transcript without speaker detection
 
-Speaker detection is enabled by default when `HF_TOKEN` is present. To force the previous Whisper-only transcript behavior:
+Speaker detection is enabled by default when `HF_TOKEN` is present. To keep the transcript unlabeled:
 
 ```bash
 keyframe recording.m4a --transcript-only --no-speaker-detection
@@ -125,7 +125,7 @@ $keyframe ~/Downloads/meeting-recording.mp4
 | `--transcription-backend` | `auto` | Transcription backend: auto/mlx/whisper |
 | `--diarization-device` | `auto` | Speaker-detection device: auto/cpu/cuda |
 | `--stage-concurrency` | `auto` | Transcript-stage policy: auto/serial/parallel |
-| `--no-speaker-detection` | | Force Whisper-only transcription and skip pyannote speaker detection |
+| `--no-speaker-detection` | | Skip pyannote speaker detection |
 
 ## How it works
 
@@ -161,6 +161,6 @@ output_dir/
 
 - For UI recordings with many important states: try `--pass1-clusters 20`
 - Default transcription uses `--whisper-model medium`
-- Use `--no-speaker-detection` when you want Whisper-only output or do not want to use `HF_TOKEN`
+- Use `--no-speaker-detection` when you want an unlabeled transcript or do not want to use `HF_TOKEN`
 - Florence-2 uses `florence-community/Florence-2-base` (native transformers support). The original `microsoft/Florence-2-base` weights are broken with transformers 4.50+.
 - CLIP model is used for image embedding; deterministic OCR/dHash merge logic handles final dedupe.

@@ -10,6 +10,7 @@ import signal
 import threading
 import uuid
 from collections.abc import Callable, Iterable, Mapping
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, replace
 from multiprocessing.connection import wait as wait_for_connections
 from pathlib import Path
@@ -166,6 +167,70 @@ def emit_stage_progress(progress_queue: Any, event: StageProgress) -> None:
         pass
 
 
+class _StageProgressStream:
+    """Turn line-oriented worker text into lossy, stage-prefixed events."""
+
+    encoding = "utf-8"
+    errors = "replace"
+    _MAX_FRAGMENT_LENGTH = 4096
+
+    def __init__(self, stage: str, progress_queue: Any) -> None:
+        self.stage = stage
+        self.progress_queue = progress_queue
+        self._buffer = ""
+        self._lock = threading.Lock()
+
+    def write(self, value: str) -> int:
+        rendered = str(value)
+        with self._lock:
+            self._buffer += rendered.replace("\r", "\n")
+            self._emit_complete_lines()
+            while len(self._buffer) >= self._MAX_FRAGMENT_LENGTH:
+                fragment = self._buffer[: self._MAX_FRAGMENT_LENGTH]
+                self._buffer = self._buffer[self._MAX_FRAGMENT_LENGTH :]
+                self._emit(fragment)
+        return len(rendered)
+
+    def flush(self) -> None:
+        with self._lock:
+            if self._buffer:
+                self._emit(self._buffer)
+                self._buffer = ""
+
+    def isatty(self) -> bool:
+        return False
+
+    def writable(self) -> bool:
+        return True
+
+    def _emit_complete_lines(self) -> None:
+        lines = self._buffer.split("\n")
+        self._buffer = lines.pop()
+        for line in lines:
+            self._emit(line)
+
+    def _emit(self, line: str) -> None:
+        message = line.strip()
+        if message:
+            emit_stage_progress(
+                self.progress_queue,
+                StageProgress(self.stage, "output", message),
+            )
+
+
+def _run_with_routed_output(
+    stage: str,
+    progress_queue: Any,
+    operation: Callable[[], Mapping[str, Any]],
+) -> Mapping[str, Any]:
+    stream = _StageProgressStream(stage, progress_queue)
+    try:
+        with redirect_stdout(stream), redirect_stderr(stream):
+            return operation()
+    finally:
+        stream.flush()
+
+
 def _send_terminal(terminal_send: Any, terminal: StageTerminal) -> None:
     try:
         terminal_send.send(terminal)
@@ -197,7 +262,7 @@ def _execute_worker(
         emit_stage_progress(progress_queue, StageProgress(stage, "started"))
         if cancellation_event.is_set():
             raise RuntimeError("cancelled before stage start")
-        metadata = operation()
+        metadata = _run_with_routed_output(stage, progress_queue, operation)
         if cancellation_event.is_set():
             raise RuntimeError("cancelled before checkpoint commit")
         _send_terminal(terminal_send, StageTerminal.succeeded(stage, metadata))
