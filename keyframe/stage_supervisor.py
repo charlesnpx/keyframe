@@ -740,7 +740,7 @@ class StageSupervisor:
             finally:
                 if self.lock is not None:
                     self.lock.release()
-            if isinstance(exc, OSError) and not isinstance(exc, FileExistsError):
+            if isinstance(exc, OSError):
                 raise StageSupervisorError(
                     f"failed to initialize output directory {self.output_dir}: {exc}"
                 ) from exc

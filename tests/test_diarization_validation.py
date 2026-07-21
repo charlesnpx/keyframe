@@ -35,6 +35,27 @@ def test_partition_comparison_tolerates_precision_order_and_label_permutation():
     assert comparison.max_timestamp_delta_seconds == pytest.approx(0.0004)
 
 
+def test_partition_comparison_resolves_ambiguous_simultaneous_speaker_rows():
+    reference = (
+        DiarizationRow(0.0, 1.0, "SPEAKER_00"),
+        DiarizationRow(0.0, 1.0, "SPEAKER_01"),
+        DiarizationRow(1.0, 2.0, "SPEAKER_00"),
+    )
+    candidate = (
+        DiarizationRow(0.0, 1.0, "person-a"),
+        DiarizationRow(0.0, 1.0, "person-b"),
+        DiarizationRow(1.0, 2.0, "person-b"),
+    )
+
+    comparison = compare_diarization_partitions(reference, candidate)
+
+    assert comparison.equivalent
+    assert comparison.label_mapping == (
+        ("person-a", "SPEAKER_01"),
+        ("person-b", "SPEAKER_00"),
+    )
+
+
 @pytest.mark.parametrize(
     ("candidate", "reason"),
     [
@@ -44,7 +65,7 @@ def test_partition_comparison_tolerates_precision_order_and_label_permutation():
                 DiarizationRow(1.25, 2.5, "A"),
                 DiarizationRow(2.5, 4.0, "A"),
             ),
-            "maps to multiple",
+            "speaker partition changed",
         ),
         (
             (

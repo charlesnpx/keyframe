@@ -51,12 +51,35 @@ def _comparison_row(value: DiarizationRow | Mapping[str, Any]) -> DiarizationRow
 def _comparison_rows(
     values: Iterable[DiarizationRow | Mapping[str, Any]],
 ) -> tuple[DiarizationRow, ...]:
-    return tuple(
-        sorted(
-            (_comparison_row(value) for value in values),
-            key=lambda row: (row.start, row.end, row.speaker),
+    return tuple(_comparison_row(value) for value in values)
+
+
+def _speaker_intervals(
+    rows: Iterable[DiarizationRow],
+) -> dict[str, tuple[tuple[float, float], ...]]:
+    grouped: dict[str, list[tuple[float, float]]] = {}
+    for row in rows:
+        grouped.setdefault(row.speaker, []).append((row.start, row.end))
+    return {
+        speaker: tuple(sorted(intervals))
+        for speaker, intervals in grouped.items()
+    }
+
+
+def _interval_delta(
+    reference: tuple[tuple[float, float], ...],
+    candidate: tuple[tuple[float, float], ...],
+) -> float | None:
+    if len(reference) != len(candidate):
+        return None
+    maximum = 0.0
+    for expected, actual in zip(reference, candidate, strict=True):
+        maximum = max(
+            maximum,
+            abs(expected[0] - actual[0]),
+            abs(expected[1] - actual[1]),
         )
-    )
+    return maximum
 
 
 def compare_diarization_partitions(
@@ -108,45 +131,83 @@ def compare_diarization_partitions(
             0.0,
         )
 
-    candidate_to_reference: dict[str, str] = {}
+    reference_speakers = _speaker_intervals(reference_rows)
+    candidate_speakers = _speaker_intervals(candidate_rows)
+    if len(reference_speakers) != len(candidate_speakers):
+        return result(
+            False,
+            (
+                "speaker partition changed from "
+                f"{len(reference_speakers)} to {len(candidate_speakers)} labels"
+            ),
+            {},
+            0.0,
+        )
+
+    edge_deltas: dict[tuple[str, str], float] = {}
+    compatible: dict[str, tuple[str, ...]] = {}
+    for candidate_speaker, candidate_intervals in sorted(candidate_speakers.items()):
+        candidates = []
+        closest_delta: float | None = None
+        for reference_speaker, reference_intervals in sorted(reference_speakers.items()):
+            delta = _interval_delta(reference_intervals, candidate_intervals)
+            if delta is None:
+                continue
+            closest_delta = delta if closest_delta is None else min(closest_delta, delta)
+            if delta <= tolerance:
+                candidates.append(reference_speaker)
+                edge_deltas[(candidate_speaker, reference_speaker)] = delta
+        if not candidates:
+            if closest_delta is None:
+                reason = (
+                    f"speaker {candidate_speaker!r} has a different number of turns"
+                )
+                maximum_delta = 0.0
+            else:
+                reason = (
+                    f"speaker {candidate_speaker!r} boundary changed by at least "
+                    f"{closest_delta:.9f}s (tolerance {tolerance:.9f}s)"
+                )
+                maximum_delta = closest_delta
+            return result(False, reason, {}, maximum_delta)
+        compatible[candidate_speaker] = tuple(candidates)
+
     reference_to_candidate: dict[str, str] = {}
-    maximum_delta = 0.0
-    for index, (expected, actual) in enumerate(
-        zip(reference_rows, candidate_rows, strict=True)
+
+    def assign(candidate_speaker: str, seen: set[str]) -> bool:
+        for reference_speaker in compatible[candidate_speaker]:
+            if reference_speaker in seen:
+                continue
+            seen.add(reference_speaker)
+            previous = reference_to_candidate.get(reference_speaker)
+            if previous is None or assign(previous, seen):
+                reference_to_candidate[reference_speaker] = candidate_speaker
+                return True
+        return False
+
+    for candidate_speaker in sorted(
+        compatible,
+        key=lambda speaker: (len(compatible[speaker]), speaker),
     ):
-        start_delta = abs(expected.start - actual.start)
-        end_delta = abs(expected.end - actual.end)
-        row_delta = max(start_delta, end_delta)
-        maximum_delta = max(maximum_delta, row_delta)
-        if row_delta > tolerance:
+        if not assign(candidate_speaker, set()):
             return result(
                 False,
-                (
-                    f"row {index} boundary changed by {row_delta:.9f}s "
-                    f"(tolerance {tolerance:.9f}s)"
-                ),
-                candidate_to_reference,
-                maximum_delta,
+                "speaker turns do not admit one global bijective label mapping",
+                {},
+                0.0,
             )
 
-        mapped_reference = candidate_to_reference.get(actual.speaker)
-        mapped_candidate = reference_to_candidate.get(expected.speaker)
-        if mapped_reference is not None and mapped_reference != expected.speaker:
-            return result(
-                False,
-                f"candidate speaker {actual.speaker!r} maps to multiple reference speakers",
-                candidate_to_reference,
-                maximum_delta,
-            )
-        if mapped_candidate is not None and mapped_candidate != actual.speaker:
-            return result(
-                False,
-                f"reference speaker {expected.speaker!r} maps to multiple candidate speakers",
-                candidate_to_reference,
-                maximum_delta,
-            )
-        candidate_to_reference[actual.speaker] = expected.speaker
-        reference_to_candidate[expected.speaker] = actual.speaker
+    candidate_to_reference = {
+        candidate_speaker: reference_speaker
+        for reference_speaker, candidate_speaker in reference_to_candidate.items()
+    }
+    maximum_delta = max(
+        (
+            edge_deltas[(candidate_speaker, reference_speaker)]
+            for candidate_speaker, reference_speaker in candidate_to_reference.items()
+        ),
+        default=0.0,
+    )
 
     return result(
         True,

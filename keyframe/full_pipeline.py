@@ -23,6 +23,7 @@ from keyframe.transcript_cli import (
     TranscriptPreflight,
     TranscriptRunResult,
     _final_output_paths,
+    _final_output_staging_root,
     _print_preflight,
     _print_schedule,
     _print_transcript_result,
@@ -308,7 +309,12 @@ def run_supervised_full_pipeline(
             transcript._print_speaker_detection_failure(exc)
 
     try:
-        _write_final_outputs(segments, output_paths, config.fmt)
+        _write_final_outputs(
+            segments,
+            output_paths,
+            config.fmt,
+            staging_root=_final_output_staging_root(supervisor),
+        )
     except BaseException as exc:
         if frame_error is not None:
             exc.add_note(
