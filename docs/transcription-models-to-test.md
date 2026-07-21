@@ -93,7 +93,9 @@ physical-page `vm_stat` fallback and no swap. CPU transcription and CPU
 diarization additionally require at least four CPUs. MLX transcription, MPS
 diarization, and MPS frames all claim the same Apple accelerator and remain
 serialized. Existing CPU-diarization overlap remains available, and an MPS to
-CPU fallback receives a fresh admission decision before frame work starts.
+CPU fallback receives a fresh admission decision. If an MPS attempt fails while
+independent CPU frame work is already running, the CPU retry starts after those
+frames instead of aborting the extraction.
 Diarization remains holistic; Keyframe does not split recordings or reconcile
 per-chunk speaker identities.
 
@@ -102,9 +104,9 @@ expressions:
 `max(T + F, D) + M + E`, `max(T, D) + F + M + E`,
 `T + max(D, F) + M + E`, `T + D + F + M + E`, and
 `T + F + M + E`. `T`, `D`, and `F` are the stage intervals, `M` is transcript
-merge/output, and `E` is frame-manifest enrichment/promotion. Six additional
-expressions introduce `R` for a failed MPS attempt and distinguish serial from
-overlapping CPU fallback and frame work.
+merge/output, and `E` is frame-manifest enrichment/promotion. Ten additional
+expressions introduce `R` for a failed MPS attempt, including late failures
+that overlap independent CPU frame work before the CPU retry begins.
 
 ### MPS diarization spike: 2026-07-21
 

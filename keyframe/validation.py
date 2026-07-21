@@ -198,6 +198,10 @@ CRITICAL_PATH_EXPRESSIONS = frozenset(
         "max(T, R) + F + M + E",
         "max(T, R) + max(D, F) + M + E",
         "max(T, R) + D + F + M + E",
+        "T + max(R, F) + M + E",
+        "T + max(R, F) + D + M + E",
+        "max(T + F, R) + M + E",
+        "max(T + F, R) + D + M + E",
     }
 )
 
@@ -259,6 +263,18 @@ def expected_critical_path_seconds(
         assert diarization is not None
         return transcription + diarization + frames + merge + enrichment
     assert retry is not None
+    if expression.startswith("T + max(R, F)"):
+        value = transcription + max(retry, frames)
+        if " D " in expression:
+            assert diarization is not None
+            value += diarization
+        return value + merge + enrichment
+    if expression.startswith("max(T + F, R)"):
+        value = max(transcription + frames, retry)
+        if " D " in expression:
+            assert diarization is not None
+            value += diarization
+        return value + merge + enrichment
     prefix = (
         max(transcription, retry)
         if expression.startswith("max(T, R)")

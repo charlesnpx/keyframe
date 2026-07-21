@@ -68,6 +68,7 @@ MAX_PROCESS_TREE_RSS_GIB = 6.60
 MAX_MLX_ALLOCATOR_PEAK_GIB = 5.96
 MAX_LOCAL_MODEL_RESOLUTION_SECONDS = 1.0
 MAX_MPS_DIARIZATION_SECONDS = 335.0
+APPLE_ACCELERATOR_SERIAL_REASON = "stages share exclusive accelerator apple:0"
 EXPECTED_RUNTIME_PACKAGES = {
     "keyframe": "0.6.2",
     "mlx": "0.32.0",
@@ -94,9 +95,11 @@ CANDIDATE_CONTRACT = {
     "schedule_policy": "auto",
     "schedule_mode": "serial",
     "schedule_source": "macos-memory-pressure",
+    "schedule_reason": APPLE_ACCELERATOR_SERIAL_REASON,
     "frame_schedule_policy": "auto",
     "frame_schedule_mode": "serial",
     "frame_schedule_source": "macos-memory-pressure",
+    "frame_schedule_reason": APPLE_ACCELERATOR_SERIAL_REASON,
     "fallback_used": False,
     "fallback_waited_for_diarization": False,
     "model_resolution_source": "local-hit",
@@ -260,6 +263,11 @@ def _run_candidate_case(request: _CaseRequest) -> dict[str, Any]:
         if schedule.resources.source != "macos-memory-pressure":
             raise BenchmarkError(
                 f"the {label} automatic schedule did not use macOS pressure evidence"
+            )
+        if schedule.reason != APPLE_ACCELERATOR_SERIAL_REASON:
+            raise BenchmarkError(
+                f"the {label} automatic schedule did not serialize because of "
+                "the shared Apple accelerator"
             )
     if result.transcript.fallback_used:
         raise BenchmarkError("the release candidate fell back from pinned MLX")

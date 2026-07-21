@@ -694,6 +694,64 @@ def test_initial_wave_mps_failure_uses_max_t_r_retry_critical_path(tmp_path):
     assert result.critical_path == "max(T, R) + max(D, F) + M + E"
 
 
+def test_mps_failure_during_cpu_frames_retries_cpu_after_frames(tmp_path):
+    events = []
+    output = tmp_path / "out"
+    preflight = _preflight(
+        runtime=transcript.RuntimePlatform("Darwin", "arm64", 13, 22),
+        backend="whisper",
+        requested_backend="whisper",
+        transcription_device="cpu",
+        diarization_device="mps",
+        requested_diarization_device="auto",
+    )
+    supervisor = _FakeSupervisor(
+        output,
+        events,
+        effective_backend="whisper",
+        fail_first_mps=True,
+    )
+    frame_device = resolve_frame_device(preflight)
+
+    result = run_supervised_full_pipeline(
+        tmp_path / "recording.mp4",
+        output,
+        preflight,
+        supervisor=supervisor,
+        frame_device=frame_device,
+        frame_runner=_frame_runner(supervisor, output, events),
+        scheduler=_scheduler(),
+    )
+
+    names = _event_names(events)
+    starts = [
+        detail for name, detail in events if name == "start-diarization"
+    ]
+    start_indices = [
+        index for index, name in enumerate(names) if name == "start-diarization"
+    ]
+    assert frame_device == "cpu"
+    assert [start["device"] for start in starts] == ["mps", "cpu"]
+    assert names.index("finish-frames") < start_indices[-1]
+    assert result.diarization_attempted_devices == ("mps", "cpu")
+    assert result.diarization_fallback_used
+    assert result.frame_schedule.parallel
+    assert result.transcript.diarization_fallback_schedule is not None
+    assert tuple(
+        stage.stage
+        for stage in result.transcript.diarization_fallback_schedule.stages
+    ) == ("diarization",)
+    assert result.transcript.diarization_fallback_schedule.stages[0].device == "cpu"
+    assert result.critical_path == "max(T + F, R) + D + M + E"
+    assert result.pipeline_evidence.interval("diarization_retry").overlaps(
+        result.pipeline_evidence.interval("frames")
+    )
+    assert not result.pipeline_evidence.interval("diarization").overlaps(
+        result.pipeline_evidence.interval("frames")
+    )
+    assert result.transcript.segments[0].speaker == "SPEAKER_00"
+
+
 def test_empty_transcript_does_not_retry_an_already_failed_mps_worker(tmp_path):
     events = []
     output = tmp_path / "out"

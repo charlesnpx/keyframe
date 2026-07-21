@@ -911,10 +911,12 @@ _MPS_NON_COMPUTE_FAILURE_MARKERS = (
     "authoriz",
     "checkpoint",
     "codec",
+    "credential",
     "data shape",
     "decod",
     "download",
     "ffmpeg",
+    "fetch",
     "forbidden",
     "gated",
     "hf token",
@@ -922,18 +924,36 @@ _MPS_NON_COMPUTE_FAILURE_MARKERS = (
     "hugging face",
     "invalid shape",
     "malformed shape",
+    "network",
     "protocol",
     "repository",
     "revision",
     "shape mismatch",
+    "size mismatch",
+    "tensor size",
     "tensor shape",
     "timestamp",
     "unauthorized",
 )
 _MPS_COMPUTE_FAILURE_PATTERNS = (
-    re.compile(r"\bmps\b"),
-    re.compile(r"\bmpsgraph\b"),
-    re.compile(r"\bmetal\b"),
+    re.compile(
+        r"\bmps(?:graph)?\s+(?:allocator|backend|command buffer|device|"
+        r"execution|graph|kernel|operation|operator)\b"
+    ),
+    re.compile(
+        r"\b(?:allocator|backend|command buffer|device|execution|graph|kernel|"
+        r"operation|operator)\b[^\n]*\bmps(?:graph)?\b"
+    ),
+    re.compile(
+        r"\bmetal\s+(?:allocator|backend|command buffer|device|kernel|library|"
+        r"performance shaders|pipeline|resource)\b"
+    ),
+    re.compile(r"\bmps\b[^\n]*\b(?:oom|out of memory)\b"),
+    re.compile(
+        r"\bmps\b[^\n]*\b(?:does not support|not implemented|not supported|"
+        r"unsupported)\b"
+    ),
+    re.compile(r"\bmpsndarray\b"),
 )
 
 
@@ -945,6 +965,8 @@ def _is_mps_compute_failure(exc: BaseException) -> bool:
     message = " ".join(str(exc).lower().split())
     if any(marker in message for marker in _MPS_NON_COMPUTE_FAILURE_MARKERS):
         return False
+    if isinstance(exc, MemoryError):
+        return True
     return (
         any(pattern.search(message) for pattern in _MPS_COMPUTE_FAILURE_PATTERNS)
         or "placeholder storage" in message
@@ -1229,8 +1251,10 @@ def _detect_speakers(
     video: Path,
     hf_token: str,
     *,
-    device: str = "auto",
+    device: str = "cpu",
 ) -> tuple[DiarizationRow, ...]:
+    """Detect speakers; supervised CLI workers pass their resolved device."""
+
     with _condense_expected_pyannote_warnings():
         import whisperx
         from whisperx.diarize import DiarizationPipeline

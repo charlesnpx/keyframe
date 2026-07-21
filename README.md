@@ -207,8 +207,10 @@ with physical memory from `sysctl`; a bounded `vm_stat` calculation is the
 fallback, and swap is never counted. MLX transcription, MPS diarization, and
 MPS frame extraction all share the Apple accelerator and therefore run
 serially. A full run makes a fresh scheduling decision after transcription and
-again before any CPU diarization fallback, so CPU diarization can still overlap
-MPS/CUDA frames when current pressure admits it. `parallel` may override
+again before any CPU diarization fallback. CPU diarization can overlap
+MPS/CUDA frames when current pressure admits it; if MPS fails while independent
+CPU frame work is already running, the CPU retry starts after those frames.
+`parallel` may override
 CPU-count and memory admission with a warning, but never shared-accelerator
 exclusion.
 
@@ -219,8 +221,8 @@ five full-run critical paths:
 `T + F + M + E`. Here `T`, `D`, and `F` are transcription, diarization, and
 frame intervals; `M` is speaker merge/output writing and `E` is manifest
 enrichment/promotion. A failed MPS attempt is represented separately as `R`;
-six retry-aware expressions distinguish whether that attempt overlaps
-transcription and whether CPU diarization overlaps frames. The scheduler derives
+ten retry-aware expressions also cover a failed MPS attempt overlapping CPU
+frames before the CPU retry begins. The scheduler derives
 the expression from recorded stage intervals rather than inferring overlap from
 launch intent.
 

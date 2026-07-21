@@ -293,8 +293,6 @@ def critical_path_from_pipeline_evidence(
                 )
             prefix = "T + R"
             retry_barrier = retry_interval.ended_at
-        if frame_interval.started_at < retry_barrier:
-            raise RuntimeError("frames started before the failed MPS attempt settled")
         if diarization_interval is not None:
             if diarization_interval.launch_wave != "post-transcription":
                 raise RuntimeError("CPU diarization retry has an invalid launch wave")
@@ -302,6 +300,31 @@ def critical_path_from_pipeline_evidence(
                 raise RuntimeError(
                     "CPU diarization retry started before the MPS attempt settled"
                 )
+        retry_overlapped_frames = frame_interval.started_at < retry_barrier
+        if retry_overlapped_frames:
+            if not retry_interval.overlaps(frame_interval):
+                raise RuntimeError(
+                    "frames started before the failed MPS attempt without overlap"
+                )
+            if (
+                diarization_interval is not None
+                and diarization_interval.outcome != "cancelled"
+                and diarization_interval.started_at < frame_interval.ended_at
+            ):
+                raise RuntimeError(
+                    "late CPU diarization retry started before frame work settled"
+                )
+            late_prefix = (
+                "max(T + F, R)"
+                if retry_interval.launch_wave == "initial"
+                else "T + max(R, F)"
+            )
+            if (
+                diarization_interval is None
+                or diarization_interval.outcome == "cancelled"
+            ):
+                return f"{late_prefix} + M + E"
+            return f"{late_prefix} + D + M + E"
         if (
             diarization_interval is None
             or diarization_interval.outcome == "cancelled"
@@ -747,6 +770,18 @@ def run_supervised_full_pipeline(
         raise
 
     if diarization_handle is not None and not diarization_settled:
+        settle_diarization()
+
+    if diarization_retry_pending:
+        if diarization_stage is None or diarization_stage.device != "cpu":
+            raise RuntimeError("automatic diarization retry did not select CPU")
+        diarization_fallback_schedule = scheduler.decide((diarization_stage,))
+        print("CPU diarization fallback admission after frame work:")
+        _print_schedule(diarization_fallback_schedule)
+        start_diarization(
+            diarization_fallback_schedule,
+            "post-transcription",
+        )
         settle_diarization()
 
     pipeline_evidence = evidence_builder.snapshot()

@@ -364,12 +364,18 @@ def test_detect_speakers_uses_only_whisperx_audio_and_pyannote(monkeypatch, tmp_
         ),
     )
     monkeypatch.setitem(sys.modules, "faster_whisper", fake_faster_whisper)
-    monkeypatch.setattr(transcript, "_select_whisperx_device", lambda: ("cpu", "int8"))
+    monkeypatch.setattr(
+        transcript,
+        "_select_whisperx_device",
+        lambda requested: calls.append(("select_device", requested))
+        or ("cpu", "int8"),
+    )
 
     rows = transcript._detect_speakers(video, "hf_test")
 
     assert rows == (transcript.DiarizationRow(0, 1, "SPEAKER_00"),)
     assert calls == [
+        ("select_device", "cpu"),
         ("load_audio", str(video)),
         ("diarization_init", "pyannote/speaker-diarization-community-1", "hf_test", "cpu"),
         ("diarize", "audio"),
@@ -413,7 +419,11 @@ def test_detect_speakers_reports_monotonic_progress_and_closes_bar(monkeypatch, 
         SimpleNamespace(DiarizationPipeline=FakeDiarizationPipeline),
     )
     monkeypatch.setitem(sys.modules, "tqdm", SimpleNamespace(tqdm=FakeProgress))
-    monkeypatch.setattr(transcript, "_select_whisperx_device", lambda: ("cpu", "int8"))
+    monkeypatch.setattr(
+        transcript,
+        "_select_whisperx_device",
+        lambda _requested: ("cpu", "int8"),
+    )
 
     rows = transcript._detect_speakers(video, "hf_test")
 
@@ -438,6 +448,26 @@ def test_detect_speakers_reports_monotonic_progress_and_closes_bar(monkeypatch, 
         (
             "infer",
             RuntimeError("MPS backend connection lost"),
+            transcript.MPSDiarizationInferenceError,
+        ),
+        (
+            "infer",
+            RuntimeError("MPSGraph execution failed"),
+            transcript.MPSDiarizationInferenceError,
+        ),
+        (
+            "infer",
+            RuntimeError("Metal command buffer failed"),
+            transcript.MPSDiarizationInferenceError,
+        ),
+        (
+            "infer",
+            RuntimeError("invalid buffer size"),
+            transcript.MPSDiarizationInferenceError,
+        ),
+        (
+            "infer",
+            NotImplementedError("MPS does not support this operator"),
             transcript.MPSDiarizationInferenceError,
         ),
         ("init", RuntimeError("checkpoint protocol mismatch"), RuntimeError),
@@ -469,6 +499,21 @@ def test_detect_speakers_reports_monotonic_progress_and_closes_bar(monkeypatch, 
         (
             "infer",
             RuntimeError("MPS audio decoding failed"),
+            RuntimeError,
+        ),
+        (
+            "infer",
+            RuntimeError("MPS tensor size mismatch"),
+            RuntimeError,
+        ),
+        (
+            "init",
+            RuntimeError("MPS invalid credentials"),
+            RuntimeError,
+        ),
+        (
+            "init",
+            RuntimeError("MPS network timeout while fetching model"),
             RuntimeError,
         ),
         ("init", ValueError("gated model"), ValueError),

@@ -174,6 +174,12 @@ def test_release_contracts_compare_cpu_reference_to_mps_candidate():
     assert benchmark.CANDIDATE_CONTRACT[
         "pytorch_mps_fallback_enabled"
     ] is False
+    assert benchmark.CANDIDATE_CONTRACT["schedule_reason"] == (
+        benchmark.APPLE_ACCELERATOR_SERIAL_REASON
+    )
+    assert benchmark.CANDIDATE_CONTRACT["frame_schedule_reason"] == (
+        benchmark.APPLE_ACCELERATOR_SERIAL_REASON
+    )
 
 
 def _set_process_tree_peak(report: dict, gibibytes: float) -> None:
@@ -256,6 +262,10 @@ def test_transcript_quality_rejects_invalid_rows_and_ngram_size():
         ("max(T, R) + F + M + E", 16.0),
         ("max(T, R) + max(D, F) + M + E", 33.0),
         ("max(T, R) + D + F + M + E", 36.0),
+        ("T + max(R, F) + M + E", 17.0),
+        ("T + max(R, F) + D + M + E", 37.0),
+        ("max(T + F, R) + M + E", 16.0),
+        ("max(T + F, R) + D + M + E", 36.0),
     ],
 )
 def test_expected_critical_path_supports_each_release_schedule(expression, expected):
@@ -670,6 +680,92 @@ def test_report_evaluation_passes_and_records_critical_path(tmp_path):
             "max(T, R) + F + M + E",
             7.0,
         ),
+        (
+            {
+                "transcription": _stage_interval(
+                    "transcription", "initial", 0.0, 2.0
+                ),
+                "diarization_retry": _stage_interval(
+                    "diarization_retry",
+                    "post-transcription",
+                    2.0,
+                    5.0,
+                    outcome="failed",
+                ),
+                "frames": _stage_interval(
+                    "frames", "post-transcription", 2.0, 6.0
+                ),
+            },
+            False,
+            "T + max(R, F) + M + E",
+            7.0,
+        ),
+        (
+            {
+                "transcription": _stage_interval(
+                    "transcription", "initial", 0.0, 2.0
+                ),
+                "diarization_retry": _stage_interval(
+                    "diarization_retry",
+                    "post-transcription",
+                    2.0,
+                    5.0,
+                    outcome="failed",
+                ),
+                "frames": _stage_interval(
+                    "frames", "post-transcription", 2.0, 6.0
+                ),
+                "diarization": _stage_interval(
+                    "diarization", "post-transcription", 6.0, 8.0
+                ),
+            },
+            False,
+            "T + max(R, F) + D + M + E",
+            9.0,
+        ),
+        (
+            {
+                "transcription": _stage_interval(
+                    "transcription", "initial", 0.0, 2.0
+                ),
+                "diarization_retry": _stage_interval(
+                    "diarization_retry",
+                    "initial",
+                    0.0,
+                    5.0,
+                    outcome="failed",
+                ),
+                "frames": _stage_interval(
+                    "frames", "post-transcription", 2.0, 6.0
+                ),
+            },
+            False,
+            "max(T + F, R) + M + E",
+            7.0,
+        ),
+        (
+            {
+                "transcription": _stage_interval(
+                    "transcription", "initial", 0.0, 2.0
+                ),
+                "diarization_retry": _stage_interval(
+                    "diarization_retry",
+                    "initial",
+                    0.0,
+                    5.0,
+                    outcome="failed",
+                ),
+                "frames": _stage_interval(
+                    "frames", "post-transcription", 2.0, 6.0
+                ),
+                "diarization": _stage_interval(
+                    "diarization", "post-transcription", 6.0, 8.0
+                ),
+            },
+            False,
+            "max(T + F, R) + D + M + E",
+            9.0,
+        ),
     ],
 )
 def test_reported_evidence_derives_each_supported_critical_path(
@@ -848,9 +944,21 @@ def test_report_evaluation_rejects_inconsistent_reliable_topology(
         ),
         (
             lambda report: report["candidate"].update(
+                schedule_reason="memory admission failed"
+            ),
+            "candidate schedule_reason",
+        ),
+        (
+            lambda report: report["candidate"].update(
                 frame_schedule_source="macos-vm-stat"
             ),
             "candidate frame_schedule_source",
+        ),
+        (
+            lambda report: report["candidate"].update(
+                frame_schedule_reason="memory admission failed"
+            ),
+            "candidate frame_schedule_reason",
         ),
         (
             lambda report: report["candidate"].update(wall_time_seconds=800.0),
@@ -1323,9 +1431,13 @@ def test_candidate_case_uses_and_verifies_automatic_apple_scheduling(
     assert result["schedule_policy"] == "auto"
     assert result["schedule_mode"] == "serial"
     assert result["schedule_source"] == "macos-memory-pressure"
+    assert result["schedule_reason"] == benchmark.APPLE_ACCELERATOR_SERIAL_REASON
     assert result["frame_schedule_policy"] == "auto"
     assert result["frame_schedule_mode"] == "serial"
     assert result["frame_schedule_source"] == "macos-memory-pressure"
+    assert result["frame_schedule_reason"] == (
+        benchmark.APPLE_ACCELERATOR_SERIAL_REASON
+    )
     assert result["model_resolution_source"] == "local-hit"
     assert result["model_resolution_seconds"] == pytest.approx(0.125)
     assert result["mlx_peak_memory_bytes"] == 123456789
