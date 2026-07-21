@@ -763,6 +763,7 @@ def extract_keyframes(
     config: KeyframeExtractionConfig | None = None,
     *,
     trace_sink: TraceSink | None = None,
+    report_output_dir: str | Path | None = None,
 ) -> KeyframeExtractionResult:
     """Run the shared key-frame extraction pipeline and write frame artifacts."""
     from keyframe.frames import ModelPreloader
@@ -878,13 +879,16 @@ def extract_keyframes(
         print(f"Frame extraction done in {elapsed:.1f}s")
         print(f"Pass 1: {sampling.samples.sample_count} sampled -> {post_rescue_candidate_count} CLIP candidates")
         print(f"Pass 2: {post_rescue_candidate_count} captioned -> {len(final)} final frames")
-        print(f"Saved to: {Path(output_dir).resolve()}")
-        print(f"Caption log: {artifacts.caption_log_path}")
-        print(f"Manifest: {artifacts.manifest_path}")
-        if pipeline_trace_path:
-            print(f"Pipeline trace: {pipeline_trace_path}")
-        if debug_qa_trace_path:
-            print(f"Debug QA trace: {debug_qa_trace_path}")
+        if report_output_dir is None:
+            print(f"Saved to: {output_dir.resolve()}")
+            print(f"Caption log: {artifacts.caption_log_path}")
+            print(f"Manifest: {artifacts.manifest_path}")
+            if pipeline_trace_path:
+                print(f"Pipeline trace: {pipeline_trace_path}")
+            if debug_qa_trace_path:
+                print(f"Debug QA trace: {debug_qa_trace_path}")
+        else:
+            print("Frame generation staged; awaiting validation and promotion.")
 
         return KeyframeExtractionResult(
             final=final,

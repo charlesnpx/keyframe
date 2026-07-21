@@ -18,6 +18,7 @@ import shutil
 import sys
 import time
 import tomllib
+from contextlib import nullcontext
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 
@@ -170,96 +171,206 @@ def _resolve_out_dir(video: Path, output: str | None) -> Path:
         return fallback
 
 
+def _transcript_config(args):
+    from keyframe.transcript_cli import TranscriptRunConfig
+
+    return TranscriptRunConfig(
+        model_name=args.whisper_model,
+        fmt=args.transcript_format,
+        transcription_backend=getattr(args, "transcription_backend", "auto"),
+        diarization_device=getattr(args, "diarization_device", "auto"),
+        stage_concurrency=getattr(args, "stage_concurrency", "auto"),
+        speaker_detection=not bool(getattr(args, "no_speaker_detection", False)),
+    )
+
+
+def _preflight_transcript(args):
+    from keyframe.transcript_cli import preflight_transcript_run
+
+    return preflight_transcript_run(_transcript_config(args))
+
+
+def _run_transcript(video: Path, out_dir: Path, preflight, *, supervisor=None):
+    from keyframe.transcript_cli import run_supervised_transcript
+
+    if supervisor is None:
+        return run_supervised_transcript(video, out_dir, preflight)
+    return run_supervised_transcript(
+        video,
+        out_dir,
+        preflight,
+        supervisor=supervisor,
+    )
+
+
+def _frame_config(args, *, device: str | None = None):
+    from keyframe.pipeline import KeyframeExtractionConfig
+
+    return KeyframeExtractionConfig(
+        sample_interval=args.sample_interval,
+        pass1_clusters=args.pass1_clusters,
+        similarity_threshold=args.similarity_threshold,
+        device=device,
+        max_output_frames=getattr(args, "max_output_frames", None),
+        max_clustering_memory_mb=getattr(args, "max_clustering_memory_mb", 2048),
+        max_frame_cache_mb=getattr(args, "max_frame_cache_mb", 8192),
+        frame_cache_dir=(
+            Path(args.frame_cache_dir)
+            if getattr(args, "frame_cache_dir", None)
+            else None
+        ),
+        verbose_trace=bool(getattr(args, "verbose_trace", False)),
+        debug_qa_targets_path=(
+            Path(args.debug_qa_targets)
+            if getattr(args, "debug_qa_targets", None)
+            else None
+        ),
+    )
+
+
+def _run_frame_generation(
+    video: Path,
+    out_dir: Path,
+    args,
+    session,
+    *,
+    frame_device: str | None = None,
+):
+    from keyframe.frame_generation import StagedFrameGeneration
+    from keyframe.pipeline import extract_keyframes
+
+    if session.staging is None:
+        raise RuntimeError("frame generation session did not initialize staging paths")
+    result = extract_keyframes(
+        video,
+        session.staging.frames,
+        _frame_config(args, device=frame_device),
+        report_output_dir=out_dir / "frames",
+    )
+    return StagedFrameGeneration.from_extraction(session, result)
+
+
+def _run_full_pipeline(video: Path, out_dir: Path, args, preflight, supervisor):
+    from keyframe.full_pipeline import (
+        resolve_frame_device,
+        run_supervised_full_pipeline,
+    )
+
+    frame_device = resolve_frame_device(preflight)
+    return run_supervised_full_pipeline(
+        video,
+        out_dir,
+        preflight,
+        supervisor=supervisor,
+        frame_device=frame_device,
+        frame_runner=lambda: _run_frame_generation(
+            video,
+            out_dir,
+            args,
+            supervisor,
+            frame_device=frame_device,
+        ),
+    )
+
+
+def _frame_session(out_dir: Path, *, with_transcript: bool):
+    if with_transcript:
+        from keyframe.stage_supervisor import StageSupervisor
+        from keyframe.transcript_cli import print_stage_progress
+
+        return StageSupervisor(
+            out_dir,
+            progress_callback=print_stage_progress,
+        )
+    from keyframe.frame_generation import FrameGenerationSession
+
+    return FrameGenerationSession(out_dir)
+
+
+def _print_frame_result(result) -> None:
+    print(f"\n  {result.final_frame_count} key frames")
+    print(f"  Saved to: {result.output_dir.resolve()}")
+
+
 def cmd_extract(args):
     video = Path(args.video)
     if not video.exists():
         print(f"Error: file not found: {args.video}", file=sys.stderr)
         sys.exit(1)
 
-    out_dir = _resolve_out_dir(video, args.output)
+    do_frames = not args.transcript_only
+    do_transcript = not args.frames_only
+    transcript_preflight = None
+    if do_transcript:
+        from keyframe.transcript import TranscriptionError
+
+        try:
+            transcript_preflight = _preflight_transcript(args)
+        except (ValueError, TranscriptionError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            raise SystemExit(2) from None
+
+    try:
+        out_dir = _resolve_out_dir(video, args.output)
+    except OSError as exc:
+        print(f"Error: could not create output directory: {exc}", file=sys.stderr)
+        raise SystemExit(1) from None
     print(f"Output: {out_dir.resolve()}\n")
 
     t0 = time.time()
-    do_frames = not args.transcript_only
-    do_transcript = not args.frames_only
-    manifest_frames = None
-    manifest_dir = None
-    manifest_run_metadata = None
+    session_context = (
+        _frame_session(out_dir, with_transcript=do_transcript)
+        if do_frames
+        else nullcontext(None)
+    )
+    from keyframe.output_session import OutputSessionError
 
-    # ── Key frames ──────────────────────────────────────────────────────
-    if do_frames:
-        print("=" * 60)
-        print("KEY FRAME EXTRACTION")
-        print("=" * 60)
-
-        frames_dir = out_dir / "frames"
-        from keyframe.pipeline import KeyframeExtractionConfig, extract_keyframes
-
-        result = extract_keyframes(
-            video,
-            frames_dir,
-            KeyframeExtractionConfig(
-                sample_interval=args.sample_interval,
-                pass1_clusters=args.pass1_clusters,
-                similarity_threshold=args.similarity_threshold,
-                max_output_frames=getattr(args, "max_output_frames", None),
-                max_clustering_memory_mb=getattr(args, "max_clustering_memory_mb", 2048),
-                max_frame_cache_mb=getattr(args, "max_frame_cache_mb", 8192),
-                frame_cache_dir=(
-                    Path(args.frame_cache_dir)
-                    if getattr(args, "frame_cache_dir", None)
-                    else None
-                ),
-                verbose_trace=bool(getattr(args, "verbose_trace", False)),
-                debug_qa_targets_path=(
-                    Path(args.debug_qa_targets)
-                    if getattr(args, "debug_qa_targets", None)
-                    else None
-                ),
-            ),
-        )
-        manifest_frames = result.final
-        manifest_dir = frames_dir
-        manifest_run_metadata = result.manifest_metadata
-
-        print(f"\n  {result.final_frame_count} key frames")
-        print(f"  Saved to: {frames_dir.resolve()}")
-
-    # ── Transcript ──────────────────────────────────────────────────────
-    if do_transcript:
-        print(f"\n{'=' * 60}")
-        print("TRANSCRIPT EXTRACTION")
-        print("=" * 60)
-
-        from keyframe.transcript import extract_transcript, write_json
-
-        transcript_path = out_dir / f"transcript.{args.transcript_format}"
-        segments, language = extract_transcript(
-            video_path=str(video),
-            model_name=args.whisper_model,
-            output=str(transcript_path),
-            fmt=args.transcript_format,
-            speaker_detection=not bool(getattr(args, "no_speaker_detection", False)),
-        )
-
-        if args.transcript_format != "json":
-            json_path = out_dir / "transcript.json"
-            write_json(segments, str(json_path))
-
-        if manifest_frames is not None and manifest_dir is not None:
-            from keyframe.manifest import write_manifest
-            from keyframe.pipeline.contracts import CandidateRecord, candidate_to_manifest_row
-
-            manifest_rows = [
-                candidate_to_manifest_row(
-                    frame,
-                    filename=f"frame_{frame.frame_idx:06d}_{frame.timestamp:.2f}s.png",
+    try:
+        with session_context as session:
+            if do_frames and do_transcript:
+                print("=" * 60)
+                print("FULL EXTRACTION")
+                print("=" * 60)
+                if session is None:
+                    raise RuntimeError("full extraction session was not initialized")
+                if transcript_preflight is None:
+                    raise RuntimeError("transcript preflight was not initialized")
+                full_result = _run_full_pipeline(
+                    video,
+                    out_dir,
+                    args,
+                    transcript_preflight,
+                    session,
                 )
-                if isinstance(frame, CandidateRecord)
-                else dict(frame)
-                for frame in manifest_frames
-            ]
-            write_manifest(manifest_rows, manifest_dir, segments, metadata=manifest_run_metadata)
+                _print_frame_result(full_result.frames)
+            elif do_frames:
+                print("=" * 60)
+                print("KEY FRAME EXTRACTION")
+                print("=" * 60)
+                if session is None:
+                    raise RuntimeError("frame generation session was not initialized")
+                frame_generation = _run_frame_generation(
+                    video,
+                    out_dir,
+                    args,
+                    session,
+                )
+                _print_frame_result(frame_generation.promote())
+            elif do_transcript:
+                print(f"\n{'=' * 60}")
+                print("TRANSCRIPT EXTRACTION")
+                print("=" * 60)
+
+                if transcript_preflight is None:
+                    raise RuntimeError("transcript preflight was not initialized")
+                _run_transcript(
+                    video,
+                    out_dir,
+                    transcript_preflight,
+                )
+    except OutputSessionError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from None
 
     # ── Summary ─────────────────────────────────────────────────────────
     elapsed = time.time() - t0
@@ -268,12 +379,38 @@ def cmd_extract(args):
     print(f"Output: {out_dir.resolve()}")
 
     files = sorted(out_dir.rglob("*"))
-    files = [f for f in files if f.is_file()]
+    files = [
+        f
+        for f in files
+        if f.is_file() and f.name != "keyframe-output.lock"
+    ]
     print(f"\nFiles ({len(files)}):")
     for f in files:
         rel = f.relative_to(out_dir)
         size_kb = f.stat().st_size / 1024
         print(f"  {rel}  ({size_kb:.0f} KB)")
+
+
+def _build_extract_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="keyframe",
+        description="Extract key frames and transcripts from video files.\n\n"
+                    "Usage:\n"
+                    "  keyframe video.mp4\n"
+                    "  keyframe extract video.mp4\n"
+                    "  keyframe video.mp4 -o ./output\n"
+                    "  keyframe install-skills",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _add_extract_args(parser)
+    return parser
+
+
+def _parse_extract_args(argv):
+    argv = list(argv)
+    if argv and argv[0] == "extract":
+        argv = argv[1:]
+    return _build_extract_parser().parse_args(argv)
 
 
 def main():
@@ -290,18 +427,12 @@ def main():
         cmd_install_skills(parser.parse_args(sys.argv[2:]))
         return
 
-    # Everything else is extract mode
-    parser = argparse.ArgumentParser(
-        prog="keyframe",
-        description="Extract key frames and transcripts from video files.\n\n"
-                    "Usage:\n"
-                    "  keyframe video.mp4\n"
-                    "  keyframe video.mp4 -o ./output\n"
-                    "  keyframe install-skills",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    _add_extract_args(parser)
-    args = parser.parse_args()
+    # Direct extraction and the explicit `extract` alias share one parser.
+    parser = _build_extract_parser()
+    argv = sys.argv[1:]
+    if argv and argv[0] == "extract":
+        argv = argv[1:]
+    args = parser.parse_args(argv)
 
     if not args.video:
         parser.print_help()
@@ -346,8 +477,17 @@ def _add_extract_args(parser):
     parser.add_argument("--transcript-format", default="txt",
                         choices=["txt", "srt", "vtt", "json"],
                         help="Transcript format (default: txt)")
+    parser.add_argument("--transcription-backend", default="auto",
+                        choices=["auto", "mlx", "whisper"],
+                        help="Transcription backend (default: auto)")
+    parser.add_argument("--diarization-device", default="auto",
+                        choices=["auto", "cpu", "cuda"],
+                        help="Speaker-detection device (default: auto)")
+    parser.add_argument("--stage-concurrency", default="auto",
+                        choices=["auto", "serial", "parallel"],
+                        help="Transcript-stage concurrency policy (default: auto)")
     parser.add_argument("--no-speaker-detection", action="store_true",
-                        help="Use Whisper-only transcription even when HF_TOKEN is set")
+                        help="Skip pyannote speaker detection even when HF_TOKEN is set")
 
 
 if __name__ == "__main__":

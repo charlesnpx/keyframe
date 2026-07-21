@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "recording": {
+    "description": "16 minute 28.75 second English meeting benchmark",
+    "duration_seconds": 988.75,
+    "language": "en"
+  },
+  "model": {
+    "size": "medium",
+    "mlx_repository": "mlx-community/whisper-medium-mlx",
+    "mlx_revision": "7fc08c4eac4c316526498f147dfdee6f6303f975",
+    "mlx_model_sha256": "10b597c2bcb1bcc38b2d3d24cd4f0885f461a7cd70e8444d6ad5a763ece549ea"
+  },
+  "runs": {
+    "whisper_cpu_fp32": {
+      "wall_time_seconds": 225.43,
+      "real_time_factor": 0.2280,
+      "segment_count": 275,
+      "normalized_word_count": 2513,
+      "peak_memory_gib": 5.87,
+      "maximum_resident_set_gib": 5.88
+    },
+    "whisper_mps_fp32": {
+      "wall_time_seconds": 205.09,
+      "segment_count": 131,
+      "normalized_word_count": 2581,
+      "peak_memory_gib": 12.03,
+      "normalized_word_error_rate_vs_cpu": 0.1000,
+      "accepted": false
+    },
+    "mlx_whisper": {
+      "package_version": "0.4.3",
+      "wall_time_seconds": 75.38,
+      "real_time_factor": 0.0762,
+      "segment_count": 273,
+      "normalized_word_count": 2515,
+      "peak_memory_gib": 5.41,
+      "maximum_resident_set_gib": 1.90,
+      "normalized_word_agreement_vs_cpu": 0.99443,
+      "normalized_word_edit_distance_vs_cpu": 21,
+      "normalized_word_error_rate_vs_cpu": 0.00836,
+      "character_agreement_vs_cpu": 0.99532,
+      "duplicate_five_grams": 17,
+      "opening_segments_exact": 8
+    }
+  },
+  "quality_thresholds": {
+    "minimum_normalized_word_agreement_vs_cpu": 0.99,
+    "maximum_normalized_word_error_rate_vs_cpu": 0.02,
+    "minimum_character_agreement_vs_cpu": 0.99,
+    "maximum_segment_count_relative_delta": 0.05,
+    "minimum_exact_opening_segments": 8,
+    "maximum_duplicate_five_gram_increase": 0,
+    "require_no_opening_loss": true,
+    "require_no_long_form_collapse": true
+  }
+}

@@ -448,16 +448,21 @@ def test_companion_json_uses_same_speaker_semantics(tmp_path, monkeypatch):
     video = _video(tmp_path)
     out_dir = tmp_path / "out"
 
-    def fake_extract_transcript(**_kwargs):
-        return (
-            (
-                transcript_module.TranscriptSegment(0, 1, "hello", "SPEAKER_00"),
-                transcript_module.TranscriptSegment(1, 2, "plain"),
-            ),
-            "en",
+    segments = (
+        transcript_module.TranscriptSegment(0, 1, "hello", "SPEAKER_00"),
+        transcript_module.TranscriptSegment(1, 2, "plain"),
+    )
+
+    def fake_run_transcript(_video, output, _preflight):
+        transcript_module.write_txt(segments, output / "transcript.txt")
+        transcript_module.write_json(segments, output / "transcript.json")
+        return SimpleNamespace(
+            segments=segments,
+            language="en",
         )
 
-    monkeypatch.setattr(transcript_module, "extract_transcript", fake_extract_transcript)
+    monkeypatch.setattr(cli, "_preflight_transcript", lambda _args: object())
+    monkeypatch.setattr(cli, "_run_transcript", fake_run_transcript)
 
     cli.cmd_extract(
         SimpleNamespace(

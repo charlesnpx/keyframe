@@ -20,13 +20,32 @@ def _fake_result(output_dir):
 
 
 def _fake_record_result(output_dir):
+    import json
+
+    from PIL import Image
     from keyframe.pipeline import KeyframeExtractionResult
     from keyframe.pipeline.contracts import CandidateRecord
 
     output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     candidate = CandidateRecord(sample_idx=0, frame_idx=30, timestamp=1.0).with_evidence(
         caption="frame",
         ocr_tokens=("approved",),
+    )
+    filename = "frame_000030_1.00s.png"
+    Image.new("RGB", (4, 4), "white").save(output_dir / filename)
+    (output_dir / "captions.json").write_text(
+        json.dumps([{"file": filename}]),
+        encoding="utf-8",
+    )
+    (output_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "frames": [{"filename": filename}],
+            }
+        ),
+        encoding="utf-8",
     )
     return KeyframeExtractionResult(
         final=(candidate,),
@@ -50,8 +69,8 @@ def test_cli_frames_only_delegates_to_shared_pipeline(tmp_path, monkeypatch):
     out_dir = tmp_path / "out"
     calls = []
 
-    def fake_extract(video_path, output_dir, config):
-        calls.append((video_path, output_dir, config))
+    def fake_extract(video_path, output_dir, config, **kwargs):
+        calls.append((video_path, output_dir, config, kwargs))
         return _fake_record_result(output_dir)
 
     monkeypatch.setattr(pipeline, "extract_keyframes", fake_extract)
@@ -69,11 +88,15 @@ def test_cli_frames_only_delegates_to_shared_pipeline(tmp_path, monkeypatch):
     ))
 
     assert len(calls) == 1
-    video_path, output_dir, config = calls[0]
+    video_path, output_dir, config, kwargs = calls[0]
     assert video_path == video
-    assert output_dir == out_dir / "frames"
+    assert output_dir.name == "frames"
+    assert output_dir.parent.name.startswith("keyframe-run-")
+    assert kwargs["report_output_dir"] == out_dir / "frames"
     assert config.sample_interval == 0.75
     assert config.pass1_clusters == 9
+    assert config.device is None
+    assert (out_dir / "frames" / "frame_000030_1.00s.png").exists()
 
 
 def test_frames_main_delegates_to_shared_pipeline(tmp_path, monkeypatch):
@@ -119,18 +142,34 @@ def test_frames_main_delegates_to_shared_pipeline(tmp_path, monkeypatch):
 def test_cli_transcript_manifest_rewrite_materializes_candidate_records(tmp_path, monkeypatch):
     from keyframe import cli
     import keyframe.pipeline as pipeline
-    import keyframe.transcript as transcript
 
     video = tmp_path / "input.mp4"
     video.write_bytes(b"not a real video")
     out_dir = tmp_path / "out"
 
-    monkeypatch.setattr(pipeline, "extract_keyframes", lambda video_path, output_dir, config: _fake_record_result(output_dir))
     monkeypatch.setattr(
-        transcript,
-        "extract_transcript",
-        lambda **kwargs: ([{"start": 0.0, "end": 2.0, "text": "hello"}], "en"),
+        pipeline,
+        "extract_keyframes",
+        lambda video_path, output_dir, config, **_kwargs: _fake_record_result(
+            output_dir
+        ),
     )
+    monkeypatch.setattr(cli, "_preflight_transcript", lambda _args: object())
+
+    def fake_full_pipeline(video_path, output, args, _preflight, supervisor):
+        generation = cli._run_frame_generation(
+            video_path,
+            output,
+            args,
+            supervisor,
+            frame_device="cpu",
+        )
+        generation.enrich_manifest(
+            [{"start": 0.0, "end": 2.0, "text": "hello"}]
+        )
+        return SimpleNamespace(frames=generation.promote())
+
+    monkeypatch.setattr(cli, "_run_full_pipeline", fake_full_pipeline)
 
     cli.cmd_extract(SimpleNamespace(
         video=str(video),
@@ -157,18 +196,20 @@ def test_cli_transcript_manifest_rewrite_materializes_candidate_records(tmp_path
 
 def test_cli_no_speaker_detection_passed_to_transcript(tmp_path, monkeypatch):
     from keyframe import cli
-    import keyframe.transcript as transcript
 
     video = tmp_path / "input.mp4"
     video.write_bytes(b"not a real video")
     out_dir = tmp_path / "out"
     calls = []
 
-    def fake_extract_transcript(**kwargs):
-        calls.append(kwargs)
-        return ([{"start": 0.0, "end": 2.0, "text": "hello"}], "en")
+    def fake_run_transcript(_video, _output, preflight):
+        calls.append(preflight)
+        return SimpleNamespace(
+            segments=[{"start": 0.0, "end": 2.0, "text": "hello"}],
+            language="en",
+        )
 
-    monkeypatch.setattr(transcript, "extract_transcript", fake_extract_transcript)
+    monkeypatch.setattr(cli, "_run_transcript", fake_run_transcript)
 
     cli.cmd_extract(SimpleNamespace(
         video=str(video),
@@ -186,7 +227,7 @@ def test_cli_no_speaker_detection_passed_to_transcript(tmp_path, monkeypatch):
         no_speaker_detection=True,
     ))
 
-    assert calls[0]["speaker_detection"] is False
+    assert calls[0].config.speaker_detection is False
 
 
 def test_cli_frames_only_does_not_import_transcript(tmp_path, monkeypatch):
@@ -199,8 +240,14 @@ def test_cli_frames_only_does_not_import_transcript(tmp_path, monkeypatch):
     out_dir = tmp_path / "out"
 
     monkeypatch.setenv("HF_TOKEN", "hf_test")
-    monkeypatch.setattr(pipeline, "extract_keyframes", lambda video_path, output_dir, config: _fake_record_result(output_dir))
-    sys.modules.pop("keyframe.transcript", None)
+    monkeypatch.setattr(
+        pipeline,
+        "extract_keyframes",
+        lambda video_path, output_dir, config, **_kwargs: _fake_record_result(
+            output_dir
+        ),
+    )
+    monkeypatch.delitem(sys.modules, "keyframe.transcript", raising=False)
 
     cli.cmd_extract(SimpleNamespace(
         video=str(video),
