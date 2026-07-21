@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -329,6 +330,60 @@ def test_replay_rejects_report_for_a_different_recording(monkeypatch, tmp_path):
                 str(replay_path),
             ]
         )
+
+
+@pytest.mark.parametrize("protected_name", ["input", "baseline", "replay"])
+@pytest.mark.parametrize("alias_kind", ["lexical", "symlink", "hardlink"])
+def test_report_rejects_protected_path_aliases_before_model_work(
+    monkeypatch,
+    tmp_path,
+    protected_name,
+    alias_kind,
+):
+    input_path = tmp_path / "recording.mp4"
+    input_path.write_bytes(b"benchmark recording")
+    baseline_path = tmp_path / "baseline.json"
+    baseline_path.write_text(BASELINE_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    replay_path = tmp_path / "replay.json"
+    replay_path.write_text("{}", encoding="utf-8")
+    protected_paths = {
+        "input": input_path,
+        "baseline": baseline_path,
+        "replay": replay_path,
+    }
+    protected = protected_paths[protected_name]
+    original = protected.read_bytes()
+
+    if alias_kind == "lexical":
+        report_path = protected
+    else:
+        report_path = tmp_path / f"report-{protected_name}-{alias_kind}.json"
+        if alias_kind == "symlink":
+            report_path.symlink_to(protected)
+        else:
+            os.link(protected, report_path)
+
+    monkeypatch.setattr(
+        benchmark,
+        "_probe_duration_seconds",
+        lambda _path: pytest.fail("alias validation must run before model work"),
+    )
+
+    with pytest.raises(benchmark.BenchmarkError, match="must not alias"):
+        benchmark.main(
+            [
+                "--input",
+                str(input_path),
+                "--baseline",
+                str(baseline_path),
+                "--replay-report",
+                str(replay_path),
+                "--report",
+                str(report_path),
+            ]
+        )
+
+    assert protected.read_bytes() == original
 
 
 def test_candidate_case_forces_and_verifies_the_parallel_apple_schedule(

@@ -25,7 +25,11 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from keyframe import cli, transcript
-from keyframe.artifacts import atomic_write_json
+from keyframe.artifacts import (
+    ArtifactPathCollisionError,
+    atomic_write_json,
+    reject_path_aliases,
+)
 from keyframe.full_pipeline import resolve_frame_device, run_supervised_full_pipeline
 from keyframe.stage_supervisor import StageSupervisor
 from keyframe.transcript_cli import (
@@ -606,10 +610,29 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     input_path = Path(args.input).expanduser()
     baseline_path = Path(args.baseline).expanduser()
+    replay_report_path = (
+        Path(args.replay_report).expanduser() if args.replay_report else None
+    )
+    explicit_report_path = Path(args.report).expanduser() if args.report else None
     if not input_path.is_file():
         raise BenchmarkError(f"benchmark input does not exist: {input_path}")
     if not baseline_path.is_file():
         raise BenchmarkError(f"benchmark baseline does not exist: {baseline_path}")
+    if replay_report_path is not None and not replay_report_path.is_file():
+        raise BenchmarkError(
+            f"benchmark replay report does not exist: {replay_report_path}"
+        )
+    if explicit_report_path is not None:
+        protected_paths = [input_path, baseline_path]
+        if replay_report_path is not None:
+            protected_paths.append(replay_report_path)
+        try:
+            reject_path_aliases(explicit_report_path, protected_paths)
+        except ArtifactPathCollisionError as exc:
+            raise BenchmarkError(
+                "benchmark report path must not alias the recording, baseline, "
+                f"or replay report: {exc}"
+            ) from exc
     if args.timestamp_tolerance_seconds < 0:
         raise BenchmarkError("timestamp tolerance must be non-negative")
     if args.critical_path_tolerance_seconds < 0:
@@ -623,10 +646,10 @@ def main(argv: list[str] | None = None) -> int:
             f"expected {expected_duration:.3f}s, found {duration_seconds:.3f}s"
         )
 
-    if args.replay_report:
-        report = _load_json(Path(args.replay_report).expanduser(), "benchmark report")
+    if replay_report_path is not None:
+        report = _load_json(replay_report_path, "benchmark report")
         _validate_report_recording(report, input_path, duration_seconds)
-        report_path = Path(args.report).expanduser() if args.report else None
+        report_path = explicit_report_path
     else:
         output_dir = (
             Path(args.output).expanduser()
@@ -642,8 +665,8 @@ def main(argv: list[str] | None = None) -> int:
             timestamp_tolerance_seconds=args.timestamp_tolerance_seconds,
         )
         report_path = (
-            Path(args.report).expanduser()
-            if args.report
+            explicit_report_path
+            if explicit_report_path is not None
             else output_dir / "report.json"
         )
 
