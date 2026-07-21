@@ -1,0 +1,217 @@
+"""Release-validation helpers for comparing nondeterministic model output."""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
+from typing import Any
+
+from keyframe.transcript import DiarizationRow
+
+
+@dataclass(frozen=True)
+class DiarizationPartitionComparison:
+    """Result of comparing two diarization partitions modulo speaker labels."""
+
+    equivalent: bool
+    reason: str
+    label_mapping: tuple[tuple[str, str], ...]
+    max_timestamp_delta_seconds: float
+    reference_row_count: int
+    candidate_row_count: int
+
+
+def _comparison_row(value: DiarizationRow | Mapping[str, Any]) -> DiarizationRow:
+    if isinstance(value, DiarizationRow):
+        row = value
+    elif isinstance(value, Mapping):
+        try:
+            row = DiarizationRow(
+                start=float(value["start"]),
+                end=float(value["end"]),
+                speaker=str(value["speaker"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"invalid diarization comparison row: {value!r}") from exc
+    else:
+        raise TypeError(f"diarization comparison row must be a row or mapping: {value!r}")
+
+    if (
+        not math.isfinite(row.start)
+        or not math.isfinite(row.end)
+        or row.start < 0
+        or row.end <= row.start
+        or not row.speaker.strip()
+    ):
+        raise ValueError(f"invalid diarization comparison row: {value!r}")
+    return DiarizationRow(row.start, row.end, row.speaker.strip())
+
+
+def _comparison_rows(
+    values: Iterable[DiarizationRow | Mapping[str, Any]],
+) -> tuple[DiarizationRow, ...]:
+    return tuple(_comparison_row(value) for value in values)
+
+
+def _speaker_intervals(
+    rows: Iterable[DiarizationRow],
+) -> dict[str, tuple[tuple[float, float], ...]]:
+    grouped: dict[str, list[tuple[float, float]]] = {}
+    for row in rows:
+        grouped.setdefault(row.speaker, []).append((row.start, row.end))
+    return {
+        speaker: tuple(sorted(intervals))
+        for speaker, intervals in grouped.items()
+    }
+
+
+def _interval_delta(
+    reference: tuple[tuple[float, float], ...],
+    candidate: tuple[tuple[float, float], ...],
+) -> float | None:
+    if len(reference) != len(candidate):
+        return None
+    maximum = 0.0
+    for expected, actual in zip(reference, candidate, strict=True):
+        maximum = max(
+            maximum,
+            abs(expected[0] - actual[0]),
+            abs(expected[1] - actual[1]),
+        )
+    return maximum
+
+
+def compare_diarization_partitions(
+    reference: Iterable[DiarizationRow | Mapping[str, Any]],
+    candidate: Iterable[DiarizationRow | Mapping[str, Any]],
+    *,
+    timestamp_tolerance_seconds: float = 0.05,
+) -> DiarizationPartitionComparison:
+    """Compare row partitions with timing tolerance and a bijective label map.
+
+    Rows are ordered by their time interval, then compared one-for-one. Speaker
+    names may differ completely, but one candidate label must map consistently
+    to exactly one reference label and vice versa. A changed boundary, split,
+    merge, or speaker partition therefore remains visible to release checks.
+    """
+
+    try:
+        tolerance = float(timestamp_tolerance_seconds)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("timestamp tolerance must be a finite non-negative number") from exc
+    if not math.isfinite(tolerance) or tolerance < 0:
+        raise ValueError("timestamp tolerance must be a finite non-negative number")
+
+    reference_rows = _comparison_rows(reference)
+    candidate_rows = _comparison_rows(candidate)
+    reference_count = len(reference_rows)
+    candidate_count = len(candidate_rows)
+
+    def result(
+        equivalent: bool,
+        reason: str,
+        mapping: Mapping[str, str],
+        maximum_delta: float,
+    ) -> DiarizationPartitionComparison:
+        return DiarizationPartitionComparison(
+            equivalent=equivalent,
+            reason=reason,
+            label_mapping=tuple(sorted(mapping.items())),
+            max_timestamp_delta_seconds=maximum_delta,
+            reference_row_count=reference_count,
+            candidate_row_count=candidate_count,
+        )
+
+    if reference_count != candidate_count:
+        return result(
+            False,
+            f"row count changed from {reference_count} to {candidate_count}",
+            {},
+            0.0,
+        )
+
+    reference_speakers = _speaker_intervals(reference_rows)
+    candidate_speakers = _speaker_intervals(candidate_rows)
+    if len(reference_speakers) != len(candidate_speakers):
+        return result(
+            False,
+            (
+                "speaker partition changed from "
+                f"{len(reference_speakers)} to {len(candidate_speakers)} labels"
+            ),
+            {},
+            0.0,
+        )
+
+    edge_deltas: dict[tuple[str, str], float] = {}
+    compatible: dict[str, tuple[str, ...]] = {}
+    for candidate_speaker, candidate_intervals in sorted(candidate_speakers.items()):
+        candidates = []
+        closest_delta: float | None = None
+        for reference_speaker, reference_intervals in sorted(reference_speakers.items()):
+            delta = _interval_delta(reference_intervals, candidate_intervals)
+            if delta is None:
+                continue
+            closest_delta = delta if closest_delta is None else min(closest_delta, delta)
+            if delta <= tolerance:
+                candidates.append(reference_speaker)
+                edge_deltas[(candidate_speaker, reference_speaker)] = delta
+        if not candidates:
+            if closest_delta is None:
+                reason = (
+                    f"speaker {candidate_speaker!r} has a different number of turns"
+                )
+                maximum_delta = 0.0
+            else:
+                reason = (
+                    f"speaker {candidate_speaker!r} boundary changed by at least "
+                    f"{closest_delta:.9f}s (tolerance {tolerance:.9f}s)"
+                )
+                maximum_delta = closest_delta
+            return result(False, reason, {}, maximum_delta)
+        compatible[candidate_speaker] = tuple(candidates)
+
+    reference_to_candidate: dict[str, str] = {}
+
+    def assign(candidate_speaker: str, seen: set[str]) -> bool:
+        for reference_speaker in compatible[candidate_speaker]:
+            if reference_speaker in seen:
+                continue
+            seen.add(reference_speaker)
+            previous = reference_to_candidate.get(reference_speaker)
+            if previous is None or assign(previous, seen):
+                reference_to_candidate[reference_speaker] = candidate_speaker
+                return True
+        return False
+
+    for candidate_speaker in sorted(
+        compatible,
+        key=lambda speaker: (len(compatible[speaker]), speaker),
+    ):
+        if not assign(candidate_speaker, set()):
+            return result(
+                False,
+                "speaker turns do not admit one global bijective label mapping",
+                {},
+                0.0,
+            )
+
+    candidate_to_reference = {
+        candidate_speaker: reference_speaker
+        for reference_speaker, candidate_speaker in reference_to_candidate.items()
+    }
+    maximum_delta = max(
+        (
+            edge_deltas[(candidate_speaker, reference_speaker)]
+            for candidate_speaker, reference_speaker in candidate_to_reference.items()
+        ),
+        default=0.0,
+    )
+
+    return result(
+        True,
+        "partitions are equivalent within timestamp tolerance",
+        candidate_to_reference,
+        maximum_delta,
+    )

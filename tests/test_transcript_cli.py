@@ -1,10 +1,13 @@
+import errno
 import json
 from types import SimpleNamespace
 
 import pytest
 
 from keyframe import cli, transcript
+from keyframe import transcript_cli as transcript_cli_module
 from keyframe.artifacts import transcript_checkpoint_paths
+from keyframe.output_session import OutputSessionError
 from keyframe.stage_scheduler import (
     GIB,
     RuntimeResources,
@@ -16,8 +19,10 @@ from keyframe.stage_supervisor import (
     StageWorkerError,
 )
 from keyframe.transcript_cli import (
+    TranscriptOutputError,
     TranscriptPreflight,
     TranscriptRunConfig,
+    _write_final_outputs,
     preflight_transcript_run,
     print_stage_progress,
     run_supervised_transcript,
@@ -67,6 +72,75 @@ def _scheduler(policy="auto", *, cpus=8, memory=64 * GIB):
         policy,
         resource_probe=lambda: RuntimeResources(cpus, memory),
     )
+
+
+def test_final_output_write_failure_preserves_the_previous_generation(
+    tmp_path,
+    monkeypatch,
+):
+    output = tmp_path / "out"
+    output.mkdir()
+    output_paths = (output / "transcript.txt", output / "transcript.json")
+    output_paths[0].write_text("previous text", encoding="utf-8")
+    output_paths[1].write_text("previous json", encoding="utf-8")
+    staging_root = output / "keyframe-run-test"
+    staging_root.mkdir()
+
+    def disk_full(*_args, **_kwargs):
+        raise OSError(errno.ENOSPC, "injected final-output disk exhaustion")
+
+    monkeypatch.setattr(transcript, "write_json", disk_full)
+    with pytest.raises(TranscriptOutputError, match="disk exhaustion"):
+        _write_final_outputs(
+            (transcript.TranscriptSegment(0.0, 1.0, "current"),),
+            output_paths,
+            "txt",
+            staging_root=staging_root,
+        )
+
+    assert output_paths[0].read_text(encoding="utf-8") == "previous text"
+    assert output_paths[1].read_text(encoding="utf-8") == "previous json"
+    assert not list(staging_root.iterdir())
+
+
+def test_final_output_promotion_failure_rolls_back_every_representation(
+    tmp_path,
+    monkeypatch,
+):
+    output = tmp_path / "out"
+    output.mkdir()
+    output_paths = (output / "transcript.txt", output / "transcript.json")
+    output_paths[0].write_text("previous text", encoding="utf-8")
+    output_paths[1].write_text("previous json", encoding="utf-8")
+    staging_root = output / "keyframe-run-test"
+    staging_root.mkdir()
+    real_replace = transcript_cli_module._replace_final_output
+    calls = 0
+
+    def fail_second_promotion(source, target):
+        nonlocal calls
+        calls += 1
+        if calls == 4:
+            raise OSError("injected final-output rename failure")
+        return real_replace(source, target)
+
+    monkeypatch.setattr(
+        transcript_cli_module,
+        "_replace_final_output",
+        fail_second_promotion,
+    )
+    with pytest.raises(TranscriptOutputError, match="rename failure"):
+        _write_final_outputs(
+            (transcript.TranscriptSegment(0.0, 1.0, "current"),),
+            output_paths,
+            "txt",
+            staging_root=staging_root,
+        )
+
+    assert calls == 6
+    assert output_paths[0].read_text(encoding="utf-8") == "previous text"
+    assert output_paths[1].read_text(encoding="utf-8") == "previous json"
+    assert not list(staging_root.iterdir())
 
 
 def test_preflight_selects_mlx_and_cpu_diarization_on_supported_mac_without_cuda_probe():
@@ -732,6 +806,59 @@ def test_cmd_extract_preflight_failure_happens_before_output_creation(
 
     assert raised.value.code == 2
     assert not output.exists()
+
+
+def test_transcript_only_output_file_is_a_controlled_session_error(tmp_path):
+    video = _video(tmp_path)
+    output = tmp_path / "not-a-directory"
+    output.write_text("user owned", encoding="utf-8")
+    preflight = _preflight(
+        config=_config(speaker_detection=False),
+        hf_token=None,
+        effective_diarization_device=None,
+    )
+
+    with pytest.raises(OutputSessionError, match="failed to initialize"):
+        run_supervised_transcript(
+            video,
+            output,
+            preflight,
+            scheduler=_scheduler(),
+        )
+
+    assert output.read_text(encoding="utf-8") == "user owned"
+
+
+def test_cmd_extract_reports_explicit_output_creation_failure(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    video = _video(tmp_path)
+    monkeypatch.setattr(cli, "_preflight_transcript", lambda _args: object())
+    monkeypatch.setattr(
+        cli,
+        "_resolve_out_dir",
+        lambda *_args: (_ for _ in ()).throw(PermissionError("read-only parent")),
+    )
+    args = SimpleNamespace(
+        video=str(video),
+        output=str(tmp_path / "blocked" / "out"),
+        transcript_only=True,
+        frames_only=False,
+        whisper_model="medium",
+        transcript_format="json",
+        transcription_backend="auto",
+        diarization_device="auto",
+        stage_concurrency="auto",
+        no_speaker_detection=True,
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        cli.cmd_extract(args)
+
+    assert raised.value.code == 1
+    assert "could not create output directory" in capsys.readouterr().err
 
 
 def test_cmd_extract_presents_transcription_failure_and_preserves_prior_final(

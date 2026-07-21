@@ -21,6 +21,7 @@ from keyframe.stage_supervisor import (
     StageProgress,
     StageProtocolError,
     StageSupervisor,
+    StageSupervisorError,
     StageTerminal,
     StageWorkerError,
     SupervisorSignal,
@@ -562,7 +563,7 @@ def test_failed_entry_preserves_collision_and_releases_output_lock(tmp_path):
     collision = output / "keyframe-run-collision"
     collision.write_text("not a run directory", encoding="utf-8")
 
-    with pytest.raises(FileExistsError):
+    with pytest.raises(StageSupervisorError, match="failed to initialize"):
         with StageSupervisor(output, run_id="collision"):
             pytest.fail("a run directory must not replace an existing file")
 

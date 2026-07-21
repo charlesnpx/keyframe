@@ -310,7 +310,11 @@ def cmd_extract(args):
             print(f"Error: {exc}", file=sys.stderr)
             raise SystemExit(2) from None
 
-    out_dir = _resolve_out_dir(video, args.output)
+    try:
+        out_dir = _resolve_out_dir(video, args.output)
+    except OSError as exc:
+        print(f"Error: could not create output directory: {exc}", file=sys.stderr)
+        raise SystemExit(1) from None
     print(f"Output: {out_dir.resolve()}\n")
 
     t0 = time.time()

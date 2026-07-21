@@ -180,11 +180,11 @@ class OutputRunSession:
     def __enter__(self) -> OutputRunSession:
         if self._entered:
             raise RuntimeError("output run session cannot be entered twice")
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.output_dir = self.output_dir.resolve()
-        self.lock = OutputDirectoryLock(self.output_dir)
         staging_root_was_absent = False
         try:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            self.output_dir = self.output_dir.resolve()
+            self.lock = OutputDirectoryLock(self.output_dir)
             self.lock.acquire()
             cleanup_stale_run_directories(self.output_dir)
             self.staging = run_staging_paths(self.output_dir, self.run_id)
@@ -207,7 +207,12 @@ class OutputRunSession:
                             f"failed to remove run staging directory: {cleanup_exc}"
                         )
             finally:
-                self.lock.release()
+                if self.lock is not None:
+                    self.lock.release()
+            if isinstance(exc, OSError):
+                raise OutputSessionError(
+                    f"failed to initialize output directory {self.output_dir}: {exc}"
+                ) from exc
             raise
 
     def close(self) -> None:
