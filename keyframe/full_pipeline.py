@@ -251,12 +251,15 @@ def run_supervised_full_pipeline(
     if diarization_stage is None:
         critical_path = "T + F + M + E"
     elif (
-        not initial_schedule.parallel
-        or (
-            execution.fallback_schedule is not None
-            and not execution.fallback_schedule.parallel
-        )
+        execution.fallback_schedule is not None
+        and not execution.fallback_schedule.parallel
     ):
+        # The transcription timer spans the initial MLX attempt, any wait for
+        # diarization, and the fresh CPU attempt. Adding D again would double
+        # count the fallback wait already included in T.
+        critical_path = "T + F + M + E"
+        print("Fallback timing note: any serialized D wait is included in T.")
+    elif not initial_schedule.parallel:
         critical_path = "T + D + F + M + E"
     elif frame_overlapped_diarization:
         critical_path = "max(T + F, D) + M + E"
@@ -272,10 +275,14 @@ def run_supervised_full_pipeline(
         settle_diarization()
 
     frame_generation = None
-    frame_error: Exception | None = None
+    frame_error: BaseException | None = None
     frame_started = clock()
     try:
         frame_generation = frame_runner()
+    except SystemExit as exc:
+        if exc.code in (None, 0):
+            raise
+        frame_error = exc
     except Exception as exc:
         frame_error = exc
     finally:

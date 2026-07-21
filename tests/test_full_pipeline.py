@@ -14,6 +14,7 @@ from keyframe.full_pipeline import (
     resolve_frame_device,
     run_supervised_full_pipeline,
 )
+from keyframe.output_session import remove_keyframe_owned_directory
 from keyframe.stage_scheduler import GIB, RuntimeResources, StageScheduler
 from keyframe.stage_supervisor import StageCompletion, StageWorkerError
 from keyframe.transcript_cli import (
@@ -207,6 +208,24 @@ class _FakeSupervisor:
         self.events.append((f"cancel-{handle.stage}", None))
         handle.process.alive = False
         handle.process.exitcode = -15
+
+
+class _ContextFakeSupervisor(_FakeSupervisor):
+    def __init__(self, output_dir, events, **kwargs):
+        super().__init__(output_dir, events, **kwargs)
+        self.staging_root = self.output_dir / "keyframe-run-interruption"
+
+    def __enter__(self):
+        self.staging_root.mkdir()
+        self.events.append(("enter-supervisor", None))
+        return self
+
+    def __exit__(self, *_args):
+        for handle in self.handles.values():
+            if handle.process.is_alive():
+                self.cancel(handle)
+        remove_keyframe_owned_directory(self.staging_root)
+        self.events.append(("close-supervisor", None))
 
 
 class _FakeFrameGeneration:
@@ -464,6 +483,70 @@ def test_mlx_fallback_finishes_in_a_fresh_worker_before_frames_start(tmp_path):
     assert result.transcript.effective_backend == "whisper"
 
 
+def test_serialized_mlx_fallback_does_not_double_count_diarization_in_path(
+    tmp_path,
+):
+    events = []
+    output = tmp_path / "out"
+    preflight = _preflight(requested_backend="auto")
+    supervisor = _FakeSupervisor(output, events, fail_first_mlx=True)
+    probes = (
+        RuntimeResources(8, AMPLE_MEMORY),
+        RuntimeResources(2, AMPLE_MEMORY),
+        RuntimeResources(8, AMPLE_MEMORY),
+    )
+
+    result = run_supervised_full_pipeline(
+        tmp_path / "recording.mp4",
+        output,
+        preflight,
+        supervisor=supervisor,
+        frame_device="mps",
+        frame_runner=_frame_runner(supervisor, output, events),
+        scheduler=_scheduler(probes=probes),
+    )
+
+    assert result.transcript.fallback_used
+    assert result.critical_path == "T + F + M + E"
+    assert _event_names(events).index("complete-diarization") < (
+        _event_names(events).index("start-frames")
+    )
+
+
+def test_stage_timings_span_launch_through_validated_commit(tmp_path):
+    events = []
+    output = tmp_path / "out"
+    supervisor = _FakeSupervisor(output, events)
+    ticks = iter((0.0, 0.0, 5.0, 5.0, 8.0, 10.0, 10.0, 11.0, 11.0, 12.0))
+    clock_calls = []
+
+    def clock():
+        value = next(ticks)
+        clock_calls.append(value)
+        return value
+
+    result = run_supervised_full_pipeline(
+        tmp_path / "recording.mp4",
+        output,
+        _preflight(),
+        supervisor=supervisor,
+        frame_device="mps",
+        frame_runner=_frame_runner(supervisor, output, events),
+        scheduler=_scheduler(),
+        clock=clock,
+    )
+
+    assert clock_calls == [0.0, 0.0, 5.0, 5.0, 8.0, 10.0, 10.0, 11.0, 11.0, 12.0]
+    assert result.timings == {
+        "transcription": 5.0,
+        "frames": 3.0,
+        "diarization": 10.0,
+        "merge": 1.0,
+        "manifest": 1.0,
+    }
+    assert result.transcript.timings == result.timings
+
+
 def test_empty_serial_transcript_skips_unstarted_diarization_but_keeps_frames(
     tmp_path,
 ):
@@ -521,9 +604,14 @@ def test_full_pipeline_preserves_all_final_transcript_formats(tmp_path, fmt):
 
 
 @pytest.mark.parametrize("frame_after_diarization", [False, True])
+@pytest.mark.parametrize(
+    "error_kind",
+    ["exception", "system-exit"],
+)
 def test_frame_failure_finishes_independent_transcript_and_preserves_prior_frames(
     tmp_path,
     frame_after_diarization,
+    error_kind,
 ):
     events = []
     output = tmp_path / "out"
@@ -547,6 +635,11 @@ def test_frame_failure_finishes_independent_transcript_and_preserves_prior_frame
         events,
         effective_backend=effective_backend,
     )
+    injected_error = (
+        OSError("injected frame failure")
+        if error_kind == "exception"
+        else SystemExit(1)
+    )
 
     with pytest.raises(FullPipelineFrameError, match="partial output"):
         run_supervised_full_pipeline(
@@ -559,7 +652,7 @@ def test_frame_failure_finishes_independent_transcript_and_preserves_prior_frame
                 supervisor,
                 output,
                 events,
-                error=OSError("injected frame failure"),
+                error=injected_error,
             ),
             scheduler=_scheduler(),
         )
@@ -577,6 +670,52 @@ def test_frame_failure_finishes_independent_transcript_and_preserves_prior_frame
     assert json.loads((output / "transcript.json").read_text(encoding="utf-8"))[0][
         "speaker"
     ] == "SPEAKER_00"
+
+
+def test_parent_interruption_cancels_overlap_and_discards_current_frame_stage(
+    tmp_path,
+):
+    events = []
+    output = tmp_path / "out"
+    prior_frames = output / "frames"
+    prior_frames.mkdir(parents=True)
+    (prior_frames / "previous.txt").write_text("previous", encoding="utf-8")
+    prior_final = output / "transcript.json"
+    prior_final.write_text("previous final", encoding="utf-8")
+    supervisor = _ContextFakeSupervisor(output, events)
+
+    def interrupt_frames():
+        assert supervisor.handles["diarization"].process.is_alive()
+        staged_frames = supervisor.staging_root / "frames"
+        staged_frames.mkdir()
+        (staged_frames / "partial.png").write_bytes(b"partial")
+        events.append(("interrupt-frames", None))
+        raise KeyboardInterrupt("parent interrupted")
+
+    with pytest.raises(KeyboardInterrupt, match="parent interrupted"):
+        with supervisor:
+            run_supervised_full_pipeline(
+                tmp_path / "recording.mp4",
+                output,
+                _preflight(),
+                supervisor=supervisor,
+                frame_device="mps",
+                frame_runner=interrupt_frames,
+                scheduler=_scheduler(),
+            )
+
+    names = _event_names(events)
+    assert names.index("interrupt-frames") < names.index("cancel-diarization")
+    assert names[-1] == "close-supervisor"
+    assert not supervisor.staging_root.exists()
+    assert (prior_frames / "previous.txt").read_text(encoding="utf-8") == (
+        "previous"
+    )
+    assert prior_final.read_text(encoding="utf-8") == "previous final"
+    assert transcript.read_raw_transcript_checkpoint(
+        output / "transcript.raw.json"
+    )[0].text == "hello"
+    assert not (output / "diarization.json").exists()
 
 
 def test_transcription_failure_cancels_diarization_and_never_starts_frames(
