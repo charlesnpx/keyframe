@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 
@@ -28,14 +29,21 @@ def test_real_mlx_transcription_smoke():
     if not runtime_platform.supports_mlx_whisper:
         pytest.skip("MLX smoke test requires Apple Silicon running macOS 14 or newer")
 
-    segments, language = transcript._extract_with_mlx(
+    model_name = os.environ.get("KEYFRAME_MLX_SMOKE_MODEL", "tiny")
+    result = transcript._extract_with_mlx(
         video,
-        os.environ.get("KEYFRAME_MLX_SMOKE_MODEL", "tiny"),
+        model_name,
         runtime_platform,
     )
 
-    assert segments
-    assert language and language != "unknown"
+    model_spec = transcript.MLX_MODEL_SPECS[model_name]
+    assert result.segments
+    assert result.language and result.language != "unknown"
+    assert result.metadata["model_repository"] == model_spec.repository
+    assert result.metadata["model_revision"] == model_spec.revision
+    assert result.metadata["model_resolution_source"] in {"local-hit", "downloaded"}
+    assert math.isfinite(result.metadata["model_resolution_seconds"])
+    assert result.metadata["model_resolution_seconds"] >= 0
 
 
 @pytest.mark.hardware

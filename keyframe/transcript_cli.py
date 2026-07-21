@@ -11,6 +11,7 @@ from collections.abc import Callable, Iterable, Mapping
 from contextlib import nullcontext, redirect_stdout
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from keyframe import transcript
@@ -78,6 +79,10 @@ class TranscriptRunResult:
     fallback_used: bool
     initial_schedule: ScheduleDecision
     timings: Mapping[str, float]
+    metadata: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
 
 
 class TranscriptOutputError(OutputSessionError):
@@ -483,6 +488,7 @@ def run_supervised_transcript(
                 fallback_used=execution.fallback_used,
                 initial_schedule=decision,
                 timings=dict(timings),
+                metadata=dict(execution.completion.metadata),
             )
 
         if preflight.missing_hf_token:
@@ -531,4 +537,5 @@ def run_supervised_transcript(
             fallback_used=execution.fallback_used,
             initial_schedule=decision,
             timings=dict(timings),
+            metadata=dict(execution.completion.metadata),
         )

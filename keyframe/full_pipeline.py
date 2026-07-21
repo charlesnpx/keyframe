@@ -45,6 +45,10 @@ class FullPipelineRunResult:
     critical_path: str
     timings: Mapping[str, float]
 
+    @property
+    def transcription_metadata(self) -> Mapping[str, Any]:
+        return self.transcript.metadata
+
 
 def resolve_frame_device(preflight: TranscriptPreflight) -> str:
     """Resolve the frame accelerator without importing Torch in the parent."""
@@ -347,6 +351,7 @@ def run_supervised_full_pipeline(
         fallback_used=execution.fallback_used,
         initial_schedule=initial_schedule,
         timings=dict(timings),
+        metadata=dict(execution.completion.metadata),
     )
     return FullPipelineRunResult(
         transcript=transcript_result,

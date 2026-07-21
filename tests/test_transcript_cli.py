@@ -446,10 +446,20 @@ class _FakeSupervisor:
             )
             requested = self.started[handle.attempt - 1][2]["requested_backend"]
             effective = "whisper" if requested == "whisper" else "mlx"
+            metadata = {"language": "en", "effective_backend": effective}
+            if effective == "mlx":
+                metadata.update(
+                    {
+                        "model_repository": "mlx-community/whisper-medium-mlx",
+                        "model_revision": "immutable-revision",
+                        "model_resolution_source": "local-hit",
+                        "model_resolution_seconds": 0.125,
+                    }
+                )
             return StageCompletion(
                 "transcription",
                 self.public.transcript_raw,
-                {"language": "en", "effective_backend": effective},
+                metadata,
                 self.transcript_segments,
             )
         if self.diarization_error is not None:
@@ -519,6 +529,10 @@ def test_parallel_run_promotes_current_checkpoints_before_speaker_assignment(
     assert result.segments == (
         transcript.TranscriptSegment(0.0, 2.0, "hello", "SPEAKER_00"),
     )
+    assert result.metadata["model_resolution_source"] == "local-hit"
+    assert result.metadata["model_resolution_seconds"] == 0.125
+    with pytest.raises(TypeError):
+        result.metadata["model_resolution_source"] = "changed"
     assert supervisor.events.index("start-diarization") < supervisor.events.index(
         "complete-transcription-1"
     )

@@ -25,9 +25,11 @@ import math
 import os
 import platform
 import sys
+import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Callable
 
 from keyframe.artifacts import atomic_write_json, atomic_write_text, reject_path_aliases
@@ -141,6 +143,7 @@ class MLXRuntime:
     load_model: Callable[[str, Any], Any]
     transcribe: Callable[..., Mapping[str, Any]]
     float16: Any
+    local_entry_not_found_error: type[Exception]
 
 
 @dataclass(frozen=True)
@@ -175,6 +178,20 @@ class TranscriptSegment:
         if not hasattr(self, key):
             raise KeyError(key)
         return getattr(self, key)
+
+
+@dataclass(frozen=True)
+class TranscriptionResult:
+    """Internal inference result with reliable, extensible execution evidence."""
+
+    segments: tuple[TranscriptSegment, ...]
+    language: str
+    metadata: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "segments", tuple(self.segments))
+        object.__setattr__(self, "language", str(self.language))
+        object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
 
 
 @dataclass(frozen=True)
@@ -703,6 +720,7 @@ def is_auto_fallback_eligible(exc: BaseException) -> bool:
 def _load_mlx_runtime() -> MLXRuntime:
     try:
         from huggingface_hub import snapshot_download
+        from huggingface_hub.errors import LocalEntryNotFoundError
         import mlx.core as mx
         import mlx_whisper
         from mlx_whisper.transcribe import ModelHolder
@@ -717,6 +735,58 @@ def _load_mlx_runtime() -> MLXRuntime:
         load_model=ModelHolder.get_model,
         transcribe=mlx_whisper.transcribe,
         float16=mx.float16,
+        local_entry_not_found_error=LocalEntryNotFoundError,
+    )
+
+
+def _resolve_mlx_model_snapshot(
+    runtime: MLXRuntime,
+    model_spec: MLXModelSpec,
+) -> tuple[Path, Mapping[str, Any]]:
+    """Resolve an immutable MLX snapshot locally before permitting network I/O."""
+
+    started = time.monotonic()
+    source = "local-hit"
+    print("Resolving cached MLX model...")
+    try:
+        try:
+            resolved = runtime.snapshot_download(
+                repo_id=model_spec.repository,
+                revision=model_spec.revision,
+                local_files_only=True,
+            )
+        except runtime.local_entry_not_found_error:
+            source = "downloaded"
+            print("Cached MLX model not found; downloading pinned snapshot...")
+            resolved = runtime.snapshot_download(
+                repo_id=model_spec.repository,
+                revision=model_spec.revision,
+            )
+
+        if not isinstance(resolved, (str, os.PathLike)):
+            raise TypeError("snapshot resolver returned a non-path result")
+        model_path = Path(resolved)
+        if not model_path.is_dir():
+            raise FileNotFoundError(
+                f"resolved snapshot is not an existing directory: {model_path}"
+            )
+    except TranscriptionCancelled:
+        raise
+    except Exception as exc:
+        raise MLXModelAcquisitionError(
+            f"failed to acquire {model_spec.repository}@{model_spec.revision}"
+        ) from exc
+
+    elapsed = time.monotonic() - started
+    if not math.isfinite(elapsed) or elapsed < 0:
+        elapsed = 0.0
+    return model_path, MappingProxyType(
+        {
+            "model_repository": model_spec.repository,
+            "model_revision": model_spec.revision,
+            "model_resolution_source": source,
+            "model_resolution_seconds": elapsed,
+        }
     )
 
 
@@ -753,7 +823,7 @@ def _extract_with_mlx(
     video: Path,
     model_name: str,
     runtime_platform: RuntimePlatform | None = None,
-) -> tuple[tuple[TranscriptSegment, ...], str]:
+) -> TranscriptionResult:
     runtime_platform = runtime_platform or current_runtime_platform()
     resolve_transcription_backend("mlx", runtime_platform)
     try:
@@ -761,18 +831,9 @@ def _extract_with_mlx(
     except KeyError as exc:
         raise ValueError(f"unsupported MLX Whisper model size: {model_name!r}") from exc
 
+    print("Importing MLX runtime...")
     runtime = _load_mlx_runtime()
-    try:
-        model_path = runtime.snapshot_download(
-            repo_id=model_spec.repository,
-            revision=model_spec.revision,
-        )
-    except TranscriptionCancelled:
-        raise
-    except Exception as exc:
-        raise MLXModelAcquisitionError(
-            f"failed to acquire {model_spec.repository}@{model_spec.revision}"
-        ) from exc
+    model_path, execution_metadata = _resolve_mlx_model_snapshot(runtime, model_spec)
 
     print("Loading MLX model...")
     try:
@@ -792,7 +853,8 @@ def _extract_with_mlx(
             verbose=False,
             word_timestamps=False,
         )
-        return _normalize_mlx_result(result)
+        segments, language = _normalize_mlx_result(result)
+        return TranscriptionResult(segments, language, execution_metadata)
     except TranscriptionCancelled:
         raise
     except Exception as exc:
@@ -801,7 +863,7 @@ def _extract_with_mlx(
         ) from exc
 
 
-def _extract_with_whisper(video: Path, model_name: str) -> tuple[tuple[TranscriptSegment, ...], str]:
+def _extract_with_whisper(video: Path, model_name: str) -> TranscriptionResult:
     try:
         import whisper
     except ImportError:
@@ -821,7 +883,11 @@ def _extract_with_whisper(video: Path, model_name: str) -> tuple[tuple[Transcrip
         word_timestamps=False,
     )
 
-    return transcript_segments(result["segments"]), result.get("language", "unknown")
+    return TranscriptionResult(
+        transcript_segments(result["segments"]),
+        result.get("language", "unknown"),
+        {},
+    )
 
 
 def _extract_with_transcription_backend(
@@ -829,7 +895,7 @@ def _extract_with_transcription_backend(
     model_name: str,
     requested_backend: str,
     runtime_platform: RuntimePlatform | None = None,
-) -> tuple[tuple[TranscriptSegment, ...], str]:
+) -> TranscriptionResult:
     runtime_platform = runtime_platform or current_runtime_platform()
     effective_backend = resolve_transcription_backend(requested_backend, runtime_platform)
     print(
@@ -928,11 +994,12 @@ def extract_transcript(
     print(f"Video: {video_path}")
     print(f"Model: {model_name}")
 
-    segments, language = _extract_with_transcription_backend(
+    result = _extract_with_transcription_backend(
         video,
         model_name,
         transcription_backend,
     )
+    segments, language = result.segments, result.language
 
     if speaker_detection and segments:
         hf_token = (os.environ.get("HF_TOKEN") or "").strip()
