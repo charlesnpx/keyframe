@@ -5,7 +5,6 @@ from __future__ import annotations
 import multiprocessing as mp
 import os
 import queue
-import shutil
 import signal
 import threading
 import uuid
@@ -25,6 +24,15 @@ from keyframe.artifacts import (
     run_staging_paths,
     transcript_checkpoint_paths,
 )
+from keyframe.output_session import (
+    LOCK_FILENAME,
+    RUN_DIRECTORY_PREFIX,
+    OutputDirectoryLock,
+    OutputDirectoryLockedError,
+    OutputSessionError,
+    cleanup_stale_run_directories,
+    remove_keyframe_owned_directory,
+)
 from keyframe.stage_scheduler import configure_worker_thread_budget
 from keyframe.transcript import (
     DiarizationRow,
@@ -34,16 +42,8 @@ from keyframe.transcript import (
 )
 
 
-LOCK_FILENAME = "keyframe-output.lock"
-RUN_DIRECTORY_PREFIX = "keyframe-run-"
-
-
-class StageSupervisorError(RuntimeError):
+class StageSupervisorError(OutputSessionError):
     """Base class for controlled parent-side stage failures."""
-
-
-class OutputDirectoryLockedError(StageSupervisorError):
-    """Another Keyframe CLI process owns the output directory."""
 
 
 class StageProtocolError(StageSupervisorError):
@@ -397,78 +397,6 @@ def diarization_worker_entry(
     )
 
 
-class OutputDirectoryLock:
-    """Non-blocking advisory lock keyed by the resolved output directory."""
-
-    def __init__(self, output_dir: str | Path) -> None:
-        self.output_dir = Path(output_dir).resolve()
-        self.path = self.output_dir / LOCK_FILENAME
-        self._descriptor: int | None = None
-
-    def acquire(self) -> None:
-        if self._descriptor is not None:
-            raise RuntimeError("output directory lock is already held")
-        descriptor: int | None = None
-        try:
-            descriptor = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
-            self._descriptor = descriptor
-            self._acquire_descriptor(descriptor)
-        except BaseException:
-            self._descriptor = None
-            if descriptor is not None:
-                os.close(descriptor)
-            raise
-
-    def _acquire_descriptor(self, descriptor: int) -> None:
-        if os.name == "nt":
-            import msvcrt
-
-            if os.fstat(descriptor).st_size == 0:
-                os.write(descriptor, b"\0")
-            os.lseek(descriptor, 0, os.SEEK_SET)
-            try:
-                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
-            except OSError as exc:
-                raise OutputDirectoryLockedError(
-                    f"output directory is already in use: {self.output_dir}"
-                ) from exc
-            return
-
-        import fcntl
-
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise OutputDirectoryLockedError(
-                f"output directory is already in use: {self.output_dir}"
-            ) from exc
-
-    def release(self) -> None:
-        descriptor = self._descriptor
-        if descriptor is None:
-            return
-        self._descriptor = None
-        try:
-            if os.name == "nt":
-                import msvcrt
-
-                os.lseek(descriptor, 0, os.SEEK_SET)
-                msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
-        finally:
-            os.close(descriptor)
-
-    def __enter__(self) -> OutputDirectoryLock:
-        self.acquire()
-        return self
-
-    def __exit__(self, _exc_type: Any, _exc: Any, _traceback: Any) -> None:
-        self.release()
-
-
 class StageHandle:
     """Parent-side lifecycle and protocol state for one disposable worker."""
 
@@ -804,7 +732,7 @@ class StageSupervisor:
                     and not self.staging.root.is_symlink()
                 ):
                     try:
-                        shutil.rmtree(self.staging.root)
+                        remove_keyframe_owned_directory(self.staging.root)
                     except BaseException as cleanup_exc:
                         exc.add_note(
                             f"failed to remove run staging directory: {cleanup_exc}"
@@ -830,13 +758,7 @@ class StageSupervisor:
         raise SupervisorSignal(signum)
 
     def _cleanup_stale_runs(self) -> None:
-        for candidate in self.output_dir.iterdir():
-            if (
-                candidate.name.startswith(RUN_DIRECTORY_PREFIX)
-                and candidate.is_dir()
-                and not candidate.is_symlink()
-            ):
-                shutil.rmtree(candidate)
+        cleanup_stale_run_directories(self.output_dir)
 
     def _require_entered(self) -> tuple[RunStagingPaths, TranscriptCheckpointPaths]:
         if not self._entered or self.staging is None or self.public is None:
@@ -1045,7 +967,7 @@ class StageSupervisor:
                     remember_error(exc, f"failed to cancel {handle.stage} worker")
             if self.staging is not None and self.staging.root.exists():
                 try:
-                    shutil.rmtree(self.staging.root)
+                    remove_keyframe_owned_directory(self.staging.root)
                 except BaseException as exc:
                     remember_error(exc, "failed to remove run staging directory")
         finally:

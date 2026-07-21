@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Callable, Iterable, Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -217,6 +218,7 @@ def run_supervised_transcript(
     preflight: TranscriptPreflight,
     *,
     scheduler: StageScheduler | None = None,
+    supervisor: Any | None = None,
     supervisor_factory: Callable[..., Any] | None = None,
     fallback_runner: Callable[..., Any] | None = None,
     clock: Callable[[], float] | None = None,
@@ -228,6 +230,8 @@ def run_supervised_transcript(
     output_dir.mkdir(parents=True, exist_ok=True)
     config = preflight.config
     scheduler = scheduler or StageScheduler(config.stage_concurrency)
+    if supervisor is not None and supervisor_factory is not None:
+        raise ValueError("provide either supervisor or supervisor_factory, not both")
     supervisor_factory = supervisor_factory or StageSupervisor
     fallback_runner = fallback_runner or complete_transcription_with_auto_fallback
     clock = clock or time.monotonic
@@ -257,19 +261,28 @@ def run_supervised_transcript(
     timings: dict[str, float] = {}
     diarization_handle = None
     diarization_started: float | None = None
-    with supervisor_factory(
-        output_dir,
-        progress_callback=print_stage_progress,
-    ) as supervisor:
-        if supervisor.public is None:
+    supervisor_context = (
+        nullcontext(supervisor)
+        if supervisor is not None
+        else supervisor_factory(
+            output_dir,
+            progress_callback=print_stage_progress,
+        )
+    )
+    with supervisor_context as active_supervisor:
+        if active_supervisor is None or active_supervisor.public is None:
             raise RuntimeError("stage supervisor did not initialize public paths")
+        if Path(active_supervisor.output_dir).resolve() != output_dir.resolve():
+            raise ValueError(
+                "borrowed stage supervisor owns a different output directory"
+            )
         # A diarization checkpoint is meaningful only for the current recording
         # and run. Raw transcripts are never read by this orchestrator, so a
         # previous validated raw checkpoint can safely survive a failed rerun.
-        supervisor.public.diarization.unlink(missing_ok=True)
+        active_supervisor.public.diarization.unlink(missing_ok=True)
 
         transcription_started = clock()
-        transcription_handle = supervisor.start_transcription(
+        transcription_handle = active_supervisor.start_transcription(
             video,
             model_name=config.model_name,
             requested_backend=config.transcription_backend,
@@ -278,7 +291,7 @@ def run_supervised_transcript(
         )
         if decision.parallel and diarization_stage is not None:
             diarization_started = clock()
-            diarization_handle = supervisor.start_diarization(
+            diarization_handle = active_supervisor.start_diarization(
                 video,
                 hf_token=preflight.hf_token or "",
                 final_output_paths=final_paths,
@@ -290,7 +303,7 @@ def run_supervised_transcript(
         if diarization_handle is not None and diarization_stage is not None:
             active_stages = (ActiveStage(diarization_stage, diarization_handle),)
         execution = fallback_runner(
-            supervisor,
+            active_supervisor,
             transcription_handle,
             scheduler=scheduler,
             video_path=video,
@@ -314,10 +327,10 @@ def run_supervised_transcript(
 
         if not segments:
             if diarization_handle is not None:
-                supervisor.cancel(diarization_handle)
+                active_supervisor.cancel(diarization_handle)
                 if diarization_started is not None:
                     timings["diarization"] = clock() - diarization_started
-            supervisor.public.diarization.unlink(missing_ok=True)
+            active_supervisor.public.diarization.unlink(missing_ok=True)
             _write_final_outputs(segments, output_paths, config.fmt)
             _print_transcript_result(segments, language, timings)
             return TranscriptRunResult(
@@ -335,7 +348,7 @@ def run_supervised_transcript(
         if diarization_stage is not None:
             if diarization_handle is None:
                 diarization_started = clock()
-                diarization_handle = supervisor.start_diarization(
+                diarization_handle = active_supervisor.start_diarization(
                     video,
                     hf_token=preflight.hf_token or "",
                     final_output_paths=final_paths,
@@ -343,7 +356,7 @@ def run_supervised_transcript(
                     device=preflight.effective_diarization_device,
                 )
             try:
-                diarization_completion = supervisor.complete(diarization_handle)
+                diarization_completion = active_supervisor.complete(diarization_handle)
                 if diarization_started is not None:
                     timings["diarization"] = clock() - diarization_started
                 labeled = transcript._assign_speakers(
@@ -358,7 +371,7 @@ def run_supervised_transcript(
             except Exception as exc:
                 if diarization_started is not None:
                     timings["diarization"] = clock() - diarization_started
-                supervisor.public.diarization.unlink(missing_ok=True)
+                active_supervisor.public.diarization.unlink(missing_ok=True)
                 transcript._print_speaker_detection_failure(exc)
 
         _write_final_outputs(segments, output_paths, config.fmt)

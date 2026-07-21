@@ -523,6 +523,39 @@ def test_stale_run_cleanup_is_scoped_and_does_not_follow_symlinks(tmp_path):
     assert external.exists()
 
 
+@pytest.mark.parametrize("frame_artifact", ["file", "directory-symlink"])
+def test_transcript_session_ignores_unrelated_frame_path_without_recovery_backup(
+    tmp_path,
+    frame_artifact,
+):
+    output = tmp_path / "output"
+    output.mkdir()
+    frames = output / "frames"
+    external = tmp_path / "external-frames"
+    if frame_artifact == "file":
+        frames.write_text("user-owned", encoding="utf-8")
+    else:
+        external.mkdir()
+        (external / "sentinel.txt").write_text("user-owned", encoding="utf-8")
+        frames.symlink_to(external, target_is_directory=True)
+
+    with StageSupervisor(output, run_id="transcript-only") as supervisor:
+        assert supervisor.staging is not None
+        if frame_artifact == "file":
+            assert frames.read_text(encoding="utf-8") == "user-owned"
+        else:
+            assert frames.is_symlink()
+            assert (frames / "sentinel.txt").read_text(encoding="utf-8") == (
+                "user-owned"
+            )
+
+    if frame_artifact == "file":
+        assert frames.read_text(encoding="utf-8") == "user-owned"
+    else:
+        assert frames.is_symlink()
+        assert external.exists()
+
+
 def test_failed_entry_preserves_collision_and_releases_output_lock(tmp_path):
     output = tmp_path / "output"
     output.mkdir()

@@ -670,6 +670,33 @@ def test_previous_raw_checkpoint_is_never_consumed_as_current_input(tmp_path):
     )[0].text == "current"
 
 
+def test_supervised_transcript_borrows_entered_supervisor_without_closing_it(
+    tmp_path,
+):
+    output = tmp_path / "out"
+    supervisor = _FakeSupervisor(output)
+    preflight = _preflight(
+        config=_config(speaker_detection=False),
+        hf_token=None,
+        effective_diarization_device=None,
+    )
+
+    with supervisor:
+        result = run_supervised_transcript(
+            _video(tmp_path),
+            output,
+            preflight,
+            scheduler=_scheduler(),
+            supervisor=supervisor,
+        )
+
+        assert result.segments[0].text == "hello"
+        assert supervisor.events.count("enter") == 1
+        assert "exit" not in supervisor.events
+
+    assert supervisor.events[-1] == "exit"
+
+
 def test_progress_output_is_stably_stage_prefixed(capsys):
     print_stage_progress(StageProgress("diarization", "inference", "cpu"))
 
