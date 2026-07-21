@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import signal
 import stat
+import sys
 import threading
 import time
 from pathlib import Path
@@ -25,6 +26,7 @@ from keyframe.stage_supervisor import (
     SupervisorSignal,
     TranscriptionWorkerRequest,
     _close_worker_ipc,
+    _execute_worker,
     diarization_worker_entry,
     emit_stage_progress,
     transcription_worker_entry,
@@ -108,6 +110,40 @@ def _spawn_test_worker(request, terminal_send, progress_queue, cancellation_even
         _close_worker_ipc(terminal_send, progress_queue)
 
 
+def _spawn_routed_output_worker(
+    request,
+    terminal_send,
+    progress_queue,
+    cancellation_event,
+):
+    stage = request["stage"]
+    checkpoint = Path(request["checkpoint"])
+
+    def operation():
+        print(f"{stage} stdout")
+        print(f"{stage} stderr", file=sys.stderr)
+        time.sleep(0.05)
+        if stage == "transcription":
+            transcript.write_raw_transcript_checkpoint(
+                [transcript.TranscriptSegment(0.1, 1.9, "worker")],
+                checkpoint,
+            )
+        else:
+            transcript.write_diarization_checkpoint(
+                [transcript.DiarizationRow(0.1, 1.9, "SPEAKER_00")],
+                checkpoint,
+            )
+        return {"record_count": 1}
+
+    _execute_worker(
+        stage,
+        terminal_send,
+        progress_queue,
+        cancellation_event,
+        operation,
+    )
+
+
 def _start_test_stage(supervisor, *, stage="transcription", mode="success", **request_values):
     assert supervisor.staging is not None
     if stage == "transcription":
@@ -137,6 +173,54 @@ def _wait_for_path(path: Path, timeout=5.0):
         if time.monotonic() >= deadline:
             raise AssertionError(f"timed out waiting for {path}")
         time.sleep(0.01)
+
+
+def test_concurrent_worker_text_is_routed_through_stage_progress(tmp_path, capfd):
+    events = []
+    output = tmp_path / "out"
+
+    with StageSupervisor(
+        output,
+        progress_callback=events.append,
+        progress_capacity=64,
+    ) as supervisor:
+        assert supervisor.staging is not None
+        transcription_handle = supervisor._start_stage(
+            stage="transcription",
+            target=_spawn_routed_output_worker,
+            request={
+                "stage": "transcription",
+                "checkpoint": str(supervisor.staging.transcript_raw),
+            },
+            checkpoint_path=supervisor.staging.transcript_raw,
+            validator=transcript.read_raw_transcript_checkpoint,
+        )
+        diarization_handle = supervisor._start_stage(
+            stage="diarization",
+            target=_spawn_routed_output_worker,
+            request={
+                "stage": "diarization",
+                "checkpoint": str(supervisor.staging.diarization),
+            },
+            checkpoint_path=supervisor.staging.diarization,
+            validator=transcript.read_diarization_checkpoint,
+        )
+
+        supervisor.complete(transcription_handle)
+        supervisor.complete(diarization_handle)
+
+    captured = capfd.readouterr()
+    assert "transcription stdout" not in captured.out
+    assert "transcription stderr" not in captured.err
+    assert "diarization stdout" not in captured.out
+    assert "diarization stderr" not in captured.err
+    for stage in ("transcription", "diarization"):
+        assert any(
+            event.stage == stage
+            and event.event == "output"
+            and event.message in {f"{stage} stdout", f"{stage} stderr"}
+            for event in events
+        )
 
 
 def test_spawned_worker_is_non_daemon_validated_and_promoted(tmp_path):
@@ -665,17 +749,20 @@ def test_diarization_worker_entry_keeps_bulk_result_on_disk(tmp_path, monkeypatc
     terminal = _FakeTerminal()
     progress = _FakeProgressQueue()
     cancellation = _FakeEvent()
-    monkeypatch.setattr(
-        transcript,
-        "_detect_speakers",
-        lambda *_args, **_kwargs: (
+    calls = []
+
+    def fake_detect(video_path, hf_token, *, device):
+        calls.append((video_path, hf_token, device))
+        return (
             transcript.DiarizationRow(0.1, 2.3, "SPEAKER_00"),
-        ),
-    )
+        )
+
+    monkeypatch.setattr(transcript, "_detect_speakers", fake_detect)
     request = DiarizationWorkerRequest(
         video_path=str(tmp_path / "video.mp4"),
         hf_token=" hf_test ",
         checkpoint_path=str(checkpoint),
+        device="cpu",
     )
 
     diarization_worker_entry(request, terminal, progress, cancellation)
@@ -683,6 +770,7 @@ def test_diarization_worker_entry_keeps_bulk_result_on_disk(tmp_path, monkeypatc
     assert transcript.read_diarization_checkpoint(checkpoint) == (
         transcript.DiarizationRow(0.1, 2.3, "SPEAKER_00"),
     )
+    assert calls == [(tmp_path / "video.mp4", "hf_test", "cpu")]
     assert terminal.messages == [
         StageTerminal.succeeded("diarization", {"row_count": 1})
     ]
