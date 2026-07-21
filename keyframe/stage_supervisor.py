@@ -705,11 +705,11 @@ class StageSupervisor:
     def __enter__(self) -> StageSupervisor:
         if self._entered:
             raise RuntimeError("stage supervisor cannot be entered twice")
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.output_dir = self.output_dir.resolve()
-        self.lock = OutputDirectoryLock(self.output_dir)
         staging_root_was_absent = False
         try:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            self.output_dir = self.output_dir.resolve()
+            self.lock = OutputDirectoryLock(self.output_dir)
             self.lock.acquire()
             self._cleanup_stale_runs()
             self.staging = run_staging_paths(self.output_dir, self.run_id)
@@ -738,7 +738,12 @@ class StageSupervisor:
                             f"failed to remove run staging directory: {cleanup_exc}"
                         )
             finally:
-                self.lock.release()
+                if self.lock is not None:
+                    self.lock.release()
+            if isinstance(exc, OSError) and not isinstance(exc, FileExistsError):
+                raise StageSupervisorError(
+                    f"failed to initialize output directory {self.output_dir}: {exc}"
+                ) from exc
             raise
 
     def _install_sigterm_handler(self) -> None:
@@ -934,7 +939,12 @@ class StageSupervisor:
             staged_device=staged_stat.st_dev,
             staged_inode=staged_stat.st_ino,
         )
-        atomic_promote_file(completion.checkpoint_path, public_path)
+        try:
+            atomic_promote_file(completion.checkpoint_path, public_path)
+        except OSError as exc:
+            raise StageCheckpointError(
+                f"{handle.stage} checkpoint promotion failed: {exc}"
+            ) from exc
         promoted = replace(completion, checkpoint_path=public_path)
         handle._completion = promoted
         handle._promotion_attempt = None

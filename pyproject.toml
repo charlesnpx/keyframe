@@ -47,4 +47,7 @@ packages = ["keyframe"]
 [tool.pytest.ini_options]
 markers = [
     "slow: opt-in QA fixture tests that run full local recordings",
+    "hardware: opt-in tests that execute real local model hardware",
+    "mlx: opt-in tests that require a supported Apple MLX runtime",
+    "cuda: opt-in tests that require an available CUDA runtime",
 ]
