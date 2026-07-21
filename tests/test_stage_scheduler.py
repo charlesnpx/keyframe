@@ -131,7 +131,18 @@ def test_auto_cpu_frames_do_not_overlap_cpu_transcript_stages():
     )
 
     assert not decision.parallel
-    assert "limited to transcription and diarization" in decision.reason
+    assert "CPU frame work" in decision.reason
+
+
+def test_explicit_parallel_cannot_force_cpu_frames_over_cpu_diarization(caplog):
+    caplog.set_level(logging.WARNING)
+
+    decision = _scheduler(policy="parallel", cpus=16).decide(
+        (frame_demand("cpu"), diarization_demand("cpu"))
+    )
+
+    assert not decision.parallel
+    assert "CPU frame-stage exclusion" in caplog.text
 
 
 @pytest.mark.parametrize(

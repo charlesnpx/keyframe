@@ -203,13 +203,14 @@ def _run_transcript(video: Path, out_dir: Path, preflight, *, supervisor=None):
     )
 
 
-def _frame_config(args):
+def _frame_config(args, *, device: str | None = None):
     from keyframe.pipeline import KeyframeExtractionConfig
 
     return KeyframeExtractionConfig(
         sample_interval=args.sample_interval,
         pass1_clusters=args.pass1_clusters,
         similarity_threshold=args.similarity_threshold,
+        device=device,
         max_output_frames=getattr(args, "max_output_frames", None),
         max_clustering_memory_mb=getattr(args, "max_clustering_memory_mb", 2048),
         max_frame_cache_mb=getattr(args, "max_frame_cache_mb", 8192),
@@ -227,7 +228,14 @@ def _frame_config(args):
     )
 
 
-def _run_frame_generation(video: Path, out_dir: Path, args, session):
+def _run_frame_generation(
+    video: Path,
+    out_dir: Path,
+    args,
+    session,
+    *,
+    frame_device: str | None = None,
+):
     from keyframe.frame_generation import StagedFrameGeneration
     from keyframe.pipeline import extract_keyframes
 
@@ -236,10 +244,33 @@ def _run_frame_generation(video: Path, out_dir: Path, args, session):
     result = extract_keyframes(
         video,
         session.staging.frames,
-        _frame_config(args),
+        _frame_config(args, device=frame_device),
         report_output_dir=out_dir / "frames",
     )
     return StagedFrameGeneration.from_extraction(session, result)
+
+
+def _run_full_pipeline(video: Path, out_dir: Path, args, preflight, supervisor):
+    from keyframe.full_pipeline import (
+        resolve_frame_device,
+        run_supervised_full_pipeline,
+    )
+
+    frame_device = resolve_frame_device(preflight)
+    return run_supervised_full_pipeline(
+        video,
+        out_dir,
+        preflight,
+        supervisor=supervisor,
+        frame_device=frame_device,
+        frame_runner=lambda: _run_frame_generation(
+            video,
+            out_dir,
+            args,
+            supervisor,
+            frame_device=frame_device,
+        ),
+    )
 
 
 def _frame_session(out_dir: Path, *, with_transcript: bool):
@@ -283,7 +314,6 @@ def cmd_extract(args):
     print(f"Output: {out_dir.resolve()}\n")
 
     t0 = time.time()
-    frame_generation = None
     session_context = (
         _frame_session(out_dir, with_transcript=do_transcript)
         if do_frames
@@ -293,8 +323,23 @@ def cmd_extract(args):
 
     try:
         with session_context as session:
-            # ── Key frames ──────────────────────────────────────────────
-            if do_frames:
+            if do_frames and do_transcript:
+                print("=" * 60)
+                print("FULL EXTRACTION")
+                print("=" * 60)
+                if session is None:
+                    raise RuntimeError("full extraction session was not initialized")
+                if transcript_preflight is None:
+                    raise RuntimeError("transcript preflight was not initialized")
+                full_result = _run_full_pipeline(
+                    video,
+                    out_dir,
+                    args,
+                    transcript_preflight,
+                    session,
+                )
+                _print_frame_result(full_result.frames)
+            elif do_frames:
                 print("=" * 60)
                 print("KEY FRAME EXTRACTION")
                 print("=" * 60)
@@ -306,35 +351,19 @@ def cmd_extract(args):
                     args,
                     session,
                 )
-                if not do_transcript:
-                    _print_frame_result(frame_generation.promote())
-
-            # ── Transcript ──────────────────────────────────────────────
-            if do_transcript:
+                _print_frame_result(frame_generation.promote())
+            elif do_transcript:
                 print(f"\n{'=' * 60}")
                 print("TRANSCRIPT EXTRACTION")
                 print("=" * 60)
 
                 if transcript_preflight is None:
                     raise RuntimeError("transcript preflight was not initialized")
-                if do_frames:
-                    transcript_result = _run_transcript(
-                        video,
-                        out_dir,
-                        transcript_preflight,
-                        supervisor=session,
-                    )
-                else:
-                    transcript_result = _run_transcript(
-                        video,
-                        out_dir,
-                        transcript_preflight,
-                    )
-                segments = transcript_result.segments
-
-                if frame_generation is not None:
-                    frame_generation.enrich_manifest(segments)
-                    _print_frame_result(frame_generation.promote())
+                _run_transcript(
+                    video,
+                    out_dir,
+                    transcript_preflight,
+                )
     except OutputSessionError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         raise SystemExit(1) from None

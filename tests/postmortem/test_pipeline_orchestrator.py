@@ -95,6 +95,7 @@ def test_cli_frames_only_delegates_to_shared_pipeline(tmp_path, monkeypatch):
     assert kwargs["report_output_dir"] == out_dir / "frames"
     assert config.sample_interval == 0.75
     assert config.pass1_clusters == 9
+    assert config.device is None
     assert (out_dir / "frames" / "frame_000030_1.00s.png").exists()
 
 
@@ -154,14 +155,21 @@ def test_cli_transcript_manifest_rewrite_materializes_candidate_records(tmp_path
         ),
     )
     monkeypatch.setattr(cli, "_preflight_transcript", lambda _args: object())
-    monkeypatch.setattr(
-        cli,
-        "_run_transcript",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            segments=[{"start": 0.0, "end": 2.0, "text": "hello"}],
-            language="en",
-        ),
-    )
+
+    def fake_full_pipeline(video_path, output, args, _preflight, supervisor):
+        generation = cli._run_frame_generation(
+            video_path,
+            output,
+            args,
+            supervisor,
+            frame_device="cpu",
+        )
+        generation.enrich_manifest(
+            [{"start": 0.0, "end": 2.0, "text": "hello"}]
+        )
+        return SimpleNamespace(frames=generation.promote())
+
+    monkeypatch.setattr(cli, "_run_full_pipeline", fake_full_pipeline)
 
     cli.cmd_extract(SimpleNamespace(
         video=str(video),
