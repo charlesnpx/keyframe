@@ -9,9 +9,11 @@ from pathlib import Path
 
 import pytest
 
+from keyframe import stage_supervisor as supervisor_module
 from keyframe import transcript
 from keyframe.stage_supervisor import (
     DiarizationWorkerRequest,
+    OutputDirectoryLock,
     OutputDirectoryLockedError,
     StageCheckpointError,
     StageHandle,
@@ -185,7 +187,7 @@ def test_lossy_progress_cannot_block_reliable_terminal_during_parent_work(tmp_pa
         completion = supervisor.complete(handle)
 
     assert completion.metadata["record_count"] == 1
-    assert progress
+    # Progress is deliberately lossy, including the possibility of no delivery.
     assert len(progress) < 10_000
 
 
@@ -453,6 +455,56 @@ def test_failed_entry_preserves_collision_and_releases_output_lock(tmp_path):
         assert supervisor.staging.root.exists()
 
 
+def test_interruption_after_output_lock_acquire_is_released(tmp_path, monkeypatch):
+    output = tmp_path / "output"
+    output.mkdir()
+    original_acquire = OutputDirectoryLock.acquire
+
+    def acquire_then_interrupt(lock):
+        original_acquire(lock)
+        raise KeyboardInterrupt("interrupted after lock acquisition")
+
+    monkeypatch.setattr(OutputDirectoryLock, "acquire", acquire_then_interrupt)
+    with pytest.raises(KeyboardInterrupt, match="after lock acquisition"):
+        with StageSupervisor(output, run_id="interrupted-entry"):
+            pytest.fail("entry must be interrupted")
+
+    monkeypatch.setattr(OutputDirectoryLock, "acquire", original_acquire)
+    with StageSupervisor(output, run_id="after-interrupted-entry"):
+        pass
+
+
+def test_interruption_inside_output_lock_acquire_closes_descriptor(
+    tmp_path,
+    monkeypatch,
+):
+    output = tmp_path / "output"
+    output.mkdir()
+    original_acquire_descriptor = OutputDirectoryLock._acquire_descriptor
+
+    def lock_then_interrupt(lock, descriptor):
+        original_acquire_descriptor(lock, descriptor)
+        raise KeyboardInterrupt("interrupted inside lock acquisition")
+
+    monkeypatch.setattr(
+        OutputDirectoryLock,
+        "_acquire_descriptor",
+        lock_then_interrupt,
+    )
+    lock = OutputDirectoryLock(output)
+    with pytest.raises(KeyboardInterrupt, match="inside lock acquisition"):
+        lock.acquire()
+    assert lock._descriptor is None
+
+    monkeypatch.setattr(
+        OutputDirectoryLock,
+        "_acquire_descriptor",
+        original_acquire_descriptor,
+    )
+    with OutputDirectoryLock(output):
+        pass
+
+
 def test_close_from_another_thread_releases_lock_and_can_restore_on_owner(tmp_path):
     output = tmp_path / "output"
     previous_handler = signal.getsignal(signal.SIGTERM)
@@ -525,6 +577,42 @@ def test_promotion_preserves_mode_and_repeated_completion_is_stable(tmp_path):
         assert first == second
         assert handle.wait() == first
         assert stat.S_IMODE(public.stat().st_mode) == 0o600
+
+
+def test_interrupted_completed_promotion_is_reconciled_on_retry(tmp_path, monkeypatch):
+    output = tmp_path / "output"
+    original_promote = supervisor_module.atomic_promote_file
+
+    def promote_then_interrupt(staged_path, public_path):
+        original_promote(staged_path, public_path)
+        raise KeyboardInterrupt("interrupted after checkpoint replacement")
+
+    with StageSupervisor(output, run_id="interrupted-promotion") as supervisor:
+        handle = _start_test_stage(supervisor)
+        monkeypatch.setattr(
+            supervisor_module,
+            "atomic_promote_file",
+            promote_then_interrupt,
+        )
+
+        with pytest.raises(KeyboardInterrupt, match="after checkpoint replacement"):
+            supervisor.complete(handle)
+
+        assert not handle.checkpoint_path.exists()
+        assert (output / "transcript.raw.json").exists()
+        monkeypatch.setattr(
+            supervisor_module,
+            "atomic_promote_file",
+            original_promote,
+        )
+
+        recovered = supervisor.complete(handle)
+
+        assert recovered.checkpoint_path == output / "transcript.raw.json"
+        assert recovered.records == (
+            transcript.TranscriptSegment(0.123456789, 1.987654321, "worker"),
+        )
+        assert handle.wait() == recovered
 
 
 def test_transcription_worker_entry_keeps_bulk_result_on_disk(tmp_path, monkeypatch):

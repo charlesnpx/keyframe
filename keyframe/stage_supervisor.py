@@ -137,6 +137,13 @@ class StageCompletion:
     records: tuple[TranscriptSegment, ...] | tuple[DiarizationRow, ...]
 
 
+@dataclass(frozen=True)
+class _PromotionAttempt:
+    public_path: Path
+    staged_device: int
+    staged_inode: int
+
+
 def emit_stage_progress(progress_queue: Any, event: StageProgress) -> None:
     """Best-effort progress must never delay inference or terminal delivery."""
     try:
@@ -294,13 +301,16 @@ class OutputDirectoryLock:
     def acquire(self) -> None:
         if self._descriptor is not None:
             raise RuntimeError("output directory lock is already held")
-        descriptor = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        descriptor: int | None = None
         try:
+            descriptor = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+            self._descriptor = descriptor
             self._acquire_descriptor(descriptor)
         except BaseException:
-            os.close(descriptor)
+            self._descriptor = None
+            if descriptor is not None:
+                os.close(descriptor)
             raise
-        self._descriptor = descriptor
 
     def _acquire_descriptor(self, descriptor: int) -> None:
         if os.name == "nt":
@@ -385,6 +395,7 @@ class StageHandle:
         self._ipc_closed = False
         self._completion: StageCompletion | None = None
         self._failure: BaseException | None = None
+        self._promotion_attempt: _PromotionAttempt | None = None
         self._control_thread = threading.Thread(
             target=self._monitor_control,
             name=f"keyframe-{stage}-control",
@@ -656,9 +667,9 @@ class StageSupervisor:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.output_dir = self.output_dir.resolve()
         self.lock = OutputDirectoryLock(self.output_dir)
-        self.lock.acquire()
         staging_root_was_absent = False
         try:
+            self.lock.acquire()
             self._cleanup_stale_runs()
             self.staging = run_staging_paths(self.output_dir, self.run_id)
             staging_root_was_absent = not os.path.lexists(self.staging.root)
@@ -843,10 +854,48 @@ class StageSupervisor:
             )
         completion = handle.wait()
         if completion.checkpoint_path == public_path:
+            handle._promotion_attempt = None
             return completion
+        attempt = handle._promotion_attempt
+        if (
+            attempt is not None
+            and attempt.public_path == public_path
+            and not completion.checkpoint_path.exists()
+        ):
+            try:
+                public_stat = public_path.stat()
+                public_records = handle._validator(public_path)
+            except Exception as exc:
+                raise StageCheckpointError(
+                    f"{handle.stage} checkpoint promotion could not be reconciled: {exc}"
+                ) from exc
+            if (
+                public_stat.st_dev != attempt.staged_device
+                or public_stat.st_ino != attempt.staged_inode
+                or public_records != completion.records
+            ):
+                raise StageCheckpointError(
+                    f"{handle.stage} checkpoint promotion could not be reconciled"
+                )
+            promoted = replace(completion, checkpoint_path=public_path)
+            handle._completion = promoted
+            handle._promotion_attempt = None
+            return promoted
+        try:
+            staged_stat = completion.checkpoint_path.stat()
+        except OSError as exc:
+            raise StageCheckpointError(
+                f"{handle.stage} staged checkpoint is no longer available: {exc}"
+            ) from exc
+        handle._promotion_attempt = _PromotionAttempt(
+            public_path=public_path,
+            staged_device=staged_stat.st_dev,
+            staged_inode=staged_stat.st_ino,
+        )
         atomic_promote_file(completion.checkpoint_path, public_path)
         promoted = replace(completion, checkpoint_path=public_path)
         handle._completion = promoted
+        handle._promotion_attempt = None
         return promoted
 
     def cancel(self, handle: StageHandle) -> None:
