@@ -707,7 +707,11 @@ def run_supervised_full_pipeline(
     print("Frame-stage admission after transcription:")
     _print_schedule(frame_schedule)
 
-    if diarization_stage is not None and diarization_handle is None:
+    if (
+        diarization_stage is not None
+        and diarization_handle is None
+        and not diarization_retry_pending
+    ):
         start_diarization(frame_schedule, "post-transcription")
     if (
         diarization_handle is not None

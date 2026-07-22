@@ -470,6 +470,12 @@ def test_detect_speakers_reports_monotonic_progress_and_closes_bar(monkeypatch, 
             NotImplementedError("MPS does not support this operator"),
             transcript.MPSDiarizationInferenceError,
         ),
+        (
+            "infer",
+            MemoryError("MPS allocator out of memory"),
+            transcript.MPSDiarizationInferenceError,
+        ),
+        ("init", MemoryError("Python heap exhausted"), MemoryError),
         ("init", RuntimeError("checkpoint protocol mismatch"), RuntimeError),
         (
             "init",

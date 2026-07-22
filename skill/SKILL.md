@@ -46,7 +46,7 @@ Extract key frames and/or a timestamped transcript from a video or audio file.
 
    In automatic concurrency mode, independent stages can overlap after 10%-headroom admission. macOS uses physical-memory pressure evidence with a bounded `vm_stat` fallback and never counts swap. MLX transcription, MPS diarization, and MPS frames share the Apple accelerator and remain serialized. CPU diarization retains the existing overlap behavior, including a fresh admission decision before a fallback can overlap frames.
 
-   Reliable intervals select one of the five normal topology expressions or six retry-aware variants. `T`, `R`, `D`, `F`, `M`, and `E` are transcription, failed MPS attempt, successful diarization, frames, transcript merge/output, and manifest enrichment/promotion.
+   Reliable intervals select one of the five normal topology expressions or ten retry-aware variants. `T`, `R`, `D`, `F`, `M`, and `E` are transcription, failed MPS attempt, successful diarization, frames, transcript merge/output, and manifest enrichment/promotion.
 
 4. **Present the results.** After extraction completes:
    - Read the transcript first; treat it as narrative authority for what was said

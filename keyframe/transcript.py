@@ -965,8 +965,6 @@ def _is_mps_compute_failure(exc: BaseException) -> bool:
     message = " ".join(str(exc).lower().split())
     if any(marker in message for marker in _MPS_NON_COMPUTE_FAILURE_MARKERS):
         return False
-    if isinstance(exc, MemoryError):
-        return True
     return (
         any(pattern.search(message) for pattern in _MPS_COMPUTE_FAILURE_PATTERNS)
         or "placeholder storage" in message
