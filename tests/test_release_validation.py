@@ -96,7 +96,7 @@ def _passing_report(input_path: Path) -> dict:
         },
         "reference": {
             **benchmark.REFERENCE_CONTRACT,
-            "wall_time_seconds": 10.0,
+            "wall_time_seconds": 20.0,
             "artifacts": _artifacts(frames=False),
         },
         "candidate": {
@@ -105,7 +105,7 @@ def _passing_report(input_path: Path) -> dict:
             "model_revision": baseline["model"]["mlx_revision"],
             "model_resolution_seconds": 0.125,
             "mlx_peak_memory_bytes": 5 * benchmark.GIB,
-            "peak_memory_gib": 5.0,
+            "peak_memory_gib": 4.0,
             "peak_memory_method": benchmark.PROCESS_TREE_PEAK_METHOD,
             "stage_process_tree_peak_rss_bytes": {
                 "transcription": 3 * benchmark.GIB,
@@ -119,29 +119,29 @@ def _passing_report(input_path: Path) -> dict:
             "peak_memory_components_bytes": {
                 "case_process_bytes": 1 * benchmark.GIB,
                 "max_reaped_child_bytes": 3 * benchmark.GIB,
-                "concurrent_stage_sum_bytes": 4 * benchmark.GIB,
-                "descendant_bound_bytes": 4 * benchmark.GIB,
-                "tree_upper_bound_bytes": 5 * benchmark.GIB,
+                "concurrent_stage_sum_bytes": 3 * benchmark.GIB,
+                "descendant_bound_bytes": 3 * benchmark.GIB,
+                "tree_upper_bound_bytes": 4 * benchmark.GIB,
                 "phase_upper_bound_bytes": {
-                    "initial-wave": 5 * benchmark.GIB,
+                    "initial-wave": 4 * benchmark.GIB,
                     "second-wave": 4 * benchmark.GIB,
                     "finalization": 4 * benchmark.GIB,
                 },
             },
-            "critical_path": "max(T + F, D) + M + E",
+            "critical_path": "T + D + F + M + E",
             "pipeline_evidence": {
                 "transcription": _stage_interval(
                     "transcription", "initial", 0.0, 2.0
                 ),
                 "diarization": _stage_interval(
-                    "diarization", "initial", 0.0, 3.0
+                    "diarization", "post-transcription", 2.0, 5.0
                 ),
                 "frames": _stage_interval(
-                    "frames", "post-transcription", 2.0, 6.0
+                    "frames", "post-transcription", 5.0, 9.0
                 ),
             },
             "fallback_waited_for_diarization": False,
-            "wall_time_seconds": 7.0,
+            "wall_time_seconds": 10.0,
             "timings": timings,
             "artifacts": _artifacts(frames=True),
         },
@@ -161,6 +161,25 @@ def _passing_report(input_path: Path) -> dict:
             "reason": "partitions are equivalent",
         },
     }
+
+
+def test_release_contracts_compare_cpu_reference_to_mps_candidate():
+    assert benchmark.REFERENCE_CONTRACT["diarization_device"] == "cpu"
+    assert "diarization_attempted_devices" not in benchmark.REFERENCE_CONTRACT
+    assert benchmark.CANDIDATE_CONTRACT["diarization_device"] == "mps"
+    assert benchmark.CANDIDATE_CONTRACT["diarization_attempted_devices"] == [
+        "mps"
+    ]
+    assert benchmark.CANDIDATE_CONTRACT["diarization_fallback_used"] is False
+    assert benchmark.CANDIDATE_CONTRACT[
+        "pytorch_mps_fallback_enabled"
+    ] is False
+    assert benchmark.CANDIDATE_CONTRACT["schedule_reason"] == (
+        benchmark.APPLE_ACCELERATOR_SERIAL_REASON
+    )
+    assert benchmark.CANDIDATE_CONTRACT["frame_schedule_reason"] == (
+        benchmark.APPLE_ACCELERATOR_SERIAL_REASON
+    )
 
 
 def _set_process_tree_peak(report: dict, gibibytes: float) -> None:
@@ -237,11 +256,22 @@ def test_transcript_quality_rejects_invalid_rows_and_ngram_size():
         ("max(T, D) + F + M + E", 26.0),
         ("T + max(D, F) + M + E", 33.0),
         ("T + D + F + M + E", 36.0),
+        ("T + R + F + M + E", 20.0),
+        ("T + R + max(D, F) + M + E", 37.0),
+        ("T + R + D + F + M + E", 40.0),
+        ("max(T, R) + F + M + E", 16.0),
+        ("max(T, R) + max(D, F) + M + E", 33.0),
+        ("max(T, R) + D + F + M + E", 36.0),
+        ("T + max(R, F) + M + E", 17.0),
+        ("T + max(R, F) + D + M + E", 37.0),
+        ("max(T + F, R) + M + E", 16.0),
+        ("max(T + F, R) + D + M + E", 36.0),
     ],
 )
 def test_expected_critical_path_supports_each_release_schedule(expression, expected):
     timings = {
         "transcription": 10.0,
+        "diarization_retry": 4.0,
         "diarization": 20.0,
         "frames": 3.0,
         "merge": 2.0,
@@ -387,6 +417,7 @@ def test_performance_thresholds_are_named_exact_and_finite():
         "process_rss": benchmark.MAX_PROCESS_TREE_RSS_GIB,
         "mlx_peak": benchmark.MAX_MLX_ALLOCATOR_PEAK_GIB,
         "resolution": benchmark.MAX_LOCAL_MODEL_RESOLUTION_SECONDS,
+        "mps_diarization": benchmark.MAX_MPS_DIARIZATION_SECONDS,
     }
 
     assert thresholds == {
@@ -396,6 +427,7 @@ def test_performance_thresholds_are_named_exact_and_finite():
         "process_rss": 6.60,
         "mlx_peak": 5.96,
         "resolution": 1.0,
+        "mps_diarization": 335.0,
     }
     assert all(
         isinstance(value, float) and value > 0 and value < float("inf")
@@ -416,9 +448,9 @@ def test_report_evaluation_passes_and_records_critical_path(tmp_path):
 
     assert failures == []
     assert report["critical_path_validation"] == {
-        "expression": "max(T + F, D) + M + E",
-        "predicted_seconds": 7.0,
-        "measured_wall_seconds": 7.0,
+        "expression": "T + D + F + M + E",
+        "predicted_seconds": 10.0,
+        "measured_wall_seconds": 10.0,
         "absolute_delta_seconds": 0.0,
         "tolerance_seconds": 0.01,
     }
@@ -430,8 +462,9 @@ def test_report_evaluation_passes_and_records_critical_path(tmp_path):
         "process_tree_peak_method": benchmark.PROCESS_TREE_PEAK_METHOD,
         "mlx_allocator_peak_ceiling_gib": 5.96,
         "local_resolution_ceiling_seconds": 1.0,
+        "mps_diarization_ceiling_seconds": 335.0,
         "historical_wall_limit_seconds": pytest.approx(705.7205),
-        "same_run_wall_limit_seconds": 8.5,
+        "same_run_wall_limit_seconds": 17.0,
     }
 
 
@@ -515,6 +548,224 @@ def test_report_evaluation_passes_and_records_critical_path(tmp_path):
             "T + F + M + E",
             7.0,
         ),
+        (
+            {
+                "transcription": _stage_interval(
+                    "transcription", "initial", 0.0, 2.0
+                ),
+                "diarization_retry": _stage_interval(
+                    "diarization_retry",
+                    "post-transcription",
+                    2.0,
+                    3.0,
+                    outcome="failed",
+                ),
+                "diarization": _stage_interval(
+                    "diarization", "post-transcription", 3.0, 5.0
+                ),
+                "frames": _stage_interval(
+                    "frames", "post-transcription", 3.0, 6.0
+                ),
+            },
+            False,
+            "T + R + max(D, F) + M + E",
+            7.0,
+        ),
+        (
+            {
+                "transcription": _stage_interval(
+                    "transcription", "initial", 0.0, 2.0
+                ),
+                "diarization_retry": _stage_interval(
+                    "diarization_retry",
+                    "post-transcription",
+                    2.0,
+                    3.0,
+                    outcome="failed",
+                ),
+                "diarization": _stage_interval(
+                    "diarization", "post-transcription", 3.0, 5.0
+                ),
+                "frames": _stage_interval(
+                    "frames", "post-transcription", 5.0, 8.0
+                ),
+            },
+            False,
+            "T + R + D + F + M + E",
+            9.0,
+        ),
+        (
+            {
+                "transcription": _stage_interval(
+                    "transcription", "initial", 0.0, 2.0
+                ),
+                "diarization_retry": _stage_interval(
+                    "diarization_retry",
+                    "post-transcription",
+                    2.0,
+                    3.0,
+                    outcome="failed",
+                ),
+                "frames": _stage_interval(
+                    "frames", "post-transcription", 3.0, 6.0
+                ),
+            },
+            False,
+            "T + R + F + M + E",
+            7.0,
+        ),
+        (
+            {
+                "transcription": _stage_interval(
+                    "transcription", "initial", 0.0, 2.0
+                ),
+                "diarization_retry": _stage_interval(
+                    "diarization_retry",
+                    "initial",
+                    0.0,
+                    3.0,
+                    outcome="failed",
+                ),
+                "diarization": _stage_interval(
+                    "diarization", "post-transcription", 3.0, 5.0
+                ),
+                "frames": _stage_interval(
+                    "frames", "post-transcription", 3.0, 6.0
+                ),
+            },
+            False,
+            "max(T, R) + max(D, F) + M + E",
+            7.0,
+        ),
+        (
+            {
+                "transcription": _stage_interval(
+                    "transcription", "initial", 0.0, 2.0
+                ),
+                "diarization_retry": _stage_interval(
+                    "diarization_retry",
+                    "initial",
+                    0.0,
+                    3.0,
+                    outcome="failed",
+                ),
+                "diarization": _stage_interval(
+                    "diarization", "post-transcription", 3.0, 5.0
+                ),
+                "frames": _stage_interval(
+                    "frames", "post-transcription", 5.0, 8.0
+                ),
+            },
+            False,
+            "max(T, R) + D + F + M + E",
+            9.0,
+        ),
+        (
+            {
+                "transcription": _stage_interval(
+                    "transcription", "initial", 0.0, 2.0
+                ),
+                "diarization_retry": _stage_interval(
+                    "diarization_retry",
+                    "initial",
+                    0.0,
+                    3.0,
+                    outcome="failed",
+                ),
+                "frames": _stage_interval(
+                    "frames", "post-transcription", 3.0, 6.0
+                ),
+            },
+            False,
+            "max(T, R) + F + M + E",
+            7.0,
+        ),
+        (
+            {
+                "transcription": _stage_interval(
+                    "transcription", "initial", 0.0, 2.0
+                ),
+                "diarization_retry": _stage_interval(
+                    "diarization_retry",
+                    "post-transcription",
+                    2.0,
+                    5.0,
+                    outcome="failed",
+                ),
+                "frames": _stage_interval(
+                    "frames", "post-transcription", 2.0, 6.0
+                ),
+            },
+            False,
+            "T + max(R, F) + M + E",
+            7.0,
+        ),
+        (
+            {
+                "transcription": _stage_interval(
+                    "transcription", "initial", 0.0, 2.0
+                ),
+                "diarization_retry": _stage_interval(
+                    "diarization_retry",
+                    "post-transcription",
+                    2.0,
+                    5.0,
+                    outcome="failed",
+                ),
+                "frames": _stage_interval(
+                    "frames", "post-transcription", 2.0, 6.0
+                ),
+                "diarization": _stage_interval(
+                    "diarization", "post-transcription", 6.0, 8.0
+                ),
+            },
+            False,
+            "T + max(R, F) + D + M + E",
+            9.0,
+        ),
+        (
+            {
+                "transcription": _stage_interval(
+                    "transcription", "initial", 0.0, 2.0
+                ),
+                "diarization_retry": _stage_interval(
+                    "diarization_retry",
+                    "initial",
+                    0.0,
+                    5.0,
+                    outcome="failed",
+                ),
+                "frames": _stage_interval(
+                    "frames", "post-transcription", 2.0, 6.0
+                ),
+            },
+            False,
+            "max(T + F, R) + M + E",
+            7.0,
+        ),
+        (
+            {
+                "transcription": _stage_interval(
+                    "transcription", "initial", 0.0, 2.0
+                ),
+                "diarization_retry": _stage_interval(
+                    "diarization_retry",
+                    "initial",
+                    0.0,
+                    5.0,
+                    outcome="failed",
+                ),
+                "frames": _stage_interval(
+                    "frames", "post-transcription", 2.0, 6.0
+                ),
+                "diarization": _stage_interval(
+                    "diarization", "post-transcription", 6.0, 8.0
+                ),
+            },
+            False,
+            "max(T + F, R) + D + M + E",
+            9.0,
+        ),
     ],
 )
 def test_reported_evidence_derives_each_supported_critical_path(
@@ -582,7 +833,7 @@ def test_report_evaluation_rejects_path_that_disagrees_with_pipeline_evidence(
     input_path = tmp_path / "recording.mp4"
     input_path.write_bytes(b"benchmark recording")
     report = _passing_report(input_path)
-    report["candidate"]["critical_path"] = "T + D + F + M + E"
+    report["candidate"]["critical_path"] = "max(T + F, D) + M + E"
 
     failures = benchmark.evaluate_report(
         report,
@@ -675,6 +926,12 @@ def test_report_evaluation_rejects_inconsistent_reliable_topology(
         ),
         (
             lambda report: report["candidate"].update(
+                pytorch_mps_fallback_enabled=True
+            ),
+            "candidate pytorch_mps_fallback_enabled",
+        ),
+        (
+            lambda report: report["candidate"].update(
                 schedule_policy="parallel"
             ),
             "candidate schedule_policy",
@@ -687,9 +944,21 @@ def test_report_evaluation_rejects_inconsistent_reliable_topology(
         ),
         (
             lambda report: report["candidate"].update(
+                schedule_reason="memory admission failed"
+            ),
+            "candidate schedule_reason",
+        ),
+        (
+            lambda report: report["candidate"].update(
                 frame_schedule_source="macos-vm-stat"
             ),
             "candidate frame_schedule_source",
+        ),
+        (
+            lambda report: report["candidate"].update(
+                frame_schedule_reason="memory admission failed"
+            ),
+            "candidate frame_schedule_reason",
         ),
         (
             lambda report: report["candidate"].update(wall_time_seconds=800.0),
@@ -708,6 +977,12 @@ def test_report_evaluation_rejects_inconsistent_reliable_topology(
                 mlx_peak_memory_bytes=int(5.97 * benchmark.GIB)
             ),
             "candidate MLX allocator peak exceeds 5.96 GiB",
+        ),
+        (
+            lambda report: report["candidate"]["timings"].update(
+                diarization=336.0
+            ),
+            "candidate MPS diarization exceeds the 335-second break-even bound",
         ),
     ],
 )
@@ -780,16 +1055,15 @@ def test_report_evaluation_rejects_release_configuration_drift(tmp_path):
     [
         (
             lambda candidate: candidate["pipeline_evidence"]["diarization"].update(
-                started_at=2.0,
+                started_at=1.0,
             ),
-            "transcription and diarization intervals must overlap",
+            "diarization must not start before transcription completes",
         ),
         (
             lambda candidate: candidate["pipeline_evidence"]["diarization"].update(
-                ended_at=2.0,
-                duration_seconds=2.0,
+                ended_at=6.0,
             ),
-            "frames and diarization intervals must overlap",
+            "frames must not start before diarization completes",
         ),
         (
             lambda candidate: candidate["pipeline_evidence"]["frames"].update(
@@ -800,7 +1074,7 @@ def test_report_evaluation_rejects_release_configuration_drift(tmp_path):
         ),
     ],
 )
-def test_report_evaluation_rejects_required_candidate_overlap_failures(
+def test_report_evaluation_rejects_required_candidate_serialization_failures(
     tmp_path,
     mutation,
     expected_failure,
@@ -1050,14 +1324,14 @@ def test_candidate_case_uses_and_verifies_automatic_apple_scheduling(
         effective_backend="mlx",
         hf_token="hf_test",
         transcription_device="mlx",
-        effective_diarization_device="cpu",
+        effective_diarization_device="mps",
         config=SimpleNamespace(transcription_backend="auto"),
     )
     schedule = SimpleNamespace(
-        parallel=True,
+        parallel=False,
         policy="auto",
-        mode="parallel",
-        reason="automatic memory admission succeeded",
+        mode="serial",
+        reason="stages share exclusive accelerator apple:0",
         resources=SimpleNamespace(source="macos-memory-pressure"),
     )
     pipeline_result = SimpleNamespace(
@@ -1077,19 +1351,21 @@ def test_candidate_case_uses_and_verifies_automatic_apple_scheduling(
             },
         ),
         frame_device="mps",
+        diarization_attempted_devices=("mps",),
+        diarization_fallback_used=False,
         initial_schedule=schedule,
         frame_schedule=schedule,
-        critical_path="max(T + F, D) + M + E",
+        critical_path="T + D + F + M + E",
         pipeline_evidence=SimpleNamespace(
             to_dict=lambda: {
                 "transcription": _stage_interval(
                     "transcription", "initial", 0.0, 1.0
                 ),
                 "diarization": _stage_interval(
-                    "diarization", "initial", 0.0, 2.0
+                    "diarization", "post-transcription", 1.0, 3.0
                 ),
                 "frames": _stage_interval(
-                    "frames", "post-transcription", 1.0, 2.0
+                    "frames", "post-transcription", 3.0, 4.0
                 ),
             }
         ),
@@ -1119,6 +1395,10 @@ def test_candidate_case_uses_and_verifies_automatic_apple_scheduling(
                 "diarization": 1 * benchmark.GIB,
             }
 
+        def completed_stage_metadata(self, stage):
+            assert stage == "diarization"
+            return ({"pytorch_mps_fallback_enabled": False},)
+
     monkeypatch.setattr(benchmark.cli, "_parse_extract_args", parse_args)
     monkeypatch.setattr(benchmark.cli, "_transcript_config", lambda _args: object())
     monkeypatch.setattr(benchmark, "preflight_transcript_run", lambda _config: preflight)
@@ -1139,7 +1419,7 @@ def test_candidate_case_uses_and_verifies_automatic_apple_scheduling(
 
     result = benchmark._run_candidate_case(
         benchmark._CaseRequest(
-            "mlx_concurrent_full",
+            "mlx_mps_serial_full",
             str(tmp_path / "input.mp4"),
             str(tmp_path / "output"),
         )
@@ -1149,11 +1429,15 @@ def test_candidate_case_uses_and_verifies_automatic_apple_scheduling(
     assert parsed_argv[policy_index + 1] == "auto"
     assert result["requested_backend"] == "auto"
     assert result["schedule_policy"] == "auto"
-    assert result["schedule_mode"] == "parallel"
+    assert result["schedule_mode"] == "serial"
     assert result["schedule_source"] == "macos-memory-pressure"
+    assert result["schedule_reason"] == benchmark.APPLE_ACCELERATOR_SERIAL_REASON
     assert result["frame_schedule_policy"] == "auto"
-    assert result["frame_schedule_mode"] == "parallel"
+    assert result["frame_schedule_mode"] == "serial"
     assert result["frame_schedule_source"] == "macos-memory-pressure"
+    assert result["frame_schedule_reason"] == (
+        benchmark.APPLE_ACCELERATOR_SERIAL_REASON
+    )
     assert result["model_resolution_source"] == "local-hit"
     assert result["model_resolution_seconds"] == pytest.approx(0.125)
     assert result["mlx_peak_memory_bytes"] == 123456789
@@ -1162,23 +1446,26 @@ def test_candidate_case_uses_and_verifies_automatic_apple_scheduling(
         "diarization": 1 * benchmark.GIB,
     }
     assert result["fallback_used"] is False
-    assert result["critical_path"] == "max(T + F, D) + M + E"
+    assert result["diarization_attempted_devices"] == ["mps"]
+    assert result["diarization_fallback_used"] is False
+    assert result["pytorch_mps_fallback_enabled"] is False
+    assert result["critical_path"] == "T + D + F + M + E"
     assert result["fallback_waited_for_diarization"] is False
     assert result["pipeline_evidence"]["frames"]["launch_wave"] == (
         "post-transcription"
     )
 
 
-def test_candidate_case_rejects_a_nonparallel_result(monkeypatch, tmp_path):
+def test_candidate_case_rejects_an_overlapping_apple_result(monkeypatch, tmp_path):
     preflight = SimpleNamespace(
         effective_backend="mlx",
         hf_token="hf_test",
         transcription_device="mlx",
-        effective_diarization_device="cpu",
+        effective_diarization_device="mps",
         config=SimpleNamespace(transcription_backend="auto"),
     )
     result = SimpleNamespace(
-        initial_schedule=SimpleNamespace(parallel=False),
+        initial_schedule=SimpleNamespace(parallel=True),
     )
 
     class FakeSupervisor:
@@ -1206,10 +1493,10 @@ def test_candidate_case_rejects_a_nonparallel_result(monkeypatch, tmp_path):
         lambda *_args, **_kwargs: result,
     )
 
-    with pytest.raises(benchmark.BenchmarkError, match="did not overlap"):
+    with pytest.raises(benchmark.BenchmarkError, match="overlapped"):
         benchmark._run_candidate_case(
             benchmark._CaseRequest(
-                "mlx_concurrent_full",
+                "mlx_mps_serial_full",
                 str(tmp_path / "input.mp4"),
                 str(tmp_path / "output"),
             )

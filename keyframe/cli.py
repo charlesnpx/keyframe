@@ -481,7 +481,7 @@ def _add_extract_args(parser):
                         choices=["auto", "mlx", "whisper"],
                         help="Transcription backend (default: auto)")
     parser.add_argument("--diarization-device", default="auto",
-                        choices=["auto", "cpu", "cuda"],
+                        choices=["auto", "cpu", "mps", "cuda"],
                         help="Speaker-detection device (default: auto)")
     parser.add_argument("--stage-concurrency", default="auto",
                         choices=["auto", "serial", "parallel"],

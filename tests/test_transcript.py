@@ -64,7 +64,9 @@ def test_select_whisperx_device_uses_cuda_float16(monkeypatch):
         SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: True)),
     )
 
-    assert transcript._select_whisperx_device() == ("cuda", "float16")
+    assert transcript._select_whisperx_device(
+        runtime_platform=transcript.RuntimePlatform("Linux", "x86_64")
+    ) == ("cuda", "float16")
 
 
 def test_select_whisperx_device_uses_cpu_int8(monkeypatch):
@@ -74,7 +76,61 @@ def test_select_whisperx_device_uses_cpu_int8(monkeypatch):
         SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False)),
     )
 
-    assert transcript._select_whisperx_device() == ("cpu", "int8")
+    assert transcript._select_whisperx_device(
+        runtime_platform=transcript.RuntimePlatform("Linux", "x86_64")
+    ) == ("cpu", "int8")
+
+
+def test_select_whisperx_device_uses_mps_float32_on_supported_mac():
+    assert transcript._select_whisperx_device(
+        runtime_platform=transcript.RuntimePlatform("Darwin", "arm64"),
+        mps_available=True,
+        cuda_available=False,
+    ) == ("mps", "float32")
+
+
+def test_mps_probe_requires_built_and_available_torch_backend(monkeypatch):
+    backend = SimpleNamespace(
+        is_built=lambda: True,
+        is_available=lambda: False,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(backends=SimpleNamespace(mps=backend)),
+    )
+
+    assert not transcript.mps_is_available()
+    backend.is_available = lambda: True
+    assert transcript.mps_is_available()
+
+
+@pytest.mark.parametrize(
+    ("requested", "runtime", "mps", "cuda", "expected"),
+    [
+        ("auto", transcript.RuntimePlatform("Darwin", "arm64"), True, False, "mps"),
+        ("auto", transcript.RuntimePlatform("Darwin", "arm64"), False, False, "cpu"),
+        ("auto", transcript.RuntimePlatform("Linux", "x86_64"), False, True, "cuda"),
+        ("cpu", transcript.RuntimePlatform("Darwin", "arm64"), True, True, "cpu"),
+    ],
+)
+def test_diarization_device_resolution(requested, runtime, mps, cuda, expected):
+    assert transcript.resolve_diarization_device(
+        requested,
+        runtime_platform=runtime,
+        mps_available=mps,
+        cuda_available=cuda,
+    ) == expected
+
+
+def test_explicit_unavailable_mps_is_rejected():
+    with pytest.raises(transcript.UnsupportedDiarizationDeviceError, match="MPS"):
+        transcript.resolve_diarization_device(
+            "mps",
+            runtime_platform=transcript.RuntimePlatform("Darwin", "arm64"),
+            mps_available=False,
+            cuda_available=False,
+        )
 
 
 @pytest.mark.parametrize("token", ["hf_test", None])
@@ -297,13 +353,29 @@ def test_detect_speakers_uses_only_whisperx_audio_and_pyannote(monkeypatch, tmp_
         "whisperx.diarize",
         SimpleNamespace(DiarizationPipeline=FakeDiarizationPipeline),
     )
+    monkeypatch.setitem(
+        sys.modules,
+        "tqdm",
+        SimpleNamespace(
+            tqdm=lambda **_kwargs: SimpleNamespace(
+                update=lambda _amount: None,
+                close=lambda: None,
+            )
+        ),
+    )
     monkeypatch.setitem(sys.modules, "faster_whisper", fake_faster_whisper)
-    monkeypatch.setattr(transcript, "_select_whisperx_device", lambda: ("cpu", "int8"))
+    monkeypatch.setattr(
+        transcript,
+        "_select_whisperx_device",
+        lambda requested: calls.append(("select_device", requested))
+        or ("cpu", "int8"),
+    )
 
     rows = transcript._detect_speakers(video, "hf_test")
 
     assert rows == (transcript.DiarizationRow(0, 1, "SPEAKER_00"),)
     assert calls == [
+        ("select_device", "cpu"),
         ("load_audio", str(video)),
         ("diarization_init", "pyannote/speaker-diarization-community-1", "hf_test", "cpu"),
         ("diarize", "audio"),
@@ -347,13 +419,155 @@ def test_detect_speakers_reports_monotonic_progress_and_closes_bar(monkeypatch, 
         SimpleNamespace(DiarizationPipeline=FakeDiarizationPipeline),
     )
     monkeypatch.setitem(sys.modules, "tqdm", SimpleNamespace(tqdm=FakeProgress))
-    monkeypatch.setattr(transcript, "_select_whisperx_device", lambda: ("cpu", "int8"))
+    monkeypatch.setattr(
+        transcript,
+        "_select_whisperx_device",
+        lambda _requested: ("cpu", "int8"),
+    )
 
     rows = transcript._detect_speakers(video, "hf_test")
 
     assert rows == (transcript.DiarizationRow(0, 1, "SPEAKER_00"),)
     assert updates == [20.0, 60.0, 20.0]
     assert closed == [True]
+
+
+@pytest.mark.parametrize(
+    ("phase", "failure", "expected_type"),
+    [
+        (
+            "init",
+            RuntimeError("MPS backend initialization failed"),
+            transcript.MPSDiarizationModelLoadError,
+        ),
+        (
+            "infer",
+            RuntimeError("MPS kernel failed"),
+            transcript.MPSDiarizationInferenceError,
+        ),
+        (
+            "infer",
+            RuntimeError("MPS backend connection lost"),
+            transcript.MPSDiarizationInferenceError,
+        ),
+        (
+            "infer",
+            RuntimeError("MPSGraph execution failed"),
+            transcript.MPSDiarizationInferenceError,
+        ),
+        (
+            "infer",
+            RuntimeError("Metal command buffer failed"),
+            transcript.MPSDiarizationInferenceError,
+        ),
+        (
+            "infer",
+            RuntimeError("invalid buffer size"),
+            transcript.MPSDiarizationInferenceError,
+        ),
+        (
+            "infer",
+            NotImplementedError("MPS does not support this operator"),
+            transcript.MPSDiarizationInferenceError,
+        ),
+        (
+            "infer",
+            MemoryError("MPS allocator out of memory"),
+            transcript.MPSDiarizationInferenceError,
+        ),
+        ("init", MemoryError("Python heap exhausted"), MemoryError),
+        ("init", RuntimeError("checkpoint protocol mismatch"), RuntimeError),
+        (
+            "init",
+            RuntimeError("MPS authentication failed"),
+            RuntimeError,
+        ),
+        (
+            "init",
+            RuntimeError("MPS model acquisition download failed"),
+            RuntimeError,
+        ),
+        (
+            "infer",
+            RuntimeError("MPS checkpoint protocol rejected malformed timestamps"),
+            RuntimeError,
+        ),
+        (
+            "infer",
+            RuntimeError("checkpoint contains malformed timestamps"),
+            RuntimeError,
+        ),
+        (
+            "infer",
+            RuntimeError("MPS input has invalid shape"),
+            RuntimeError,
+        ),
+        (
+            "infer",
+            RuntimeError("MPS audio decoding failed"),
+            RuntimeError,
+        ),
+        (
+            "infer",
+            RuntimeError("MPS tensor size mismatch"),
+            RuntimeError,
+        ),
+        (
+            "init",
+            RuntimeError("MPS invalid credentials"),
+            RuntimeError,
+        ),
+        (
+            "init",
+            RuntimeError("MPS network timeout while fetching model"),
+            RuntimeError,
+        ),
+        ("init", ValueError("gated model"), ValueError),
+    ],
+)
+def test_detect_speakers_classifies_only_mps_compute_failures(
+    monkeypatch,
+    tmp_path,
+    phase,
+    failure,
+    expected_type,
+):
+    class FakeDiarizationPipeline:
+        def __init__(self, *_args, **_kwargs):
+            if phase == "init":
+                raise failure
+
+        def __call__(self, *_args, **_kwargs):
+            raise failure
+
+    fake_whisperx = ModuleType("whisperx")
+    fake_whisperx.__path__ = []
+    fake_whisperx.load_audio = lambda _path: "audio"
+    monkeypatch.setitem(sys.modules, "whisperx", fake_whisperx)
+    monkeypatch.setitem(
+        sys.modules,
+        "whisperx.diarize",
+        SimpleNamespace(DiarizationPipeline=FakeDiarizationPipeline),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tqdm",
+        SimpleNamespace(
+            tqdm=lambda **_kwargs: SimpleNamespace(
+                update=lambda _amount: None,
+                close=lambda: None,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        transcript,
+        "_select_whisperx_device",
+        lambda *_args, **_kwargs: ("mps", "float32"),
+    )
+
+    with pytest.raises(expected_type) as raised:
+        transcript._detect_speakers(_video(tmp_path), "hf_test", device="mps")
+    assert type(raised.value) is expected_type
 
 
 def test_expected_pyannote_warnings_are_condensed_once_per_fingerprint(

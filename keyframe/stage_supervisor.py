@@ -389,10 +389,20 @@ def diarization_worker_entry(
     def diarize() -> Mapping[str, Any]:
         if not request.hf_token.strip():
             raise ValueError("diarization requires a non-empty Hugging Face token")
+        uses_mps = (request.device or "").strip().lower().startswith("mps")
+        if uses_mps:
+            # PyTorch reads this before its first MPS operation. Keep unsupported
+            # kernels visible to the parent so fallback receives a fresh resource
+            # admission decision instead of silently borrowing CPU in this worker.
+            os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "0"
         configure_worker_thread_budget(request.thread_budget, torch_threads=True)
         emit_stage_progress(
             progress_queue,
-            StageProgress("diarization", "inference"),
+            StageProgress(
+                "diarization",
+                "inference",
+                request.device or "auto",
+            ),
         )
         if request.device is None:
             rows = transcript_module._detect_speakers(
@@ -415,7 +425,15 @@ def diarization_worker_entry(
             request.checkpoint_path,
             final_output_paths=request.final_output_paths,
         )
-        return {"row_count": len(rows)}
+        metadata = {
+            "row_count": len(rows),
+            "device": request.device or "auto",
+        }
+        if uses_mps:
+            metadata["pytorch_mps_fallback_enabled"] = (
+                os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK") == "1"
+            )
+        return metadata
 
     _execute_worker(
         "diarization",
@@ -423,6 +441,7 @@ def diarization_worker_entry(
         progress_queue,
         cancellation_event,
         diarize,
+        transcript_module.is_auto_diarization_fallback_eligible,
     )
 
 
@@ -1033,6 +1052,20 @@ class StageSupervisor:
                 continue
             peaks[handle.stage] = max(peaks.get(handle.stage, 0), value)
         return peaks
+
+    def completed_stage_metadata(
+        self,
+        stage: str,
+    ) -> tuple[Mapping[str, Any], ...]:
+        """Return immutable metadata snapshots for successful stage attempts."""
+
+        snapshots = []
+        for handle in self._handles:
+            completion = handle._completion
+            if handle.stage != stage or completion is None:
+                continue
+            snapshots.append(MappingProxyType(dict(completion.metadata)))
+        return tuple(snapshots)
 
     def close(self) -> None:
         if not self._entered:

@@ -36,6 +36,7 @@ def _preflight(
     requested_backend=None,
     transcription_device="mlx",
     diarization_device="cpu",
+    requested_diarization_device=None,
     policy="auto",
     speaker_detection=True,
     fmt="json",
@@ -44,7 +45,11 @@ def _preflight(
         model_name="medium",
         fmt=fmt,
         transcription_backend=requested_backend or backend,
-        diarization_device=(diarization_device or "auto"),
+        diarization_device=(
+            requested_diarization_device
+            or diarization_device
+            or "auto"
+        ),
         stage_concurrency=policy,
         speaker_detection=speaker_detection,
     )
@@ -108,6 +113,8 @@ class _FakeSupervisor:
         diarization_error=None,
         effective_backend="mlx",
         fail_first_mlx=False,
+        fail_first_mps=False,
+        mps_exits_before_transcription=False,
     ):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -127,7 +134,10 @@ class _FakeSupervisor:
         self.diarization_error = diarization_error
         self.effective_backend = effective_backend
         self.fail_first_mlx = fail_first_mlx
+        self.fail_first_mps = fail_first_mps
+        self.mps_exits_before_transcription = mps_exits_before_transcription
         self.transcription_attempts = 0
+        self.diarization_attempts = 0
         self.handles = {}
 
     def start_transcription(self, _video, **kwargs):
@@ -143,7 +153,12 @@ class _FakeSupervisor:
         return handle
 
     def start_diarization(self, _video, **kwargs):
-        handle = _FakeHandle(self, "diarization")
+        self.diarization_attempts += 1
+        handle = _FakeHandle(
+            self,
+            "diarization",
+            attempt=self.diarization_attempts,
+        )
         self.handles["diarization"] = handle
         self.events.append(("start-diarization", kwargs))
         return handle
@@ -199,7 +214,22 @@ class _FakeSupervisor:
                 metadata,
                 self.segments,
             )
+            if self.mps_exits_before_transcription:
+                diarization = self.handles.get("diarization")
+                if diarization is not None:
+                    diarization.process.alive = False
+                    diarization.process.exitcode = 1
         else:
+            if self.fail_first_mps and handle.attempt == 1:
+                handle.process.exitcode = 1
+                handle.failure = StageWorkerError(
+                    "diarization",
+                    "injected MPS inference failure",
+                    exitcode=1,
+                    error_type="MPSDiarizationInferenceError",
+                    fallback_eligible=True,
+                )
+                raise handle.failure
             if self.diarization_error is not None:
                 handle.process.exitcode = 1
                 handle.failure = self.diarization_error
@@ -540,6 +570,359 @@ def test_shared_cuda_stages_remain_serial_through_diarization_and_frames(tmp_pat
     assert not result.pipeline_evidence.interval("diarization").overlaps(
         result.pipeline_evidence.interval("frames")
     )
+
+
+def test_automatic_mps_diarization_serializes_between_mlx_and_mps_frames(
+    tmp_path,
+):
+    events = []
+    output = tmp_path / "out"
+    preflight = _preflight(
+        diarization_device="mps",
+        requested_diarization_device="auto",
+    )
+    supervisor = _FakeSupervisor(output, events)
+
+    result = run_supervised_full_pipeline(
+        tmp_path / "recording.mp4",
+        output,
+        preflight,
+        supervisor=supervisor,
+        frame_device="mps",
+        frame_runner=_frame_runner(supervisor, output, events),
+        scheduler=_scheduler(),
+    )
+
+    names = _event_names(events)
+    assert names.index("complete-transcription") < names.index(
+        "start-diarization"
+    )
+    assert names.index("complete-diarization") < names.index("start-frames")
+    assert not result.initial_schedule.parallel
+    assert not result.frame_schedule.parallel
+    assert result.critical_path == "T + D + F + M + E"
+    assert result.diarization_attempted_devices == ("mps",)
+    assert not result.diarization_fallback_used
+
+
+@pytest.mark.parametrize(
+    ("policy", "expected_path", "expected_parallel"),
+    [
+        ("auto", "T + R + max(D, F) + M + E", True),
+        ("serial", "T + R + D + F + M + E", False),
+    ],
+)
+def test_automatic_mps_failure_retries_cpu_with_fresh_frame_admission(
+    tmp_path,
+    policy,
+    expected_path,
+    expected_parallel,
+):
+    events = []
+    output = tmp_path / "out"
+    preflight = _preflight(
+        diarization_device="mps",
+        requested_diarization_device="auto",
+        policy=policy,
+    )
+    supervisor = _FakeSupervisor(output, events, fail_first_mps=True)
+
+    result = run_supervised_full_pipeline(
+        tmp_path / "recording.mp4",
+        output,
+        preflight,
+        supervisor=supervisor,
+        frame_device="mps",
+        frame_runner=_frame_runner(supervisor, output, events),
+        scheduler=_scheduler(policy),
+    )
+
+    starts = [
+        detail for name, detail in events if name == "start-diarization"
+    ]
+    assert [start["device"] for start in starts] == ["mps", "cpu"]
+    assert result.diarization_attempted_devices == ("mps", "cpu")
+    assert result.diarization_fallback_used
+    assert result.transcript.diarization_fallback_schedule is result.frame_schedule
+    assert result.frame_schedule.parallel is expected_parallel
+    assert result.critical_path == expected_path
+    retry = result.pipeline_evidence.interval("diarization_retry")
+    diarization = result.pipeline_evidence.interval("diarization")
+    frames = result.pipeline_evidence.interval("frames")
+    assert retry.outcome == "failed"
+    assert retry.launch_wave == "post-transcription"
+    assert diarization.launch_wave == "post-transcription"
+    assert diarization.overlaps(frames) is expected_parallel
+    assert set(result.timings) >= {
+        "transcription",
+        "diarization_retry",
+        "diarization",
+        "frames",
+    }
+
+
+def test_initial_wave_mps_failure_uses_max_t_r_retry_critical_path(tmp_path):
+    events = []
+    output = tmp_path / "out"
+    preflight = _preflight(
+        backend="whisper",
+        requested_backend="whisper",
+        transcription_device="cpu",
+        diarization_device="mps",
+        requested_diarization_device="auto",
+    )
+    supervisor = _FakeSupervisor(
+        output,
+        events,
+        effective_backend="whisper",
+        fail_first_mps=True,
+    )
+
+    result = run_supervised_full_pipeline(
+        tmp_path / "recording.mp4",
+        output,
+        preflight,
+        supervisor=supervisor,
+        frame_device="mps",
+        frame_runner=_frame_runner(supervisor, output, events),
+        scheduler=_scheduler(),
+    )
+
+    assert result.pipeline_evidence.interval(
+        "diarization_retry"
+    ).launch_wave == "initial"
+    assert result.critical_path == "max(T, R) + max(D, F) + M + E"
+
+
+def test_mps_failure_during_cpu_frames_retries_cpu_after_frames(tmp_path):
+    events = []
+    output = tmp_path / "out"
+    preflight = _preflight(
+        runtime=transcript.RuntimePlatform("Darwin", "arm64", 13, 22),
+        backend="whisper",
+        requested_backend="whisper",
+        transcription_device="cpu",
+        diarization_device="mps",
+        requested_diarization_device="auto",
+    )
+    supervisor = _FakeSupervisor(
+        output,
+        events,
+        effective_backend="whisper",
+        fail_first_mps=True,
+    )
+    frame_device = resolve_frame_device(preflight)
+
+    result = run_supervised_full_pipeline(
+        tmp_path / "recording.mp4",
+        output,
+        preflight,
+        supervisor=supervisor,
+        frame_device=frame_device,
+        frame_runner=_frame_runner(supervisor, output, events),
+        scheduler=_scheduler(),
+    )
+
+    names = _event_names(events)
+    starts = [
+        detail for name, detail in events if name == "start-diarization"
+    ]
+    start_indices = [
+        index for index, name in enumerate(names) if name == "start-diarization"
+    ]
+    assert frame_device == "cpu"
+    assert [start["device"] for start in starts] == ["mps", "cpu"]
+    assert names.index("finish-frames") < start_indices[-1]
+    assert result.diarization_attempted_devices == ("mps", "cpu")
+    assert result.diarization_fallback_used
+    assert result.frame_schedule.parallel
+    assert result.transcript.diarization_fallback_schedule is not None
+    assert tuple(
+        stage.stage
+        for stage in result.transcript.diarization_fallback_schedule.stages
+    ) == ("diarization",)
+    assert result.transcript.diarization_fallback_schedule.stages[0].device == "cpu"
+    assert result.critical_path == "max(T + F, R) + D + M + E"
+    assert result.pipeline_evidence.interval("diarization_retry").overlaps(
+        result.pipeline_evidence.interval("frames")
+    )
+    assert not result.pipeline_evidence.interval("diarization").overlaps(
+        result.pipeline_evidence.interval("frames")
+    )
+    assert result.transcript.segments[0].speaker == "SPEAKER_00"
+
+
+def test_empty_transcript_does_not_retry_an_already_failed_mps_worker(tmp_path):
+    events = []
+    output = tmp_path / "out"
+    preflight = _preflight(
+        backend="whisper",
+        requested_backend="whisper",
+        transcription_device="cpu",
+        diarization_device="mps",
+        requested_diarization_device="auto",
+    )
+    supervisor = _FakeSupervisor(
+        output,
+        events,
+        segments=(),
+        effective_backend="whisper",
+        fail_first_mps=True,
+        mps_exits_before_transcription=True,
+    )
+
+    result = run_supervised_full_pipeline(
+        tmp_path / "recording.mp4",
+        output,
+        preflight,
+        supervisor=supervisor,
+        frame_device="mps",
+        frame_runner=_frame_runner(supervisor, output, events),
+        scheduler=_scheduler(),
+    )
+
+    starts = [
+        detail for name, detail in events if name == "start-diarization"
+    ]
+    assert [start["device"] for start in starts] == ["mps"]
+    assert result.transcript.segments == ()
+    assert result.diarization_attempted_devices == ("mps",)
+    assert not result.diarization_fallback_used
+    assert result.pipeline_evidence.interval("diarization_retry") is None
+    assert result.pipeline_evidence.interval("diarization").outcome == "failed"
+    assert (output / "frames" / "current.txt").read_text() == "current"
+
+
+def test_nonempty_transcript_retries_an_already_failed_mps_worker(tmp_path):
+    events = []
+    output = tmp_path / "out"
+    preflight = _preflight(
+        backend="whisper",
+        requested_backend="whisper",
+        transcription_device="cpu",
+        diarization_device="mps",
+        requested_diarization_device="auto",
+    )
+    supervisor = _FakeSupervisor(
+        output,
+        events,
+        effective_backend="whisper",
+        fail_first_mps=True,
+        mps_exits_before_transcription=True,
+    )
+
+    result = run_supervised_full_pipeline(
+        tmp_path / "recording.mp4",
+        output,
+        preflight,
+        supervisor=supervisor,
+        frame_device="mps",
+        frame_runner=_frame_runner(supervisor, output, events),
+        scheduler=_scheduler(),
+    )
+
+    starts = [
+        detail for name, detail in events if name == "start-diarization"
+    ]
+    assert [start["device"] for start in starts] == ["mps", "cpu"]
+    assert result.diarization_attempted_devices == ("mps", "cpu")
+    assert result.diarization_fallback_used
+    assert result.transcript.diarization_fallback_schedule is not None
+    assert tuple(
+        stage.stage
+        for stage in result.transcript.diarization_fallback_schedule.stages
+    ) == ("diarization", "frames")
+    assert result.pipeline_evidence.interval(
+        "diarization_retry"
+    ).launch_wave == "initial"
+    assert result.pipeline_evidence.interval(
+        "diarization"
+    ).launch_wave == "post-transcription"
+    assert result.transcript.segments[0].speaker == "SPEAKER_00"
+
+
+@pytest.mark.parametrize(
+    ("requested_device", "fallback_eligible"),
+    [("mps", True), ("auto", False)],
+)
+def test_explicit_or_ineligible_mps_failure_does_not_retry_cpu(
+    tmp_path,
+    requested_device,
+    fallback_eligible,
+):
+    events = []
+    output = tmp_path / "out"
+    failure = StageWorkerError(
+        "diarization",
+        "injected non-retry failure",
+        exitcode=1,
+        error_type="RuntimeError",
+        fallback_eligible=fallback_eligible,
+    )
+    preflight = _preflight(
+        diarization_device="mps",
+        requested_diarization_device=requested_device,
+    )
+    supervisor = _FakeSupervisor(
+        output,
+        events,
+        diarization_error=failure,
+    )
+
+    result = run_supervised_full_pipeline(
+        tmp_path / "recording.mp4",
+        output,
+        preflight,
+        supervisor=supervisor,
+        frame_device="mps",
+        frame_runner=_frame_runner(supervisor, output, events),
+        scheduler=_scheduler(),
+    )
+
+    assert result.diarization_attempted_devices == ("mps",)
+    assert not result.diarization_fallback_used
+    assert result.pipeline_evidence.interval("diarization_retry") is None
+    assert result.transcript.segments[0].speaker is None
+
+
+def test_failed_cpu_retry_preserves_unlabeled_transcript_and_attempt_evidence(
+    tmp_path,
+):
+    events = []
+    output = tmp_path / "out"
+    cpu_failure = StageWorkerError(
+        "diarization",
+        "injected CPU retry failure",
+        exitcode=1,
+        error_type="RuntimeError",
+    )
+    preflight = _preflight(
+        diarization_device="mps",
+        requested_diarization_device="auto",
+    )
+    supervisor = _FakeSupervisor(
+        output,
+        events,
+        fail_first_mps=True,
+        diarization_error=cpu_failure,
+    )
+
+    result = run_supervised_full_pipeline(
+        tmp_path / "recording.mp4",
+        output,
+        preflight,
+        supervisor=supervisor,
+        frame_device="mps",
+        frame_runner=_frame_runner(supervisor, output, events),
+        scheduler=_scheduler(),
+    )
+
+    assert result.diarization_attempted_devices == ("mps", "cpu")
+    assert result.diarization_fallback_used
+    assert result.pipeline_evidence.interval("diarization_retry").outcome == "failed"
+    assert result.pipeline_evidence.interval("diarization").outcome == "failed"
+    assert result.transcript.segments[0].speaker is None
+    assert not (output / "diarization.json").exists()
 
 
 def test_explicit_serial_keeps_post_transcription_wave_serial(tmp_path):

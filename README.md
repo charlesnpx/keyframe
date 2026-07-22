@@ -103,6 +103,9 @@ keyframe recording.m4a --transcript-only --transcription-backend auto
 # Force the portable OpenAI Whisper backend
 keyframe recording.m4a --transcript-only --transcription-backend whisper
 
+# Force CPU speaker detection even when MPS or CUDA is available
+keyframe recording.m4a --transcript-only --diarization-device cpu
+
 # Force serial stages for a memory-constrained machine
 keyframe recording.m4a --transcript-only --stage-concurrency serial
 ```
@@ -110,7 +113,13 @@ keyframe recording.m4a --transcript-only --stage-concurrency serial
 Explicit `--transcription-backend mlx` fails during preflight on unsupported
 machines, before importing MLX or acquiring a model. `auto` can recover from an
 eligible MLX import, acquisition, load, or inference failure by exiting that
-worker and starting a fresh OpenAI Whisper CPU worker.
+worker and starting a fresh OpenAI Whisper CPU worker. Explicit
+`--diarization-device mps` likewise fails during preflight when MPS is
+unavailable. Automatic MPS diarization retries once on CPU only for a typed MPS
+model-initialization or inference compute failure; explicit MPS is strict, and
+authentication, acquisition, decoding, and checkpoint failures do not trigger
+that fallback. MPS workers force PyTorch's implicit CPU fallback off so every
+CPU retry is admitted and reported by Keyframe.
 
 ### As a Claude Code skill
 
@@ -148,7 +157,7 @@ $keyframe ~/Downloads/meeting-recording.mp4
 | `-w, --whisper-model` | `medium` | Whisper model: tiny/base/small/medium/large |
 | `--transcript-format` | `txt` | Output format: txt/srt/vtt/json |
 | `--transcription-backend` | `auto` | Transcription backend: auto/mlx/whisper |
-| `--diarization-device` | `auto` | Speaker-detection device: auto/cpu/cuda |
+| `--diarization-device` | `auto` | Speaker-detection device: auto/cpu/mps/cuda |
 | `--stage-concurrency` | `auto` | Transcript-stage policy: auto/serial/parallel |
 | `--no-speaker-detection` | | Skip pyannote speaker detection |
 
@@ -174,6 +183,13 @@ When `HF_TOKEN` is set, pyannote detects speakers with
 `pyannote/speaker-diarization-community-1`, and Keyframe assigns a dominant
 speaker label to each Whisper segment based on diarization overlap. Speaker
 detection shows stage-prefixed progress after model loading and audio decoding.
+On Darwin ARM64, automatic speaker detection prefers Torch MPS; elsewhere it
+prefers CUDA when available and then CPU. Explicit unavailable MPS or CUDA
+requests fail during preflight. An automatic MPS compute failure retries once
+in a fresh CPU worker after a new scheduler admission decision. Explicit MPS
+requests and non-compute failures remain strict.
+MPS workers disable PyTorch's implicit CPU fallback so unsupported kernels
+cannot bypass scheduler admission or fallback evidence.
 If `HF_TOKEN` is missing or speaker detection fails, Keyframe warns and keeps
 the unlabeled Whisper transcript. The two known harmless pyannote warnings
 about unavailable TorchCodec decoding and a too-short pooling window are
@@ -182,25 +198,33 @@ validated for finite, non-negative timestamps, positive duration, and a
 non-empty speaker before the diarization checkpoint can be published.
 
 Each model stage runs in a disposable spawned process. In `auto` concurrency
-mode, MLX or CUDA transcription may overlap CPU diarization only when the
-model-aware memory check (including 10% headroom) admits both. On macOS,
-automatic admission uses `memory_pressure -Q` with physical memory from
-`sysctl`; a bounded `vm_stat` calculation is the fallback, and swap is never
-counted. CPU transcription and CPU diarization additionally require at least
-four CPUs. Stages sharing an accelerator are always serialized. In a full run,
-MPS/CUDA frame extraction starts only after transcription releases that
-accelerator. Keyframe then makes a fresh second-wave decision, allowing frames
-to overlap a still-running CPU diarization worker when current pressure admits
-it. `parallel` may override CPU-count and memory admission with a warning, but
-never shared-accelerator exclusion.
+mode, stages using independent resources may overlap only when the model-aware
+memory check (including 10% headroom) admits them. This retains MLX/CUDA
+transcription overlap with CPU diarization and CPU transcription overlap with
+MPS diarization. CPU transcription plus CPU diarization additionally requires
+at least four CPUs. On macOS, automatic admission uses `memory_pressure -Q`
+with physical memory from `sysctl`; a bounded `vm_stat` calculation is the
+fallback, and swap is never counted. MLX transcription, MPS diarization, and
+MPS frame extraction all share the Apple accelerator and therefore run
+serially. A full run makes a fresh scheduling decision after transcription and
+again before any CPU diarization fallback. CPU diarization can overlap
+MPS/CUDA frames when current pressure admits it; if MPS fails while independent
+CPU frame work is already running, the CPU retry starts after those frames.
+`parallel` may override
+CPU-count and memory admission with a warning, but never shared-accelerator
+exclusion.
 
-Reliable parent-monotonic intervals select one of five full-run critical paths:
+Without a diarization retry, reliable parent-monotonic intervals select one of
+five full-run critical paths:
 `max(T + F, D) + M + E`, `max(T, D) + F + M + E`,
 `T + max(D, F) + M + E`, `T + D + F + M + E`, or
 `T + F + M + E`. Here `T`, `D`, and `F` are transcription, diarization, and
 frame intervals; `M` is speaker merge/output writing and `E` is manifest
-enrichment/promotion. The last form covers absent or cancelled diarization and
-an MLX fallback whose required diarization wait is already contained in `T`.
+enrichment/promotion. A failed MPS attempt is represented separately as `R`;
+ten retry-aware expressions also cover a failed MPS attempt overlapping CPU
+frames before the CPU retry begins. The scheduler derives
+the expression from recorded stage intervals rather than inferring overlap from
+launch intent.
 
 The raw transcript checkpoint is atomically published as soon as transcription
 finishes, before speaker assignment. A later diarization or frame failure does

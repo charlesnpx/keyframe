@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run and replay the Keyframe 0.6.1 transcription release benchmark."""
+"""Run and replay the Keyframe 0.6.2 transcription release benchmark."""
 
 from __future__ import annotations
 
@@ -57,7 +57,7 @@ from keyframe.validation import (
 
 
 GIB = 1024**3
-REPORT_SCHEMA_VERSION = 4
+REPORT_SCHEMA_VERSION = 6
 DEFAULT_TIMESTAMP_TOLERANCE_SECONDS = 0.05
 DEFAULT_CRITICAL_PATH_TOLERANCE_SECONDS = 5.0
 PROCESS_TREE_PEAK_METHOD = "conservative-kernel-high-water-bound"
@@ -67,8 +67,10 @@ MAX_SERIAL_REFERENCE_WALL_MULTIPLIER = 0.85
 MAX_PROCESS_TREE_RSS_GIB = 6.60
 MAX_MLX_ALLOCATOR_PEAK_GIB = 5.96
 MAX_LOCAL_MODEL_RESOLUTION_SECONDS = 1.0
+MAX_MPS_DIARIZATION_SECONDS = 335.0
+APPLE_ACCELERATOR_SERIAL_REASON = "stages share exclusive accelerator apple:0"
 EXPECTED_RUNTIME_PACKAGES = {
-    "keyframe": "0.6.1",
+    "keyframe": "0.6.2",
     "mlx": "0.32.0",
     "mlx_whisper": "0.4.3",
     "whisperx": "3.8.6",
@@ -85,14 +87,19 @@ CANDIDATE_CONTRACT = {
     "requested_backend": "auto",
     "backend": "mlx",
     "device": "mlx",
-    "diarization_device": "cpu",
+    "diarization_device": "mps",
+    "diarization_attempted_devices": ["mps"],
+    "diarization_fallback_used": False,
+    "pytorch_mps_fallback_enabled": False,
     "frame_device": "mps",
     "schedule_policy": "auto",
-    "schedule_mode": "parallel",
+    "schedule_mode": "serial",
     "schedule_source": "macos-memory-pressure",
+    "schedule_reason": APPLE_ACCELERATOR_SERIAL_REASON,
     "frame_schedule_policy": "auto",
-    "frame_schedule_mode": "parallel",
+    "frame_schedule_mode": "serial",
     "frame_schedule_source": "macos-memory-pressure",
+    "frame_schedule_reason": APPLE_ACCELERATOR_SERIAL_REASON,
     "fallback_used": False,
     "fallback_waited_for_diarization": False,
     "model_resolution_source": "local-hit",
@@ -179,7 +186,7 @@ def _run_candidate_case(request: _CaseRequest) -> dict[str, Any]:
             "--transcription-backend",
             "auto",
             "--diarization-device",
-            "cpu",
+            "auto",
             "--stage-concurrency",
             "auto",
         ]
@@ -191,7 +198,12 @@ def _run_candidate_case(request: _CaseRequest) -> dict[str, Any]:
             f"selected {preflight.effective_backend!r}"
         )
     if preflight.hf_token is None:
-        raise BenchmarkError("the concurrent diarization run requires HF_TOKEN")
+        raise BenchmarkError("the MPS diarization run requires HF_TOKEN")
+    if preflight.effective_diarization_device != "mps":
+        raise BenchmarkError(
+            "the release candidate must select MPS diarization on supported "
+            "Apple Silicon"
+        )
     frame_device = resolve_frame_device(preflight)
     case_process_phase_peaks: dict[str, int] = {}
 
@@ -226,12 +238,13 @@ def _run_candidate_case(request: _CaseRequest) -> dict[str, Any]:
             frame_runner=lambda: run_frames(supervisor),
         )
     wall_time = time.monotonic() - started
-    if not result.initial_schedule.parallel:
+    if result.initial_schedule.parallel:
         raise BenchmarkError(
-            "the controlled release candidate did not overlap MLX transcription "
-            "with CPU diarization"
+            "the controlled release candidate overlapped MLX transcription "
+            "with MPS diarization"
         )
     stage_peak_rss_bytes = supervisor.completed_stage_peak_rss_bytes()
+    diarization_metadata = supervisor.completed_stage_metadata("diarization")
     current_case_peak = resource_peak_rss_bytes("self")
     case_process_phase_peaks.setdefault("initial-wave", current_case_peak)
     case_process_phase_peaks.setdefault("second-wave", current_case_peak)
@@ -243,16 +256,35 @@ def _run_candidate_case(request: _CaseRequest) -> dict[str, Any]:
             raise BenchmarkError(
                 f"the {label} candidate schedule did not use automatic policy"
             )
-        if schedule.mode != "parallel":
+        if schedule.mode != "serial":
             raise BenchmarkError(
-                f"the {label} automatic schedule did not admit parallel work"
+                f"the {label} automatic schedule did not serialize Apple work"
             )
         if schedule.resources.source != "macos-memory-pressure":
             raise BenchmarkError(
                 f"the {label} automatic schedule did not use macOS pressure evidence"
             )
+        if schedule.reason != APPLE_ACCELERATOR_SERIAL_REASON:
+            raise BenchmarkError(
+                f"the {label} automatic schedule did not serialize because of "
+                "the shared Apple accelerator"
+            )
     if result.transcript.fallback_used:
         raise BenchmarkError("the release candidate fell back from pinned MLX")
+    if result.diarization_fallback_used:
+        raise BenchmarkError("the release candidate fell back from MPS diarization")
+    if result.diarization_attempted_devices != ("mps",):
+        raise BenchmarkError(
+            "the release candidate did not make exactly one MPS diarization attempt"
+        )
+    if (
+        len(diarization_metadata) != 1
+        or diarization_metadata[0].get("pytorch_mps_fallback_enabled") is not False
+    ):
+        raise BenchmarkError(
+            "the release candidate did not prove that implicit PyTorch MPS "
+            "fallback was disabled"
+        )
     missing_peak_stages = {"transcription", "diarization"} - set(
         stage_peak_rss_bytes
     )
@@ -261,7 +293,7 @@ def _run_candidate_case(request: _CaseRequest) -> dict[str, Any]:
             "the release candidate is missing worker high-water evidence for: "
             + ", ".join(sorted(missing_peak_stages))
         )
-    if result.critical_path != "max(T + F, D) + M + E":
+    if result.critical_path != "T + D + F + M + E":
         raise BenchmarkError(
             "the controlled Apple release candidate reported an unexpected "
             f"critical path: {result.critical_path}"
@@ -273,6 +305,11 @@ def _run_candidate_case(request: _CaseRequest) -> dict[str, Any]:
         "backend": result.transcript.effective_backend,
         "device": preflight.transcription_device,
         "diarization_device": preflight.effective_diarization_device,
+        "diarization_attempted_devices": list(
+            result.diarization_attempted_devices
+        ),
+        "diarization_fallback_used": result.diarization_fallback_used,
+        "pytorch_mps_fallback_enabled": False,
         "frame_device": result.frame_device,
         "model_repository": metadata.get("model_repository"),
         "model_revision": metadata.get("model_revision"),
@@ -319,7 +356,7 @@ def _case_worker(request: _CaseRequest, terminal_send: Any) -> None:
             transcription_peak = stage_peaks.get("transcription", 0)
             diarization_peak = stage_peaks.get("diarization", 0)
             phase_stage_peaks = {
-                "initial-wave": (transcription_peak, diarization_peak),
+                "initial-wave": (transcription_peak,),
                 "second-wave": (diarization_peak,),
                 "finalization": (),
             }
@@ -481,7 +518,12 @@ def _pipeline_evidence_from_report(candidate: dict[str, Any]) -> PipelineEvidenc
     raw_evidence = candidate.get("pipeline_evidence")
     if not isinstance(raw_evidence, dict):
         raise ValueError("candidate.pipeline_evidence must be an object")
-    unexpected = set(raw_evidence) - {"transcription", "diarization", "frames"}
+    unexpected = set(raw_evidence) - {
+        "transcription",
+        "diarization_retry",
+        "diarization",
+        "frames",
+    }
     if unexpected:
         raise ValueError(
             "candidate.pipeline_evidence has unknown stages: "
@@ -626,6 +668,7 @@ def _release_contract_failures(report: dict[str, Any]) -> list[str]:
         failures.append(f"candidate pipeline evidence is invalid: {exc}")
     else:
         transcription_interval = evidence.interval("transcription")
+        retry_interval = evidence.interval("diarization_retry")
         diarization_interval = evidence.interval("diarization")
         frame_interval = evidence.interval("frames")
         assert transcription_interval is not None
@@ -635,12 +678,19 @@ def _release_contract_failures(report: dict[str, Any]) -> list[str]:
         else:
             if diarization_interval.outcome != "completed":
                 failures.append("candidate diarization interval must be completed")
-            if not transcription_interval.overlaps(diarization_interval):
+            if transcription_interval.ended_at > diarization_interval.started_at:
                 failures.append(
-                    "candidate transcription and diarization intervals must overlap"
+                    "candidate diarization must not start before transcription "
+                    "completes"
                 )
-            if not frame_interval.overlaps(diarization_interval):
-                failures.append("candidate frames and diarization intervals must overlap")
+            if diarization_interval.ended_at > frame_interval.started_at:
+                failures.append(
+                    "candidate frames must not start before diarization completes"
+                )
+        if retry_interval is not None:
+            failures.append(
+                "candidate pipeline evidence must not contain an MPS fallback attempt"
+            )
         if transcription_interval.ended_at > frame_interval.started_at:
             failures.append(
                 "candidate frames must not start before transcription completes"
@@ -771,9 +821,9 @@ def _performance_contract_failures(report: dict[str, Any]) -> list[str]:
             ):
                 raise ValueError("candidate worker high-water evidence is invalid")
             stage_peaks[stage] = value
-        stage_peak_sum = sum(stage_peaks.values())
+        stage_peak_bound = max(stage_peaks.values())
         expected_phase_stage_sums = {
-            "initial-wave": stage_peak_sum,
+            "initial-wave": stage_peaks["transcription"],
             "second-wave": stage_peaks["diarization"],
             "finalization": 0,
         }
@@ -794,9 +844,10 @@ def _performance_contract_failures(report: dict[str, Any]) -> list[str]:
         expected_tree_bound = max(expected_phase_bounds.values())
         if components["case_process_bytes"] != max(case_phases.values()):
             raise ValueError("candidate case-process high-water peak is inconsistent")
-        if components["concurrent_stage_sum_bytes"] != stage_peak_sum:
+        if components["concurrent_stage_sum_bytes"] != stage_peak_bound:
             raise ValueError(
-                "candidate worker high-water sum disagrees with memory evidence"
+                "candidate serialized worker high-water bound disagrees with "
+                "memory evidence"
             )
         if components["descendant_bound_bytes"] != expected_descendant_bound:
             raise ValueError("candidate descendant high-water bound is inconsistent")
@@ -832,6 +883,18 @@ def _performance_contract_failures(report: dict[str, Any]) -> list[str]:
         failures.append("candidate MLX allocator peak exceeds 5.96 GiB")
     if resolution_seconds >= MAX_LOCAL_MODEL_RESOLUTION_SECONDS:
         failures.append("candidate cached MLX resolution did not finish under one second")
+    try:
+        diarization_seconds = _finite_number(
+            _mapping(candidate.get("timings")).get("diarization"),
+            "candidate.timings.diarization",
+        )
+    except ValueError as exc:
+        failures.append(f"candidate diarization timing is invalid: {exc}")
+    else:
+        if diarization_seconds > MAX_MPS_DIARIZATION_SECONDS:
+            failures.append(
+                "candidate MPS diarization exceeds the 335-second break-even bound"
+            )
 
     report["performance_validation"] = {
         "historical_candidate_wall_seconds": HISTORICAL_CANDIDATE_WALL_SECONDS,
@@ -843,6 +906,7 @@ def _performance_contract_failures(report: dict[str, Any]) -> list[str]:
         "process_tree_peak_method": PROCESS_TREE_PEAK_METHOD,
         "mlx_allocator_peak_ceiling_gib": MAX_MLX_ALLOCATOR_PEAK_GIB,
         "local_resolution_ceiling_seconds": MAX_LOCAL_MODEL_RESOLUTION_SECONDS,
+        "mps_diarization_ceiling_seconds": MAX_MPS_DIARIZATION_SECONDS,
         "historical_wall_limit_seconds": historical_limit,
         "same_run_wall_limit_seconds": same_run_limit,
     }
@@ -1008,12 +1072,12 @@ def _new_report(
     timestamp_tolerance_seconds: float,
 ) -> dict[str, Any]:
     reference_dir = output_dir / "reference-whisper-cpu-serial"
-    candidate_dir = output_dir / "candidate-mlx-concurrent-full"
+    candidate_dir = output_dir / "candidate-mlx-mps-serial-full"
     reference = _run_isolated_case(
         _CaseRequest("whisper_cpu_serial", str(input_path), str(reference_dir))
     )
     candidate = _run_isolated_case(
-        _CaseRequest("mlx_concurrent_full", str(input_path), str(candidate_dir))
+        _CaseRequest("mlx_mps_serial_full", str(input_path), str(candidate_dir))
     )
     reference_segments = transcript.read_raw_transcript_checkpoint(
         reference_dir / "transcript.raw.json"

@@ -144,17 +144,30 @@ def test_final_output_promotion_failure_rolls_back_every_representation(
     assert not list(staging_root.iterdir())
 
 
-def test_preflight_selects_mlx_and_cpu_diarization_on_supported_mac_without_cuda_probe():
+def test_preflight_selects_mlx_and_mps_diarization_on_supported_mac_without_cuda_probe():
     result = preflight_transcript_run(
         _config(),
         environment={"HF_TOKEN": "  hf_test  "},
         runtime_platform=SUPPORTED_MAC,
         cuda_probe=lambda: pytest.fail("macOS preflight must not import Torch for CUDA"),
+        mps_probe=lambda: True,
     )
 
     assert result.effective_backend == "mlx"
     assert result.transcription_device == "mlx"
     assert result.hf_token == "hf_test"
+    assert result.effective_diarization_device == "mps"
+
+
+def test_preflight_falls_back_to_cpu_when_mps_is_unavailable_on_supported_mac():
+    result = preflight_transcript_run(
+        _config(),
+        environment={"HF_TOKEN": "hf_test"},
+        runtime_platform=SUPPORTED_MAC,
+        cuda_probe=lambda: pytest.fail("macOS preflight must not probe CUDA"),
+        mps_probe=lambda: False,
+    )
+
     assert result.effective_diarization_device == "cpu"
 
 
@@ -230,6 +243,29 @@ def test_preflight_rejects_forced_cuda_diarization_without_cuda():
         )
 
 
+def test_preflight_rejects_forced_mps_diarization_without_mps():
+    with pytest.raises(transcript.UnsupportedDiarizationDeviceError, match="MPS"):
+        preflight_transcript_run(
+            _config(diarization_device="mps"),
+            environment={"HF_TOKEN": "hf_test"},
+            runtime_platform=SUPPORTED_MAC,
+            cuda_probe=lambda: pytest.fail("macOS must not probe CUDA"),
+            mps_probe=lambda: False,
+        )
+
+
+def test_preflight_forced_cpu_skips_mps_and_cuda_diarization_probes():
+    result = preflight_transcript_run(
+        _config(diarization_device="cpu"),
+        environment={"HF_TOKEN": "hf_test"},
+        runtime_platform=SUPPORTED_MAC,
+        cuda_probe=lambda: pytest.fail("forced CPU must not probe CUDA"),
+        mps_probe=lambda: pytest.fail("forced CPU must not probe MPS"),
+    )
+
+    assert result.effective_diarization_device == "cpu"
+
+
 def test_direct_and_explicit_extract_alias_share_exact_parser_contract():
     direct = cli._parse_extract_args(
         [
@@ -277,6 +313,7 @@ def test_new_cli_options_default_to_auto():
         ("--transcription-backend", "whisper"),
         ("--diarization-device", "auto"),
         ("--diarization-device", "cpu"),
+        ("--diarization-device", "mps"),
         ("--diarization-device", "cuda"),
         ("--stage-concurrency", "auto"),
         ("--stage-concurrency", "serial"),
@@ -293,7 +330,7 @@ def test_new_cli_options_accept_every_documented_value(flag, value):
     ("flag", "value"),
     [
         ("--transcription-backend", "metal"),
-        ("--diarization-device", "mps"),
+        ("--diarization-device", "metal"),
         ("--stage-concurrency", "unsafe"),
     ],
 )
@@ -373,6 +410,7 @@ class _FakeSupervisor:
         diarization_error=None,
         transcription_error=None,
         fail_first_mlx=False,
+        fail_first_mps=False,
     ):
         self.output_dir = output_dir
         self.progress_callback = progress_callback
@@ -390,7 +428,9 @@ class _FakeSupervisor:
         self.diarization_error = diarization_error
         self.transcription_error = transcription_error
         self.fail_first_mlx = fail_first_mlx
+        self.fail_first_mps = fail_first_mps
         self.transcription_attempts = 0
+        self.diarization_attempts = 0
         self.events = []
         self.started = []
 
@@ -418,7 +458,12 @@ class _FakeSupervisor:
         return handle
 
     def start_diarization(self, video_path, **kwargs):
-        handle = _FakeHandle(self, "diarization")
+        self.diarization_attempts += 1
+        handle = _FakeHandle(
+            self,
+            "diarization",
+            attempt=self.diarization_attempts,
+        )
         self.started.append(("diarization", video_path, kwargs, handle))
         self.events.append("start-diarization")
         if self.progress_callback is not None:
@@ -462,6 +507,15 @@ class _FakeSupervisor:
                 self.public.transcript_raw,
                 metadata,
                 self.transcript_segments,
+            )
+        if self.fail_first_mps and handle.attempt == 1:
+            handle.process.exitcode = 1
+            raise StageWorkerError(
+                "diarization",
+                "forced MPS inference failure",
+                exitcode=1,
+                error_type="MPSDiarizationInferenceError",
+                fallback_eligible=True,
             )
         if self.diarization_error is not None:
             handle.process.exitcode = 1
@@ -562,6 +616,122 @@ def test_serial_run_starts_diarization_only_after_raw_transcript_promotion(tmp_p
     events = supervisors[0].events
     assert events.index("complete-transcription-1") < events.index("start-diarization")
     assert (output / "transcript.raw.json").exists()
+
+
+def test_transcript_only_automatic_mps_success_records_attempt_and_stays_serial(
+    tmp_path,
+):
+    supervisors = []
+    preflight = _preflight(
+        config=_config(diarization_device="auto"),
+        effective_diarization_device="mps",
+    )
+
+    result = run_supervised_transcript(
+        _video(tmp_path),
+        tmp_path / "out",
+        preflight,
+        scheduler=_scheduler(),
+        supervisor_factory=_factory(supervisors),
+    )
+
+    starts = [
+        entry for entry in supervisors[0].started if entry[0] == "diarization"
+    ]
+    assert [start[2]["device"] for start in starts] == ["mps"]
+    assert result.diarization_attempted_devices == ("mps",)
+    assert not result.diarization_fallback_used
+    assert not result.initial_schedule.parallel
+
+
+def test_transcript_only_automatic_mps_failure_retries_cpu_once(tmp_path):
+    supervisors = []
+    preflight = _preflight(
+        config=_config(diarization_device="auto"),
+        effective_diarization_device="mps",
+    )
+
+    result = run_supervised_transcript(
+        _video(tmp_path),
+        tmp_path / "out",
+        preflight,
+        scheduler=_scheduler(),
+        supervisor_factory=_factory(supervisors, fail_first_mps=True),
+    )
+
+    starts = [
+        entry for entry in supervisors[0].started if entry[0] == "diarization"
+    ]
+    assert [start[2]["device"] for start in starts] == ["mps", "cpu"]
+    assert result.diarization_attempted_devices == ("mps", "cpu")
+    assert result.diarization_fallback_used
+    assert result.diarization_fallback_schedule is not None
+    assert result.diarization_fallback_schedule.stages[0].device == "cpu"
+    assert set(result.timings) >= {
+        "transcription",
+        "diarization_retry",
+        "diarization",
+    }
+    assert result.segments[0].speaker == "SPEAKER_00"
+
+
+def test_transcript_only_explicit_mps_failure_does_not_retry(tmp_path):
+    supervisors = []
+    failure = StageWorkerError(
+        "diarization",
+        "forced explicit MPS failure",
+        exitcode=1,
+        error_type="MPSDiarizationInferenceError",
+        fallback_eligible=True,
+    )
+    preflight = _preflight(
+        config=_config(diarization_device="mps"),
+        effective_diarization_device="mps",
+    )
+
+    result = run_supervised_transcript(
+        _video(tmp_path),
+        tmp_path / "out",
+        preflight,
+        scheduler=_scheduler(),
+        supervisor_factory=_factory(
+            supervisors,
+            diarization_error=failure,
+        ),
+    )
+
+    assert result.diarization_attempted_devices == ("mps",)
+    assert not result.diarization_fallback_used
+    assert result.segments[0].speaker is None
+
+
+def test_transcript_only_failed_cpu_retry_keeps_unlabeled_output(tmp_path):
+    cpu_failure = StageWorkerError(
+        "diarization",
+        "forced CPU retry failure",
+        exitcode=1,
+        error_type="RuntimeError",
+    )
+    preflight = _preflight(
+        config=_config(diarization_device="auto"),
+        effective_diarization_device="mps",
+    )
+
+    result = run_supervised_transcript(
+        _video(tmp_path),
+        tmp_path / "out",
+        preflight,
+        scheduler=_scheduler(),
+        supervisor_factory=_factory(
+            [],
+            fail_first_mps=True,
+            diarization_error=cpu_failure,
+        ),
+    )
+
+    assert result.diarization_attempted_devices == ("mps", "cpu")
+    assert result.diarization_fallback_used
+    assert result.segments[0].speaker is None
 
 
 @pytest.mark.parametrize("fmt", ["txt", "srt", "vtt", "json"])

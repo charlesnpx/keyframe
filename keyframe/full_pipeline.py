@@ -21,6 +21,7 @@ from keyframe.stage_scheduler import (
     frame_demand,
     transcription_demand,
 )
+from keyframe.stage_supervisor import StageWorkerError
 from keyframe.transcript_cli import (
     TranscriptPreflight,
     TranscriptRunResult,
@@ -50,7 +51,12 @@ class StageInterval:
     outcome: str
 
     def __post_init__(self) -> None:
-        if self.stage not in {"transcription", "diarization", "frames"}:
+        if self.stage not in {
+            "transcription",
+            "diarization_retry",
+            "diarization",
+            "frames",
+        }:
             raise ValueError(f"unknown pipeline stage: {self.stage!r}")
         if self.launch_wave not in {"initial", "post-transcription"}:
             raise ValueError(f"unknown launch wave: {self.launch_wave!r}")
@@ -102,7 +108,12 @@ class PipelineEvidence:
 
 
 class _PipelineEvidenceBuilder:
-    _ORDER = {"transcription": 0, "diarization": 1, "frames": 2}
+    _ORDER = {
+        "transcription": 0,
+        "diarization_retry": 1,
+        "diarization": 2,
+        "frames": 3,
+    }
 
     def __init__(self) -> None:
         self._open: dict[str, tuple[str, float]] = {}
@@ -130,6 +141,25 @@ class _PipelineEvidenceBuilder:
         self._closed[stage] = interval
         return interval
 
+    def relabel(self, source: str, target: str) -> StageInterval:
+        if target in self._open or target in self._closed:
+            raise RuntimeError(f"pipeline stage {target!r} already exists")
+        try:
+            interval = self._closed.pop(source)
+        except KeyError as exc:
+            raise RuntimeError(
+                f"pipeline stage {source!r} is not closed"
+            ) from exc
+        relabeled = StageInterval(
+            stage=target,
+            launch_wave=interval.launch_wave,
+            started_at=interval.started_at,
+            ended_at=interval.ended_at,
+            outcome=interval.outcome,
+        )
+        self._closed[target] = relabeled
+        return relabeled
+
     def snapshot(self) -> PipelineEvidence:
         intervals = tuple(
             sorted(
@@ -155,6 +185,14 @@ class FullPipelineRunResult:
     @property
     def transcription_metadata(self) -> Mapping[str, Any]:
         return self.transcript.metadata
+
+    @property
+    def diarization_attempted_devices(self) -> tuple[str, ...]:
+        return self.transcript.diarization_attempted_devices
+
+    @property
+    def diarization_fallback_used(self) -> bool:
+        return self.transcript.diarization_fallback_used
 
 
 def resolve_frame_device(preflight: TranscriptPreflight) -> str:
@@ -218,6 +256,7 @@ def critical_path_from_pipeline_evidence(
     transcription_interval = evidence.interval("transcription")
     frame_interval = evidence.interval("frames")
     diarization_interval = evidence.interval("diarization")
+    retry_interval = evidence.interval("diarization_retry")
     if transcription_interval is None or frame_interval is None:
         raise RuntimeError("completed pipeline evidence is missing required stages")
     if transcription_interval.launch_wave != "initial":
@@ -226,6 +265,74 @@ def critical_path_from_pipeline_evidence(
         raise RuntimeError("frames must belong to the post-transcription launch wave")
     if transcription_interval.ended_at > frame_interval.started_at:
         raise RuntimeError("frames started before transcription completed")
+    if retry_interval is not None:
+        if retry_interval.outcome != "failed":
+            raise RuntimeError(
+                "automatic MPS retry evidence must describe a failed attempt"
+            )
+        if fallback_waited_for_diarization:
+            raise RuntimeError(
+                "MLX fallback wait evidence cannot also contain an MPS "
+                "diarization retry"
+            )
+        if retry_interval.launch_wave == "initial":
+            if retry_interval.started_at > transcription_interval.ended_at:
+                raise RuntimeError(
+                    "initial-wave MPS attempt started after transcription completed"
+                )
+            prefix = "max(T, R)"
+            retry_barrier = max(
+                transcription_interval.ended_at,
+                retry_interval.ended_at,
+            )
+        else:
+            if retry_interval.started_at < transcription_interval.ended_at:
+                raise RuntimeError(
+                    "post-transcription MPS attempt started before transcription "
+                    "completed"
+                )
+            prefix = "T + R"
+            retry_barrier = retry_interval.ended_at
+        if diarization_interval is not None:
+            if diarization_interval.launch_wave != "post-transcription":
+                raise RuntimeError("CPU diarization retry has an invalid launch wave")
+            if diarization_interval.started_at < retry_barrier:
+                raise RuntimeError(
+                    "CPU diarization retry started before the MPS attempt settled"
+                )
+        retry_overlapped_frames = frame_interval.started_at < retry_barrier
+        if retry_overlapped_frames:
+            if not retry_interval.overlaps(frame_interval):
+                raise RuntimeError(
+                    "frames started before the failed MPS attempt without overlap"
+                )
+            if (
+                diarization_interval is not None
+                and diarization_interval.outcome != "cancelled"
+                and diarization_interval.started_at < frame_interval.ended_at
+            ):
+                raise RuntimeError(
+                    "late CPU diarization retry started before frame work settled"
+                )
+            late_prefix = (
+                "max(T + F, R)"
+                if retry_interval.launch_wave == "initial"
+                else "T + max(R, F)"
+            )
+            if (
+                diarization_interval is None
+                or diarization_interval.outcome == "cancelled"
+            ):
+                return f"{late_prefix} + M + E"
+            return f"{late_prefix} + D + M + E"
+        if (
+            diarization_interval is None
+            or diarization_interval.outcome == "cancelled"
+        ):
+            return f"{prefix} + F + M + E"
+        if diarization_interval.overlaps(frame_interval):
+            return f"{prefix} + max(D, F) + M + E"
+        return f"{prefix} + D + F + M + E"
     if diarization_interval is not None:
         if (
             diarization_interval.launch_wave == "initial"
@@ -326,25 +433,37 @@ def run_supervised_full_pipeline(
     diarization_completion = None
     diarization_settled = False
     diarization_observed_end: float | None = None
+    diarization_evidence_stage = "diarization"
+    diarization_retry_pending = False
+    diarization_attempted_devices: list[str] = []
+    diarization_fallback_used = False
+    diarization_fallback_schedule: ScheduleDecision | None = None
 
     def start_diarization(
         decision: ScheduleDecision,
         launch_wave: str,
     ) -> Any:
         nonlocal diarization_handle, diarization_settled, diarization_started
+        nonlocal diarization_retry_pending
         if diarization_stage is None:
             raise RuntimeError("diarization is disabled")
         if diarization_handle is not None:
             return diarization_handle
+        diarization_retry_pending = False
         diarization_started = clock()
-        evidence_builder.start("diarization", launch_wave, diarization_started)
+        evidence_builder.start(
+            diarization_evidence_stage,
+            launch_wave,
+            diarization_started,
+        )
+        diarization_attempted_devices.append(diarization_stage.device)
         try:
             diarization_handle = supervisor.start_diarization(
                 video,
                 hf_token=preflight.hf_token or "",
                 final_output_paths=final_paths,
                 thread_budget=decision.cpu_threads_for("diarization"),
-                device=preflight.effective_diarization_device,
+                device=diarization_stage.device,
             )
         except BaseException as exc:
             diarization_settled = True
@@ -367,25 +486,62 @@ def run_supervised_full_pipeline(
             if diarization_observed_end is not None
             else clock()
         )
-        interval = evidence_builder.finish("diarization", effective_end, outcome)
-        timings["diarization"] = interval.duration_seconds
+        interval = evidence_builder.finish(
+            diarization_evidence_stage,
+            effective_end,
+            outcome,
+        )
+        timings[diarization_evidence_stage] = interval.duration_seconds
 
-    def settle_diarization() -> Any | None:
+    def settle_diarization(*, allow_fallback: bool = True) -> Any | None:
         nonlocal diarization_completion, diarization_settled
+        nonlocal diarization_handle, diarization_started
+        nonlocal diarization_stage, diarization_evidence_stage
+        nonlocal diarization_retry_pending, diarization_fallback_used
         if diarization_handle is None or diarization_settled:
             return diarization_completion
         diarization_settled = True
-        outcome = "completed"
         try:
             diarization_completion = supervisor.complete(diarization_handle)
         except Exception as exc:
-            outcome = "failed"
+            finish_diarization(
+                "failed",
+                ended_at=_handle_ended_at(diarization_handle),
+            )
             supervisor.public.diarization.unlink(missing_ok=True)
+            eligible_mps_fallback = (
+                allow_fallback
+                and isinstance(exc, StageWorkerError)
+                and config.diarization_device == "auto"
+                and diarization_stage is not None
+                and diarization_stage.device == "mps"
+                and not diarization_fallback_used
+                and exc.fallback_eligible
+            )
+            if eligible_mps_fallback:
+                evidence_builder.relabel(
+                    "diarization",
+                    "diarization_retry",
+                )
+                timings["diarization_retry"] = timings.pop("diarization")
+                diarization_fallback_used = True
+                diarization_retry_pending = True
+                diarization_stage = diarization_demand("cpu")
+                diarization_handle = None
+                diarization_completion = None
+                diarization_settled = False
+                diarization_started = None
+                diarization_evidence_stage = "diarization"
+                print(
+                    "Automatic MPS diarization failed during compute; "
+                    "retrying once on CPU"
+                )
+                return None
             transcript._print_speaker_detection_failure(exc)
             diarization_completion = None
-        finally:
+        else:
             finish_diarization(
-                outcome,
+                "completed",
                 ended_at=_handle_ended_at(diarization_handle),
             )
         return diarization_completion
@@ -529,7 +685,7 @@ def run_supervised_full_pipeline(
                 diarization_settled = True
                 finish_diarization("cancelled")
             else:
-                settle_diarization()
+                settle_diarization(allow_fallback=False)
             supervisor.public.diarization.unlink(missing_ok=True)
         diarization_stage = None
     elif preflight.missing_hf_token:
@@ -551,7 +707,11 @@ def run_supervised_full_pipeline(
     print("Frame-stage admission after transcription:")
     _print_schedule(frame_schedule)
 
-    if diarization_stage is not None and diarization_handle is None:
+    if (
+        diarization_stage is not None
+        and diarization_handle is None
+        and not diarization_retry_pending
+    ):
         start_diarization(frame_schedule, "post-transcription")
     if (
         diarization_handle is not None
@@ -559,6 +719,18 @@ def run_supervised_full_pipeline(
         and not diarization_runs_with_frames
     ):
         settle_diarization()
+
+    if diarization_retry_pending:
+        if diarization_stage is None or diarization_stage.device != "cpu":
+            raise RuntimeError("automatic diarization retry did not select CPU")
+        frame_schedule = scheduler.decide((diarization_stage, frame_stage))
+        diarization_fallback_schedule = frame_schedule
+        diarization_runs_with_frames = frame_schedule.parallel
+        print("CPU diarization fallback admission after failed MPS attempt:")
+        _print_schedule(frame_schedule)
+        start_diarization(frame_schedule, "post-transcription")
+        if not diarization_runs_with_frames:
+            settle_diarization()
 
     frame_generation = None
     frame_error: BaseException | None = None
@@ -602,6 +774,18 @@ def run_supervised_full_pipeline(
         raise
 
     if diarization_handle is not None and not diarization_settled:
+        settle_diarization()
+
+    if diarization_retry_pending:
+        if diarization_stage is None or diarization_stage.device != "cpu":
+            raise RuntimeError("automatic diarization retry did not select CPU")
+        diarization_fallback_schedule = scheduler.decide((diarization_stage,))
+        print("CPU diarization fallback admission after frame work:")
+        _print_schedule(diarization_fallback_schedule)
+        start_diarization(
+            diarization_fallback_schedule,
+            "post-transcription",
+        )
         settle_diarization()
 
     pipeline_evidence = evidence_builder.snapshot()
@@ -680,6 +864,9 @@ def run_supervised_full_pipeline(
         initial_schedule=initial_schedule,
         timings=dict(timings),
         metadata=dict(execution.completion.metadata),
+        diarization_attempted_devices=tuple(diarization_attempted_devices),
+        diarization_fallback_used=diarization_fallback_used,
+        diarization_fallback_schedule=diarization_fallback_schedule,
     )
     return FullPipelineRunResult(
         transcript=transcript_result,

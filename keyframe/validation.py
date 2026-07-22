@@ -192,6 +192,16 @@ CRITICAL_PATH_EXPRESSIONS = frozenset(
         "max(T, D) + F + M + E",
         "T + max(D, F) + M + E",
         "T + D + F + M + E",
+        "T + R + F + M + E",
+        "T + R + max(D, F) + M + E",
+        "T + R + D + F + M + E",
+        "max(T, R) + F + M + E",
+        "max(T, R) + max(D, F) + M + E",
+        "max(T, R) + D + F + M + E",
+        "T + max(R, F) + M + E",
+        "T + max(R, F) + D + M + E",
+        "max(T + F, R) + M + E",
+        "max(T + F, R) + D + M + E",
     }
 )
 
@@ -217,9 +227,22 @@ def expected_critical_path_seconds(
             diarization = float(timings["diarization"])
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("critical-path timings are incomplete or invalid") from exc
+    retry = None
+    if "R" in expression:
+        try:
+            retry = float(timings["diarization_retry"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("critical-path timings are incomplete or invalid") from exc
     values = tuple(
         value
-        for value in (transcription, diarization, frames, merge, enrichment)
+        for value in (
+            transcription,
+            retry,
+            diarization,
+            frames,
+            merge,
+            enrichment,
+        )
         if value is not None
     )
     if any(not math.isfinite(value) or value < 0 for value in values):
@@ -236,8 +259,34 @@ def expected_critical_path_seconds(
     if expression == "T + max(D, F) + M + E":
         assert diarization is not None
         return transcription + max(diarization, frames) + merge + enrichment
-    assert diarization is not None
-    return transcription + diarization + frames + merge + enrichment
+    if expression == "T + D + F + M + E":
+        assert diarization is not None
+        return transcription + diarization + frames + merge + enrichment
+    assert retry is not None
+    if expression.startswith("T + max(R, F)"):
+        value = transcription + max(retry, frames)
+        if " D " in expression:
+            assert diarization is not None
+            value += diarization
+        return value + merge + enrichment
+    if expression.startswith("max(T + F, R)"):
+        value = max(transcription + frames, retry)
+        if " D " in expression:
+            assert diarization is not None
+            value += diarization
+        return value + merge + enrichment
+    prefix = (
+        max(transcription, retry)
+        if expression.startswith("max(T, R)")
+        else transcription + retry
+    )
+    if "max(D, F)" in expression:
+        assert diarization is not None
+        return prefix + max(diarization, frames) + merge + enrichment
+    if " D " in expression:
+        assert diarization is not None
+        return prefix + diarization + frames + merge + enrichment
+    return prefix + frames + merge + enrichment
 
 
 def _comparison_row(value: DiarizationRow | Mapping[str, Any]) -> DiarizationRow:
