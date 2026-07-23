@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import shutil
+import uuid
 from itertools import count
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from PIL import Image
 
 from keyframe import full_pipeline as full_pipeline_module
 from keyframe import transcript
@@ -15,14 +18,12 @@ from keyframe.full_pipeline import (
     resolve_frame_device,
     run_supervised_full_pipeline,
 )
-from keyframe.output_session import remove_keyframe_owned_directory
 from keyframe.stage_scheduler import GIB, RuntimeResources, StageScheduler
 from keyframe.stage_supervisor import StageCompletion, StageWorkerError
 from keyframe.transcript_cli import (
     TranscriptPreflight,
     TranscriptRunConfig,
 )
-
 
 MAC = transcript.RuntimePlatform("Darwin", "arm64", 14, 23)
 LINUX = transcript.RuntimePlatform("Linux", "x86_64", None, 6)
@@ -118,6 +119,17 @@ class _FakeSupervisor:
     ):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.staging_root = (
+            self.output_dir
+            / ".keyframe-work"
+            / "runs"
+            / str(uuid.uuid4())
+        )
+        self.staging_root.mkdir(parents=True)
+        self.staging = SimpleNamespace(
+            root=self.staging_root,
+            frames=self.staging_root / "frames",
+        )
         self.public = transcript_checkpoint_paths(self.output_dir)
         self.events = events
         self.segments = tuple(
@@ -254,12 +266,7 @@ class _FakeSupervisor:
 
 
 class _ContextFakeSupervisor(_FakeSupervisor):
-    def __init__(self, output_dir, events, **kwargs):
-        super().__init__(output_dir, events, **kwargs)
-        self.staging_root = self.output_dir / "keyframe-run-interruption"
-
     def __enter__(self):
-        self.staging_root.mkdir()
         self.events.append(("enter-supervisor", None))
         return self
 
@@ -267,7 +274,7 @@ class _ContextFakeSupervisor(_FakeSupervisor):
         for handle in self.handles.values():
             if handle.process.is_alive():
                 self.cancel(handle)
-        remove_keyframe_owned_directory(self.staging_root)
+        shutil.rmtree(self.staging_root)
         self.events.append(("close-supervisor", None))
 
 
@@ -287,7 +294,31 @@ class _FakeFrameGeneration:
         assert self.enriched_segments is not None
         public = self.output_dir / "frames"
         public.mkdir(parents=True, exist_ok=True)
-        (public / "current.txt").write_text("current", encoding="utf-8")
+        frame_name = "frame_000001_1.00s.png"
+        Image.new("RGB", (4, 4), "white").save(public / frame_name)
+        (public / "captions.json").write_text(
+            json.dumps(
+                [{"file": frame_name, "timestamp": 1.0, "caption": "current"}]
+            ),
+            encoding="utf-8",
+        )
+        (public / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "frames": [
+                        {
+                            "filename": frame_name,
+                            "timestamp": 1.0,
+                            "caption": "current",
+                            "transcript_window": "",
+                        }
+                    ],
+                    "metadata": {},
+                }
+            ),
+            encoding="utf-8",
+        )
         return SimpleNamespace(final_frame_count=1, output_dir=public)
 
 
@@ -790,7 +821,7 @@ def test_empty_transcript_does_not_retry_an_already_failed_mps_worker(tmp_path):
     assert not result.diarization_fallback_used
     assert result.pipeline_evidence.interval("diarization_retry") is None
     assert result.pipeline_evidence.interval("diarization").outcome == "failed"
-    assert (output / "frames" / "current.txt").read_text() == "current"
+    assert (output / "frames" / "frame_000001_1.00s.png").is_file()
 
 
 def test_nonempty_transcript_retries_an_already_failed_mps_worker(tmp_path):
@@ -1134,7 +1165,7 @@ def test_empty_serial_transcript_skips_unstarted_diarization_but_keeps_frames(
     assert result.critical_path == "T + F + M + E"
     assert result.pipeline_evidence.interval("diarization") is None
     assert json.loads((output / "transcript.json").read_text(encoding="utf-8")) == []
-    assert (output / "frames" / "current.txt").exists()
+    assert (output / "frames" / "frame_000001_1.00s.png").exists()
 
 
 def test_empty_parallel_transcript_cancels_diarization_and_records_topology(tmp_path):
@@ -1464,7 +1495,7 @@ def test_diarization_failure_still_promotes_frames_and_writes_unlabeled_transcri
     )
 
     assert result.transcript.segments[0].speaker is None
-    assert (output / "frames" / "current.txt").exists()
+    assert (output / "frames" / "frame_000001_1.00s.png").exists()
     assert not (output / "diarization.json").exists()
     assert "speaker detection failed" in capsys.readouterr().err
 
@@ -1509,8 +1540,9 @@ def test_full_cli_reports_partial_frame_output_with_nonzero_status(
     video.write_bytes(b"media")
     output = tmp_path / "out"
     prior_frames = output / "frames"
-    prior_frames.mkdir(parents=True)
-    (prior_frames / "previous.txt").write_text("previous", encoding="utf-8")
+    prior_generation = _FakeFrameGeneration(output, [])
+    prior_generation.enriched_segments = ()
+    prior_generation.promote()
     monkeypatch.setattr(cli, "_preflight_transcript", lambda _args: object())
 
     def fail_full_pipeline(*_args):
@@ -1532,17 +1564,15 @@ def test_full_cli_reports_partial_frame_output_with_nonzero_status(
 
     assert raised.value.code == 1
     assert "Error: partial output" in capsys.readouterr().err
-    assert (prior_frames / "previous.txt").read_text(encoding="utf-8") == (
-        "previous"
-    )
+    assert (prior_frames / "frame_000001_1.00s.png").is_file()
 
 
 def test_cli_full_pipeline_pins_frame_extraction_to_the_scheduled_device(
     tmp_path,
     monkeypatch,
 ):
-    from keyframe import cli
     import keyframe.full_pipeline as full_pipeline
+    from keyframe import cli
 
     preflight = _preflight()
     supervisor = object()

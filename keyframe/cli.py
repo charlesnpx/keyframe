@@ -378,12 +378,9 @@ def cmd_extract(args):
     print(f"Done in {elapsed:.1f}s")
     print(f"Output: {out_dir.resolve()}")
 
-    files = sorted(out_dir.rglob("*"))
-    files = [
-        f
-        for f in files
-        if f.is_file() and f.name != "keyframe-output.lock"
-    ]
+    from keyframe.managed_workspace import known_public_artifact_paths
+
+    files = known_public_artifact_paths(out_dir)
     print(f"\nFiles ({len(files)}):")
     for f in files:
         rel = f.relative_to(out_dir)

@@ -1,5 +1,5 @@
-from types import SimpleNamespace
 from pathlib import Path
+from types import SimpleNamespace
 
 
 def _fake_result(output_dir):
@@ -23,6 +23,7 @@ def _fake_record_result(output_dir):
     import json
 
     from PIL import Image
+
     from keyframe.pipeline import KeyframeExtractionResult
     from keyframe.pipeline.contracts import CandidateRecord
 
@@ -61,8 +62,8 @@ def _fake_record_result(output_dir):
 
 
 def test_cli_frames_only_delegates_to_shared_pipeline(tmp_path, monkeypatch):
-    from keyframe import cli
     import keyframe.pipeline as pipeline
+    from keyframe import cli
 
     video = tmp_path / "input.mp4"
     video.write_bytes(b"not a real video")
@@ -91,7 +92,8 @@ def test_cli_frames_only_delegates_to_shared_pipeline(tmp_path, monkeypatch):
     video_path, output_dir, config, kwargs = calls[0]
     assert video_path == video
     assert output_dir.name == "frames"
-    assert output_dir.parent.name.startswith("keyframe-run-")
+    assert output_dir.parent.parent.name == "runs"
+    assert output_dir.parent.parent.parent.name == ".keyframe-work"
     assert kwargs["report_output_dir"] == out_dir / "frames"
     assert config.sample_interval == 0.75
     assert config.pass1_clusters == 9
@@ -101,6 +103,7 @@ def test_cli_frames_only_delegates_to_shared_pipeline(tmp_path, monkeypatch):
 
 def test_frames_main_delegates_to_shared_pipeline(tmp_path, monkeypatch):
     import sys
+
     import keyframe.frames as frames_mod
     import keyframe.pipeline as pipeline
 
@@ -140,8 +143,8 @@ def test_frames_main_delegates_to_shared_pipeline(tmp_path, monkeypatch):
 
 
 def test_cli_transcript_manifest_rewrite_materializes_candidate_records(tmp_path, monkeypatch):
-    from keyframe import cli
     import keyframe.pipeline as pipeline
+    from keyframe import cli
 
     video = tmp_path / "input.mp4"
     video.write_bytes(b"not a real video")
@@ -232,8 +235,9 @@ def test_cli_no_speaker_detection_passed_to_transcript(tmp_path, monkeypatch):
 
 def test_cli_frames_only_does_not_import_transcript(tmp_path, monkeypatch):
     import sys
-    from keyframe import cli
+
     import keyframe.pipeline as pipeline
+    from keyframe import cli
 
     video = tmp_path / "input.mp4"
     video.write_bytes(b"not a real video")
@@ -270,9 +274,16 @@ def test_cli_frames_only_does_not_import_transcript(tmp_path, monkeypatch):
 
 def test_survival_stage_applies_explicit_output_cap_after_dedupe():
     from PIL import Image
+
     from keyframe.pipeline.config import KeyframeExtractionConfig
     from keyframe.pipeline.context import make_context
-    from keyframe.pipeline.contracts import CandidateRecord, FeatureOutput, FrameStore, SampleTable, SamplingOutput
+    from keyframe.pipeline.contracts import (
+        CandidateRecord,
+        FeatureOutput,
+        FrameStore,
+        SampleTable,
+        SamplingOutput,
+    )
     from keyframe.pipeline.orchestrator import SurvivalStage
     from keyframe.pipeline.trace import NoOpTraceSink
 

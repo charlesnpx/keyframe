@@ -4,16 +4,13 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import secrets
 import stat
+import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-
-
-RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 
 
 class ArtifactPathCollisionError(ValueError):
@@ -49,24 +46,10 @@ def transcript_checkpoint_paths(
     )
 
 
-def run_staging_paths(output_dir: str | Path, run_id: str) -> RunStagingPaths:
-    """Return non-hidden, output-filesystem staging paths for one CLI run."""
-    if not isinstance(run_id, str) or not RUN_ID_PATTERN.fullmatch(run_id):
-        raise ValueError(
-            "run_id must start with an alphanumeric character and contain only "
-            "letters, numbers, underscores, or hyphens"
-        )
-    output_dir = Path(output_dir)
-    root = output_dir / f"keyframe-run-{run_id}"
-    return RunStagingPaths(
-        output_dir=output_dir,
-        run_id=run_id,
-        root=root,
-        transcript_raw=root / "transcript.raw.json",
-        diarization=root / "diarization.json",
-        frames=root / "frames",
-        frame_backup=output_dir / f"keyframe-frame-backup-{run_id}",
-    )
+def run_staging_paths(workspace: Any, run_id: uuid.UUID) -> RunStagingPaths:
+    """Return workspace-derived paths for one parsed UUIDv4 run id."""
+
+    return workspace.staging_paths(run_id)
 
 
 def paths_alias(left: str | Path, right: str | Path) -> bool:
