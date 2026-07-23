@@ -978,6 +978,58 @@ def test_quoted_tilde_output_and_cache_execute_at_the_validated_destinations(
     assert not (cwd / "~").exists()
 
 
+def test_default_output_materializes_only_the_preflight_selected_fallback(
+    tmp_path,
+    monkeypatch,
+):
+    video = tmp_path / "recording.mp4"
+    video.write_bytes(b"media")
+    preferred = tmp_path / "recording_extracted"
+    fallback = tmp_path / "validated-fallback"
+    args = _cli_args(
+        video,
+        preferred,
+    )
+    args.output = None
+    _patch_media(monkeypatch, _probe(_video_stream()))
+    _patch_frame_runtime(monkeypatch)
+
+    def select_fallback(planned_video, requested_output):
+        assert planned_video == video.resolve()
+        assert requested_output is None
+        assert not preferred.exists()
+        return fallback
+
+    class Generation:
+        def promote(self):
+            return SimpleNamespace(final_frame_count=0, output_dir=fallback / "frames")
+
+    monkeypatch.setattr(cli, "_plan_out_dir", select_fallback)
+    monkeypatch.setattr(
+        cli,
+        "_frame_session",
+        lambda *_args, **_kwargs: nullcontext(object()),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_run_frame_generation",
+        lambda _video, output, _config, _session: (
+            Generation()
+            if output == fallback
+            else pytest.fail(f"unvalidated output destination: {output}")
+        ),
+    )
+    monkeypatch.setattr(
+        "keyframe.managed_workspace.known_public_artifact_paths",
+        lambda _output: (),
+    )
+
+    cli.cmd_extract(args)
+
+    assert fallback.is_dir()
+    assert not preferred.exists()
+
+
 @pytest.mark.parametrize(
     ("failure", "exit_code"),
     [(RuntimeError("model failed"), 1), (KeyboardInterrupt(), 130)],

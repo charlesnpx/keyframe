@@ -482,10 +482,9 @@ def cmd_extract(args):
             )
             raise SystemExit(1) from None
     try:
-        requested_output = getattr(args, "output", None)
         out_dir = _resolve_out_dir(
             video,
-            str(preflight.output_dir) if requested_output else None,
+            str(preflight.output_dir),
         )
     except OSError as exc:
         print(f"Error: could not create output directory: {exc}", file=sys.stderr)
