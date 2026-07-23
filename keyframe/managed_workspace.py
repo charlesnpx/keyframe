@@ -902,6 +902,7 @@ class ManagedWorkspace:
 
         # Reclassify all workspace state immediately before the first mutation.
         inspection = _inspect_workspace(self.output_dir, self.root)
+        _require_unambiguous_recovery_state(inspection)
         if parsed not in inspection.run_ids:
             raise FrameGenerationPromotionError(
                 f"current managed run is no longer present: {parsed}"
@@ -919,6 +920,11 @@ class ManagedWorkspace:
                 f"current run recovery id is already present: {parsed}"
             )
 
+        if staged.lstat().st_dev != self.output_dir.lstat().st_dev:
+            raise FrameGenerationPromotionError(
+                "staged and public frame generations are on different filesystems"
+            )
+
         public_existed = inspection.public_generation is not None
         public_mode: int | None = None
         if public_existed:
@@ -931,10 +937,6 @@ class ManagedWorkspace:
                 raise FrameGenerationPromotionError(
                     f"failed to prepare frame generation permissions: {exc}"
                 ) from exc
-        if staged.lstat().st_dev != self.output_dir.lstat().st_dev:
-            raise FrameGenerationPromotionError(
-                "staged and public frame generations are on different filesystems"
-            )
 
         recovery_frames: Path | None = None
         old_moved = False

@@ -645,6 +645,75 @@ def test_failed_publish_restores_previous_generation_and_staging(
         assert not session.staging.frame_backup.parent.exists()
 
 
+def test_promotion_rejects_empty_recovery_that_appears_after_startup(tmp_path):
+    output = tmp_path / "out"
+
+    with OutputRunSession(output) as session:
+        assert session.staging is not None
+        assert session.workspace is not None
+        expected = _write_generation(
+            session.staging.frames,
+            marker="replacement",
+            frame_index=2,
+        )
+        empty_recovery = session.workspace.recovery_dir / str(uuid.uuid4())
+        empty_recovery.mkdir()
+        before = _snapshot(output)
+
+        with pytest.raises(ManagedWorkspaceError, match="empty prepared"):
+            session.workspace.promote_frame_generation(
+                session.staging.frames,
+                expected_frame_names=expected,
+                entry_id=session.entry_id,
+            )
+
+        assert _snapshot(output) == before
+        assert not (output / "frames").exists()
+
+
+def test_cross_filesystem_preflight_preserves_generation_permissions(
+    tmp_path,
+    monkeypatch,
+):
+    output = tmp_path / "out"
+    _write_generation(output / "frames", marker="previous", frame_index=1)
+    (output / "frames").chmod(0o500)
+
+    with OutputRunSession(output) as session:
+        assert session.staging is not None
+        assert session.workspace is not None
+        expected = _write_generation(
+            session.staging.frames,
+            marker="replacement",
+            frame_index=2,
+        )
+        session.staging.frames.chmod(0o500)
+        real_lstat = Path.lstat
+
+        def report_staging_on_other_device(path):
+            info = real_lstat(path)
+            if path == session.staging.frames:
+                values = list(info)
+                values[2] = info.st_dev + 1
+                return os.stat_result(values)
+            return info
+
+        monkeypatch.setattr(Path, "lstat", report_staging_on_other_device)
+
+        with pytest.raises(
+            FrameGenerationPromotionError,
+            match="different filesystems",
+        ):
+            session.workspace.promote_frame_generation(
+                session.staging.frames,
+                expected_frame_names=expected,
+                entry_id=session.entry_id,
+            )
+
+        assert stat.S_IMODE(real_lstat(output / "frames").st_mode) == 0o500
+        assert stat.S_IMODE(real_lstat(session.staging.frames).st_mode) == 0o500
+
+
 def test_failed_post_publish_validation_rolls_back_last_valid_generation(
     tmp_path,
     monkeypatch,

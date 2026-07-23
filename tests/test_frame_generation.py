@@ -302,7 +302,7 @@ def test_cli_frame_write_failure_discards_stage_and_preserves_public_generation(
         cli.cmd_extract(_frames_only_args(video, output))
 
     assert _tree_snapshot(output / "frames") == previous
-    assert not list(output.glob("keyframe-run-*"))
+    assert not list((output / ".keyframe-work" / "runs").iterdir())
 
 
 @pytest.mark.parametrize("failure_calls", [{2}])
