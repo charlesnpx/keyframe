@@ -27,12 +27,8 @@ dependencies = [
     "tqdm",
     "pyobjc-framework-Vision; sys_platform == 'darwin'",
     "pyobjc-framework-Quartz; sys_platform == 'darwin'",
-]
-
-[project.optional-dependencies]
-paddle = [
-    "paddlepaddle",
-    "paddleocr",
+    "paddlepaddle>=3.3.1,<4; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "paddleocr>=3.7,<4; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
 [project.scripts]

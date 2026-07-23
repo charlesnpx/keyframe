@@ -18,12 +18,14 @@ from keyframe.full_pipeline import (
     resolve_frame_device,
     run_supervised_full_pipeline,
 )
+from keyframe.pipeline.config import KeyframeExtractionConfig
 from keyframe.stage_scheduler import GIB, RuntimeResources, StageScheduler
 from keyframe.stage_supervisor import StageCompletion, StageWorkerError
 from keyframe.transcript_cli import (
     TranscriptPreflight,
     TranscriptRunConfig,
 )
+from tests.preflight_helpers import patch_cli_media
 
 MAC = transcript.RuntimePlatform("Darwin", "arm64", 14, 23)
 LINUX = transcript.RuntimePlatform("Linux", "x86_64", None, 6)
@@ -1543,7 +1545,8 @@ def test_full_cli_reports_partial_frame_output_with_nonzero_status(
     prior_generation = _FakeFrameGeneration(output, [])
     prior_generation.enriched_segments = ()
     prior_generation.promote()
-    monkeypatch.setattr(cli, "_preflight_transcript", lambda _args: object())
+    monkeypatch.setattr(cli, "_preflight_transcript", lambda _args: _preflight())
+    patch_cli_media(monkeypatch, video=True, audio=True)
 
     def fail_full_pipeline(*_args):
         raise FullPipelineFrameError("partial output: injected frame failure")
@@ -1581,17 +1584,14 @@ def test_cli_full_pipeline_pins_frame_extraction_to_the_scheduled_device(
     def fake_frame_generation(
         video,
         output,
-        args,
+        frame_config,
         active_supervisor,
-        *,
-        frame_device,
     ):
         captured["frame"] = (
             video,
             output,
-            args,
+            frame_config,
             active_supervisor,
-            frame_device,
         )
         return "staged-frames"
 
@@ -1622,16 +1622,16 @@ def test_cli_full_pipeline_pins_frame_extraction_to_the_scheduled_device(
     )
     video = tmp_path / "recording.mp4"
     output = tmp_path / "out"
-    args = object()
+    frame_config = KeyframeExtractionConfig(device="mps")
 
     result = cli._run_full_pipeline(
         video,
         output,
-        args,
         preflight,
+        frame_config,
         supervisor,
     )
 
     assert result == "full-result"
     assert captured["orchestrator"][-1] == "mps"
-    assert captured["frame"][-1] == "mps"
+    assert captured["frame"][2] is frame_config

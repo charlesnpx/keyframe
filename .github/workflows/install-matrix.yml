@@ -48,10 +48,11 @@ jobs:
           python -m pip install \
             --index-url https://download.pytorch.org/whl/cpu \
             torch==2.8.0 torchaudio==2.8.0 torchvision==0.23.0
-      - name: Install package from source
+      - name: Build wheel and sdist, then install the wheel
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install .
+          python -m pip install --upgrade pip build
+          python -m build
+          python -m pip install dist/keyframe-*.whl
       - name: Validate distribution, imports, and MLX platform gate
         run: python scripts/validate_install.py --expect-platform ${{ matrix.platform }}
       - name: Run release suite

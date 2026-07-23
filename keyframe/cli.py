@@ -16,11 +16,14 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 import time
 import tomllib
 from contextlib import nullcontext
+from dataclasses import dataclass
 from importlib import metadata as importlib_metadata
 from pathlib import Path
+from typing import Any
 
 
 def _skill_bundle_dir() -> Path:
@@ -171,6 +174,75 @@ def _resolve_out_dir(video: Path, output: str | None) -> Path:
         return fallback
 
 
+class ExtractionPreflightError(ValueError):
+    """CLI extraction inputs cannot safely proceed to side effects."""
+
+
+@dataclass(frozen=True)
+class ExtractionPreflight:
+    input_path: Path
+    output_dir: Path
+    do_frames: bool
+    do_transcript: bool
+    notice: str | None
+    transcript: Any | None
+    frame_config: Any | None
+
+
+def _nearest_existing_directory(path: Path, *, label: str) -> Path:
+    candidate = path.expanduser()
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    ancestor = candidate
+    while not os.path.lexists(ancestor):
+        parent = ancestor.parent
+        if parent == ancestor:
+            raise ExtractionPreflightError(
+                f"{label} has no existing directory ancestor: {path}"
+            )
+        ancestor = parent
+    try:
+        resolved = ancestor.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ExtractionPreflightError(
+            f"{label} ancestor cannot be resolved: {ancestor}: {exc}"
+        ) from exc
+    if not resolved.is_dir():
+        raise ExtractionPreflightError(
+            f"{label} nearest existing ancestor is not a directory: {ancestor}"
+        )
+    if not os.access(resolved, os.W_OK | os.X_OK):
+        raise ExtractionPreflightError(
+            f"{label} nearest existing directory is not writable: {resolved}"
+        )
+    return resolved
+
+
+def _validate_directory_destination(path: Path, *, label: str) -> Path:
+    _nearest_existing_directory(path, label=label)
+    return path
+
+
+def _plan_out_dir(video: Path, output: str | None) -> Path:
+    if output:
+        return _validate_directory_destination(
+            Path(output),
+            label="output directory",
+        )
+    preferred = video.parent / f"{video.stem}_extracted"
+    try:
+        return _validate_directory_destination(
+            preferred,
+            label="default output directory",
+        )
+    except ExtractionPreflightError:
+        fallback = Path("/tmp") / f"{video.stem}_extracted"
+        return _validate_directory_destination(
+            fallback,
+            label="fallback output directory",
+        )
+
+
 def _transcript_config(args):
     from keyframe.transcript_cli import TranscriptRunConfig
 
@@ -203,38 +275,116 @@ def _run_transcript(video: Path, out_dir: Path, preflight, *, supervisor=None):
     )
 
 
-def _frame_config(args, *, device: str | None = None):
+def _frame_config(
+    args,
+    *,
+    device: str | None = None,
+    include_paths: bool = True,
+):
     from keyframe.pipeline import KeyframeExtractionConfig
 
+    frame_cache_arg = (
+        getattr(args, "frame_cache_dir", None) if include_paths else None
+    )
+    qa_targets_arg = (
+        getattr(args, "debug_qa_targets", None) if include_paths else None
+    )
     return KeyframeExtractionConfig(
-        sample_interval=args.sample_interval,
-        pass1_clusters=args.pass1_clusters,
-        similarity_threshold=args.similarity_threshold,
+        sample_interval=getattr(args, "sample_interval", 0.5),
+        pass1_clusters=getattr(args, "pass1_clusters", 15),
+        similarity_threshold=getattr(args, "similarity_threshold", 0.85),
         device=device,
         max_output_frames=getattr(args, "max_output_frames", None),
         max_clustering_memory_mb=getattr(args, "max_clustering_memory_mb", 2048),
         max_frame_cache_mb=getattr(args, "max_frame_cache_mb", 8192),
         frame_cache_dir=(
-            Path(args.frame_cache_dir)
-            if getattr(args, "frame_cache_dir", None)
-            else None
+            Path(frame_cache_arg) if frame_cache_arg else None
         ),
         verbose_trace=bool(getattr(args, "verbose_trace", False)),
         debug_qa_targets_path=(
-            Path(args.debug_qa_targets)
-            if getattr(args, "debug_qa_targets", None)
-            else None
+            Path(qa_targets_arg) if qa_targets_arg else None
         ),
+    )
+
+
+def _preflight_extract(args) -> ExtractionPreflight:
+    from keyframe.frame_preflight import (
+        FramePreflightError,
+        preflight_frame_runtime,
+        resolve_frame_execution_device,
+    )
+    from keyframe.media_preflight import (
+        MediaPreflightError,
+        probe_media,
+        resolve_extraction_mode,
+        resolve_readable_media_file,
+    )
+
+    try:
+        video = resolve_readable_media_file(args.video)
+        media = probe_media(video)
+        mode = resolve_extraction_mode(
+            media,
+            frames_only=bool(getattr(args, "frames_only", False)),
+            transcript_only=bool(getattr(args, "transcript_only", False)),
+        )
+        output_dir = _plan_out_dir(video, getattr(args, "output", None))
+    except (MediaPreflightError, ExtractionPreflightError) as exc:
+        raise ExtractionPreflightError(str(exc)) from exc
+
+    transcript_preflight = None
+    if mode.do_transcript:
+        from keyframe.transcript import TranscriptionError
+
+        try:
+            transcript_preflight = _preflight_transcript(args)
+        except (ValueError, TranscriptionError) as exc:
+            raise ExtractionPreflightError(str(exc)) from exc
+
+    frame_config = None
+    if mode.do_frames:
+        try:
+            frame_runtime = preflight_frame_runtime()
+            if transcript_preflight is not None:
+                from keyframe.full_pipeline import resolve_frame_device
+
+                frame_device = resolve_frame_device(transcript_preflight)
+            else:
+                frame_device = resolve_frame_execution_device(frame_runtime)
+            frame_config = _frame_config(args, device=frame_device)
+            cache_root = (
+                frame_config.frame_cache_dir
+                if frame_config.frame_cache_dir is not None
+                else Path(tempfile.gettempdir())
+            )
+            _validate_directory_destination(
+                cache_root,
+                label="frame cache directory",
+            )
+        except (FramePreflightError, ValueError) as exc:
+            raise ExtractionPreflightError(str(exc)) from exc
+    else:
+        try:
+            _frame_config(args, include_paths=False)
+        except ValueError as exc:
+            raise ExtractionPreflightError(str(exc)) from exc
+
+    return ExtractionPreflight(
+        input_path=video,
+        output_dir=output_dir,
+        do_frames=mode.do_frames,
+        do_transcript=mode.do_transcript,
+        notice=mode.notice,
+        transcript=transcript_preflight,
+        frame_config=frame_config,
     )
 
 
 def _run_frame_generation(
     video: Path,
     out_dir: Path,
-    args,
+    frame_config,
     session,
-    *,
-    frame_device: str | None = None,
 ):
     from keyframe.frame_generation import StagedFrameGeneration
     from keyframe.pipeline import extract_keyframes
@@ -244,31 +394,40 @@ def _run_frame_generation(
     result = extract_keyframes(
         video,
         session.staging.frames,
-        _frame_config(args, device=frame_device),
+        frame_config,
         report_output_dir=out_dir / "frames",
     )
     return StagedFrameGeneration.from_extraction(session, result)
 
 
-def _run_full_pipeline(video: Path, out_dir: Path, args, preflight, supervisor):
+def _run_full_pipeline(
+    video: Path,
+    out_dir: Path,
+    transcript_preflight,
+    frame_config,
+    supervisor,
+):
     from keyframe.full_pipeline import (
         resolve_frame_device,
         run_supervised_full_pipeline,
     )
 
-    frame_device = resolve_frame_device(preflight)
+    frame_device = resolve_frame_device(transcript_preflight)
+    if frame_config.device != frame_device:
+        raise RuntimeError(
+            "validated frame configuration does not match the scheduled device"
+        )
     return run_supervised_full_pipeline(
         video,
         out_dir,
-        preflight,
+        transcript_preflight,
         supervisor=supervisor,
         frame_device=frame_device,
         frame_runner=lambda: _run_frame_generation(
             video,
             out_dir,
-            args,
+            frame_config,
             supervisor,
-            frame_device=frame_device,
         ),
     )
 
@@ -293,28 +452,40 @@ def _print_frame_result(result) -> None:
 
 
 def cmd_extract(args):
-    video = Path(args.video)
-    if not video.exists():
-        print(f"Error: file not found: {args.video}", file=sys.stderr)
-        sys.exit(1)
-
-    do_frames = not args.transcript_only
-    do_transcript = not args.frames_only
-    transcript_preflight = None
-    if do_transcript:
-        from keyframe.transcript import TranscriptionError
-
-        try:
-            transcript_preflight = _preflight_transcript(args)
-        except (ValueError, TranscriptionError) as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            raise SystemExit(2) from None
-
     try:
-        out_dir = _resolve_out_dir(video, args.output)
+        preflight = _preflight_extract(args)
+    except ExtractionPreflightError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
+
+    video = preflight.input_path
+    do_frames = preflight.do_frames
+    do_transcript = preflight.do_transcript
+    transcript_preflight = preflight.transcript
+    frame_config = preflight.frame_config
+    if preflight.notice is not None:
+        print(f"Notice: {preflight.notice}.")
+
+    if frame_config is not None and frame_config.frame_cache_dir is not None:
+        try:
+            frame_config.frame_cache_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            print(
+                f"Error: could not create frame cache directory: {exc}",
+                file=sys.stderr,
+            )
+            raise SystemExit(1) from None
+    try:
+        out_dir = _resolve_out_dir(video, getattr(args, "output", None))
     except OSError as exc:
         print(f"Error: could not create output directory: {exc}", file=sys.stderr)
         raise SystemExit(1) from None
+    if out_dir.resolve() != preflight.output_dir.resolve():
+        print(
+            "Error: output directory changed after preflight",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
     print(f"Output: {out_dir.resolve()}\n")
 
     t0 = time.time()
@@ -335,11 +506,13 @@ def cmd_extract(args):
                     raise RuntimeError("full extraction session was not initialized")
                 if transcript_preflight is None:
                     raise RuntimeError("transcript preflight was not initialized")
+                if frame_config is None:
+                    raise RuntimeError("frame preflight was not initialized")
                 full_result = _run_full_pipeline(
                     video,
                     out_dir,
-                    args,
                     transcript_preflight,
+                    frame_config,
                     session,
                 )
                 _print_frame_result(full_result.frames)
@@ -349,10 +522,12 @@ def cmd_extract(args):
                 print("=" * 60)
                 if session is None:
                     raise RuntimeError("frame generation session was not initialized")
+                if frame_config is None:
+                    raise RuntimeError("frame preflight was not initialized")
                 frame_generation = _run_frame_generation(
                     video,
                     out_dir,
-                    args,
+                    frame_config,
                     session,
                 )
                 _print_frame_result(frame_generation.promote())
@@ -369,6 +544,12 @@ def cmd_extract(args):
                     transcript_preflight,
                 )
     except OutputSessionError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from None
+    except KeyboardInterrupt:
+        print("Error: extraction interrupted", file=sys.stderr)
+        raise SystemExit(130) from None
+    except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
         raise SystemExit(1) from None
 
@@ -391,7 +572,10 @@ def cmd_extract(args):
 def _build_extract_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="keyframe",
-        description="Extract key frames and transcripts from video files.\n\n"
+        description="Probe media and extract supported key frames and/or "
+                    "transcripts.\n"
+                    "Frames: Darwin ARM64 or Linux x86-64. "
+                    "Transcript-only remains portable.\n\n"
                     "Usage:\n"
                     "  keyframe video.mp4\n"
                     "  keyframe extract video.mp4\n"
@@ -446,9 +630,10 @@ def _add_extract_args(parser):
 
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--frames-only", action="store_true",
-                      help="Only extract key frames, skip transcript")
+                      help="Require usable video and extract frames only "
+                           "(Darwin ARM64 or Linux x86-64)")
     mode.add_argument("--transcript-only", action="store_true",
-                      help="Only extract transcript, skip key frames")
+                      help="Require usable audio and extract transcript only")
 
     parser.add_argument("--sample-interval", "-i", type=float, default=0.5,
                         help="Sample one frame every N seconds (default: 0.5)")
