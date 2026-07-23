@@ -18,6 +18,7 @@ from keyframe.frame_generation import (
 )
 from keyframe.pipeline.config import KeyframeExtractionResult
 from keyframe.pipeline.contracts import CandidateRecord
+from tests.preflight_helpers import patch_cli_media, transcript_preflight_stub
 
 
 def _candidate(frame_idx, timestamp, text="frame"):
@@ -297,10 +298,12 @@ def test_cli_frame_write_failure_discards_stage_and_preserves_public_generation(
         raise OSError("injected manifest failure")
 
     monkeypatch.setattr(cli, "_run_frame_generation", fail_generation)
+    patch_cli_media(monkeypatch, video=True, audio=False)
 
-    with pytest.raises(OSError, match="injected"):
+    with pytest.raises(SystemExit) as raised:
         cli.cmd_extract(_frames_only_args(video, output))
 
+    assert raised.value.code == 1
     assert _tree_snapshot(output / "frames") == previous
     assert not list((output / ".keyframe-work" / "runs").iterdir())
 
@@ -454,16 +457,15 @@ def test_full_cli_defers_publication_until_transcript_manifest_enrichment(
     def fake_full_pipeline(
         video_path,
         out_dir,
-        call_args,
         _preflight,
+        frame_config,
         supervisor,
     ):
         generation = cli._run_frame_generation(
             video_path,
             out_dir,
-            call_args,
+            frame_config,
             supervisor,
-            frame_device="cpu",
         )
         assert supervisor.staging is not None
         assert supervisor.staging.frames.exists()
@@ -475,8 +477,13 @@ def test_full_cli_defers_publication_until_transcript_manifest_enrichment(
         return SimpleNamespace(frames=generation.promote())
 
     monkeypatch.setattr(pipeline, "extract_keyframes", fake_extract)
-    monkeypatch.setattr(cli, "_preflight_transcript", lambda _args: object())
+    monkeypatch.setattr(
+        cli,
+        "_preflight_transcript",
+        lambda _args: transcript_preflight_stub(),
+    )
     monkeypatch.setattr(cli, "_run_full_pipeline", fake_full_pipeline)
+    patch_cli_media(monkeypatch, video=True, audio=True)
     args = _frames_only_args(video, output)
     args.frames_only = False
 

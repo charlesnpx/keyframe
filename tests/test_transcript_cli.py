@@ -29,6 +29,7 @@ from keyframe.transcript_cli import (
     print_stage_progress,
     run_supervised_transcript,
 )
+from tests.preflight_helpers import patch_cli_media
 
 SUPPORTED_MAC = transcript.RuntimePlatform("Darwin", "arm64", 14, 23)
 LINUX = transcript.RuntimePlatform("Linux", "x86_64", None, 6)
@@ -1013,6 +1014,7 @@ def test_cmd_extract_preflight_failure_happens_before_output_creation(
         "current_runtime_platform",
         lambda: LINUX,
     )
+    patch_cli_media(monkeypatch, video=False, audio=True)
     args = SimpleNamespace(
         video=str(video),
         output=str(output),
@@ -1060,6 +1062,7 @@ def test_cmd_extract_reports_explicit_output_creation_failure(
     capsys,
 ):
     video = _video(tmp_path)
+    patch_cli_media(monkeypatch, video=False, audio=True)
     monkeypatch.setattr(cli, "_preflight_transcript", lambda _args: object())
     monkeypatch.setattr(
         cli,
@@ -1092,6 +1095,7 @@ def test_cmd_extract_presents_transcription_failure_and_preserves_prior_final(
     capsys,
 ):
     video = _video(tmp_path)
+    patch_cli_media(monkeypatch, video=False, audio=True)
     output = tmp_path / "out"
     output.mkdir()
     final = output / "transcript.json"

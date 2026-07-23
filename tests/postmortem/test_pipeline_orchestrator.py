@@ -1,6 +1,8 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+from tests.preflight_helpers import patch_cli_media, transcript_preflight_stub
+
 
 def _fake_result(output_dir):
     from keyframe.pipeline import KeyframeExtractionResult
@@ -75,6 +77,7 @@ def test_cli_frames_only_delegates_to_shared_pipeline(tmp_path, monkeypatch):
         return _fake_record_result(output_dir)
 
     monkeypatch.setattr(pipeline, "extract_keyframes", fake_extract)
+    patch_cli_media(monkeypatch, video=True, audio=False)
 
     cli.cmd_extract(SimpleNamespace(
         video=str(video),
@@ -97,7 +100,7 @@ def test_cli_frames_only_delegates_to_shared_pipeline(tmp_path, monkeypatch):
     assert kwargs["report_output_dir"] == out_dir / "frames"
     assert config.sample_interval == 0.75
     assert config.pass1_clusters == 9
-    assert config.device is None
+    assert config.device == "cpu"
     assert (out_dir / "frames" / "frame_000030_1.00s.png").exists()
 
 
@@ -157,15 +160,24 @@ def test_cli_transcript_manifest_rewrite_materializes_candidate_records(tmp_path
             output_dir
         ),
     )
-    monkeypatch.setattr(cli, "_preflight_transcript", lambda _args: object())
+    monkeypatch.setattr(
+        cli,
+        "_preflight_transcript",
+        lambda _args: transcript_preflight_stub(),
+    )
 
-    def fake_full_pipeline(video_path, output, args, _preflight, supervisor):
+    def fake_full_pipeline(
+        video_path,
+        output,
+        _preflight,
+        frame_config,
+        supervisor,
+    ):
         generation = cli._run_frame_generation(
             video_path,
             output,
-            args,
+            frame_config,
             supervisor,
-            frame_device="cpu",
         )
         generation.enrich_manifest(
             [{"start": 0.0, "end": 2.0, "text": "hello"}]
@@ -173,6 +185,7 @@ def test_cli_transcript_manifest_rewrite_materializes_candidate_records(tmp_path
         return SimpleNamespace(frames=generation.promote())
 
     monkeypatch.setattr(cli, "_run_full_pipeline", fake_full_pipeline)
+    patch_cli_media(monkeypatch, video=True, audio=True)
 
     cli.cmd_extract(SimpleNamespace(
         video=str(video),
@@ -213,6 +226,7 @@ def test_cli_no_speaker_detection_passed_to_transcript(tmp_path, monkeypatch):
         )
 
     monkeypatch.setattr(cli, "_run_transcript", fake_run_transcript)
+    patch_cli_media(monkeypatch, video=False, audio=True)
 
     cli.cmd_extract(SimpleNamespace(
         video=str(video),
@@ -252,6 +266,7 @@ def test_cli_frames_only_does_not_import_transcript(tmp_path, monkeypatch):
         ),
     )
     monkeypatch.delitem(sys.modules, "keyframe.transcript", raising=False)
+    patch_cli_media(monkeypatch, video=True, audio=False)
 
     cli.cmd_extract(SimpleNamespace(
         video=str(video),

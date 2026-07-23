@@ -499,7 +499,7 @@ class RescueSelectionStage:
             rescue_budget=proposal.rescue_budget,
             clip_embeddings=features.clip_embeddings,
         )
-        if ctx.config.verbose_trace or ctx.config.debug_qa_targets_path is not None:
+        if ctx.config.verbose_trace or ctx.config.debug_qa_targets is not None:
             preflight = rescue_promotion_preflight_report(
                 candidates,
                 shortlist,
@@ -752,7 +752,7 @@ class OutputStage:
 def _build_trace_sink(config: KeyframeExtractionConfig, trace_sink: TraceSink | None) -> TraceSink:
     if trace_sink is not None:
         return trace_sink
-    if config.verbose_trace or config.debug_qa_targets_path is not None:
+    if config.verbose_trace or config.debug_qa_targets is not None:
         return SnapshotTraceSink()
     return NoOpTraceSink()
 
@@ -866,10 +866,10 @@ def extract_keyframes(
             if cfg.verbose_trace:
                 pipeline_trace_path = output_dir / "pipeline_trace.json"
                 trace.write(pipeline_trace_path)
-            if cfg.debug_qa_targets_path is not None:
+            if cfg.debug_qa_targets is not None:
                 debug_qa_trace_path = write_debug_qa_trace(
                     trace_records=trace.records,
-                    targets_path=cfg.debug_qa_targets_path,
+                    targets=cfg.debug_qa_targets,
                     video=str(video_path),
                     output_path=output_dir / "debug_qa_trace.json",
                 )

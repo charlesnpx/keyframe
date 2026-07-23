@@ -305,14 +305,16 @@ class CandidateFrameCache:
     def __init__(self, *, cache_root: Path | None, max_bytes: int):
         root = Path(cache_root) if cache_root is not None else Path(tempfile.gettempdir())
         try:
-            root.lstat()
-        except OSError as exc:
+            resolved_root = root.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
             raise FrameCacheError(f"cannot inspect frame cache directory {root}: {exc}") from exc
-        if not root.is_dir() or root.is_symlink():
+        if not resolved_root.is_dir():
             raise FrameCacheError(f"frame cache directory must be a real directory: {root}")
-        self.root = root
+        self.root = resolved_root
         self.max_bytes = int(max_bytes)
-        self.path = Path(tempfile.mkdtemp(prefix="keyframe-frame-cache-", dir=root))
+        self.path = Path(
+            tempfile.mkdtemp(prefix="keyframe-frame-cache-", dir=resolved_root)
+        )
         os.chmod(self.path, 0o700)
         self._paths: dict[int, Path] = {}
         self._sizes: dict[int, int] = {}

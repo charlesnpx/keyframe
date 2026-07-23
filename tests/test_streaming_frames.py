@@ -68,6 +68,20 @@ def test_streaming_pass_keeps_compact_metadata_and_caches_only_candidates(tmp_pa
     assert not cache_path.exists()
 
 
+def test_candidate_cache_uses_the_real_directory_behind_a_valid_symlink(tmp_path):
+    target = tmp_path / "cache-root"
+    target.mkdir()
+    alias = tmp_path / "cache-alias"
+    alias.symlink_to(target, target_is_directory=True)
+
+    cache = CandidateFrameCache(cache_root=alias, max_bytes=1024)
+    try:
+        assert cache.root == target.resolve()
+        assert cache.path.parent == target.resolve()
+    finally:
+        cache.cleanup()
+
+
 def test_candidate_cache_rejects_union_above_configured_byte_limit(tmp_path):
     video = _video(tmp_path / "recording.mp4")
     streamed = stream_video_features(

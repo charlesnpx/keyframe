@@ -205,6 +205,7 @@ def _run_candidate_case(request: _CaseRequest) -> dict[str, Any]:
             "Apple Silicon"
         )
     frame_device = resolve_frame_device(preflight)
+    frame_config = cli._frame_config(args, device=frame_device)
     case_process_phase_peaks: dict[str, int] = {}
 
     def run_frames(supervisor: StageSupervisor) -> Any:
@@ -215,9 +216,8 @@ def _run_candidate_case(request: _CaseRequest) -> dict[str, Any]:
             return cli._run_frame_generation(
                 video,
                 output_dir,
-                args,
+                frame_config,
                 supervisor,
-                frame_device=frame_device,
             )
         finally:
             case_process_phase_peaks["second-wave"] = resource_peak_rss_bytes(
