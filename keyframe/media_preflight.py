@@ -73,13 +73,13 @@ class ExtractionMode:
 def resolve_readable_media_file(path: str | Path) -> Path:
     """Resolve ``path`` and prove that the target is a readable regular file."""
 
-    candidate = Path(path).expanduser()
     try:
+        candidate = Path(path).expanduser()
         resolved = candidate.resolve(strict=True)
         mode = resolved.stat().st_mode
-    except (OSError, RuntimeError) as exc:
+    except (OSError, RuntimeError, ValueError) as exc:
         raise MediaPreflightError(
-            f"input must resolve to a readable regular file: {candidate}: {exc}"
+            f"input must resolve to a readable regular file: {path}: {exc}"
         ) from exc
     if not stat.S_ISREG(mode):
         raise MediaPreflightError(
@@ -227,6 +227,10 @@ def probe_media(
         raise MediaPreflightError(
             "ffprobe is not installed or is not available on PATH"
         ) from exc
+    except UnicodeError as exc:
+        raise MediaPreflightError(
+            f"ffprobe returned undecodable output: {exc}"
+        ) from exc
     except OSError as exc:
         raise MediaPreflightError(f"ffprobe could not be executed: {exc}") from exc
 
@@ -238,7 +242,7 @@ def probe_media(
         )
     try:
         payload = json.loads(completed.stdout)
-    except (json.JSONDecodeError, TypeError) as exc:
+    except (json.JSONDecodeError, TypeError, UnicodeError) as exc:
         raise MediaPreflightError(f"ffprobe returned malformed JSON: {exc}") from exc
     return parse_ffprobe_payload(payload)
 

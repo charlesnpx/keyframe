@@ -258,6 +258,22 @@ def test_ffprobe_execution_failures_are_controlled(failure, message):
         probe_media("/tmp/input.mp4", runner=runner)
 
 
+def test_ffprobe_decoding_failure_is_controlled():
+    decoding_error = UnicodeDecodeError(
+        "utf-8",
+        b"\xff",
+        0,
+        1,
+        "invalid start byte",
+    )
+
+    def runner(*_args, **_kwargs):
+        raise decoding_error
+
+    with pytest.raises(MediaPreflightError, match="undecodable output"):
+        probe_media("/tmp/input.mp4", runner=runner)
+
+
 @pytest.mark.parametrize(
     ("completed", "message"),
     [
@@ -276,6 +292,21 @@ def test_ffprobe_failed_status_and_malformed_json_are_controlled(
     message,
 ):
     with pytest.raises(MediaPreflightError, match=message):
+        probe_media(
+            "/tmp/input.mp4",
+            runner=lambda *_args, **_kwargs: completed,
+        )
+
+
+def test_ffprobe_undecodable_json_bytes_are_controlled():
+    completed = subprocess.CompletedProcess(
+        [],
+        0,
+        stdout=b"{\xff}",
+        stderr=b"",
+    )
+
+    with pytest.raises(MediaPreflightError, match="malformed JSON"):
         probe_media(
             "/tmp/input.mp4",
             runner=lambda *_args, **_kwargs: completed,
@@ -325,6 +356,41 @@ def test_cli_resolves_input_file_before_invoking_ffprobe(tmp_path, monkeypatch):
         cli._preflight_extract(_cli_args(tmp_path, output))
 
     assert calls == []
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("invalid_path", ["input", "output", "cache"])
+def test_cli_unknown_user_expansion_is_a_controlled_exit_2(
+    tmp_path,
+    monkeypatch,
+    invalid_path,
+    capsys,
+):
+    unknown_user_path = "~definitely_no_such_keyframe_user_74f01/path"
+    video = tmp_path / "recording.mp4"
+    video.write_bytes(b"media")
+    output = tmp_path / "out"
+    args = _cli_args(video, output)
+    if invalid_path == "input":
+        args.video = unknown_user_path
+    elif invalid_path == "output":
+        args.output = unknown_user_path
+    else:
+        args.frame_cache_dir = unknown_user_path
+
+    _patch_media(monkeypatch, _probe(_video_stream()))
+    _patch_frame_runtime(monkeypatch)
+    monkeypatch.setattr(
+        cli,
+        "_frame_session",
+        lambda *_args, **_kwargs: pytest.fail("session must not start"),
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        cli.cmd_extract(args)
+
+    assert raised.value.code == 2
+    assert "Error:" in capsys.readouterr().err
     assert not output.exists()
 
 

@@ -190,7 +190,12 @@ class ExtractionPreflight:
 
 
 def _normalize_destination_path(path: Path) -> Path:
-    candidate = path.expanduser()
+    try:
+        candidate = path.expanduser()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ExtractionPreflightError(
+            f"destination path cannot be expanded: {path}: {exc}"
+        ) from exc
     return candidate if candidate.is_absolute() else Path.cwd() / candidate
 
 
