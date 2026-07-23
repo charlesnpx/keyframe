@@ -248,6 +248,28 @@ def test_deferred_enrichment_keeps_public_generation_unchanged_until_promote(
     )
 
 
+def test_hard_linked_staged_manifest_is_rejected_before_enrichment(tmp_path):
+    output = tmp_path / "out"
+    external_manifest = tmp_path / "external-manifest.json"
+
+    with FrameGenerationSession(output, run_id="hard-link") as session:
+        assert session.staging is not None
+        result = _write_result(
+            session.staging.frames,
+            (_candidate(20, 2.0, "new"),),
+        )
+        external_manifest.hardlink_to(result.manifest_path)
+        external_before = external_manifest.read_bytes()
+
+        with pytest.raises(FrameGenerationValidationError, match="hard-linked"):
+            StagedFrameGeneration.from_extraction(session, result)
+
+        assert external_manifest.read_bytes() == external_before
+        result.manifest_path.unlink()
+
+    assert external_manifest.read_bytes() == external_before
+
+
 @pytest.mark.parametrize("failure_step", ["second_png", "captions", "manifest"])
 def test_cli_frame_write_failure_discards_stage_and_preserves_public_generation(
     tmp_path,

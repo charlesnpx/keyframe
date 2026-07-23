@@ -191,14 +191,19 @@ def _read_json(path: Path, label: str) -> Any:
 
 def _require_regular_file(path: Path, label: str) -> None:
     try:
-        mode = path.lstat().st_mode
+        artifact_stat = path.lstat()
     except OSError as exc:
         raise FrameGenerationValidationError(
             f"{label} is missing or unreadable: {path}: {exc}"
         ) from exc
+    mode = artifact_stat.st_mode
     if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
         raise FrameGenerationValidationError(
             f"{label} is not a regular non-symlinked file: {path}"
+        )
+    if artifact_stat.st_nlink != 1:
+        raise FrameGenerationValidationError(
+            f"{label} is a hard-linked regular file: {path}"
         )
 
 
