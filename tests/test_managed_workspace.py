@@ -171,6 +171,12 @@ def test_managed_layout_uses_exact_ownership_and_preserves_legacy_paths(tmp_path
             "root_id": "a" * 32,
         },
         {
+            "schema_version": 1.0,
+            "application": "keyframe",
+            "purpose": "managed-output-workspace",
+            "root_id": "a" * 32,
+        },
+        {
             "schema_version": 1,
             "application": "other",
             "purpose": "managed-output-workspace",
@@ -209,6 +215,32 @@ def test_invalid_ownership_sentinel_preserves_every_managed_entry(
             pytest.fail("invalid ownership must fail closed")
 
     assert _snapshot(root) == before
+
+
+def test_duplicate_ownership_keys_preserve_every_managed_entry(tmp_path):
+    output = tmp_path / "out"
+    _initialize_workspace(output)
+    root, runs, _recovery = _workspace_paths(output)
+    stale = runs / str(uuid.uuid4())
+    stale.mkdir()
+    (stale / "precious.txt").write_text("keep", encoding="utf-8")
+    (root / "ownership.json").write_text(
+        (
+            '{"schema_version":2,"schema_version":1,'
+            '"application":"keyframe",'
+            '"purpose":"managed-output-workspace",'
+            f'"root_id":"{"a" * 32}"}}'
+        ),
+        encoding="utf-8",
+    )
+    before = _snapshot(root)
+
+    with pytest.raises(ManagedWorkspaceError, match="duplicate JSON key"):
+        with OutputRunSession(output):
+            pytest.fail("ambiguous ownership must fail closed")
+
+    assert _snapshot(root) == before
+    assert stale.exists()
 
 
 def test_interrupted_initialization_before_sentinel_reports_exact_manual_recovery(
@@ -508,6 +540,41 @@ def test_invalid_public_lists_all_unknown_paths_and_preserves_everything(tmp_pat
     assert _snapshot(output / "frames") == public_before
 
 
+@pytest.mark.parametrize("malformation", ["float-schema", "duplicate-schema"])
+def test_non_exact_public_manifest_preserves_everything(tmp_path, malformation):
+    output = tmp_path / "out"
+    _initialize_workspace(output)
+    root, runs, _recovery = _workspace_paths(output)
+    _write_generation(output / "frames", marker="public")
+    manifest_path = output / "frames" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if malformation == "float-schema":
+        manifest["schema_version"] = 1.0
+        rendered = json.dumps(manifest)
+        expected_error = "schema_version 1"
+    else:
+        rendered = (
+            '{"schema_version":2,"schema_version":1,'
+            f'"frames":{json.dumps(manifest["frames"])},'
+            f'"metadata":{json.dumps(manifest["metadata"])}}}'
+        )
+        expected_error = "duplicate JSON key"
+    manifest_path.write_text(rendered, encoding="utf-8")
+    stale = runs / str(uuid.uuid4())
+    stale.mkdir()
+    (stale / "precious.txt").write_text("keep", encoding="utf-8")
+    root_before = _snapshot(root)
+    public_before = _snapshot(output / "frames")
+
+    with pytest.raises(FrameGenerationValidationError, match=expected_error):
+        with OutputRunSession(output):
+            pytest.fail("non-exact public manifest must block mutation")
+
+    assert _snapshot(root) == root_before
+    assert _snapshot(output / "frames") == public_before
+    assert stale.exists()
+
+
 def test_optional_traces_must_be_regular_and_no_unknown_artifacts_are_allowed(
     tmp_path,
 ):
@@ -724,6 +791,65 @@ def test_deletion_api_rejects_arbitrary_identifiers_and_symlink_trees(tmp_path):
 
     with pytest.raises(ManagedWorkspaceError, match="held output lock"):
         retained_workspace.create_run(uuid.uuid4())
+
+
+def test_hard_link_in_stale_run_preserves_external_file_and_workspace(tmp_path):
+    output = tmp_path / "out"
+    _initialize_workspace(output)
+    root, runs, _recovery = _workspace_paths(output)
+    legacy = output / "keyframe-run-unrelated-project"
+    legacy.mkdir()
+    precious = legacy / "precious.txt"
+    precious.write_text("keep", encoding="utf-8")
+    precious.chmod(0o400)
+    stale = runs / str(uuid.uuid4())
+    stale.mkdir()
+    os.link(precious, stale / "linked.txt")
+    before = _snapshot(root)
+
+    with pytest.raises(ManagedWorkspaceError, match="hard-linked"):
+        with OutputRunSession(output):
+            pytest.fail("hard-linked stale run must fail closed")
+
+    assert _snapshot(root) == before
+    assert precious.read_text(encoding="utf-8") == "keep"
+    assert stat.S_IMODE(precious.stat().st_mode) == 0o400
+    assert stale.exists()
+
+
+def test_hard_link_in_recovery_blocks_all_cleanup_without_external_mutation(
+    tmp_path,
+):
+    output = tmp_path / "out"
+    _initialize_workspace(output)
+    root, runs, recovery = _workspace_paths(output)
+    _write_generation(output / "frames", marker="public", frame_index=1)
+    recovery_frames = recovery / str(uuid.uuid4()) / "frames"
+    frame_names = _write_generation(
+        recovery_frames,
+        marker="obsolete",
+        frame_index=2,
+    )
+    legacy = output / "keyframe-frame-backup-precious"
+    legacy.mkdir()
+    precious = legacy / "precious.png"
+    (recovery_frames / frame_names[0]).replace(precious)
+    os.link(precious, recovery_frames / frame_names[0])
+    precious.chmod(0o400)
+    stale = runs / str(uuid.uuid4())
+    stale.mkdir()
+    (stale / "precious.txt").write_text("keep", encoding="utf-8")
+    root_before = _snapshot(root)
+    public_before = _snapshot(output / "frames")
+
+    with pytest.raises(ManagedWorkspaceError, match="hard-linked"):
+        with OutputRunSession(output):
+            pytest.fail("hard-linked recovery must block every managed mutation")
+
+    assert _snapshot(root) == root_before
+    assert _snapshot(output / "frames") == public_before
+    assert stat.S_IMODE(precious.stat().st_mode) == 0o400
+    assert stale.exists()
 
 
 @pytest.mark.parametrize("lock_kind", ["symlink", "directory"])

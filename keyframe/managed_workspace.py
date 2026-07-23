@@ -85,6 +85,10 @@ class FrameGenerationPromotionError(FrameGenerationError):
     """A validated frame generation could not replace the public generation."""
 
 
+class _StrictJSONError(ValueError):
+    """JSON is ambiguous or uses a non-standard numeric constant."""
+
+
 class _HeldOutputLock(Protocol):
     @property
     def is_held(self) -> bool: ...
@@ -157,10 +161,29 @@ def parse_canonical_uuid4(value: str | uuid.UUID) -> uuid.UUID:
     return parsed
 
 
+def _strict_json_loads(payload: str) -> Any:
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise _StrictJSONError(f"duplicate JSON key: {key!r}")
+            result[key] = value
+        return result
+
+    def reject_constant(value: str) -> Any:
+        raise _StrictJSONError(f"non-standard JSON constant: {value}")
+
+    return json.loads(
+        payload,
+        object_pairs_hook=reject_duplicate_keys,
+        parse_constant=reject_constant,
+    )
+
+
 def _read_json(path: Path, label: str) -> Any:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return _strict_json_loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, _StrictJSONError) as exc:
         raise FrameGenerationValidationError(
             f"{label} is not readable JSON: {path}: {exc}"
         ) from exc
@@ -272,7 +295,7 @@ def inspect_frame_generation(
     manifest = _read_json(manifest_path, f"{label} manifest.json")
     if (
         not isinstance(manifest, Mapping)
-        or isinstance(manifest.get("schema_version"), bool)
+        or type(manifest.get("schema_version")) is not int
         or manifest.get("schema_version") != 1
     ):
         raise FrameGenerationValidationError(
@@ -397,16 +420,22 @@ def _validate_disposable_tree(root: Path, label: str) -> None:
         for entry in entries:
             path = Path(entry.path)
             try:
-                mode = entry.stat(follow_symlinks=False).st_mode
+                entry_stat = entry.stat(follow_symlinks=False)
             except OSError as exc:
                 raise ManagedWorkspaceError(
                     f"{label} entry is unreadable: {path}: {exc}"
                 ) from exc
+            mode = entry_stat.st_mode
             if stat.S_ISLNK(mode):
                 raise ManagedWorkspaceError(f"{label} contains a symlink: {path}")
             if stat.S_ISDIR(mode):
                 visit(path)
-            elif not stat.S_ISREG(mode):
+            elif stat.S_ISREG(mode):
+                if entry_stat.st_nlink != 1:
+                    raise ManagedWorkspaceError(
+                        f"{label} contains a hard-linked regular file: {path}"
+                    )
+            else:
                 raise ManagedWorkspaceError(
                     f"{label} contains a non-regular entry: {path}"
                 )
@@ -420,8 +449,8 @@ def _ownership_root_id(sentinel: Path) -> str:
     except FrameGenerationValidationError as exc:
         raise ManagedWorkspaceError(str(exc)) from exc
     try:
-        payload = json.loads(sentinel.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        payload = _strict_json_loads(sentinel.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, _StrictJSONError) as exc:
         raise ManagedWorkspaceError(
             f"managed workspace ownership sentinel is invalid: {sentinel}: {exc}"
         ) from exc
@@ -433,7 +462,7 @@ def _ownership_root_id(sentinel: Path) -> str:
     root_id = payload.get("root_id")
     if (
         set(payload) != expected_keys
-        or isinstance(payload.get("schema_version"), bool)
+        or type(payload.get("schema_version")) is not int
         or payload.get("schema_version") != 1
         or payload.get("application") != "keyframe"
         or payload.get("purpose") != "managed-output-workspace"
@@ -460,7 +489,7 @@ def _entry_uuid(path: Path, label: str) -> uuid.UUID:
 
 def _inspect_recovery_entry(path: Path) -> _RecoveryEntry:
     entry_id = _entry_uuid(path, "managed recovery entry")
-    _require_directory(path, "managed recovery entry")
+    _validate_disposable_tree(path, "managed recovery entry")
     try:
         entries = tuple(sorted(path.iterdir(), key=lambda item: item.name))
     except OSError as exc:
