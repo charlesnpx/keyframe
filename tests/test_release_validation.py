@@ -1315,6 +1315,9 @@ def test_candidate_case_uses_and_verifies_automatic_apple_scheduling(
     tmp_path,
 ):
     parsed_argv = []
+    frame_config = object()
+    frame_generation = object()
+    frame_calls = []
 
     def parse_args(argv):
         parsed_argv.extend(argv)
@@ -1401,13 +1404,35 @@ def test_candidate_case_uses_and_verifies_automatic_apple_scheduling(
 
     monkeypatch.setattr(benchmark.cli, "_parse_extract_args", parse_args)
     monkeypatch.setattr(benchmark.cli, "_transcript_config", lambda _args: object())
+    monkeypatch.setattr(
+        benchmark.cli,
+        "_frame_config",
+        lambda args, *, device: (
+            frame_calls.append(("config", args, device)) or frame_config
+        ),
+    )
+    monkeypatch.setattr(
+        benchmark.cli,
+        "_run_frame_generation",
+        lambda video, output, config, supervisor: (
+            frame_calls.append(
+                ("run", video, output, config, supervisor)
+            )
+            or frame_generation
+        ),
+    )
     monkeypatch.setattr(benchmark, "preflight_transcript_run", lambda _config: preflight)
     monkeypatch.setattr(benchmark, "resolve_frame_device", lambda _preflight: "mps")
     monkeypatch.setattr(benchmark, "StageSupervisor", FakeSupervisor)
+
+    def run_pipeline(*_args, **kwargs):
+        assert kwargs["frame_runner"]() is frame_generation
+        return pipeline_result
+
     monkeypatch.setattr(
         benchmark,
         "run_supervised_full_pipeline",
-        lambda *_args, **_kwargs: pipeline_result,
+        run_pipeline,
     )
     monkeypatch.setattr(
         benchmark,
@@ -1454,6 +1479,14 @@ def test_candidate_case_uses_and_verifies_automatic_apple_scheduling(
     assert result["pipeline_evidence"]["frames"]["launch_wave"] == (
         "post-transcription"
     )
+    assert frame_calls[0][0] == "config"
+    assert frame_calls[0][2] == "mps"
+    run_call = frame_calls[1]
+    assert run_call[0] == "run"
+    assert run_call[1] == tmp_path / "input.mp4"
+    assert run_call[2] == tmp_path / "output"
+    assert run_call[3] is frame_config
+    assert isinstance(run_call[4], FakeSupervisor)
 
 
 def test_candidate_case_rejects_an_overlapping_apple_result(monkeypatch, tmp_path):
