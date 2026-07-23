@@ -189,10 +189,13 @@ class ExtractionPreflight:
     frame_config: Any | None
 
 
-def _nearest_existing_directory(path: Path, *, label: str) -> Path:
+def _normalize_destination_path(path: Path) -> Path:
     candidate = path.expanduser()
-    if not candidate.is_absolute():
-        candidate = Path.cwd() / candidate
+    return candidate if candidate.is_absolute() else Path.cwd() / candidate
+
+
+def _nearest_existing_directory(path: Path, *, label: str) -> Path:
+    candidate = _normalize_destination_path(path)
     ancestor = candidate
     while not os.path.lexists(ancestor):
         parent = ancestor.parent
@@ -219,8 +222,9 @@ def _nearest_existing_directory(path: Path, *, label: str) -> Path:
 
 
 def _validate_directory_destination(path: Path, *, label: str) -> Path:
-    _nearest_existing_directory(path, label=label)
-    return path
+    candidate = _normalize_destination_path(path)
+    _nearest_existing_directory(candidate, label=label)
+    return candidate
 
 
 def _plan_out_dir(video: Path, output: str | None) -> Path:
@@ -298,7 +302,9 @@ def _frame_config(
         max_clustering_memory_mb=getattr(args, "max_clustering_memory_mb", 2048),
         max_frame_cache_mb=getattr(args, "max_frame_cache_mb", 8192),
         frame_cache_dir=(
-            Path(frame_cache_arg) if frame_cache_arg else None
+            _normalize_destination_path(Path(frame_cache_arg))
+            if frame_cache_arg
+            else None
         ),
         verbose_trace=bool(getattr(args, "verbose_trace", False)),
         debug_qa_targets_path=(
@@ -476,7 +482,11 @@ def cmd_extract(args):
             )
             raise SystemExit(1) from None
     try:
-        out_dir = _resolve_out_dir(video, getattr(args, "output", None))
+        requested_output = getattr(args, "output", None)
+        out_dir = _resolve_out_dir(
+            video,
+            str(preflight.output_dir) if requested_output else None,
+        )
     except OSError as exc:
         print(f"Error: could not create output directory: {exc}", file=sys.stderr)
         raise SystemExit(1) from None

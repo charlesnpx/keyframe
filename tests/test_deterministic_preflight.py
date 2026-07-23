@@ -923,6 +923,61 @@ def test_nested_output_and_cache_are_created_only_after_preflight_and_reuse_conf
     )
 
 
+def test_quoted_tilde_output_and_cache_execute_at_the_validated_destinations(
+    tmp_path,
+    monkeypatch,
+):
+    home = tmp_path / "home"
+    cwd = tmp_path / "cwd"
+    home.mkdir()
+    cwd.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(cwd)
+
+    video = tmp_path / "recording.mp4"
+    video.write_bytes(b"media")
+    output = home / "nested" / "output"
+    cache = home / "nested-cache" / "candidate-cache"
+    args = _cli_args(
+        video,
+        Path("~/nested/output"),
+        frame_cache_dir="~/nested-cache/candidate-cache",
+    )
+    _patch_media(monkeypatch, _probe(_video_stream()))
+    _patch_frame_runtime(monkeypatch)
+
+    captured = []
+
+    class Generation:
+        def promote(self):
+            return SimpleNamespace(final_frame_count=0, output_dir=output / "frames")
+
+    monkeypatch.setattr(
+        cli,
+        "_frame_session",
+        lambda *_args, **_kwargs: nullcontext(object()),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_run_frame_generation",
+        lambda _video, _output, config, _session: (
+            captured.append((_output, config)) or Generation()
+        ),
+    )
+    monkeypatch.setattr(
+        "keyframe.managed_workspace.known_public_artifact_paths",
+        lambda _output: (),
+    )
+
+    cli.cmd_extract(args)
+
+    assert output.is_dir()
+    assert cache.is_dir()
+    assert captured[0][0] == output
+    assert captured[0][1].frame_cache_dir == cache
+    assert not (cwd / "~").exists()
+
+
 @pytest.mark.parametrize(
     ("failure", "exit_code"),
     [(RuntimeError("model failed"), 1), (KeyboardInterrupt(), 130)],
