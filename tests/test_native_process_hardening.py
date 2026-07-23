@@ -23,7 +23,6 @@ from tests.native_process_harness import (
     successful_transcription_worker,
 )
 
-
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -274,15 +273,18 @@ def test_read_only_output_fails_without_mixing_artifacts(tmp_path, session_type)
         pass
     previous = output / "transcript.raw.json"
     previous.write_text("previous", encoding="utf-8")
+    runs = output / ".keyframe-work" / "runs"
     output.chmod(0o500)
+    runs.chmod(0o500)
     try:
         with pytest.raises(
             OutputSessionError,
-            match="failed to initialize output directory",
+            match="failed to create managed run",
         ):
             with session_type(output, run_id="read-only"):
                 pytest.fail("read-only output must not admit a run")
     finally:
+        runs.chmod(0o700)
         output.chmod(0o700)
 
     assert previous.read_text(encoding="utf-8") == "previous"

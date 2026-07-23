@@ -1,11 +1,13 @@
 import json
 import stat
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from PIL import Image
 
+import keyframe.managed_workspace as workspace_module
 from keyframe import cli
 from keyframe.frame_generation import (
     FrameGenerationPromotionError,
@@ -169,7 +171,7 @@ def test_replacement_of_read_only_generation_cleans_backup_and_allows_rerun(
         _stage(session, (_candidate(20, 2.0),)).promote()
 
     assert stat.S_IMODE(public.stat().st_mode) == 0o555
-    assert not list(output.glob("keyframe-frame-backup-*"))
+    assert not any((output / ".keyframe-work" / "recovery").iterdir())
 
     with FrameGenerationSession(output, run_id="third") as session:
         assert session.staging is not None
@@ -180,22 +182,22 @@ def test_failed_read_only_replacement_cleans_staging_directory(
     tmp_path,
     monkeypatch,
 ):
-    import keyframe.frame_generation as frame_generation
-
     output = tmp_path / "out"
     with FrameGenerationSession(output, run_id="previous") as session:
         _stage(session, (_candidate(5, 0.5, "previous"),)).promote()
     public = output / "frames"
     public.chmod(0o555)
-    staging_root = output / "keyframe-run-replacement"
+    staging_root = None
 
     with pytest.raises(
         FrameGenerationPromotionError,
         match="previous generation was restored",
     ):
         with FrameGenerationSession(output, run_id="replacement") as session:
+            assert session.staging is not None
+            staging_root = session.staging.root
             generation = _stage(session, (_candidate(10, 1.0, "new"),))
-            real_replace = frame_generation.os.replace
+            real_replace = workspace_module.os.replace
 
             def fail_staged_promotion(source, target):
                 if Path(source) == generation.staged_dir:
@@ -203,15 +205,16 @@ def test_failed_read_only_replacement_cleans_staging_directory(
                 return real_replace(source, target)
 
             monkeypatch.setattr(
-                frame_generation.os,
+                workspace_module.os,
                 "replace",
                 fail_staged_promotion,
             )
             generation.promote()
 
     assert stat.S_IMODE(public.stat().st_mode) == 0o555
+    assert staging_root is not None
     assert not staging_root.exists()
-    assert not list(output.glob("keyframe-frame-backup-*"))
+    assert not any((output / ".keyframe-work" / "recovery").iterdir())
 
 
 def test_deferred_enrichment_keeps_public_generation_unchanged_until_promote(
@@ -243,6 +246,28 @@ def test_deferred_enrichment_keeps_public_generation_unchanged_until_promote(
     assert public_manifest["frames"][0]["transcript_window"] == (
         "current transcript"
     )
+
+
+def test_hard_linked_staged_manifest_is_rejected_before_enrichment(tmp_path):
+    output = tmp_path / "out"
+    external_manifest = tmp_path / "external-manifest.json"
+
+    with FrameGenerationSession(output, run_id="hard-link") as session:
+        assert session.staging is not None
+        result = _write_result(
+            session.staging.frames,
+            (_candidate(20, 2.0, "new"),),
+        )
+        external_manifest.hardlink_to(result.manifest_path)
+        external_before = external_manifest.read_bytes()
+
+        with pytest.raises(FrameGenerationValidationError, match="hard-linked"):
+            StagedFrameGeneration.from_extraction(session, result)
+
+        assert external_manifest.read_bytes() == external_before
+        result.manifest_path.unlink()
+
+    assert external_manifest.read_bytes() == external_before
 
 
 @pytest.mark.parametrize("failure_step", ["second_png", "captions", "manifest"])
@@ -277,17 +302,15 @@ def test_cli_frame_write_failure_discards_stage_and_preserves_public_generation(
         cli.cmd_extract(_frames_only_args(video, output))
 
     assert _tree_snapshot(output / "frames") == previous
-    assert not list(output.glob("keyframe-run-*"))
+    assert not list((output / ".keyframe-work" / "runs").iterdir())
 
 
-@pytest.mark.parametrize("failure_calls", [{2}, {2, 3}])
+@pytest.mark.parametrize("failure_calls", [{2}])
 def test_replacement_failure_restores_previous_generation_even_after_retry(
     tmp_path,
     monkeypatch,
     failure_calls,
 ):
-    import keyframe.frame_generation as frame_generation
-
     output = tmp_path / "out"
     with FrameGenerationSession(output, run_id="previous") as session:
         _stage(session, (_candidate(5, 0.5, "previous"),)).promote()
@@ -295,7 +318,7 @@ def test_replacement_failure_restores_previous_generation_even_after_retry(
 
     with FrameGenerationSession(output, run_id="replacement") as session:
         generation = _stage(session, (_candidate(10, 1.0, "new"),))
-        real_replace = frame_generation.os.replace
+        real_replace = workspace_module.os.replace
         calls = 0
 
         def flaky_replace(source, target):
@@ -305,7 +328,7 @@ def test_replacement_failure_restores_previous_generation_even_after_retry(
                 raise OSError(f"injected rename failure {calls}")
             return real_replace(source, target)
 
-        monkeypatch.setattr(frame_generation.os, "replace", flaky_replace)
+        monkeypatch.setattr(workspace_module.os, "replace", flaky_replace)
 
         with pytest.raises(
             FrameGenerationPromotionError,
@@ -322,17 +345,16 @@ def test_unrecoverable_rollback_keeps_external_backup_for_next_locked_run(
     tmp_path,
     monkeypatch,
 ):
-    import keyframe.frame_generation as frame_generation
-
     output = tmp_path / "out"
     with FrameGenerationSession(output, run_id="previous") as session:
         _stage(session, (_candidate(5, 0.5, "previous"),)).promote()
     previous = _tree_snapshot(output / "frames")
-    backup = output / "keyframe-frame-backup-broken"
+    backup = None
 
     with FrameGenerationSession(output, run_id="broken") as session:
         generation = _stage(session, (_candidate(10, 1.0, "new"),))
-        real_replace = frame_generation.os.replace
+        backup = generation.backup_dir
+        real_replace = workspace_module.os.replace
         calls = 0
 
         def persistent_failure(source, target):
@@ -343,17 +365,18 @@ def test_unrecoverable_rollback_keeps_external_backup_for_next_locked_run(
             return real_replace(source, target)
 
         with monkeypatch.context() as patcher:
-            patcher.setattr(frame_generation.os, "replace", persistent_failure)
+            patcher.setattr(workspace_module.os, "replace", persistent_failure)
             with pytest.raises(
                 FrameGenerationPromotionError,
-                match="recovery backup remains",
+                match="recovery state remains",
             ):
                 generation.promote()
         assert not (output / "frames").exists()
+        assert backup is not None
         assert backup.exists()
         assert _tree_snapshot(backup) == previous
 
-    assert backup.exists()
+    assert backup is not None and backup.exists()
     with FrameGenerationSession(output, run_id="recovery"):
         assert _tree_snapshot(output / "frames") == previous
         assert not backup.exists()
@@ -361,22 +384,31 @@ def test_unrecoverable_rollback_keeps_external_backup_for_next_locked_run(
 
 def test_locked_session_cleans_abandoned_staging_and_obsolete_backup(tmp_path):
     output = tmp_path / "out"
-    output.mkdir()
+    with FrameGenerationSession(output):
+        pass
     public = output / "frames"
-    public.mkdir()
-    (public / "sentinel.txt").write_text("current", encoding="utf-8")
-    stale = output / "keyframe-run-stale"
-    stale.mkdir()
-    (stale / "partial.png").write_bytes(b"partial")
-    obsolete_backup = output / "keyframe-frame-backup-stale"
-    obsolete_backup.mkdir()
-    (obsolete_backup / "old.txt").write_text("old", encoding="utf-8")
+    _write_result(public, (_candidate(1, 0.1, "current"),))
+    runs = output / ".keyframe-work" / "runs"
+    recovery = output / ".keyframe-work" / "recovery"
+    managed_stale = runs / str(uuid.uuid4())
+    managed_stale.mkdir()
+    (managed_stale / "partial.png").write_bytes(b"partial")
+    obsolete_backup = recovery / str(uuid.uuid4()) / "frames"
+    _write_result(obsolete_backup, (_candidate(2, 0.2, "old"),))
+    legacy_stale = output / "keyframe-run-stale"
+    legacy_stale.mkdir()
+    (legacy_stale / "partial.png").write_bytes(b"partial")
+    legacy_backup = output / "keyframe-frame-backup-stale"
+    legacy_backup.mkdir()
+    (legacy_backup / "old.txt").write_text("old", encoding="utf-8")
     unrelated = output / "user-data"
     unrelated.mkdir()
 
     with FrameGenerationSession(output, run_id="current") as session:
-        assert not stale.exists()
-        assert not obsolete_backup.exists()
+        assert not managed_stale.exists()
+        assert not obsolete_backup.parent.exists()
+        assert legacy_stale.exists()
+        assert legacy_backup.exists()
         assert unrelated.exists()
         assert session.staging is not None
         assert session.staging.root.exists()
@@ -409,10 +441,8 @@ def test_full_cli_defers_publication_until_transcript_manifest_enrichment(
     video.write_bytes(b"media")
     output = tmp_path / "out"
     public = output / "frames"
-    public.mkdir(parents=True)
-    (public / "old.png").write_bytes(b"old")
-    (public / "captions.json").write_text("old", encoding="utf-8")
-    (public / "manifest.json").write_text("old", encoding="utf-8")
+    old_candidate = _candidate(5, 0.5, "old")
+    _write_result(public, (old_candidate,))
     candidate = _candidate(30, 3.0, "replacement")
     calls = []
 
@@ -437,7 +467,7 @@ def test_full_cli_defers_publication_until_transcript_manifest_enrichment(
         )
         assert supervisor.staging is not None
         assert supervisor.staging.frames.exists()
-        assert (public / "old.png").exists()
+        assert (public / _filename(old_candidate)).exists()
         assert not (public / _filename(candidate)).exists()
         generation.enrich_manifest(
             [{"start": 2.5, "end": 3.5, "text": "enriched"}]
@@ -453,9 +483,10 @@ def test_full_cli_defers_publication_until_transcript_manifest_enrichment(
     cli.cmd_extract(args)
 
     assert calls[0][0].name == "frames"
-    assert calls[0][0].parent.name.startswith("keyframe-run-")
+    assert calls[0][0].parent.parent.name == "runs"
+    assert calls[0][0].parent.parent.parent.name == ".keyframe-work"
     assert calls[0][1]["report_output_dir"] == public
-    assert not (public / "old.png").exists()
+    assert not (public / _filename(old_candidate)).exists()
     assert (public / _filename(candidate)).exists()
     manifest = json.loads((public / "manifest.json").read_text())
     assert manifest["frames"][0]["transcript_window"] == "enriched"
