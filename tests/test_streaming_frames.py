@@ -48,14 +48,20 @@ def test_streaming_pass_keeps_compact_metadata_and_caches_only_candidates(tmp_pa
     assert sum(batches) == 5
 
     cache = CandidateFrameCache(cache_root=tmp_path, max_bytes=1024 * 1024)
-    provider = cache_candidate_frames(
+    cache_result = cache_candidate_frames(
         video,
         0.1,
         candidate_indices={1, 3},
+        frame_indices=streamed.frame_indices,
+        timestamps=streamed.timestamps,
+        consumed_targets=streamed.consumed_targets,
+        next_targets=streamed.next_targets,
         frame_sizes=streamed.frame_sizes,
         pixel_digests=streamed.pixel_digests,
+        sampling_timing=streamed.sampling_timing,
         cache=cache,
     )
+    provider = cache_result.provider
     first = provider[1]
     try:
         assert first.size == (24, 16)
@@ -96,8 +102,13 @@ def test_candidate_cache_rejects_union_above_configured_byte_limit(tmp_path):
             video,
             0.1,
             candidate_indices={0},
+            frame_indices=streamed.frame_indices,
+            timestamps=streamed.timestamps,
+            consumed_targets=streamed.consumed_targets,
+            next_targets=streamed.next_targets,
             frame_sizes=streamed.frame_sizes,
             pixel_digests=streamed.pixel_digests,
+            sampling_timing=streamed.sampling_timing,
             cache=cache,
         )
 
