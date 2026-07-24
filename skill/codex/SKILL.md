@@ -50,6 +50,16 @@ Extract key frames and/or a timestamped transcript from a video or audio file.
 
    Reliable intervals select one of the five normal topology expressions or ten retry-aware variants. `T`, `R`, `D`, `F`, `M`, and `E` are transcription, failed MPS attempt, successful diarization, frames, transcript merge/output, and manifest enrichment/promotion.
 
+   Release qualification is separate from ordinary user extraction. Keyframe
+   0.6.3 includes a synthetic public frame fixture and the
+   `keyframe-release-evidence` fresh/replay runner. Fresh artifact evidence is
+   limited to Darwin ARM64 and Linux x86-64 and executes the default CLI route
+   in an isolated clean artifact environment outside the checkout. Model-free
+   replay resolves only regular non-symlinked files beneath the bundle and
+   recomputes hashes, normalized OCR target subsets, budgets, redundancy,
+   platform, package, and exact source identity instead of trusting stored
+   pass fields.
+
 3. **Present results.** Read the transcript first; treat it as narrative authority for what was said. Use `frames/manifest.json` as the frame triage index. Describe only what is visibly shown in frame images, and distinguish “frame visibly shows X” from “speaker said X near this timestamp.”
 
 ## Output

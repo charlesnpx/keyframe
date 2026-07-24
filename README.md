@@ -158,6 +158,8 @@ $keyframe ~/Downloads/meeting-recording.mp4
 | `keyframe <file>` | Probe streams and select full, frames-only, or transcript-only extraction |
 | `keyframe extract <file>` | Same as above (explicit subcommand) |
 | `keyframe install-skills` | Install Claude Code and Codex skills |
+| `keyframe-release-evidence fresh ...` | Create a standalone public-fixture evidence bundle |
+| `keyframe-release-evidence replay --bundle <dir>` | Recompute standalone evidence without loading models |
 
 ## Flags
 
@@ -277,6 +279,41 @@ output_dir/
 run. In full extraction, frames, captions, and the manifest are staged as one
 generation and replace the public `frames/` directory only after validation and
 transcript-window enrichment complete.
+
+## Release evidence
+
+Keyframe 0.6.3 includes a redistributable 36-second synthetic frame fixture at
+`tests/fixtures/release-frame-fixture/`. Its schema-1 metadata fixes the media
+hash and identity, six target windows, normalized OCR token groups, bounded
+aliases, budgets, construction command, ownership, and MIT redistribution
+permission.
+
+Maintainers build one wheel or sdist, install that exact artifact into clean
+Linux x86-64 and Darwin ARM64 environments, and run the Linux standalone gate
+first. Artifact mode launches the default `keyframe` CLI route through the
+clean environment interpreter with isolated imports, no repository
+`PYTHONPATH`, and a working directory outside the checkout. The evidence bundle
+contains the fixture contract, release artifact, manifest, captions, selected
+PNGs, optional traces, package/model/OCR provenance, and hashes for every
+declared artifact. The aggregate schema-7 benchmark then performs a fresh
+Darwin run and imports the passing Linux bundle.
+
+Replay is model-free and does not trust stored pass fields:
+
+```bash
+python3.12 scripts/release_frame_evidence.py replay \
+  --bundle /path/to/frame-evidence-bundle
+```
+
+Replay accepts only regular, non-symlinked files beneath the bundle, rehashes
+and reparses them, and recomputes target, budget, redundancy, platform, and
+source conclusions. OCR validation compares normalized required token subsets
+and metadata-declared aliases; complete OCR text and line layout need not match
+across Apple Vision and PaddleOCR. Model revisions are observed provenance, not
+a guarantee that a mutable upstream cache can be reconstructed. See
+`docs/transcription-models-to-test.md` for the Linux-first and aggregate
+commands. Ordinary pull-request tests validate these contracts with fake
+evidence and do not download or load models.
 
 ## Tips
 
