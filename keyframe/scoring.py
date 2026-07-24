@@ -18,6 +18,7 @@ from keyframe.dedupe import (
     hamming,
 )
 from keyframe.evidence import (
+    VALUE_WORDS,
     select_structured_comparator,
     structured_delta_categories,
     structured_signature_change_count,
@@ -304,12 +305,20 @@ def build_rescue_shortlist(
             )
         return int(value) if value is not None else None
 
-    def path_content_delta(left: int, right: int) -> float:
-        start, end = sorted((int(left), int(right)))
-        if start == end:
+    def endpoint_content_delta(left: int, right: int) -> float | None:
+        left = int(left)
+        right = int(right)
+        if left == right:
             return 0.0
-        segment = content_deltas[start + 1 : end + 1]
-        return max(segment, default=float("inf"))
+        if frame_metrics is not None:
+            metric_delta = frame_metrics.content_delta_between(left, right)
+            if metric_delta is not None:
+                return float(metric_delta)
+        if frames is not None:
+            return float(
+                mean_abs_content_delta(frames[left], frames[right])
+            )
+        return None
 
     ranked: list[dict[str, Any]] = []
     for sample_idx, metrics in enumerate(proxy_rows):
@@ -418,7 +427,7 @@ def build_rescue_shortlist(
                 "covering_sample_idx": int(exact.sample_idx),
                 "covering_timestamp": float(exact.timestamp),
                 "dhash_distance": 0,
-                "content_path_delta": 0.0,
+                "content_endpoint_delta": 0.0,
             }
         scene_id = sample_scenes.get(sample_idx) if sample_scenes else None
         sample_timestamp = float(timestamps[sample_idx])
@@ -441,13 +450,16 @@ def build_rescue_shortlist(
                 if sample_hash is not None and selected_hash is not None
                 else None
             )
-            content_delta = path_content_delta(
+            content_delta = endpoint_content_delta(
                 sample_idx,
                 int(selected.sample_idx),
             )
             if (
                 (hash_distance is not None and hash_distance <= 6)
-                or content_delta <= 2.5
+                or (
+                    content_delta is not None
+                    and content_delta <= 2.5
+                )
             ):
                 return {
                     "coverage_reason": (
@@ -458,7 +470,7 @@ def build_rescue_shortlist(
                     "covering_sample_idx": int(selected.sample_idx),
                     "covering_timestamp": float(selected.timestamp),
                     "dhash_distance": hash_distance,
-                    "content_path_delta": float(content_delta),
+                    "content_endpoint_delta": content_delta,
                 }
         return None
 
@@ -1363,23 +1375,107 @@ def _represented_structured_diversity_buckets(
     }
 
 
-def _structured_label_ids(
+def _structured_label_components(
     candidate: CandidateRecord,
-) -> set[str]:
+) -> dict[str, dict[str, frozenset[str]]]:
+    components: dict[str, dict[str, set[str]]] = defaultdict(
+        lambda: defaultdict(set)
+    )
+    for signature in candidate.evidence.field_signature:
+        prefix, separator, remainder = signature.partition(":")
+        if (
+            not separator
+            or prefix not in {"field-state", "label-value"}
+        ):
+            continue
+        label_id, separator, value = remainder.partition(":")
+        if separator and label_id and value:
+            components[label_id][prefix].add(value)
     return {
-        signature
-        for signature in candidate.evidence.field_signature
-        if signature.startswith("label:")
+        label_id: {
+            prefix: frozenset(values)
+            for prefix, values in values_by_prefix.items()
+        }
+        for label_id, values_by_prefix in components.items()
     }
 
 
-def _represented_structured_label_ids(
+def _stable_structured_values(values: frozenset[str]) -> bool:
+    return bool(values) and all(
+        (
+            any(character.isdigit() for character in value)
+            or all(
+                token in VALUE_WORDS
+                for token in value.split("~")
+            )
+        )
+        for value in values
+    )
+
+
+def _structured_changed_label_ids(
+    candidate: CandidateRecord,
+    comparator: CandidateRecord | None,
+) -> set[str]:
+    if comparator is None:
+        return set()
+    candidate_components = _structured_label_components(candidate)
+    comparator_components = _structured_label_components(comparator)
+    changed: set[str] = set()
+    for label_id in (
+        candidate_components.keys()
+        & comparator_components.keys()
+    ):
+        candidate_state = candidate_components[label_id].get(
+            "field-state",
+            frozenset(),
+        )
+        comparator_state = comparator_components[label_id].get(
+            "field-state",
+            frozenset(),
+        )
+        if candidate_state != comparator_state:
+            changed.add(label_id)
+            continue
+        candidate_values = candidate_components[label_id].get(
+            "label-value",
+            frozenset(),
+        )
+        comparator_values = comparator_components[label_id].get(
+            "label-value",
+            frozenset(),
+        )
+        if (
+            candidate_values != comparator_values
+            and _stable_structured_values(candidate_values)
+            and bool(comparator_values)
+        ):
+            changed.add(label_id)
+    return changed
+
+
+def _represented_structured_changed_label_ids(
     candidates: Sequence[CandidateRecord],
 ) -> set[str]:
+    by_sample_idx = {
+        int(candidate.sample_idx): candidate
+        for candidate in candidates
+    }
     represented: set[str] = set()
     for candidate in candidates:
-        if candidate.selection.rescue_reason == "structured_delta":
-            represented.update(_structured_label_ids(candidate))
+        if candidate.selection.rescue_reason != "structured_delta":
+            continue
+        comparator_idx = (
+            candidate.selection.structured_comparator_sample_idx
+        )
+        comparator = (
+            by_sample_idx.get(int(comparator_idx))
+            if comparator_idx is not None
+            else None
+        )
+        represented.update(
+            _structured_changed_label_ids(candidate, comparator)
+        )
     return represented
 
 
@@ -1469,13 +1565,13 @@ def _additive_priority_components(
     represented_structured_buckets = (
         represented_structured_buckets or set()
     )
-    structured_labels = (
-        _structured_label_ids(rescue)
+    changed_structured_labels = (
+        _structured_changed_label_ids(rescue, primary)
         if structured_delta
         else set()
     )
-    represented_structured_labels = (
-        _represented_structured_label_ids(candidates)
+    represented_changed_structured_labels = (
+        _represented_structured_changed_label_ids(candidates)
     )
     lane = _promotion_lane(reason)
     represented_ordinary_scenes = (
@@ -1522,14 +1618,11 @@ def _additive_priority_components(
             diversity_bucket is not None
             and diversity_bucket not in represented_structured_buckets
         ),
-        # Independent form labels are separate material states; repeated OCR
-        # variants of an already represented field remain round-robin bounded.
-        "structured_independent_label_set": bool(
-            structured_labels
-            and represented_structured_labels
-            and structured_labels.isdisjoint(
-                represented_structured_labels
-            )
+        # A newly changed form label is a separate material state; repeated
+        # changes to represented fields remain round-robin bounded.
+        "structured_changed_label_novel": bool(
+            changed_structured_labels
+            - represented_changed_structured_labels
         ),
         "promotion_lane": lane,
         "promotion_lane_round": int(lane_counts.get(lane, 0)),
@@ -1586,7 +1679,7 @@ def _additive_priority_key(
         promotion_lane_counts,
     )
     return (
-        float(components["structured_independent_label_set"]),
+        float(components["structured_changed_label_novel"]),
         -float(components["promotion_lane_round"]),
         float(components["priority_tier"]),
         float(components["structured_diversity_novel"]),

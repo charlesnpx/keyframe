@@ -828,6 +828,74 @@ def test_transition_side_rejects_exact_selected_local_coverage():
     assert rejection["covering_sample_idx"] == 2
 
 
+def test_transition_side_local_coverage_uses_endpoint_content_delta():
+    sample_count = 6
+    metrics = _metric_table(
+        [0.1] * sample_count,
+        prev_deltas=[0.0, 2.0, 2.0, 20.0, 0.0, 0.0],
+        textline_scores=[0.0] * sample_count,
+    )
+
+    shortlist, *_ = build_rescue_shortlist_with_metadata(
+        None,
+        [float(i) for i in range(sample_count)],
+        list(range(sample_count)),
+        [_cand(0, 0.0)],
+        pass1_clusters=3,
+        sample_scenes={i: 0 for i in range(sample_count)},
+        frame_metrics=metrics,
+        frame_count=sample_count,
+        dhashes=[
+            0,
+            0,
+            (1 << 16) - 1,
+            (1 << 16) - 1,
+            (1 << 16) - 1,
+            (1 << 16) - 1,
+        ],
+    )
+
+    assert {
+        row["sample_idx"]
+        for row in shortlist
+        if row["proposal_lane"] == "transition"
+        and row["transition_boundary_sample_idx"] == 3
+    } == {2, 3}
+
+
+def test_transition_side_unavailable_endpoint_delta_is_json_safe():
+    sample_count = 6
+    metrics = _metric_table(
+        [0.1] * sample_count,
+        prev_deltas=[0.0, 2.0, 2.0, 20.0, 0.0, 0.0],
+        textline_scores=[0.0] * sample_count,
+    )
+    metrics.content_gray_stack = np.empty((0, 1, 1), dtype=np.float32)
+
+    _shortlist, *_rest, metadata = build_rescue_shortlist_with_metadata(
+        None,
+        [float(i) for i in range(sample_count)],
+        list(range(sample_count)),
+        [_cand(0, 0.0)],
+        pass1_clusters=3,
+        sample_scenes={i: 0 for i in range(sample_count)},
+        frame_metrics=metrics,
+        frame_count=sample_count,
+        dhashes=[0, 0, 0, (1 << 16) - 1, 0, 0],
+    )
+
+    rejection = next(
+        row
+        for row in metadata["proposal_decisions"]
+        if row["decision"] == "transition_side_rejected"
+        and row["boundary_sample_idx"] == 3
+        and row["transition_side"] == "pre"
+    )
+    assert rejection["coverage_reason"] == "local_selected_dhash"
+    assert rejection["content_endpoint_delta"] is None
+    json.dumps(metadata, allow_nan=False)
+
+
 def test_transition_side_applies_relative_sharpness_floor_before_distance():
     frames = [Image.new("RGB", (8, 8), "white") for _ in range(8)]
     metrics = _metric_table(
@@ -1399,20 +1467,13 @@ def test_promotion_round_robin_resumes_for_repeated_structured_label():
     ]
 
 
-def test_structured_form_changes_across_scenes_exhaust_small_budget_first():
+def test_independent_changed_form_labels_exhaust_small_budget_first():
     candidates = [
         {
             **_cand(0, 0.0, scene=0),
             "dwell_id": 0,
             "field_signature": field_section_signatures(
-                "Status: Draft"
-            ),
-        },
-        {
-            **_cand(10, 10.0, scene=1),
-            "dwell_id": 1,
-            "field_signature": field_section_signatures(
-                "Control ID: 12345"
+                "Control ID:\nStatus:"
             ),
         },
     ]
@@ -1421,19 +1482,19 @@ def test_structured_form_changes_across_scenes_exhaust_small_budget_first():
             **_cand(1, 1.0, scene=0, cluster=2, proxy=0.9),
             "dwell_id": 0,
             "field_signature": field_section_signatures(
-                "Status: Approved"
+                "Control ID: 12345\nStatus:"
             ),
         },
         {
-            **_cand(11, 11.0, scene=1, cluster=3, proxy=0.8),
-            "dwell_id": 1,
+            **_cand(2, 2.0, scene=0, cluster=3, proxy=0.8),
+            "dwell_id": 0,
             "field_signature": field_section_signatures(
-                "Control ID: 67890"
+                "Control ID:\nStatus: Approved"
             ),
         },
         {
-            **_cand(20, 20.0, scene=2, cluster=4, proxy=0.01),
-            "dwell_id": 2,
+            **_cand(10, 10.0, scene=1, cluster=4, proxy=0.01),
+            "dwell_id": 1,
             "proposal_lane": "transition",
         },
     ]
@@ -1441,7 +1502,7 @@ def test_structured_form_changes_across_scenes_exhaust_small_budget_first():
     promoted = promote_rescue_candidates(
         candidates,
         shortlist,
-        list(range(21)),
+        list(range(11)),
         rescue_budget=2,
     )
 
@@ -1449,7 +1510,55 @@ def test_structured_form_changes_across_scenes_exhaust_small_budget_first():
         row["sample_idx"]
         for row in promoted
         if row.get("rescue_origin")
-    } == {1, 11}
+    } == {1, 2}
+
+
+def test_noisy_prose_value_change_does_not_outrank_stable_field_value():
+    candidates = [
+        {
+            **_cand(0, 0.0, scene=0),
+            "dwell_id": 0,
+            "field_signature": field_section_signatures(
+                "Owner: Naygen"
+            ),
+        },
+        {
+            **_cand(10, 10.0, scene=1),
+            "dwell_id": 1,
+            "field_signature": field_section_signatures(
+                "Control ID: Unlink"
+            ),
+        },
+    ]
+    shortlist = [
+        {
+            **_cand(1, 1.0, scene=0, cluster=2, proxy=1.0),
+            "dwell_id": 0,
+            "field_signature": field_section_signatures(
+                "Owner: Naveen"
+            ),
+        },
+        {
+            **_cand(11, 11.0, scene=1, cluster=3, proxy=0.1),
+            "dwell_id": 1,
+            "field_signature": field_section_signatures(
+                "Control ID: 67890"
+            ),
+        },
+    ]
+
+    promoted = promote_rescue_candidates(
+        candidates,
+        shortlist,
+        list(range(12)),
+        rescue_budget=1,
+    )
+
+    assert {
+        row["sample_idx"]
+        for row in promoted
+        if row.get("rescue_origin")
+    } == {11}
 
 
 def test_structured_lane_wins_first_round_over_transition_and_ordinary():
