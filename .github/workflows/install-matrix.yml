@@ -41,6 +41,14 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           cache: pip
+      - name: Install FFmpeg on macOS
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+      - name: Install FFmpeg on Linux
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ffmpeg
       - name: Install CPU Torch wheels on Linux
         if: runner.os == 'Linux'
         run: |
