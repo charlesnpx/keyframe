@@ -12,6 +12,7 @@ from keyframe.dedupe import (
     has_evidence_asymmetry,
     has_protective_caption_asymmetry,
     is_protected_candidate,
+    is_structured_candidate,
     merge_candidate_lineage,
 )
 from keyframe.scoring import score_candidate_for_rep
@@ -88,6 +89,8 @@ def _should_merge(
     has_ocr_a: bool,
     has_ocr_b: bool,
 ) -> tuple[bool, str]:
+    if is_structured_candidate(cand_a) or is_structured_candidate(cand_b):
+        return False, "structured-delta"
     if has_ocr_a and has_ocr_b:
         jac = jaccard_similarity(tokens_a, tokens_b)
         if has_differing_evidence(tokens_a, tokens_b):
@@ -124,6 +127,10 @@ def _component_evidence_compatible(
 ) -> bool:
     for i in left:
         for j in right:
+            if is_structured_candidate(candidates[i]) or is_structured_candidate(
+                candidates[j]
+            ):
+                return False
             tokens_i = set(ocr_token_sets[i])
             tokens_j = set(ocr_token_sets[j])
             if has_differing_evidence(tokens_i, tokens_j):

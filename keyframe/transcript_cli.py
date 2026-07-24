@@ -15,11 +15,7 @@ from types import MappingProxyType
 from typing import Any
 
 from keyframe import transcript
-from keyframe.output_session import (
-    RUN_DIRECTORY_PREFIX,
-    OutputSessionError,
-    remove_keyframe_owned_directory,
-)
+from keyframe.output_session import OutputSessionError
 from keyframe.stage_scheduler import (
     CONCURRENCY_POLICIES,
     ActiveStage,
@@ -242,16 +238,14 @@ def _write_final_outputs(
     if len(writers) != len(output_paths):
         raise ValueError("final transcript writer and output counts do not match")
 
-    output_parent = output_paths[0].parent
-    staging_parent = Path(staging_root) if staging_root is not None else output_parent
-    prefix = (
-        "final-transcript-"
-        if staging_root is not None
-        else f"{RUN_DIRECTORY_PREFIX}final-transcript-"
-    )
+    if staging_root is None:
+        raise ValueError(
+            "final transcript publication requires a managed run staging root"
+        )
+    staging_parent = Path(staging_root)
     try:
         publication_root = Path(
-            tempfile.mkdtemp(prefix=prefix, dir=staging_parent)
+            tempfile.mkdtemp(prefix="final-transcript-", dir=staging_parent)
         )
     except OSError as exc:
         raise TranscriptOutputError(
@@ -323,8 +317,6 @@ def _write_final_outputs(
         raise TranscriptOutputError(
             f"failed to stage final transcript outputs: {exc}"
         ) from exc
-    finally:
-        remove_keyframe_owned_directory(publication_root)
 
 
 def _replace_final_output(source: Path, target: Path) -> None:
