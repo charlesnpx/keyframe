@@ -228,6 +228,22 @@ def test_target_sampler_selects_each_frame_once_and_skips_missed_targets():
     assert [decision.next_target for decision in selected] == [0.5, 1.0, 1.5]
 
 
+def test_target_sampler_tolerates_decimal_boundaries_after_nonzero_origin():
+    normalizer = DecoderTimestampNormalizer()
+    sampler = TargetTimeSampler(0.1)
+    selected_source_indices = []
+
+    for source_index, raw_timestamp in enumerate(
+        (7.25, 7.35, 7.45, 7.55, 7.65)
+    ):
+        normalized = normalizer.observe(raw_timestamp)
+        if sampler.consider(normalized) is not None:
+            selected_source_indices.append(source_index)
+    normalizer.finalize()
+
+    assert selected_source_indices == [0, 1, 2, 3, 4]
+
+
 def test_decoder_timing_normalizes_origin_and_clamps_epsilon_regression():
     timing = DecoderTimestampNormalizer()
 

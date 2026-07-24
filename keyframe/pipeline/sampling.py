@@ -47,15 +47,18 @@ class TargetTimeSampler:
             raise FrameTimingError(
                 "normalized decoder timestamp must be finite and non-negative"
             )
+        effective_timestamp = (
+            rendered + PRESENTATION_TIME_EPSILON_SECONDS
+        )
         consumed = self.next_target
-        if rendered < consumed:
+        if effective_timestamp < consumed:
             return None
 
         next_index = max(
             self._next_target_index + 1,
-            math.floor(rendered / self.interval_seconds) + 1,
+            math.floor(effective_timestamp / self.interval_seconds) + 1,
         )
-        while next_index * self.interval_seconds <= rendered:
+        while next_index * self.interval_seconds <= effective_timestamp:
             next_index += 1
         self._next_target_index = next_index
         return SamplingDecision(
