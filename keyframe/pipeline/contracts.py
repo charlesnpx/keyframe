@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from keyframe.visual import FrameMetricTable
@@ -44,7 +44,7 @@ class SamplingOutput:
 class FeatureOutput:
     dhashes: list[int]
     clip_embeddings: Any
-    frame_metrics: "FrameMetricTable | None" = None
+    frame_metrics: FrameMetricTable | None = None
     source_sharpness: list[float] = field(default_factory=list)
     pixel_digests: list[str] = field(default_factory=list)
     frame_sizes: list[tuple[int, int]] = field(default_factory=list)
@@ -133,6 +133,17 @@ class CandidateSelectionMetadata:
     content_area_previous_delta: float | None = None
     content_area_next_delta: float | None = None
     proposal_lane: str | None = None
+    transition_side: str | None = None
+    transition_boundary_sample_idx: int | None = None
+    transition_boundary_timestamp: float | None = None
+    transition_boundary_content_delta: float | None = None
+    transition_boundary_text_band_delta: float | None = None
+    transition_boundary_dhash_distance: int | None = None
+    transition_boundary_predicates: tuple[str, ...] = ()
+    structured_delta_categories: tuple[str, ...] = ()
+    structured_comparator_sample_idx: int | None = None
+    structured_comparator_timestamp: float | None = None
+    structured_changed_signature_count: int | None = None
     end_of_dwell_bonus: float | None = None
     rescue_origin: str | None = None
     rescue_reason: str | None = None
@@ -205,7 +216,7 @@ class CandidateRecord:
         frame_idx: int | None = None,
         timestamp: float | None = None,
         origin: str | None = None,
-    ) -> "CandidateRecord":
+    ) -> CandidateRecord:
         return replace(
             self,
             sample_idx=self.sample_idx if sample_idx is None else int(sample_idx),
@@ -214,19 +225,19 @@ class CandidateRecord:
             origin=self.origin if origin is None else str(origin),
         )
 
-    def with_visual(self, **updates: Any) -> "CandidateRecord":
+    def with_visual(self, **updates: Any) -> CandidateRecord:
         return replace(self, visual=_replace_group(self.visual, updates))
 
-    def with_temporal(self, **updates: Any) -> "CandidateRecord":
+    def with_temporal(self, **updates: Any) -> CandidateRecord:
         return replace(self, temporal=_replace_group(self.temporal, updates))
 
-    def with_evidence(self, **updates: Any) -> "CandidateRecord":
+    def with_evidence(self, **updates: Any) -> CandidateRecord:
         return replace(self, evidence=_replace_group(self.evidence, updates))
 
-    def with_selection(self, **updates: Any) -> "CandidateRecord":
+    def with_selection(self, **updates: Any) -> CandidateRecord:
         return replace(self, selection=_replace_group(self.selection, updates))
 
-    def with_lineage(self, **updates: Any) -> "CandidateRecord":
+    def with_lineage(self, **updates: Any) -> CandidateRecord:
         return replace(self, lineage=_replace_group(self.lineage, updates))
 
 
@@ -335,6 +346,8 @@ class ProposalOutput:
     temporal_window_count: int
     scene_count: int
     legacy_proxy_dropped_count: int = 0
+    reserved_proposal_capacity: int = 0
+    proposal_decisions: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass

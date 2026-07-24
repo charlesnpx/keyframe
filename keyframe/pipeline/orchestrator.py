@@ -307,6 +307,7 @@ class ProposalStage:
         ctx: RunContext,
     ) -> ProposalOutput:
         from keyframe.scoring import (
+            assign_dwell_ids,
             assign_temporal_window_ids,
             build_rescue_shortlist,
             rescue_window_seconds,
@@ -375,6 +376,7 @@ class ProposalStage:
             temporal_window_count,
             scene_count,
             legacy_proxy_dropped_count,
+            proposal_metadata,
         ) = build_rescue_shortlist(
             None,
             timestamps,
@@ -385,9 +387,12 @@ class ProposalStage:
             sample_scenes=sample_scenes,
             frame_metrics=frame_metrics,
             frame_count=len(timestamps),
+            dhashes=features.dhashes,
         )
+        dwell_ids = assign_dwell_ids(features.dhashes)
         candidates = tuple(
             cand.with_selection(proxy_content_score=float(proxy_rows[int(cand.sample_idx)]["proxy_content_score"]))
+            .with_temporal(dwell_id=dwell_ids[int(cand.sample_idx)])
             if 0 <= int(cand.sample_idx) < len(proxy_rows)
             else cand
             for cand in candidates
@@ -397,6 +402,7 @@ class ProposalStage:
                 dhash=features.dhashes[int(row.sample_idx)],
                 dhash_hex=f"{features.dhashes[int(row.sample_idx)]:016x}",
             )
+            .with_temporal(dwell_id=dwell_ids[int(row.sample_idx)])
             for row in shortlist
         )
         rescue_metadata = {
@@ -405,7 +411,9 @@ class ProposalStage:
             "temporal_window_count": int(temporal_window_count),
             "scene_count": int(scene_count),
             "legacy_proxy_dropped_count": int(legacy_proxy_dropped_count),
+            **proposal_metadata,
         }
+        ctx.metadata["rescue_proposal"] = rescue_metadata
         ctx.trace.exit(
             "proposal.rescue_shortlist",
             _candidate_batch("proposal.rescue_shortlist", shortlist, rescue_metadata),
@@ -419,6 +427,12 @@ class ProposalStage:
             temporal_window_count=temporal_window_count,
             scene_count=scene_count,
             legacy_proxy_dropped_count=legacy_proxy_dropped_count,
+            reserved_proposal_capacity=int(
+                proposal_metadata["reserved_proposal_capacity"]
+            ),
+            proposal_decisions=tuple(
+                proposal_metadata["proposal_decisions"]
+            ),
             frame_metrics=frame_metrics,
         )
 
@@ -433,6 +447,7 @@ class RescueEvidenceStage:
         from keyframe.frames import (
             _comparison_primary_sample_idxs,
             attach_rescue_ocr_metadata,
+            attach_structured_delta_metadata,
             ocr_candidates,
         )
         shortlist = proposal.rescue_shortlist
@@ -466,8 +481,14 @@ class RescueEvidenceStage:
         rescue_ocr_texts, ocr_batch = ocr_candidates(ocr_batch, frames, preloaded_engine=self.preloader.get_ocr_engine())
         ocr_batch = attach_rescue_ocr_metadata(ocr_batch, rescue_ocr_texts)
         updated_by_idx = {int(cand.sample_idx): cand for cand in ocr_batch}
-        proposal.rescue_shortlist = tuple(updated_by_idx.get(int(row.sample_idx), row) for row in shortlist)
         proposal.candidates = tuple(updated_by_idx.get(int(cand.sample_idx), cand) for cand in proposal.candidates)
+        proposal.rescue_shortlist = attach_structured_delta_metadata(
+            tuple(
+                updated_by_idx.get(int(row.sample_idx), row)
+                for row in shortlist
+            ),
+            proposal.candidates,
+        )
         print(
             "  Rescue OCR comparison primaries: "
             f"{len(comparison_primaries)} cached selected candidates"
@@ -646,6 +667,32 @@ class SurvivalStage:
             ranked = sorted(
                 post_veto,
                 key=lambda cand: (
+                    bool(cand.selection.structured_delta_categories),
+                    (
+                        "blank_populated"
+                        in cand.selection.structured_delta_categories
+                    ),
+                    bool(
+                        {"status", "date"}
+                        & set(
+                            cand.selection.structured_delta_categories
+                        )
+                    ),
+                    (
+                        "same_label_value"
+                        in cand.selection.structured_delta_categories
+                    ),
+                    bool(
+                        {"page", "section"}
+                        & set(
+                            cand.selection.structured_delta_categories
+                        )
+                    ),
+                    int(
+                        cand.selection.structured_changed_signature_count
+                        or 0
+                    ),
+                    cand.selection.proposal_lane == "transition",
                     len(cand.evidence.ocr_tokens),
                     float(cand.selection.candidate_score or cand.selection.score or cand.visual.sharpness or 0.0),
                     -float(cand.timestamp),
@@ -737,6 +784,23 @@ class OutputStage:
                 "temporal_window_count": temporal_window_count,
                 "scene_count": scene_count,
                 "legacy_proxy_dropped_count": legacy_proxy_dropped_count,
+                "reserved_proposal_capacity": (
+                    (ctx.metadata.get("rescue_proposal") or {}).get(
+                        "reserved_proposal_capacity",
+                        0,
+                    )
+                ),
+                "transition_content_threshold": (
+                    (ctx.metadata.get("rescue_proposal") or {}).get(
+                        "transition_content_threshold"
+                    )
+                ),
+                "proposal_decisions": (
+                    (ctx.metadata.get("rescue_proposal") or {}).get(
+                        "proposal_decisions",
+                        (),
+                    )
+                ),
             },
         }
         manifest_rows = [

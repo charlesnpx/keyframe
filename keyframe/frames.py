@@ -30,7 +30,13 @@ from keyframe.dedupe import (
     clean_ocr_token_sets,
     hamming,
 )
-from keyframe.evidence import field_section_signatures, normalized_ocr_line_signatures
+from keyframe.evidence import (
+    field_section_signatures,
+    normalized_ocr_line_signatures,
+    select_structured_comparator,
+    structured_delta_categories,
+    structured_signature_change_count,
+)
 from keyframe.merge import build_ocr_token_sets
 from keyframe.scoring import score_candidate_for_rep
 from keyframe.pipeline.contracts import CandidateRecord, candidate_records, candidate_to_caption_log_row
@@ -620,7 +626,7 @@ def ocr_candidates(candidates, frames, preloaded_engine=None):
             if owns_images:
                 img.close()
 
-        raw_text = " ".join(lines)
+        raw_text = "\n".join(lines)
         ocr_texts.append(raw_text)
         updated_candidates.append(cand.with_evidence(ocr_text=raw_text))
         preview = raw_text[:120] if raw_text else "(no text)"
@@ -780,31 +786,44 @@ def attach_rescue_ocr_metadata(candidates, raw_ocr_texts):
     return tuple(updated_candidates)
 
 
+def attach_structured_delta_metadata(shortlist, candidates):
+    """Classify shortlist field changes against deterministic selected peers."""
+    shortlist = candidate_records(shortlist)
+    candidates = candidate_records(candidates)
+    updated = []
+    for rescue in shortlist:
+        comparator = select_structured_comparator(rescue, candidates)
+        if comparator is None:
+            updated.append(rescue)
+            continue
+        categories = structured_delta_categories(
+            rescue.evidence.field_signature,
+            comparator.evidence.field_signature,
+        )
+        updated.append(
+            rescue.with_selection(
+                structured_delta_categories=categories,
+                structured_comparator_sample_idx=int(comparator.sample_idx),
+                structured_comparator_timestamp=float(comparator.timestamp),
+                structured_changed_signature_count=(
+                    structured_signature_change_count(
+                        rescue.evidence.field_signature,
+                        comparator.evidence.field_signature,
+                    )
+                ),
+            )
+        )
+    return tuple(updated)
+
+
 def _comparison_primary_sample_idxs(candidates, shortlist):
     candidates = candidate_records(candidates)
     shortlist = candidate_records(shortlist)
     selected: set[int] = set()
     for rescue in shortlist:
-        rescue_ts = float(rescue.timestamp)
-        rescue_cluster = rescue.visual.clip_cluster
-        rescue_scene = rescue.temporal.scene_id
-
-        same_cluster = [
-            cand for cand in candidates
-            if rescue_cluster is not None and cand.visual.clip_cluster == rescue_cluster
-        ]
-        same_scene = [
-            cand for cand in candidates
-            if rescue_scene is not None and cand.temporal.scene_id == rescue_scene
-        ]
-        for pool in (same_cluster, same_scene):
-            if not pool:
-                continue
-            primary = min(
-                pool,
-                key=lambda cand: abs(float(cand.timestamp) - rescue_ts),
-            )
-            selected.add(int(primary.sample_idx))
+        comparator = select_structured_comparator(rescue, candidates)
+        if comparator is not None:
+            selected.add(int(comparator.sample_idx))
     return selected
 
 

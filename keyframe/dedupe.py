@@ -321,7 +321,16 @@ def is_protected_candidate(candidate: Mapping[str, Any] | CandidateRecord) -> bo
     return (
         str(candidate.selection.retention_reason or "none") != "none"
         or bool(candidate.selection.rescue_origin)
+        or is_structured_candidate(candidate)
     )
+
+
+def is_structured_candidate(
+    candidate: Mapping[str, Any] | CandidateRecord,
+) -> bool:
+    """Return whether a material structured OCR delta protects this frame."""
+    record = candidate_records((candidate,))[0]
+    return bool(record.selection.structured_delta_categories)
 
 
 def merge_candidate_lineage(
@@ -470,6 +479,10 @@ def _ocr_policy_allows_merge(
     tokens_b: set[str],
     default_threshold: float,
 ) -> tuple[bool, str]:
+    if is_structured_candidate(candidate_a) or is_structured_candidate(
+        candidate_b
+    ):
+        return False, "structured_delta"
     if has_differing_evidence(tokens_a, tokens_b):
         return False, "differing_evidence"
     if _density_asymmetry_veto(tokens_a, tokens_b):
@@ -524,6 +537,29 @@ def retain_cluster_alternates(candidates: Sequence[Mapping[str, Any] | Candidate
                 retained.append(primary)
                 continue
             role = row.visual.cluster_role
+            if is_structured_candidate(row):
+                reason = "structured_delta"
+                retained.append(
+                    row.with_selection(
+                        retention_reason=reason,
+                        retention_candidate_reason="structured_delta",
+                        retention_rejected_reason=None,
+                    ).with_lineage(
+                        retention_reasons_seen=tuple(
+                            sorted(
+                                set(row.lineage.retention_reasons_seen)
+                                | {reason}
+                            )
+                        ),
+                        lineage_roles=tuple(
+                            sorted(
+                                set(row.lineage.lineage_roles)
+                                | {str(role or "structured")}
+                            )
+                        ),
+                    )
+                )
+                continue
             if role == "single" or role not in {"alt"}:
                 reason = str(row.selection.retention_reason or "none")
                 reasons_seen = set(row.lineage.retention_reasons_seen) | {reason}
@@ -587,6 +623,15 @@ def filter_low_information_candidates(
 
     for row in rows:
         tokens = _tokens(row)
+        if is_structured_candidate(row):
+            survivors.append(
+                row.with_selection(
+                    low_information_filter_reason=(
+                        "protected_structured_delta"
+                    )
+                )
+            )
+            continue
         has_evidence = _has_evidence_markers(tokens)
         has_protective_caption = _has_protective_caption(row)
         has_strong_protective_caption = _has_strong_protective_caption(row)
@@ -734,6 +779,9 @@ def content_area_duplicate_veto(
             survivors.append(row)
             continue
         previous = survivors[-1]
+        if is_structured_candidate(previous) or is_structured_candidate(row):
+            survivors.append(row)
+            continue
         if not _same_scene_or_dwell(previous, row):
             survivors.append(row)
             continue
@@ -817,6 +865,10 @@ def near_time_dedupe(
             dt = abs(float(row.timestamp) - float(survivor.timestamp))
             if dt > max_dt_seconds:
                 break
+            if is_structured_candidate(row) or is_structured_candidate(
+                survivor
+            ):
+                continue
 
             survivor_tokens = _tokens(survivor)
             if row_tokens and survivor_tokens:
@@ -869,6 +921,10 @@ def global_candidate_dedupe(
         duplicate_idx: int | None = None
 
         for i, survivor in enumerate(survivors):
+            if is_structured_candidate(row) or is_structured_candidate(
+                survivor
+            ):
+                continue
             survivor_tokens = _tokens(survivor)
             if row_tokens and survivor_tokens:
                 ok, _reason = _ocr_policy_allows_merge(

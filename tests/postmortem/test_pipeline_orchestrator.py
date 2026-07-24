@@ -320,3 +320,67 @@ def test_survival_stage_applies_explicit_output_cap_after_dedupe():
     assert len(final) == 2
     assert ctx.metadata["survival"]["cap_pressure"] == 2
     assert len(ctx.metadata["survival"]["cap_dropped_frames"]) == 2
+
+
+def test_survival_output_cap_prioritizes_structured_delta_candidate():
+    from PIL import Image
+
+    from keyframe.pipeline.config import KeyframeExtractionConfig
+    from keyframe.pipeline.context import make_context
+    from keyframe.pipeline.contracts import (
+        CandidateRecord,
+        FeatureOutput,
+        FrameStore,
+        SampleTable,
+        SamplingOutput,
+    )
+    from keyframe.pipeline.orchestrator import SurvivalStage
+    from keyframe.pipeline.trace import NoOpTraceSink
+
+    ordinary = CandidateRecord(
+        sample_idx=0,
+        frame_idx=0,
+        timestamp=0.0,
+    ).with_evidence(
+        ocr_tokens=("ordinary", "screen", "content"),
+    ).with_selection(candidate_score=100.0)
+    structured = CandidateRecord(
+        sample_idx=1,
+        frame_idx=1,
+        timestamp=10.0,
+    ).with_evidence(
+        ocr_tokens=("structured", "screen", "content"),
+    ).with_selection(
+        candidate_score=0.01,
+        structured_delta_categories=("same_label_value",),
+        structured_changed_signature_count=2,
+    )
+    sampling = SamplingOutput(
+        frame_store=FrameStore(
+            [
+                Image.new("RGB", (16, 16), "white"),
+                Image.new("RGB", (16, 16), "black"),
+            ]
+        ),
+        samples=SampleTable(
+            timestamps=[0.0, 10.0],
+            frame_indices=[0, 1],
+        ),
+    )
+    features = FeatureOutput(
+        dhashes=[0, (1 << 16) - 1],
+        clip_embeddings=None,
+    )
+    ctx = make_context(
+        KeyframeExtractionConfig(max_output_frames=1),
+        NoOpTraceSink(),
+    )
+
+    final = SurvivalStage().run(
+        (ordinary, structured),
+        sampling,
+        features,
+        ctx,
+    )
+
+    assert [candidate.sample_idx for candidate in final] == [1]
