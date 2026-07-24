@@ -169,29 +169,20 @@ FIXTURES = {
 
 EXPECTED_BASELINE = {
     "36381": {
-        "misses": {
-            "amot_spacing_midpage_consequence_dependencies_comments",
-            "amot_spacing_page_boundary_current_state_description_to_page2",
-            "source_form_text_fields_for_spacing_comparison",
-            "priority_form_spacing_sections",
-        },
+        "misses": set(),
         "buckets": {
-            "amot_spacing_midpage_consequence_dependencies_comments": "sampled_but_no_proposal_near_target",
-            "amot_spacing_page_boundary_current_state_description_to_page2": "rescue_ocrd_but_not_promoted",
-            "source_form_text_fields_for_spacing_comparison": "rescue_ocrd_but_not_promoted",
-            "priority_form_spacing_sections": "sampled_but_no_proposal_near_target",
+            "amot_spacing_midpage_consequence_dependencies_comments": "hit_direct",
+            "amot_spacing_page_boundary_current_state_description_to_page2": "hit_direct",
+            "source_form_text_fields_for_spacing_comparison": "hit_direct",
+            "priority_form_spacing_sections": "hit_direct",
         },
     },
     "36380": {
-        "misses": {
-            "regular_amot_pdf_header_body_fields_wrong_location",
-            "cover_page_unapproved_signed_by_should_be_blank",
-            "priority_form_header_fields_in_body",
-        },
+        "misses": set(),
         "buckets": {
-            "regular_amot_pdf_header_body_fields_wrong_location": "sampled_but_no_proposal_near_target",
-            "cover_page_unapproved_signed_by_should_be_blank": "sampled_but_no_proposal_near_target",
-            "priority_form_header_fields_in_body": "sampled_but_no_proposal_near_target",
+            "regular_amot_pdf_header_body_fields_wrong_location": "hit_direct",
+            "cover_page_unapproved_signed_by_should_be_blank": "hit_direct",
+            "priority_form_header_fields_in_body": "hit_direct",
         },
     },
     "36324": {
@@ -466,8 +457,8 @@ def test_full_video_qa_fixture_diagnostic_bucket_baseline(tmp_path, name, annota
 
 
 ACCEPTANCE_PARAMS = [
-    pytest.param("36381", FIXTURES["36381"], marks=pytest.mark.xfail(reason="known gap: content-area delta proposal/promotion does not yet recover all 36381 targets")),
-    pytest.param("36380", FIXTURES["36380"], marks=pytest.mark.xfail(reason="known gap: rescue promotion still misses 36380 PDF/form-state targets")),
+    pytest.param("36381", FIXTURES["36381"]),
+    pytest.param("36380", FIXTURES["36380"]),
     pytest.param("36324", FIXTURES["36324"]),
     pytest.param("11111", FIXTURES["11111"]),
 ]

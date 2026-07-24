@@ -44,18 +44,24 @@ def test_streaming_pass_keeps_compact_metadata_and_caches_only_candidates(tmp_pa
     assert streamed.clip_embeddings.shape == (5, 3)
     assert len(streamed.pixel_digests) == 5
     assert streamed.frame_metrics.full_gray_stack.shape == (0, 0, 0)
-    assert streamed.frame_metrics.content_gray_stack.shape == (0, 0, 0)
+    assert streamed.frame_metrics.content_gray_stack.shape == (5, 18, 32)
     assert sum(batches) == 5
 
     cache = CandidateFrameCache(cache_root=tmp_path, max_bytes=1024 * 1024)
-    provider = cache_candidate_frames(
+    cache_result = cache_candidate_frames(
         video,
         0.1,
         candidate_indices={1, 3},
+        frame_indices=streamed.frame_indices,
+        timestamps=streamed.timestamps,
+        consumed_targets=streamed.consumed_targets,
+        next_targets=streamed.next_targets,
         frame_sizes=streamed.frame_sizes,
         pixel_digests=streamed.pixel_digests,
+        sampling_timing=streamed.sampling_timing,
         cache=cache,
     )
+    provider = cache_result.provider
     first = provider[1]
     try:
         assert first.size == (24, 16)
@@ -66,6 +72,20 @@ def test_streaming_pass_keeps_compact_metadata_and_caches_only_candidates(tmp_pa
     cache_path = cache.path
     cache.cleanup()
     assert not cache_path.exists()
+
+
+def test_candidate_cache_uses_the_real_directory_behind_a_valid_symlink(tmp_path):
+    target = tmp_path / "cache-root"
+    target.mkdir()
+    alias = tmp_path / "cache-alias"
+    alias.symlink_to(target, target_is_directory=True)
+
+    cache = CandidateFrameCache(cache_root=alias, max_bytes=1024)
+    try:
+        assert cache.root == target.resolve()
+        assert cache.path.parent == target.resolve()
+    finally:
+        cache.cleanup()
 
 
 def test_candidate_cache_rejects_union_above_configured_byte_limit(tmp_path):
@@ -82,8 +102,13 @@ def test_candidate_cache_rejects_union_above_configured_byte_limit(tmp_path):
             video,
             0.1,
             candidate_indices={0},
+            frame_indices=streamed.frame_indices,
+            timestamps=streamed.timestamps,
+            consumed_targets=streamed.consumed_targets,
+            next_targets=streamed.next_targets,
             frame_sizes=streamed.frame_sizes,
             pixel_digests=streamed.pixel_digests,
+            sampling_timing=streamed.sampling_timing,
             cache=cache,
         )
 

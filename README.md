@@ -26,10 +26,14 @@ the staged absolute paths in JSON.
 ### Prerequisites
 
 - Python 3.11, 3.12, or 3.13. Python 3.12 is recommended; Python 3.14 is not supported.
-- ffmpeg (required by Whisper for audio extraction)
+- ffmpeg, including `ffprobe` (required for media preflight and audio extraction)
   ```bash
   brew install ffmpeg
   ```
+- Frame extraction is supported on Darwin ARM64 and Linux x86-64. Linux
+  x86-64 installs PaddlePaddle 3.3.1+ and PaddleOCR 3.7+ as gated default
+  dependencies; no extra is required. Other platforms can still use
+  transcript-only extraction for inputs with usable audio.
 - Optional for speaker detection: `HF_TOKEN` with access to the pyannote diarization model.
   Accept the model terms at <https://huggingface.co/pyannote/speaker-diarization-community-1>,
   create a token at <https://huggingface.co/settings/tokens>, then export it:
@@ -54,6 +58,7 @@ export SSL_CERT_FILE=/path/to/corporate-ca-bundle.crt
 These download automatically on first use and are cached:
 - **CLIP ViT-B-32** (~350MB) — image/text embeddings
 - **Florence-2-base** (~450MB) — frame captioning
+- **PaddleOCR** — OCR for supported Linux x86-64 frame extraction
 - **Whisper medium** (~1.4GB) — MLX-Whisper on supported Apple Silicon Macs, OpenAI Whisper elsewhere
 - **pyannote speaker diarization** — segment-level speaker labels when `HF_TOKEN` is configured
 
@@ -73,11 +78,21 @@ keyframe video.mp4
 keyframe video.mp4 -o ./output-dir
 ```
 
+Before creating output or cache directories, Keyframe resolves the input to a
+readable regular file and probes its streams with a 15-second `ffprobe`
+timeout. With no explicit mode, video plus audio selects full extraction,
+video-only selects frames with a notice, and audio-only selects transcription.
+An input with neither usable stream exits with an argument/preflight error.
+Attached album artwork does not count as a video stream.
+
 ### Frames only
 
 ```bash
 keyframe video.mp4 --frames-only
 ```
+
+`--frames-only` requires a usable non-attached-picture video stream and a
+supported Darwin ARM64 or Linux x86-64 frame runtime.
 
 ### Transcript only
 
@@ -85,6 +100,9 @@ keyframe video.mp4 --frames-only
 keyframe video.mp4 --transcript-only
 keyframe recording.m4a --transcript-only
 ```
+
+`--transcript-only` requires a usable audio stream and remains available on
+platforms that do not support frame extraction.
 
 ### Transcript without speaker detection
 
@@ -137,18 +155,20 @@ $keyframe ~/Downloads/meeting-recording.mp4
 
 | Command | Description |
 |---------|-------------|
-| `keyframe <file>` | Extract frames + transcript |
+| `keyframe <file>` | Probe streams and select full, frames-only, or transcript-only extraction |
 | `keyframe extract <file>` | Same as above (explicit subcommand) |
 | `keyframe install-skills` | Install Claude Code and Codex skills |
+| `keyframe-release-evidence fresh ...` | Create a standalone public-fixture evidence bundle |
+| `keyframe-release-evidence replay --bundle <dir>` | Recompute standalone evidence without loading models |
 
 ## Flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-o, --output` | `<input-file-folder>/<video>_extracted/` | Output directory (falls back to `/tmp` if the input folder isn't writable) |
-| `--frames-only` | | Skip transcript extraction |
-| `--transcript-only` | | Skip frame extraction |
-| `-i, --sample-interval` | `0.5` | Sample one frame every N seconds |
+| `--frames-only` | | Require video and skip transcript extraction |
+| `--transcript-only` | | Require audio and skip frame extraction |
+| `-i, --sample-interval` | `0.5` | Finite positive sampling interval in seconds |
 | `-c, --pass1-clusters` | `15` | CLIP over-segmentation clusters (1-64) |
 | `--max-clustering-memory-mb` | `2048` | Memory admission limit for each isolated average-linkage worker |
 | `--max-frame-cache-mb` | `8192` | Maximum size of the temporary, lossless candidate-frame cache |
@@ -160,6 +180,11 @@ $keyframe ~/Downloads/meeting-recording.mp4
 | `--diarization-device` | `auto` | Speaker-detection device: auto/cpu/mps/cuda |
 | `--stage-concurrency` | `auto` | Transcript-stage policy: auto/serial/parallel |
 | `--no-speaker-detection` | | Skip pyannote speaker detection |
+
+Frame-specific cache and QA paths are ignored when frames are not selected.
+All selected-mode configuration, path ancestry, imports, and QA targets are
+validated before Keyframe creates output/cache directories or starts a model
+or worker.
 
 ## How it works
 
@@ -254,6 +279,41 @@ output_dir/
 run. In full extraction, frames, captions, and the manifest are staged as one
 generation and replace the public `frames/` directory only after validation and
 transcript-window enrichment complete.
+
+## Release evidence
+
+Keyframe 0.6.3 includes a redistributable 36-second synthetic frame fixture at
+`tests/fixtures/release-frame-fixture/`. Its schema-1 metadata fixes the media
+hash and identity, six target windows, normalized OCR token groups, bounded
+aliases, budgets, construction command, ownership, and MIT redistribution
+permission.
+
+Maintainers build one wheel or sdist, install that exact artifact into clean
+Linux x86-64 and Darwin ARM64 environments, and run the Linux standalone gate
+first. Artifact mode launches the default `keyframe` CLI route through the
+clean environment interpreter with isolated imports, no repository
+`PYTHONPATH`, and a working directory outside the checkout. The evidence bundle
+contains the fixture contract, release artifact, manifest, captions, selected
+PNGs, optional traces, package/model/OCR provenance, and hashes for every
+declared artifact. The aggregate schema-7 benchmark then performs a fresh
+Darwin run and imports the passing Linux bundle.
+
+Replay is model-free and does not trust stored pass fields:
+
+```bash
+python3.12 scripts/release_frame_evidence.py replay \
+  --bundle /path/to/frame-evidence-bundle
+```
+
+Replay accepts only regular, non-symlinked files beneath the bundle, rehashes
+and reparses them, and recomputes target, budget, redundancy, platform, and
+source conclusions. OCR validation compares normalized required token subsets
+and metadata-declared aliases; complete OCR text and line layout need not match
+across Apple Vision and PaddleOCR. Model revisions are observed provenance, not
+a guarantee that a mutable upstream cache can be reconstructed. See
+`docs/transcription-models-to-test.md` for the Linux-first and aggregate
+commands. Ordinary pull-request tests validate these contracts with fake
+evidence and do not download or load models.
 
 ## Tips
 

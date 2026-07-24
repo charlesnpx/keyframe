@@ -38,6 +38,31 @@ def test_no_average_link_chain_through_intermediate_near_matches():
     assert {2} in groups
 
 
+def test_union_find_does_not_merge_structured_delta_candidate():
+    candidates = [
+        {
+            **_candidate(0, 0.0, score=10.0),
+            "ocr_tokens": ["same", "screen", "text"],
+        },
+        {
+            **_candidate(1, 1.0, score=1.0),
+            "ocr_tokens": ["same", "screen", "text"],
+            "structured_delta_categories": ["same_label_value"],
+            "structured_changed_signature_count": 2,
+        },
+    ]
+    tokens = [{"same", "screen", "text"}] * 2
+
+    final = union_find_merge(
+        candidates,
+        tokens,
+        [True, True],
+        _frames(2),
+    )
+
+    assert {row["sample_idx"] for row in final} == {0, 1}
+
+
 def test_populated_approval_block_does_not_merge_into_empty_template_neighbor():
     candidates = [_candidate(0, 0), _candidate(1, 2)]
     tokens = [

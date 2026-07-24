@@ -1,0 +1,207 @@
+{
+  "identifier": "keyframe.release-frame-fixture",
+  "schema_version": 1,
+  "creator": "Keyframe contributors",
+  "license": {
+    "spdx": "MIT",
+    "redistribution_permitted": true,
+    "path": "LICENSE.txt",
+    "sha256": "4fe8f580bf6d310b3b10a6c75fd04ffab468f552fd694974b3da5b5a79986e49"
+  },
+  "provenance": {
+    "ownership": "All displayed names, identifiers, form fields, and values are synthetic project-owned content. The rendered fixture contains no customer, confidential, or production data.",
+    "construction_command": "python tests/fixtures/release-frame-fixture/generate_fixture.py",
+    "source_files": [
+      {
+        "path": "source.json",
+        "sha256": "f6316f93826e76b8b1c6e9ea34aae96c244b2c1be91bb50a7a78b24592d338fb"
+      },
+      {
+        "path": "generate_fixture.py",
+        "sha256": "4245158d51b645c042050d08e46787d19534a17955f95660eba7728642937be2"
+      }
+    ]
+  },
+  "recording": {
+    "path": "release-frame-fixture.mp4",
+    "size_bytes": 355604,
+    "sha256": "aefcf8b147a502aeced0c921815023be6c51aaa100aa3b7db26f2ceecb324a68"
+  },
+  "media": {
+    "container": "mp4",
+    "codec": "h264",
+    "pixel_format": "yuv420p",
+    "width": 1280,
+    "height": 720,
+    "duration_seconds": 36.0,
+    "frame_rate": "30/1",
+    "frame_count": 1080,
+    "video_streams": 1,
+    "audio_streams": 0
+  },
+  "aliases": {
+    "imc": [
+      "lmc"
+    ],
+    "approved": [
+      "approvecl"
+    ],
+    "signed": [
+      "signcd"
+    ]
+  },
+  "targets": [
+    {
+      "id": "source-fields",
+      "time_seconds": 3.0,
+      "tolerance_seconds": 2.25,
+      "description": "Source fields with linked risk, identifier, description, and dependency labels.",
+      "required_token_groups": [
+        {
+          "name": "heading",
+          "tokens": [
+            "source",
+            "fields"
+          ]
+        },
+        {
+          "name": "source-labels",
+          "tokens": [
+            "linked",
+            "risks",
+            "description",
+            "dependencies"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "priority-sections",
+      "time_seconds": 9.0,
+      "tolerance_seconds": 2.25,
+      "description": "Priority sections covering justification, considerations, and override rationale.",
+      "required_token_groups": [
+        {
+          "name": "heading",
+          "tokens": [
+            "priority",
+            "form"
+          ]
+        },
+        {
+          "name": "priority-labels",
+          "tokens": [
+            "risk",
+            "justification",
+            "other",
+            "considerations",
+            "override"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "consequence-comments",
+      "time_seconds": 15.0,
+      "tolerance_seconds": 2.25,
+      "description": "Consequence, dependency, comment, and change-summary state.",
+      "required_token_groups": [
+        {
+          "name": "heading",
+          "tokens": [
+            "consequence",
+            "failure"
+          ]
+        },
+        {
+          "name": "change-labels",
+          "tokens": [
+            "dependencies",
+            "comments",
+            "summary",
+            "changes"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "page-transition",
+      "time_seconds": 21.0,
+      "tolerance_seconds": 2.25,
+      "description": "A hard page transition into the second structured form page.",
+      "required_token_groups": [
+        {
+          "name": "page",
+          "tokens": [
+            "page",
+            "2"
+          ]
+        },
+        {
+          "name": "page-labels",
+          "tokens": [
+            "current",
+            "state",
+            "description",
+            "prepared"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "signed-blank",
+      "time_seconds": 27.0,
+      "tolerance_seconds": 2.25,
+      "description": "The approval form before signer and date values are populated.",
+      "required_token_groups": [
+        {
+          "name": "signed-label",
+          "tokens": [
+            "signed",
+            "behalf",
+            "imc"
+          ]
+        },
+        {
+          "name": "blank-state",
+          "tokens": [
+            "approved",
+            "date",
+            "status",
+            "draft"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "signed-populated",
+      "time_seconds": 33.0,
+      "tolerance_seconds": 2.25,
+      "description": "The same approval form with signer, status, and date populated.",
+      "required_token_groups": [
+        {
+          "name": "signed-label",
+          "tokens": [
+            "signed",
+            "behalf",
+            "imc"
+          ]
+        },
+        {
+          "name": "populated-state",
+          "tokens": [
+            "alyssa",
+            "leon",
+            "29apr2026",
+            "approved"
+          ]
+        }
+      ]
+    }
+  ],
+  "budgets": {
+    "min_output_frames": 6,
+    "max_output_frames": 15,
+    "max_target_redundancy": 0.0
+  }
+}

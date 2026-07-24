@@ -12,6 +12,7 @@ Dependencies:
 
 import cv2
 import gc
+import hashlib
 import numpy as np
 import os
 import re
@@ -30,11 +31,120 @@ from keyframe.dedupe import (
     clean_ocr_token_sets,
     hamming,
 )
-from keyframe.evidence import field_section_signatures, normalized_ocr_line_signatures
+from keyframe.evidence import (
+    field_section_signatures,
+    normalized_ocr_line_signatures,
+    select_structured_comparator,
+    structured_delta_categories,
+    structured_signature_change_count,
+)
 from keyframe.merge import build_ocr_token_sets
 from keyframe.scoring import score_candidate_for_rep
 from keyframe.pipeline.contracts import CandidateRecord, candidate_records, candidate_to_caption_log_row
 from keyframe.visual import laplacian_sharpness
+
+
+CLIP_MODEL_NAME = "ViT-B-32"
+CLIP_PRETRAINED = "laion2b_s34b_b79k"
+FLORENCE_MODEL_ID = "florence-community/Florence-2-base"
+APPLE_VISION_MODEL_ID = "com.apple.Vision.VNRecognizeTextRequest"
+PADDLE_OCR_MODEL_ID = "PaddleOCR/default-English-pipeline"
+
+_DIRECT_WEIGHT_PATH_ATTRIBUTES = (
+    "checkpoint_file",
+    "checkpoint_path",
+    "model_file",
+    "model_path",
+    "pretrained_path",
+    "weight_file",
+    "weights_file",
+    "weights_path",
+)
+_MODEL_ID_ATTRIBUTES = ("name_or_path", "_name_or_path", "model_id")
+_REVISION_ATTRIBUTES = ("_commit_hash", "commit_hash", "revision")
+
+
+def _hash_file(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _direct_loader_objects(*objects):
+    observed = []
+    for value in objects:
+        if value is None:
+            continue
+        observed.append(value)
+        config = getattr(value, "config", None)
+        if config is not None:
+            observed.append(config)
+    return tuple(observed)
+
+
+def _direct_string_attribute(objects, names):
+    for value in objects:
+        for name in names:
+            candidate = getattr(value, name, None)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+    return None
+
+
+def _direct_weight_files(objects):
+    records = []
+    seen = set()
+    for value in objects:
+        for attribute in _DIRECT_WEIGHT_PATH_ATTRIBUTES:
+            candidate = getattr(value, attribute, None)
+            candidates = candidate if isinstance(candidate, (list, tuple)) else (candidate,)
+            for raw_path in candidates:
+                if not isinstance(raw_path, (str, os.PathLike)):
+                    continue
+                path = Path(raw_path).expanduser()
+                try:
+                    if not path.is_file():
+                        continue
+                    identity = path.resolve()
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                    records.append(
+                        {
+                            "loader_attribute": attribute,
+                            "filename": path.name,
+                            "size_bytes": path.stat().st_size,
+                            "sha256": _hash_file(path),
+                        }
+                    )
+                except OSError:
+                    continue
+    return sorted(
+        records,
+        key=lambda record: (
+            record["loader_attribute"],
+            record["filename"],
+            record["sha256"],
+        ),
+    )
+
+
+def _observed_model_provenance(role, fallback_model_id, *loader_results):
+    objects = _direct_loader_objects(*loader_results)
+    return {
+        "role": role,
+        "model_id": (
+            _direct_string_attribute(objects, _MODEL_ID_ATTRIBUTES)
+            or fallback_model_id
+        ),
+        "repository_revision": _direct_string_attribute(
+            objects,
+            _REVISION_ATTRIBUTES,
+        ),
+        "stable_weight_files": _direct_weight_files(objects),
+    }
 
 
 # ── Video sampling ──────────────────────────────────────────────────────────
@@ -76,15 +186,40 @@ def sample_frames(video_path, interval_seconds=0.5):
 
 # ── Scene detection ──────────────────────────────────────────────────────
 
-def detect_scenes(video_path, timestamps, threshold=27.0):
+def detect_scenes(
+    video_path,
+    timestamps,
+    frame_indices=None,
+    threshold=27.0,
+):
     """Run pySceneDetect ContentDetector and return scene boundaries as
-    (start_idx, end_idx) tuples indexed into the timestamps/frames arrays."""
+    (start_idx, end_idx) tuples indexed into the sampled-frame arrays.
+
+    SceneDetect timecodes retain decoded source-frame numbers but convert
+    seconds through the container's nominal frame rate.  That conversion is
+    not presentation time for VFR media, so production sampling supplies the
+    recorded source-frame indices and maps scene boundaries by index.
+    """
     from scenedetect import open_video, SceneManager
     from scenedetect.detectors import ContentDetector
     import bisect
 
+    if not timestamps:
+        return []
+
+    source_frame_indices = None
+    if frame_indices is not None:
+        source_frame_indices = [int(value) for value in frame_indices]
+        if len(source_frame_indices) != len(timestamps):
+            raise ValueError("scene timestamps and source frame indices are misaligned")
+        if any(
+            source_frame_indices[index] <= source_frame_indices[index - 1]
+            for index in range(1, len(source_frame_indices))
+        ):
+            raise ValueError("scene source frame indices must be strictly increasing")
+
     print(f"\n── Scene detection (ContentDetector, threshold={threshold}) ──")
-    video = open_video(video_path)
+    video = open_video(str(video_path))
     sm = SceneManager()
     sm.add_detector(ContentDetector(threshold=threshold))
     sm.detect_scenes(video)
@@ -96,13 +231,31 @@ def detect_scenes(video_path, timestamps, threshold=27.0):
 
     scenes = []
     for start_tc, end_tc in scene_list:
-        start_sec = start_tc.get_seconds()
-        end_sec = end_tc.get_seconds()
-        s_idx = bisect.bisect_left(timestamps, start_sec)
-        e_idx = bisect.bisect_right(timestamps, end_sec) - 1
+        if source_frame_indices is not None:
+            start_frame = int(start_tc.get_frames())
+            end_frame = int(end_tc.get_frames())
+            s_idx = bisect.bisect_left(source_frame_indices, start_frame)
+            # SceneDetect end timecodes are exclusive.  A sample exactly at
+            # the end frame belongs to the following scene.
+            e_idx = bisect.bisect_left(source_frame_indices, end_frame) - 1
+            if (
+                s_idx >= len(source_frame_indices)
+                or e_idx < 0
+                or e_idx < s_idx
+            ):
+                continue
+        else:
+            start_sec = start_tc.get_seconds()
+            end_sec = end_tc.get_seconds()
+            s_idx = bisect.bisect_left(timestamps, start_sec)
+            e_idx = bisect.bisect_right(timestamps, end_sec) - 1
         s_idx = max(0, min(s_idx, len(timestamps) - 1))
         e_idx = max(s_idx, min(e_idx, len(timestamps) - 1))
         scenes.append((s_idx, e_idx))
+
+    if not scenes:
+        print("  No sampled scene cuts detected — treating entire video as one scene")
+        return [(0, len(timestamps) - 1)]
 
     print(f"  Detected {len(scenes)} scenes:")
     for i, (s, e) in enumerate(scenes):
@@ -114,7 +267,11 @@ def detect_scenes(video_path, timestamps, threshold=27.0):
 
 # ── Parallel model preloading ─────────────────────────────────────────────
 
-def _load_clip(device, model_name="ViT-B-32", pretrained="laion2b_s34b_b79k"):
+def _load_clip(
+    device,
+    model_name=CLIP_MODEL_NAME,
+    pretrained=CLIP_PRETRAINED,
+):
     """Load CLIP model (called in background thread)."""
     model, _, preprocess = open_clip.create_model_and_transforms(
         model_name, pretrained=pretrained, device=device
@@ -138,10 +295,10 @@ def _florence_dtype(device):
 
 def _load_florence(device):
     """Load Florence-2 model + processor (called in background thread)."""
-    model_name = "florence-community/Florence-2-base"
-    processor = AutoProcessor.from_pretrained(model_name)
+    processor = AutoProcessor.from_pretrained(FLORENCE_MODEL_ID)
     model = Florence2ForConditionalGeneration.from_pretrained(
-        model_name, dtype=_florence_dtype(device),
+        FLORENCE_MODEL_ID,
+        dtype=_florence_dtype(device),
     ).to(device)
     model.eval()
     return model, processor
@@ -180,16 +337,29 @@ class ModelPreloader:
     def __init__(self, device="mps", need_florence=True, need_ocr=True):
         self._device = device
         self._need_florence = need_florence
-        self._need_ocr = need_ocr and not _is_macos()
+        self._use_apple_vision = need_ocr and _is_macos()
+        self._need_ocr = need_ocr and not self._use_apple_vision
 
         self._clip = None
         self._florence = None
         self._ocr = None
+        self._model_provenance = {}
 
     def get_clip(self):
         if self._clip is None:
             print("  Loading CLIP...")
-            self._clip = _load_clip(self._device)
+            self._clip = _load_clip(
+                self._device,
+                model_name=CLIP_MODEL_NAME,
+                pretrained=CLIP_PRETRAINED,
+            )
+            self._model_provenance["visual-embedding"] = (
+                _observed_model_provenance(
+                    "visual-embedding",
+                    f"open_clip/{CLIP_MODEL_NAME}/{CLIP_PRETRAINED}",
+                    self._clip[0],
+                )
+            )
         return self._clip
 
     def get_florence(self):
@@ -198,15 +368,39 @@ class ModelPreloader:
         if self._florence is None:
             print("  Loading Florence-2...")
             self._florence = _load_florence(self._device)
+            self._model_provenance["captioning"] = _observed_model_provenance(
+                "captioning",
+                FLORENCE_MODEL_ID,
+                *self._florence,
+            )
         return self._florence
 
     def get_ocr_engine(self):
+        if self._use_apple_vision:
+            self._model_provenance["ocr"] = _observed_model_provenance(
+                "ocr",
+                APPLE_VISION_MODEL_ID,
+            )
+            return None
         if not self._need_ocr:
             return None
         if self._ocr is None:
             print("  Loading PaddleOCR...")
             self._ocr = _load_ocr_engine()
+            self._model_provenance["ocr"] = _observed_model_provenance(
+                "ocr",
+                PADDLE_OCR_MODEL_ID,
+                self._ocr,
+            )
         return self._ocr
+
+    def model_provenance(self):
+        role_order = ("visual-embedding", "captioning", "ocr")
+        return [
+            dict(self._model_provenance[role])
+            for role in role_order
+            if role in self._model_provenance
+        ]
 
     def release_clip(self):
         if self._clip is not None:
@@ -577,7 +771,7 @@ def ocr_candidates(candidates, frames, preloaded_engine=None):
             if owns_images:
                 img.close()
 
-        raw_text = " ".join(lines)
+        raw_text = "\n".join(lines)
         ocr_texts.append(raw_text)
         updated_candidates.append(cand.with_evidence(ocr_text=raw_text))
         preview = raw_text[:120] if raw_text else "(no text)"
@@ -737,31 +931,44 @@ def attach_rescue_ocr_metadata(candidates, raw_ocr_texts):
     return tuple(updated_candidates)
 
 
+def attach_structured_delta_metadata(shortlist, candidates):
+    """Classify shortlist field changes against deterministic selected peers."""
+    shortlist = candidate_records(shortlist)
+    candidates = candidate_records(candidates)
+    updated = []
+    for rescue in shortlist:
+        comparator = select_structured_comparator(rescue, candidates)
+        if comparator is None:
+            updated.append(rescue)
+            continue
+        categories = structured_delta_categories(
+            rescue.evidence.field_signature,
+            comparator.evidence.field_signature,
+        )
+        updated.append(
+            rescue.with_selection(
+                structured_delta_categories=categories,
+                structured_comparator_sample_idx=int(comparator.sample_idx),
+                structured_comparator_timestamp=float(comparator.timestamp),
+                structured_changed_signature_count=(
+                    structured_signature_change_count(
+                        rescue.evidence.field_signature,
+                        comparator.evidence.field_signature,
+                    )
+                ),
+            )
+        )
+    return tuple(updated)
+
+
 def _comparison_primary_sample_idxs(candidates, shortlist):
     candidates = candidate_records(candidates)
     shortlist = candidate_records(shortlist)
     selected: set[int] = set()
     for rescue in shortlist:
-        rescue_ts = float(rescue.timestamp)
-        rescue_cluster = rescue.visual.clip_cluster
-        rescue_scene = rescue.temporal.scene_id
-
-        same_cluster = [
-            cand for cand in candidates
-            if rescue_cluster is not None and cand.visual.clip_cluster == rescue_cluster
-        ]
-        same_scene = [
-            cand for cand in candidates
-            if rescue_scene is not None and cand.temporal.scene_id == rescue_scene
-        ]
-        for pool in (same_cluster, same_scene):
-            if not pool:
-                continue
-            primary = min(
-                pool,
-                key=lambda cand: abs(float(cand.timestamp) - rescue_ts),
-            )
-            selected.add(int(primary.sample_idx))
+        comparator = select_structured_comparator(rescue, candidates)
+        if comparator is not None:
+            selected.add(int(comparator.sample_idx))
     return selected
 
 
