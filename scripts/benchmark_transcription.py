@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run and replay the Keyframe 0.6.3 cross-platform release benchmark."""
+"""Run and replay the Keyframe 0.6.2 transcription release benchmark."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from keyframe import cli, release_evidence, transcript
+from keyframe import cli, transcript
 from keyframe.artifacts import (
     ArtifactPathCollisionError,
     atomic_write_json,
@@ -57,9 +57,7 @@ from keyframe.validation import (
 
 
 GIB = 1024**3
-REPORT_SCHEMA_VERSION = 7
-FRAME_EVIDENCE_IDENTIFIER = "keyframe.cross-platform-frame-evidence"
-FRAME_EVIDENCE_SCHEMA_VERSION = 1
+REPORT_SCHEMA_VERSION = 6
 DEFAULT_TIMESTAMP_TOLERANCE_SECONDS = 0.05
 DEFAULT_CRITICAL_PATH_TOLERANCE_SECONDS = 5.0
 PROCESS_TREE_PEAK_METHOD = "conservative-kernel-high-water-bound"
@@ -72,7 +70,7 @@ MAX_LOCAL_MODEL_RESOLUTION_SECONDS = 1.0
 MAX_MPS_DIARIZATION_SECONDS = 335.0
 APPLE_ACCELERATOR_SERIAL_REASON = "stages share exclusive accelerator apple:0"
 EXPECTED_RUNTIME_PACKAGES = {
-    "keyframe": "0.6.3",
+    "keyframe": "0.6.2",
     "mlx": "0.32.0",
     "mlx_whisper": "0.4.3",
     "whisperx": "3.8.6",
@@ -106,14 +104,6 @@ CANDIDATE_CONTRACT = {
     "fallback_waited_for_diarization": False,
     "model_resolution_source": "local-hit",
 }
-DEFAULT_FRAME_FIXTURE = (
-    REPOSITORY_ROOT
-    / "tests"
-    / "fixtures"
-    / "release-frame-fixture"
-    / "release-frame-fixture.mp4"
-)
-DEFAULT_FRAME_METADATA = DEFAULT_FRAME_FIXTURE.with_name("metadata.json")
 
 
 class BenchmarkError(RuntimeError):
@@ -215,7 +205,6 @@ def _run_candidate_case(request: _CaseRequest) -> dict[str, Any]:
             "Apple Silicon"
         )
     frame_device = resolve_frame_device(preflight)
-    frame_config = cli._frame_config(args, device=frame_device)
     case_process_phase_peaks: dict[str, int] = {}
 
     def run_frames(supervisor: StageSupervisor) -> Any:
@@ -226,8 +215,9 @@ def _run_candidate_case(request: _CaseRequest) -> dict[str, Any]:
             return cli._run_frame_generation(
                 video,
                 output_dir,
-                frame_config,
+                args,
                 supervisor,
+                frame_device=frame_device,
             )
         finally:
             case_process_phase_peaks["second-wave"] = resource_peak_rss_bytes(
@@ -522,296 +512,6 @@ def _finite_number(value: Any, label: str) -> float:
 
 def _mapping(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
-
-
-def _standalone_source_key(evidence: Mapping[str, Any]) -> tuple[Any, ...] | None:
-    source = evidence.get("source_identity")
-    if not isinstance(source, dict):
-        return None
-    kind = source.get("kind")
-    version = source.get("version")
-    if kind == "git":
-        return kind, source.get("commit_sha"), version
-    if kind == "artifact":
-        return (
-            kind,
-            source.get("name"),
-            version,
-            source.get("sha256"),
-        )
-    return None
-
-
-def _standalone_summary_failures(
-    evidence: Any,
-    *,
-    expected_system: str,
-    expected_machine: str,
-    label: str,
-) -> list[str]:
-    failures: list[str] = []
-    if not isinstance(evidence, dict):
-        return [f"{label} embedded evidence must be an object"]
-    if evidence.get("identifier") != release_evidence.EVIDENCE_IDENTIFIER:
-        failures.append(
-            f"{label} evidence identifier must be "
-            f"{release_evidence.EVIDENCE_IDENTIFIER!r}"
-        )
-    if (
-        evidence.get("schema_version")
-        != release_evidence.EVIDENCE_SCHEMA_VERSION
-    ):
-        failures.append(
-            f"{label} evidence schema_version must be "
-            f"{release_evidence.EVIDENCE_SCHEMA_VERSION}"
-        )
-    runtime = _mapping(evidence.get("platform"))
-    if runtime.get("system") != expected_system:
-        failures.append(
-            f"{label} evidence system must be {expected_system!r}"
-        )
-    if str(runtime.get("machine", "")).lower() != expected_machine:
-        failures.append(
-            f"{label} evidence machine must be {expected_machine!r}"
-        )
-    source = _mapping(evidence.get("source_identity"))
-    source_key = _standalone_source_key(evidence)
-    if source_key is None:
-        failures.append(f"{label} source_identity is invalid")
-    package_version = _mapping(evidence.get("packages")).get("keyframe")
-    if package_version != source.get("version"):
-        failures.append(
-            f"{label} package version must match source_identity"
-        )
-    targets = evidence.get("targets")
-    if not isinstance(targets, list) or len(targets) != 6:
-        failures.append(f"{label} must contain all six frame targets")
-    elif any(
-        not isinstance(target, dict) or target.get("passed") is not True
-        for target in targets
-    ):
-        failures.append(f"{label} has a failed frame target")
-    budgets = _mapping(evidence.get("budgets"))
-    if budgets.get("passed") is not True:
-        failures.append(f"{label} has a failed frame budget")
-    redundancy = _mapping(evidence.get("redundancy"))
-    if redundancy.get("passed") is not True:
-        failures.append(f"{label} has a failed redundancy budget")
-    validation = _mapping(evidence.get("validation"))
-    if validation.get("passed") is not True:
-        failures.append(f"{label} standalone validation did not pass")
-    artifacts = _mapping(evidence.get("artifacts"))
-    for field in ("manifest", "captions"):
-        record = _mapping(artifacts.get(field))
-        if not isinstance(record.get("sha256"), str):
-            failures.append(f"{label} is missing {field} integrity evidence")
-    if not isinstance(
-        artifacts.get("canonical_png_aggregate_sha256"),
-        str,
-    ):
-        failures.append(f"{label} is missing canonical PNG integrity evidence")
-    return failures
-
-
-def _frame_evidence_failures(
-    report: Mapping[str, Any],
-    *,
-    report_root: Path | None = None,
-) -> list[str]:
-    failures: list[str] = []
-    aggregate = report.get("frame_evidence")
-    if not isinstance(aggregate, dict):
-        return ["report is missing cross-platform frame evidence"]
-    if aggregate.get("identifier") != FRAME_EVIDENCE_IDENTIFIER:
-        failures.append(
-            f"frame evidence identifier must be {FRAME_EVIDENCE_IDENTIFIER!r}"
-        )
-    if aggregate.get("schema_version") != FRAME_EVIDENCE_SCHEMA_VERSION:
-        failures.append(
-            f"frame evidence schema_version must be "
-            f"{FRAME_EVIDENCE_SCHEMA_VERSION}"
-        )
-
-    specifications = (
-        ("darwin_arm64", "Darwin", "arm64"),
-        ("linux_x86_64", "Linux", "x86_64"),
-    )
-    embedded: dict[str, dict[str, Any]] = {}
-    for entry_name, expected_system, expected_machine in specifications:
-        entry = aggregate.get(entry_name)
-        if not isinstance(entry, dict):
-            failures.append(f"frame evidence is missing {entry_name}")
-            continue
-        report_path = entry.get("report_path")
-        report_hash = entry.get("report_sha256")
-        evidence = entry.get("evidence")
-        if not isinstance(report_path, str) or not report_path:
-            failures.append(
-                f"frame evidence {entry_name}.report_path must be relative"
-            )
-        if (
-            not isinstance(report_hash, str)
-            or release_evidence.SHA256_RE.fullmatch(report_hash) is None
-        ):
-            failures.append(
-                f"frame evidence {entry_name}.report_sha256 must be SHA-256"
-            )
-        failures.extend(
-            _standalone_summary_failures(
-                evidence,
-                expected_system=expected_system,
-                expected_machine=expected_machine,
-                label=entry_name,
-            )
-        )
-        if isinstance(evidence, dict):
-            embedded[entry_name] = evidence
-
-        if (
-            report_root is None
-            or not isinstance(report_path, str)
-            or not isinstance(report_hash, str)
-        ):
-            continue
-        try:
-            evidence_path = release_evidence.resolve_bundle_file(
-                report_root,
-                report_path,
-                label=f"{entry_name} standalone report",
-            )
-        except release_evidence.ReleaseEvidenceError as exc:
-            failures.append(str(exc))
-            continue
-        if evidence_path.name != "evidence.json":
-            failures.append(
-                f"{entry_name} standalone report must be named evidence.json"
-            )
-            continue
-        if _sha256(evidence_path) != report_hash:
-            failures.append(
-                f"{entry_name} standalone report hash does not match"
-            )
-        try:
-            on_disk = _load_json(
-                evidence_path,
-                f"{entry_name} standalone report",
-            )
-        except BenchmarkError as exc:
-            failures.append(str(exc))
-            continue
-        if on_disk != evidence:
-            failures.append(
-                f"{entry_name} embedded evidence differs from its report file"
-            )
-        replay = release_evidence.replay_bundle(evidence_path.parent)
-        failures.extend(
-            f"{entry_name} replay: {failure}"
-            for failure in replay.failures
-        )
-
-    if set(embedded) == {"darwin_arm64", "linux_x86_64"}:
-        darwin_key = _standalone_source_key(embedded["darwin_arm64"])
-        linux_key = _standalone_source_key(embedded["linux_x86_64"])
-        if darwin_key != linux_key:
-            failures.append(
-                "Darwin and Linux frame evidence must use the same source_identity"
-            )
-        darwin_version = _mapping(
-            embedded["darwin_arm64"].get("packages")
-        ).get("keyframe")
-        linux_version = _mapping(
-            embedded["linux_x86_64"].get("packages")
-        ).get("keyframe")
-        if darwin_version != linux_version:
-            failures.append(
-                "Darwin and Linux frame evidence must use the same package version"
-            )
-    return failures
-
-
-def _standalone_report_entry(
-    bundle: Path,
-    *,
-    aggregate_root: Path,
-) -> dict[str, Any]:
-    replay = release_evidence.replay_bundle(bundle)
-    if not replay.passed or replay.report is None:
-        raise BenchmarkError(
-            "standalone frame evidence failed replay: "
-            + "; ".join(replay.failures)
-        )
-    report_path = bundle / "evidence.json"
-    return {
-        "report_path": report_path.resolve().relative_to(
-            aggregate_root.resolve()
-        ).as_posix(),
-        "report_sha256": _sha256(report_path),
-        "evidence": replay.report,
-    }
-
-
-def _fresh_frame_evidence(
-    *,
-    output_dir: Path,
-    fixture: Path,
-    metadata: Path,
-    linux_bundle: Path,
-    runtime_python: Path,
-    artifact: Path,
-) -> dict[str, Any]:
-    if (platform.system(), platform.machine().lower()) != ("Darwin", "arm64"):
-        raise BenchmarkError(
-            "fresh aggregate release evidence must run on Darwin ARM64"
-        )
-    darwin_bundle = output_dir / "frame-evidence" / "darwin-arm64"
-    linux_destination = output_dir / "frame-evidence" / "linux-x86_64"
-    try:
-        darwin_report = release_evidence.run_fresh(
-            fixture=fixture,
-            metadata=metadata,
-            output=darwin_bundle,
-            runtime_python=runtime_python,
-            artifact=artifact,
-            repository_root=REPOSITORY_ROOT,
-        )
-        if not _mapping(darwin_report.get("validation")).get("passed"):
-            raise BenchmarkError(
-                "fresh Darwin frame evidence did not pass: "
-                + "; ".join(
-                    str(value)
-                    for value in _mapping(
-                        darwin_report.get("validation")
-                    ).get("failures", [])
-                )
-            )
-        release_evidence.copy_validated_bundle(
-            linux_bundle,
-            linux_destination,
-        )
-    except release_evidence.ReleaseEvidenceError as exc:
-        raise BenchmarkError(f"frame evidence failed: {exc}") from exc
-
-    aggregate = {
-        "identifier": FRAME_EVIDENCE_IDENTIFIER,
-        "schema_version": FRAME_EVIDENCE_SCHEMA_VERSION,
-        "darwin_arm64": _standalone_report_entry(
-            darwin_bundle,
-            aggregate_root=output_dir,
-        ),
-        "linux_x86_64": _standalone_report_entry(
-            linux_destination,
-            aggregate_root=output_dir,
-        ),
-    }
-    failures = _frame_evidence_failures(
-        {"frame_evidence": aggregate},
-        report_root=output_dir,
-    )
-    if failures:
-        raise BenchmarkError(
-            "cross-platform frame evidence failed: " + "; ".join(failures)
-        )
-    return aggregate
 
 
 def _pipeline_evidence_from_report(candidate: dict[str, Any]) -> PipelineEvidence:
@@ -1285,19 +985,12 @@ def evaluate_report(
     baseline: dict[str, Any],
     *,
     critical_path_tolerance_seconds: float,
-    report_root: Path | None = None,
 ) -> list[str]:
     """Return release-contract failures for a fresh or replayed report."""
 
     failures = _quality_failures(report, baseline)
     failures.extend(_release_contract_failures(report))
     failures.extend(_performance_contract_failures(report))
-    failures.extend(
-        _frame_evidence_failures(
-            report,
-            report_root=report_root,
-        )
-    )
     try:
         critical_path_tolerance = _finite_number(
             critical_path_tolerance_seconds,
@@ -1465,7 +1158,7 @@ def _validate_report_recording(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run or replay the Keyframe cross-platform release benchmark.",
+        description="Run or replay the Keyframe transcription release benchmark.",
     )
     parser.add_argument("--input", required=True, help="Explicit benchmark recording")
     parser.add_argument("--baseline", required=True, help="Checked-in baseline JSON")
@@ -1477,28 +1170,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--replay-report",
         help="Validate an existing report without running models",
-    )
-    parser.add_argument(
-        "--frame-fixture",
-        default=str(DEFAULT_FRAME_FIXTURE),
-        help="Public release-frame fixture for a fresh Darwin run",
-    )
-    parser.add_argument(
-        "--frame-metadata",
-        default=str(DEFAULT_FRAME_METADATA),
-        help="Public release-frame fixture metadata",
-    )
-    parser.add_argument(
-        "--linux-frame-bundle",
-        help="Prior Linux x86-64 standalone frame-evidence bundle",
-    )
-    parser.add_argument(
-        "--frame-runtime-python",
-        help="Clean artifact environment interpreter for the fresh Darwin frame run",
-    )
-    parser.add_argument(
-        "--release-artifact",
-        help="The exact wheel or sdist already used by the Linux frame bundle",
     )
     parser.add_argument(
         "--timestamp-tolerance-seconds",
@@ -1521,23 +1192,6 @@ def main(argv: list[str] | None = None) -> int:
         Path(args.replay_report).expanduser() if args.replay_report else None
     )
     explicit_report_path = Path(args.report).expanduser() if args.report else None
-    frame_fixture_path = Path(args.frame_fixture).expanduser()
-    frame_metadata_path = Path(args.frame_metadata).expanduser()
-    linux_frame_bundle = (
-        Path(args.linux_frame_bundle).expanduser()
-        if args.linux_frame_bundle
-        else None
-    )
-    frame_runtime_python = (
-        Path(args.frame_runtime_python).expanduser()
-        if args.frame_runtime_python
-        else None
-    )
-    release_artifact = (
-        Path(args.release_artifact).expanduser()
-        if args.release_artifact
-        else None
-    )
     if not input_path.is_file():
         raise BenchmarkError(f"benchmark input does not exist: {input_path}")
     if not baseline_path.is_file():
@@ -1546,74 +1200,24 @@ def main(argv: list[str] | None = None) -> int:
         raise BenchmarkError(
             f"benchmark replay report does not exist: {replay_report_path}"
         )
-    if (
-        not math.isfinite(args.timestamp_tolerance_seconds)
-        or args.timestamp_tolerance_seconds < 0
-    ):
-        raise BenchmarkError("timestamp tolerance must be finite and non-negative")
-    if (
-        not math.isfinite(args.critical_path_tolerance_seconds)
-        or args.critical_path_tolerance_seconds < 0
-    ):
-        raise BenchmarkError(
-            "critical-path tolerance must be finite and non-negative"
-        )
-    if replay_report_path is None:
-        required_paths = {
-            "frame fixture": frame_fixture_path,
-            "frame metadata": frame_metadata_path,
-            "Linux frame bundle": linux_frame_bundle,
-            "frame runtime Python": frame_runtime_python,
-            "release artifact": release_artifact,
-        }
-        for label, path in required_paths.items():
-            if path is None:
-                raise BenchmarkError(f"fresh benchmark requires {label}")
-        if not frame_fixture_path.is_file():
-            raise BenchmarkError(
-                f"frame fixture does not exist: {frame_fixture_path}"
-            )
-        if not frame_metadata_path.is_file():
-            raise BenchmarkError(
-                f"frame metadata does not exist: {frame_metadata_path}"
-            )
-        assert linux_frame_bundle is not None
-        if not linux_frame_bundle.is_dir():
-            raise BenchmarkError(
-                f"Linux frame bundle does not exist: {linux_frame_bundle}"
-            )
-        assert frame_runtime_python is not None
-        if not frame_runtime_python.is_file():
-            raise BenchmarkError(
-                f"frame runtime Python does not exist: {frame_runtime_python}"
-            )
-        assert release_artifact is not None
-        if not release_artifact.is_file():
-            raise BenchmarkError(
-                f"release artifact does not exist: {release_artifact}"
-            )
     if explicit_report_path is not None:
         protected_paths = [input_path, baseline_path]
         if replay_report_path is not None:
             protected_paths.append(replay_report_path)
-        else:
-            protected_paths.extend(
-                [
-                    frame_fixture_path,
-                    frame_metadata_path,
-                    release_artifact,
-                ]
-            )
         try:
-            reject_path_aliases(
-                explicit_report_path,
-                [path for path in protected_paths if path is not None],
-            )
+            reject_path_aliases(explicit_report_path, protected_paths)
         except ArtifactPathCollisionError as exc:
             raise BenchmarkError(
                 "benchmark report path must not alias the recording, baseline, "
                 f"or replay report: {exc}"
             ) from exc
+    if not math.isfinite(args.timestamp_tolerance_seconds) or args.timestamp_tolerance_seconds < 0:
+        raise BenchmarkError("timestamp tolerance must be finite and non-negative")
+    if (
+        not math.isfinite(args.critical_path_tolerance_seconds)
+        or args.critical_path_tolerance_seconds < 0
+    ):
+        raise BenchmarkError("critical-path tolerance must be finite and non-negative")
     baseline = _load_json(baseline_path, "baseline")
     duration_seconds = _probe_duration_seconds(input_path)
     expected_duration = float(baseline.get("recording", {}).get("duration_seconds", 0.0))
@@ -1634,16 +1238,6 @@ def main(argv: list[str] | None = None) -> int:
             else Path(tempfile.mkdtemp(prefix="keyframe-benchmark-", dir="/tmp"))
         )
         _prepare_output_dir(output_dir)
-        report_path = (
-            explicit_report_path
-            if explicit_report_path is not None
-            else output_dir / "report.json"
-        )
-        if report_path.resolve().parent != output_dir.resolve():
-            raise BenchmarkError(
-                "fresh benchmark report must be written directly beneath "
-                "the benchmark output directory"
-            )
         report = _new_report(
             input_path,
             duration_seconds,
@@ -1651,28 +1245,16 @@ def main(argv: list[str] | None = None) -> int:
             output_dir,
             timestamp_tolerance_seconds=args.timestamp_tolerance_seconds,
         )
-        assert linux_frame_bundle is not None
-        assert frame_runtime_python is not None
-        assert release_artifact is not None
-        report["frame_evidence"] = _fresh_frame_evidence(
-            output_dir=output_dir,
-            fixture=frame_fixture_path,
-            metadata=frame_metadata_path,
-            linux_bundle=linux_frame_bundle,
-            runtime_python=frame_runtime_python,
-            artifact=release_artifact,
+        report_path = (
+            explicit_report_path
+            if explicit_report_path is not None
+            else output_dir / "report.json"
         )
 
-    report_root = (
-        replay_report_path.parent
-        if replay_report_path is not None
-        else report_path.parent
-    )
     failures = evaluate_report(
         report,
         baseline,
         critical_path_tolerance_seconds=args.critical_path_tolerance_seconds,
-        report_root=report_root,
     )
     report["validation"] = {"passed": not failures, "failures": failures}
     if report_path is not None:

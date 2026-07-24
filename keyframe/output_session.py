@@ -1,26 +1,24 @@
-"""Shared output-directory locking and managed run lifecycle."""
+"""Shared output-directory locking and run-scoped staging lifecycle."""
 
 from __future__ import annotations
 
 import os
+import shutil
 import stat
 import uuid
 from pathlib import Path
 from typing import Any
 
-from keyframe.artifacts import RunStagingPaths
-from keyframe.managed_workspace import (
-    ManagedWorkspace,
-    OutputSessionError,
-    parse_canonical_uuid4,
-)
+from keyframe.artifacts import RunStagingPaths, run_staging_paths
+
 
 LOCK_FILENAME = "keyframe-output.lock"
-
-# These names identify legacy top-level artifacts only.  Keyframe deliberately
-# never discovers, cleans, restores, or otherwise mutates them.
 RUN_DIRECTORY_PREFIX = "keyframe-run-"
 FRAME_BACKUP_PREFIX = "keyframe-frame-backup-"
+
+
+class OutputSessionError(RuntimeError):
+    """A controlled failure while owning a Keyframe output directory."""
 
 
 class OutputDirectoryLockedError(OutputSessionError):
@@ -35,75 +33,18 @@ class OutputDirectoryLock:
         self.path = self.output_dir / LOCK_FILENAME
         self._descriptor: int | None = None
 
-    @property
-    def is_held(self) -> bool:
-        return self._descriptor is not None
-
-    def _open_regular_lock(self) -> int:
-        if os.path.lexists(self.path):
-            try:
-                before = self.path.lstat()
-            except OSError as exc:
-                raise OutputSessionError(
-                    f"output lock path is unreadable: {self.path}: {exc}"
-                ) from exc
-            if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
-                raise OutputSessionError(
-                    "output lock path must be a regular non-symlinked file: "
-                    f"{self.path}"
-                )
-
-        flags = os.O_RDWR | os.O_CREAT
-        flags |= getattr(os, "O_BINARY", 0)
-        flags |= getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOINHERIT", 0)
-        flags |= getattr(os, "O_NONBLOCK", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        try:
-            descriptor = os.open(self.path, flags, 0o600)
-        except OSError as exc:
-            raise OutputSessionError(
-                "output lock path could not be opened as a regular "
-                f"non-symlinked file: {self.path}: {exc}"
-            ) from exc
-
-        try:
-            opened = os.fstat(descriptor)
-            if not stat.S_ISREG(opened.st_mode):
-                raise OutputSessionError(
-                    f"opened output lock is not a regular file: {self.path}"
-                )
-            observed = self.path.lstat()
-            if (
-                stat.S_ISLNK(observed.st_mode)
-                or not stat.S_ISREG(observed.st_mode)
-                or (opened.st_dev, opened.st_ino)
-                != (observed.st_dev, observed.st_ino)
-            ):
-                raise OutputSessionError(
-                    "output lock path changed while it was being opened: "
-                    f"{self.path}"
-                )
-        except BaseException:
-            os.close(descriptor)
-            raise
-        return descriptor
-
     def acquire(self) -> None:
         if self._descriptor is not None:
             raise RuntimeError("output directory lock is already held")
         descriptor: int | None = None
         try:
-            descriptor = self._open_regular_lock()
+            descriptor = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
             self._descriptor = descriptor
             self._acquire_descriptor(descriptor)
         except BaseException:
             self._descriptor = None
-            if descriptor is not None and descriptor >= 0:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
+            if descriptor is not None:
+                os.close(descriptor)
             raise
 
     def _acquire_descriptor(self, descriptor: int) -> None:
@@ -156,58 +97,114 @@ class OutputDirectoryLock:
         self.release()
 
 
-def workspace_entry_id(run_id: str | uuid.UUID | None) -> uuid.UUID:
-    if run_id is None:
-        return uuid.uuid4()
-    try:
-        return parse_canonical_uuid4(run_id)
-    except (TypeError, ValueError):
-        # Legacy diagnostic run labels remain accepted, but never influence a
-        # filesystem path.  Every managed entry is still a fresh UUIDv4.
-        if not isinstance(run_id, str):
-            raise TypeError("run_id must be a string, UUID, or None") from None
-        return uuid.uuid4()
+def remove_keyframe_owned_directory(path: str | Path) -> None:
+    """Make one validated Keyframe-owned tree removable, then delete it."""
+
+    root = Path(path)
+    if not os.path.lexists(root):
+        return
+    if root.is_symlink() or not root.is_dir():
+        raise OutputSessionError(
+            f"refusing to recursively remove a non-directory artifact: {root}"
+        )
+
+    def make_writable(candidate: Path, *, directory: bool) -> None:
+        if candidate.is_symlink():
+            return
+        mode = stat.S_IMODE(candidate.stat().st_mode)
+        owner_bits = stat.S_IRUSR | stat.S_IWUSR
+        if directory:
+            owner_bits |= stat.S_IXUSR
+        candidate.chmod(mode | owner_bits)
+
+    make_writable(root, directory=True)
+    for current_root, directories, files in os.walk(root):
+        current = Path(current_root)
+        make_writable(current, directory=True)
+        for name in directories:
+            make_writable(current / name, directory=True)
+        for name in files:
+            make_writable(current / name, directory=False)
+    shutil.rmtree(root)
+
+
+def cleanup_stale_run_directories(output_dir: Path) -> None:
+    public_frames = output_dir / "frames"
+    backups = sorted(
+        candidate
+        for candidate in output_dir.iterdir()
+        if candidate.name.startswith(FRAME_BACKUP_PREFIX)
+        and candidate.is_dir()
+        and not candidate.is_symlink()
+    )
+    if backups:
+        if os.path.lexists(public_frames):
+            if public_frames.is_symlink() or not public_frames.is_dir():
+                raise OutputSessionError(
+                    f"public frame path is not a recoverable directory: {public_frames}"
+                )
+            for backup in backups:
+                remove_keyframe_owned_directory(backup)
+        elif len(backups) == 1:
+            os.replace(backups[0], public_frames)
+        else:
+            raise OutputSessionError(
+                "multiple frame-generation recovery backups exist while the public "
+                f"frames directory is missing: {[str(path) for path in backups]}"
+            )
+
+    for candidate in output_dir.iterdir():
+        if (
+            candidate.name.startswith(RUN_DIRECTORY_PREFIX)
+            and candidate.is_dir()
+            and not candidate.is_symlink()
+        ):
+            remove_keyframe_owned_directory(candidate)
 
 
 class OutputRunSession:
-    """Own one output lock and one UUID-scoped managed run directory."""
+    """Own one output lock and disposable run directory without model imports."""
 
     def __init__(
         self,
         output_dir: str | Path,
         *,
-        run_id: str | uuid.UUID | None = None,
+        run_id: str | None = None,
     ) -> None:
         self.output_dir = Path(output_dir)
-        self.entry_id = workspace_entry_id(run_id)
-        self.run_id = str(self.entry_id)
+        self.run_id = run_id or uuid.uuid4().hex
         self.lock: OutputDirectoryLock | None = None
-        self.workspace: ManagedWorkspace | None = None
         self.staging: RunStagingPaths | None = None
         self._entered = False
 
     def __enter__(self) -> OutputRunSession:
         if self._entered:
             raise RuntimeError("output run session cannot be entered twice")
-        run_created = False
+        staging_root_was_absent = False
         try:
             self.output_dir.mkdir(parents=True, exist_ok=True)
             self.output_dir = self.output_dir.resolve()
             self.lock = OutputDirectoryLock(self.output_dir)
             self.lock.acquire()
-            self.workspace = ManagedWorkspace.open(self.output_dir, self.lock)
-            self.staging = self.workspace.create_run(self.entry_id)
-            run_created = True
+            cleanup_stale_run_directories(self.output_dir)
+            self.staging = run_staging_paths(self.output_dir, self.run_id)
+            staging_root_was_absent = not os.path.lexists(self.staging.root)
+            self.staging.root.mkdir()
             self._entered = True
             return self
         except BaseException as exc:
             try:
-                if run_created and self.workspace is not None:
+                if (
+                    staging_root_was_absent
+                    and self.staging is not None
+                    and self.staging.root.is_dir()
+                    and not self.staging.root.is_symlink()
+                ):
                     try:
-                        self.workspace.delete_entry("run", self.entry_id)
+                        remove_keyframe_owned_directory(self.staging.root)
                     except BaseException as cleanup_exc:
                         exc.add_note(
-                            f"failed to remove managed run entry: {cleanup_exc}"
+                            f"failed to remove run staging directory: {cleanup_exc}"
                         )
             finally:
                 if self.lock is not None:
@@ -224,9 +221,13 @@ class OutputRunSession:
         self._entered = False
         first_error: BaseException | None = None
         try:
-            if self.workspace is not None:
+            if (
+                self.staging is not None
+                and self.staging.root.is_dir()
+                and not self.staging.root.is_symlink()
+            ):
                 try:
-                    self.workspace.delete_entry("run", self.entry_id)
+                    remove_keyframe_owned_directory(self.staging.root)
                 except BaseException as exc:
                     first_error = exc
         finally:
@@ -238,8 +239,7 @@ class OutputRunSession:
                         first_error = exc
                     else:
                         first_error.add_note(
-                            f"failed to release output lock: "
-                            f"{type(exc).__name__}: {exc}"
+                            f"failed to release output lock: {type(exc).__name__}: {exc}"
                         )
         if first_error is not None:
             raise first_error

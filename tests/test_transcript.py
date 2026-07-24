@@ -7,7 +7,6 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 from keyframe import transcript
-from tests.preflight_helpers import patch_cli_media
 
 
 def _video(tmp_path):
@@ -830,7 +829,6 @@ def test_companion_json_uses_same_speaker_semantics(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cli, "_preflight_transcript", lambda _args: object())
     monkeypatch.setattr(cli, "_run_transcript", fake_run_transcript)
-    patch_cli_media(monkeypatch, video=False, audio=True)
 
     cli.cmd_extract(
         SimpleNamespace(

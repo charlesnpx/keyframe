@@ -41,14 +41,6 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           cache: pip
-      - name: Install FFmpeg on macOS
-        if: runner.os == 'macOS'
-        run: brew install ffmpeg
-      - name: Install FFmpeg on Linux
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes ffmpeg
       - name: Install CPU Torch wheels on Linux
         if: runner.os == 'Linux'
         run: |
@@ -56,11 +48,10 @@ jobs:
           python -m pip install \
             --index-url https://download.pytorch.org/whl/cpu \
             torch==2.8.0 torchaudio==2.8.0 torchvision==0.23.0
-      - name: Build wheel and sdist, then install the wheel
+      - name: Install package from source
         run: |
-          python -m pip install --upgrade pip build
-          python -m build
-          python -m pip install dist/keyframe-*.whl
+          python -m pip install --upgrade pip
+          python -m pip install .
       - name: Validate distribution, imports, and MLX platform gate
         run: python scripts/validate_install.py --expect-platform ${{ matrix.platform }}
       - name: Run release suite

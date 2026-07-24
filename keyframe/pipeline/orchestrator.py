@@ -190,7 +190,6 @@ class StreamingAnalysisStage:
                 video_path,
                 ctx.config.sample_interval,
                 embed_images=lambda batch: clip.embed_images(batch, batch_size=len(batch)),
-                video_timing=ctx.config.video_timing,
             )
         finally:
             clip.cleanup()
@@ -203,9 +202,6 @@ class StreamingAnalysisStage:
             samples=SampleTable(
                 timestamps=streamed.timestamps,
                 frame_indices=streamed.frame_indices,
-                consumed_targets=streamed.consumed_targets,
-                next_targets=streamed.next_targets,
-                timing_metadata=streamed.sampling_timing,
             ),
         )
         features = FeatureOutput(
@@ -263,14 +259,9 @@ class TemporalStage:
         )
 
         timestamps = sampling.samples.timestamps
-        frame_indices = sampling.samples.frame_indices
         dhashes = features.dhashes
         n_clusters = min(ctx.config.pass1_clusters, len(timestamps) // 2)
-        scenes = detect_scenes(
-            str(video_path),
-            timestamps,
-            frame_indices=frame_indices,
-        )
+        scenes = detect_scenes(str(video_path), timestamps)
         scenes, scene_coalescence = coalesce_tiny_scenes(
             scenes, timestamps, dhashes, return_trace=True
         )
@@ -307,7 +298,6 @@ class ProposalStage:
         ctx: RunContext,
     ) -> ProposalOutput:
         from keyframe.scoring import (
-            assign_dwell_ids,
             assign_temporal_window_ids,
             build_rescue_shortlist,
             rescue_window_seconds,
@@ -376,7 +366,6 @@ class ProposalStage:
             temporal_window_count,
             scene_count,
             legacy_proxy_dropped_count,
-            proposal_metadata,
         ) = build_rescue_shortlist(
             None,
             timestamps,
@@ -387,12 +376,9 @@ class ProposalStage:
             sample_scenes=sample_scenes,
             frame_metrics=frame_metrics,
             frame_count=len(timestamps),
-            dhashes=features.dhashes,
         )
-        dwell_ids = assign_dwell_ids(features.dhashes)
         candidates = tuple(
             cand.with_selection(proxy_content_score=float(proxy_rows[int(cand.sample_idx)]["proxy_content_score"]))
-            .with_temporal(dwell_id=dwell_ids[int(cand.sample_idx)])
             if 0 <= int(cand.sample_idx) < len(proxy_rows)
             else cand
             for cand in candidates
@@ -402,7 +388,6 @@ class ProposalStage:
                 dhash=features.dhashes[int(row.sample_idx)],
                 dhash_hex=f"{features.dhashes[int(row.sample_idx)]:016x}",
             )
-            .with_temporal(dwell_id=dwell_ids[int(row.sample_idx)])
             for row in shortlist
         )
         rescue_metadata = {
@@ -411,9 +396,7 @@ class ProposalStage:
             "temporal_window_count": int(temporal_window_count),
             "scene_count": int(scene_count),
             "legacy_proxy_dropped_count": int(legacy_proxy_dropped_count),
-            **proposal_metadata,
         }
-        ctx.metadata["rescue_proposal"] = rescue_metadata
         ctx.trace.exit(
             "proposal.rescue_shortlist",
             _candidate_batch("proposal.rescue_shortlist", shortlist, rescue_metadata),
@@ -427,12 +410,6 @@ class ProposalStage:
             temporal_window_count=temporal_window_count,
             scene_count=scene_count,
             legacy_proxy_dropped_count=legacy_proxy_dropped_count,
-            reserved_proposal_capacity=int(
-                proposal_metadata["reserved_proposal_capacity"]
-            ),
-            proposal_decisions=tuple(
-                proposal_metadata["proposal_decisions"]
-            ),
             frame_metrics=frame_metrics,
         )
 
@@ -447,7 +424,6 @@ class RescueEvidenceStage:
         from keyframe.frames import (
             _comparison_primary_sample_idxs,
             attach_rescue_ocr_metadata,
-            attach_structured_delta_metadata,
             ocr_candidates,
         )
         shortlist = proposal.rescue_shortlist
@@ -481,14 +457,8 @@ class RescueEvidenceStage:
         rescue_ocr_texts, ocr_batch = ocr_candidates(ocr_batch, frames, preloaded_engine=self.preloader.get_ocr_engine())
         ocr_batch = attach_rescue_ocr_metadata(ocr_batch, rescue_ocr_texts)
         updated_by_idx = {int(cand.sample_idx): cand for cand in ocr_batch}
+        proposal.rescue_shortlist = tuple(updated_by_idx.get(int(row.sample_idx), row) for row in shortlist)
         proposal.candidates = tuple(updated_by_idx.get(int(cand.sample_idx), cand) for cand in proposal.candidates)
-        proposal.rescue_shortlist = attach_structured_delta_metadata(
-            tuple(
-                updated_by_idx.get(int(row.sample_idx), row)
-                for row in shortlist
-            ),
-            proposal.candidates,
-        )
         print(
             "  Rescue OCR comparison primaries: "
             f"{len(comparison_primaries)} cached selected candidates"
@@ -529,7 +499,7 @@ class RescueSelectionStage:
             rescue_budget=proposal.rescue_budget,
             clip_embeddings=features.clip_embeddings,
         )
-        if ctx.config.verbose_trace or ctx.config.debug_qa_targets is not None:
+        if ctx.config.verbose_trace or ctx.config.debug_qa_targets_path is not None:
             preflight = rescue_promotion_preflight_report(
                 candidates,
                 shortlist,
@@ -667,32 +637,6 @@ class SurvivalStage:
             ranked = sorted(
                 post_veto,
                 key=lambda cand: (
-                    bool(cand.selection.structured_delta_categories),
-                    (
-                        "blank_populated"
-                        in cand.selection.structured_delta_categories
-                    ),
-                    bool(
-                        {"status", "date"}
-                        & set(
-                            cand.selection.structured_delta_categories
-                        )
-                    ),
-                    (
-                        "same_label_value"
-                        in cand.selection.structured_delta_categories
-                    ),
-                    bool(
-                        {"page", "section"}
-                        & set(
-                            cand.selection.structured_delta_categories
-                        )
-                    ),
-                    int(
-                        cand.selection.structured_changed_signature_count
-                        or 0
-                    ),
-                    cand.selection.proposal_lane == "transition",
                     len(cand.evidence.ocr_tokens),
                     float(cand.selection.candidate_score or cand.selection.score or cand.visual.sharpness or 0.0),
                     -float(cand.timestamp),
@@ -762,7 +706,6 @@ class OutputStage:
         frames = sampling.frame_store.frames
         caption_log_path = save_results(final, frames, output_dir)
         manifest_metadata = {
-            "sampling_timing": sampling.samples.timing_metadata,
             "scene_coalescence": temporal.scene_coalescence,
             "output_cap": {
                 "max_output_frames": ctx.config.max_output_frames,
@@ -784,23 +727,6 @@ class OutputStage:
                 "temporal_window_count": temporal_window_count,
                 "scene_count": scene_count,
                 "legacy_proxy_dropped_count": legacy_proxy_dropped_count,
-                "reserved_proposal_capacity": (
-                    (ctx.metadata.get("rescue_proposal") or {}).get(
-                        "reserved_proposal_capacity",
-                        0,
-                    )
-                ),
-                "transition_content_threshold": (
-                    (ctx.metadata.get("rescue_proposal") or {}).get(
-                        "transition_content_threshold"
-                    )
-                ),
-                "proposal_decisions": (
-                    (ctx.metadata.get("rescue_proposal") or {}).get(
-                        "proposal_decisions",
-                        (),
-                    )
-                ),
             },
         }
         manifest_rows = [
@@ -826,7 +752,7 @@ class OutputStage:
 def _build_trace_sink(config: KeyframeExtractionConfig, trace_sink: TraceSink | None) -> TraceSink:
     if trace_sink is not None:
         return trace_sink
-    if config.verbose_trace or config.debug_qa_targets is not None:
+    if config.verbose_trace or config.debug_qa_targets_path is not None:
         return SnapshotTraceSink()
     return NoOpTraceSink()
 
@@ -881,22 +807,13 @@ def extract_keyframes(
             cache_root=cfg.frame_cache_dir,
             max_bytes=int(cfg.max_frame_cache_mb) * 1024 * 1024,
         )
-        cache_result = cache_candidate_frames(
+        sampling.frame_store.frames = cache_candidate_frames(
             video_path,
             cfg.sample_interval,
             candidate_indices=candidate_union,
-            frame_indices=sampling.samples.frame_indices,
-            timestamps=sampling.samples.timestamps,
-            consumed_targets=sampling.samples.consumed_targets,
-            next_targets=sampling.samples.next_targets,
             frame_sizes=features.frame_sizes,
             pixel_digests=features.pixel_digests,
-            sampling_timing=sampling.samples.timing_metadata,
             cache=frame_cache,
-        )
-        sampling.frame_store.frames = cache_result.provider
-        sampling.samples.timing_metadata["second_pass"] = (
-            cache_result.timing_metadata
         )
 
         RescueEvidenceStage(preloader).run(proposal, sampling, ctx)
@@ -946,17 +863,13 @@ def extract_keyframes(
         )
 
         if isinstance(trace, SnapshotTraceSink):
-            trace.exit(
-                "models.provenance",
-                {"models": preloader.model_provenance()},
-            )
             if cfg.verbose_trace:
                 pipeline_trace_path = output_dir / "pipeline_trace.json"
                 trace.write(pipeline_trace_path)
-            if cfg.debug_qa_targets is not None:
+            if cfg.debug_qa_targets_path is not None:
                 debug_qa_trace_path = write_debug_qa_trace(
                     trace_records=trace.records,
-                    targets=cfg.debug_qa_targets,
+                    targets_path=cfg.debug_qa_targets_path,
                     video=str(video_path),
                     output_path=output_dir / "debug_qa_trace.json",
                 )

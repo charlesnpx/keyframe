@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import json
-import math
-from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -72,105 +70,13 @@ FAMILY_STAGE_ORDER = {
 }
 
 
-def _finite_number(
-    value: Any,
-    *,
-    field: str,
-    target_index: int,
-    positive: bool = False,
-) -> float:
-    if isinstance(value, bool) or type(value) not in {int, float}:
-        raise ValueError(
-            f"QA target {target_index} {field} must be a finite number"
-        )
-    try:
-        rendered = float(value)
-    except (OverflowError, ValueError) as exc:
-        raise ValueError(
-            f"QA target {target_index} {field} must be a finite number"
-        ) from exc
-    if not math.isfinite(rendered):
-        raise ValueError(
-            f"QA target {target_index} {field} must be a finite number"
-        )
-    if positive and rendered <= 0:
-        raise ValueError(f"QA target {target_index} {field} must be positive")
-    if not positive and rendered < 0:
-        raise ValueError(f"QA target {target_index} {field} cannot be negative")
-    return rendered
-
-
-def normalize_targets(payload: Any) -> tuple[dict[str, Any], ...]:
+def load_targets(path: str | Path) -> list[dict[str, Any]]:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
     if isinstance(payload, list):
-        raw_targets = payload
-    elif isinstance(payload, Mapping) and isinstance(payload.get("targets"), list):
-        raw_targets = payload["targets"]
-    else:
-        raise ValueError(
-            "QA target file must be a list or an object with a 'targets' list"
-        )
-
-    normalized: list[dict[str, Any]] = []
-    for index, raw_target in enumerate(raw_targets):
-        if not isinstance(raw_target, Mapping):
-            raise ValueError(f"QA target {index} must be an object")
-        if "time" not in raw_target:
-            raise ValueError(f"QA target {index} must contain time")
-        raw_time = raw_target["time"]
-        target_time = _finite_number(
-            raw_time,
-            field="time",
-            target_index=index,
-        )
-
-        if "label" in raw_target:
-            label = raw_target["label"]
-            if not isinstance(label, str) or not label.strip():
-                raise ValueError(
-                    f"QA target {index} label must be a nonempty string"
-                )
-        else:
-            label = str(raw_time)
-
-        tolerance = _finite_number(
-            raw_target.get("tolerance", 2.25),
-            field="tolerance",
-            target_index=index,
-            positive=True,
-        )
-        anchor_tokens = raw_target.get("anchor_tokens", [])
-        if not isinstance(anchor_tokens, list):
-            raise ValueError(
-                f"QA target {index} anchor_tokens must be a list of "
-                "nonempty strings"
-            )
-        if any(
-            not isinstance(token, str) or not token.strip()
-            for token in anchor_tokens
-        ):
-            raise ValueError(
-                f"QA target {index} anchor_tokens must be a list of "
-                "nonempty strings"
-            )
-
-        normalized.append(
-            {
-                "time": target_time,
-                "label": label,
-                "tolerance": tolerance,
-                "anchor_tokens": list(anchor_tokens),
-            }
-        )
-    return tuple(normalized)
-
-
-def load_targets(path: str | Path) -> tuple[dict[str, Any], ...]:
-    target_path = Path(path)
-    try:
-        payload = json.loads(target_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"could not load QA target file {target_path}: {exc}") from exc
-    return normalize_targets(payload)
+        return [dict(item) for item in payload]
+    if isinstance(payload, Mapping) and isinstance(payload.get("targets"), list):
+        return [dict(item) for item in payload["targets"]]
+    raise ValueError("QA target file must be a list or an object with a 'targets' list")
 
 
 def _target_time(target: Mapping[str, Any]) -> float:
@@ -220,7 +126,6 @@ def _stage_summaries(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]
                 "rescue_shortlist_count",
                 "rescue_budget",
                 "rescue_ocr_cap",
-                "reserved_proposal_capacity",
                 "temporal_window_count",
                 "legacy_proxy_dropped_count",
             )
@@ -478,7 +383,7 @@ def _bucket(stage_membership: Mapping[str, Mapping[str, Any]]) -> str:
 def build_debug_qa_trace(
     *,
     trace_records: list[dict[str, Any]],
-    targets: Sequence[Mapping[str, Any]],
+    targets: list[dict[str, Any]],
     video: str,
     stage_order: list[str] | None = None,
 ) -> dict[str, Any]:
@@ -552,17 +457,11 @@ def build_debug_qa_trace(
 def write_debug_qa_trace(
     *,
     trace_records: list[dict[str, Any]],
-    targets: Sequence[Mapping[str, Any]] | None = None,
-    targets_path: str | Path | None = None,
+    targets_path: str | Path,
     video: str,
     output_path: str | Path,
 ) -> Path:
-    if targets is None:
-        if targets_path is None:
-            raise ValueError("debug QA trace requires normalized targets")
-        targets = load_targets(targets_path)
-    elif targets_path is not None:
-        raise ValueError("provide normalized targets or targets_path, not both")
+    targets = load_targets(targets_path)
     payload = build_debug_qa_trace(
         trace_records=trace_records,
         targets=targets,
