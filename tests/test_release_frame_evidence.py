@@ -10,6 +10,7 @@ import pytest
 from keyframe import release_evidence
 from tests.release_evidence_helpers import (
     FIXTURE_ROOT,
+    TARGET_TEXT,
     write_frame_evidence_bundle,
 )
 
@@ -134,6 +135,54 @@ def test_target_timing_accepts_validated_same_state_lineage():
     assert results[-1]["selected_timestamp"] == 30.0
     assert results[-1]["matched_timestamp"] == 32.5
     assert results[-1]["matched_via"] == "merged_timestamps"
+
+
+def test_target_evaluation_rejects_caption_only_without_ocr_evidence():
+    contract = release_evidence.load_fixture_contract(
+        FIXTURE_ROOT / "metadata.json"
+    )
+    rows = []
+    captions = {}
+    for target, text in zip(
+        contract.metadata["targets"],
+        TARGET_TEXT,
+        strict=True,
+    ):
+        timestamp = float(target["time_seconds"])
+        name = f"{target['id']}.png"
+        rows.append(
+            {
+                "filename": name,
+                "timestamp": timestamp,
+                "caption": text,
+            }
+        )
+        captions[name] = {
+            "file": name,
+            "timestamp": timestamp,
+            "caption": text,
+        }
+        if target["id"] != "signed-blank":
+            captions[name]["ocr_text"] = text
+
+    results, failures = release_evidence._evaluate_targets(
+        contract.metadata,
+        rows,
+        captions,
+    )
+
+    signed_blank = next(
+        result for result in results if result["id"] == "signed-blank"
+    )
+    assert signed_blank["passed"] is False
+    assert all(
+        not group["matched_tokens"]
+        for group in signed_blank["token_groups"]
+    )
+    assert len(failures) == 1
+    assert failures[0].startswith(
+        "target signed-blank is missing normalized OCR tokens:"
+    )
 
 
 def test_replay_recomputes_and_ignores_stored_pass_fields(tmp_path):

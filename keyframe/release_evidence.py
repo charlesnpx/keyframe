@@ -789,16 +789,15 @@ def _frame_rows(
     return manifest_rows, caption_rows
 
 
-def _text_for_frame(
+def _ocr_text_for_frame(
     manifest_row: Mapping[str, Any],
     caption_row: Mapping[str, Any],
 ) -> str:
     values: list[str] = []
     for row in (manifest_row, caption_row):
-        for field in ("ocr_text", "caption"):
-            value = row.get(field)
-            if isinstance(value, str):
-                values.append(value)
+        value = row.get("ocr_text")
+        if isinstance(value, str):
+            values.append(value)
         raw_tokens = row.get("ocr_tokens")
         if isinstance(raw_tokens, list):
             values.extend(str(token) for token in raw_tokens if isinstance(token, str))
@@ -845,7 +844,7 @@ def _evaluate_targets(
             if delta > float(target["tolerance_seconds"]):
                 continue
             tokens = normalize_tokens(
-                _text_for_frame(row, caption_rows[str(row["filename"])])
+                _ocr_text_for_frame(row, caption_rows[str(row["filename"])])
             )
             groups: list[dict[str, Any]] = []
             matched_count = 0
