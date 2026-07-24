@@ -93,6 +93,37 @@ def _candidate_row(stage: str, cand: Mapping[str, Any] | CandidateRecord, index:
         "retention_rejected_reason": cand.get("retention_rejected_reason"),
         "proxy_content_score": _safe_float(cand.get("proxy_content_score")),
         "proposal_lane": cand.get("proposal_lane"),
+        "transition_side": cand.get("transition_side"),
+        "transition_boundary_sample_idx": _safe_int(
+            cand.get("transition_boundary_sample_idx")
+        ),
+        "transition_boundary_timestamp": _safe_float(
+            cand.get("transition_boundary_timestamp")
+        ),
+        "transition_boundary_content_delta": _safe_float(
+            cand.get("transition_boundary_content_delta")
+        ),
+        "transition_boundary_text_band_delta": _safe_float(
+            cand.get("transition_boundary_text_band_delta")
+        ),
+        "transition_boundary_dhash_distance": _safe_int(
+            cand.get("transition_boundary_dhash_distance")
+        ),
+        "transition_boundary_predicates": list(
+            cand.get("transition_boundary_predicates", []) or []
+        ),
+        "structured_delta_categories": list(
+            cand.get("structured_delta_categories", []) or []
+        ),
+        "structured_comparator_sample_idx": _safe_int(
+            cand.get("structured_comparator_sample_idx")
+        ),
+        "structured_comparator_timestamp": _safe_float(
+            cand.get("structured_comparator_timestamp")
+        ),
+        "structured_changed_signature_count": _safe_int(
+            cand.get("structured_changed_signature_count")
+        ),
         "rescue_priority": _safe_int(cand.get("rescue_priority")),
         "merged_timestamps": [
             ts for ts in (_safe_float(v) for v in cand.get("merged_timestamps", []))
@@ -167,6 +198,10 @@ class SnapshotterRegistry:
                 "temporal_window_count": int(value.temporal_window_count),
                 "scene_count": int(value.scene_count),
                 "legacy_proxy_dropped_count": int(value.legacy_proxy_dropped_count),
+                "reserved_proposal_capacity": int(
+                    value.reserved_proposal_capacity
+                ),
+                "proposal_decisions": _jsonish(value.proposal_decisions),
             }
         if isinstance(value, SamplingOutput):
             return self.snapshot(stage, value.samples)

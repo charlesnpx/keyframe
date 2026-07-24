@@ -220,6 +220,7 @@ def _stage_summaries(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]
                 "rescue_shortlist_count",
                 "rescue_budget",
                 "rescue_ocr_cap",
+                "reserved_proposal_capacity",
                 "temporal_window_count",
                 "legacy_proxy_dropped_count",
             )

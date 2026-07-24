@@ -74,6 +74,18 @@ def test_outputs_include_additive_attribution_fields(tmp_path):
         "retention_rejected_reason": None,
         "rescue_origin": "additive_rescue",
         "proxy_content_score": 0.72,
+        "proposal_lane": "transition",
+        "transition_side": "post",
+        "transition_boundary_sample_idx": 4,
+        "transition_boundary_timestamp": 1.0,
+        "transition_boundary_content_delta": 12.0,
+        "transition_boundary_text_band_delta": 0.5,
+        "transition_boundary_dhash_distance": 16,
+        "transition_boundary_predicates": ["settled_transition"],
+        "structured_delta_categories": ["same_label_value"],
+        "structured_comparator_sample_idx": 3,
+        "structured_comparator_timestamp": 0.75,
+        "structured_changed_signature_count": 2,
         "rescue_priority": 1,
         "lineage_roles": ["primary", "alt"],
         "ocr_text": "Page 1 Approved",
@@ -105,6 +117,7 @@ def test_outputs_include_additive_attribution_fields(tmp_path):
         assert payload["retention_rejected_reason"] is None
         assert payload["rescue_origin"] == "additive_rescue"
         assert payload["proxy_content_score"] == 0.72
+        assert payload["proposal_lane"] == "transition"
         assert payload["rescue_priority"] == 1
         assert payload["lineage_roles"] == ["primary", "alt"]
         assert payload["raw_token_count"] == 3
@@ -113,4 +126,16 @@ def test_outputs_include_additive_attribution_fields(tmp_path):
         assert payload["low_information_filter_reason"] == "protected_retained_evidence"
         assert payload["dedupe_stage"] == "union_find_merge"
         assert payload["merge_reason"] == "component"
+    manifest_row = manifest["frames"][0]
+    assert manifest_row["transition_side"] == "post"
+    assert manifest_row["transition_boundary_sample_idx"] == 4
+    assert manifest_row["transition_boundary_dhash_distance"] == 16
+    assert manifest_row["transition_boundary_predicates"] == [
+        "settled_transition"
+    ]
+    assert manifest_row["structured_delta_categories"] == [
+        "same_label_value"
+    ]
+    assert manifest_row["structured_comparator_sample_idx"] == 3
+    assert manifest_row["structured_changed_signature_count"] == 2
     assert manifest["metadata"]["scene_coalescence"]["original_scene_count"] == 2

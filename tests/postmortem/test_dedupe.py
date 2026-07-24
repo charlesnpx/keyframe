@@ -16,7 +16,12 @@ from keyframe.dedupe import (
     near_time_dedupe as _near_time_dedupe,
     retain_cluster_alternates as _retain_cluster_alternates,
 )
-from keyframe.evidence import field_section_signatures, normalized_ocr_line_signatures
+from keyframe.evidence import (
+    field_section_signatures,
+    normalized_ocr_line_signatures,
+    structured_delta_categories,
+    structured_signature_change_count,
+)
 from keyframe.pipeline.contracts import as_candidate_record
 from keyframe.visual import build_frame_metric_table
 
@@ -574,6 +579,104 @@ def test_ocr_signatures_capture_generic_label_value_pair_changes():
     assert left_values != right_values
 
 
+def test_structured_delta_classifier_covers_supported_material_categories():
+    cases = [
+        ("Status: Draft", "Status: Approved", {"status", "same_label_value"}),
+        ("Review Date:", "Review Date: 24APR2026", {"blank_populated", "date"}),
+        ("Page 1", "Page 2", {"page"}),
+        ("Section 1", "Section 2", {"section"}),
+        ("Control ID: 12345", "Control ID: 67890", {"same_label_value"}),
+        ("Field:", "Field: populated", {"blank_populated"}),
+        ("Field: populated", "Field:", {"blank_populated"}),
+    ]
+
+    for left_text, right_text, expected in cases:
+        left = field_section_signatures(left_text)
+        right = field_section_signatures(right_text)
+        assert set(structured_delta_categories(left, right)) == expected
+        assert structured_signature_change_count(left, right) > 0
+
+
+def test_page_and_section_categories_require_values_on_both_sides():
+    no_marker = field_section_signatures("Document body")
+    page = field_section_signatures("Page 1")
+    section = field_section_signatures("Section 2")
+
+    assert structured_delta_categories(no_marker, page) == ()
+    assert structured_delta_categories(no_marker, section) == ()
+    assert structured_signature_change_count(no_marker, page) == 0
+    assert structured_signature_change_count(no_marker, section) == 0
+
+
+def test_explicit_label_followed_by_value_line_records_populated_state():
+    blank = field_section_signatures("Control ID:\n")
+    populated = field_section_signatures("Control ID:\n12345")
+
+    assert structured_delta_categories(blank, populated) == (
+        "blank_populated",
+    )
+    assert any(
+        signature.startswith("label-value:")
+        for signature in populated
+    )
+
+
+def test_structured_signatures_reject_long_labels_headings_and_character_noise():
+    long_label = field_section_signatures(
+        "one two three four five six seven eight nine: populated"
+    )
+    heading = field_section_signatures("Release Checklist")
+    blank = field_section_signatures("Code:")
+    one_character = field_section_signatures("Code: X")
+
+    assert long_label == ()
+    assert heading == ()
+    assert structured_delta_categories(blank, one_character) == ()
+    assert not any(
+        signature.startswith("label-value:")
+        for signature in one_character
+    )
+
+
+def test_structured_signatures_reject_prose_clock_path_and_browser_chrome_labels():
+    noisy = (
+        "GIVEN: a user\n"
+        "WHEN: the user saves\n"
+        "THEN: the record appears\n"
+        "Note: continue scrolling\n"
+        "4/30/2026 12:00 AM\n"
+        "< > C File C:/Users/example/document.pdf\n"
+        "Ca NPX Favourites :8 Benefits C ECHO\n"
+        "© AMOT-0561-CoverPage: x"
+    )
+
+    assert field_section_signatures(noisy) == ()
+
+
+def test_structured_signatures_ignore_one_character_value_ocr_edits():
+    left = field_section_signatures("Facility: Bruce Al")
+    right = field_section_signatures("Facility: Bruce A")
+
+    assert structured_delta_categories(left, right) == ()
+    assert structured_signature_change_count(left, right) == 0
+
+
+def test_structured_signatures_require_context_for_status_date_page_and_section():
+    fields = field_section_signatures(
+        "Power Pages\n"
+        "Updated sections: 4, 5, 8\n"
+        "The task is complete\n"
+        "2026-04-29"
+    )
+
+    assert not any(
+        signature.startswith(
+            ("status:", "date:", "page:", "section:")
+        )
+        for signature in fields
+    )
+
+
 def test_ocr_signatures_capture_heading_and_line_novelty_without_domain_terms():
     left_text = "Release Checklist"
     right_text = "Deployment Checklist"
@@ -584,15 +687,14 @@ def test_ocr_signatures_capture_heading_and_line_novelty_without_domain_terms():
 
     assert left_lines == ("release checklist",)
     assert right_lines == ("deployment checklist",)
-    assert any(sig.startswith("heading:") for sig in left_fields)
-    assert any(sig.startswith("heading:") for sig in right_fields)
-    assert left_fields != right_fields
+    assert left_fields == ()
+    assert right_fields == ()
 
 
 def test_ocr_signatures_capture_generic_reference_artifact_words():
     fields = field_section_signatures("Source design reference")
 
-    assert {"reference:source", "reference:design", "reference:reference"} <= set(fields)
+    assert fields == ()
 
 
 def test_ocr_field_signatures_do_not_emit_fixture_domain_concepts():
@@ -603,6 +705,82 @@ def test_ocr_field_signatures_do_not_emit_fixture_domain_concepts():
     joined = "\n".join(fields).casefold()
     for banned in ("amot", "priority", "risk", "override", "signed", "behalf"):
         assert banned not in joined
+
+
+def test_structured_candidate_survives_alternate_and_visual_dedupe_stages():
+    ordinary = {
+        "sample_idx": 0,
+        "frame_idx": 0,
+        "timestamp": 0.0,
+        "clip_cluster": 1,
+        "cluster_role": "primary",
+        "scene_id": 0,
+        "dwell_id": 0,
+        "ocr_tokens": ["same", "screen", "text"],
+        "candidate_score": 10.0,
+    }
+    structured = {
+        "sample_idx": 1,
+        "frame_idx": 1,
+        "timestamp": 1.0,
+        "clip_cluster": 1,
+        "cluster_role": "alt",
+        "scene_id": 0,
+        "dwell_id": 0,
+        "ocr_tokens": ["same", "screen", "text"],
+        "candidate_score": 1.0,
+        "structured_delta_categories": ["same_label_value"],
+        "structured_changed_signature_count": 2,
+    }
+
+    retained = retain_cluster_alternates([ordinary, structured])
+    assert {row["sample_idx"] for row in retained} == {0, 1}
+
+    near = near_time_dedupe(
+        [ordinary, structured],
+        [{"same", "screen", "text"}] * 2,
+        [0, 0],
+    )
+    assert {row["sample_idx"] for row in near} == {0, 1}
+
+    global_rows = global_candidate_dedupe(
+        [ordinary, structured],
+        [{"same", "screen", "text"}] * 2,
+        [0, 0],
+    )
+    assert {row["sample_idx"] for row in global_rows} == {0, 1}
+
+    adjacent = adjacent_same_screen_dedupe([ordinary, structured])
+    assert {row["sample_idx"] for row in adjacent} == {0, 1}
+
+    image = Image.new("RGB", (40, 40), "white")
+    post_veto, dropped = content_area_duplicate_veto(
+        [ordinary, structured],
+        [image, image.copy()],
+    )
+    assert {row["sample_idx"] for row in post_veto} == {0, 1}
+    assert dropped == []
+
+
+def test_structured_candidate_survives_low_information_filter():
+    structured = {
+        "sample_idx": 0,
+        "frame_idx": 0,
+        "timestamp": 0.0,
+        "ocr_tokens": [],
+        "structured_delta_categories": ["blank_populated"],
+    }
+
+    survivors = filter_low_information_candidates(
+        [structured],
+        [Image.new("RGB", (40, 40), "black")],
+    )
+
+    assert [row["sample_idx"] for row in survivors] == [0]
+    assert (
+        survivors[0]["low_information_filter_reason"]
+        == "protected_structured_delta"
+    )
 
 
 def test_production_code_does_not_contain_fixture_domain_terms():
