@@ -581,6 +581,44 @@ def test_candidate_cache_rejects_boundary_crossing_and_nonmonotonic_replay(
         run_cache()
 
 
+def test_candidate_cache_rejects_target_reassigned_to_a_non_candidate_frame(
+    tmp_path,
+    monkeypatch,
+):
+    _streamed, _cache, run_cache = _cache_streamed(
+        tmp_path,
+        monkeypatch,
+        first_timestamps=[0.0, 100.0, 200.0, 700.0, 1200.0],
+        second_timestamps=[0.0, 100.0, 550.0, 700.0, 1200.0],
+    )
+
+    with pytest.raises(FrameCacheError, match="changed the sampling target assignment"):
+        run_cache()
+
+
+def test_candidate_cache_defers_assignment_checks_for_all_zero_replay_timing(
+    tmp_path,
+    monkeypatch,
+):
+    _streamed, cache, run_cache = _cache_streamed(
+        tmp_path,
+        monkeypatch,
+        first_timestamps=[0.0, 100.0, 200.0, 700.0, 1200.0],
+        second_timestamps=[0.0, 0.0, 0.0, 0.0, 0.0],
+    )
+
+    result = run_cache()
+    try:
+        assert "all-zero" in result.timing_metadata["decoder_error"]
+        assert result.timing_metadata["assignment_schedule_verified"] is None
+        assert all(
+            not row["comparison_enforced"]
+            for row in result.timing_metadata["candidate_comparisons"]
+        )
+    finally:
+        cache.cleanup()
+
+
 def test_candidate_cache_rejects_a_missing_recorded_source_index(
     tmp_path,
     monkeypatch,
@@ -741,6 +779,39 @@ def _raw_decoder_timestamps(path: Path):
     finally:
         capture.release()
     return rows
+
+
+def test_vfr_scene_boundaries_map_source_indices_not_nominal_timecodes(
+    tmp_path,
+):
+    from keyframe.frames import detect_scenes
+
+    fixture = tmp_path / "vfr-scene-cut.mp4"
+    writer = cv2.VideoWriter(
+        str(fixture),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        10.0,
+        (64, 48),
+    )
+    assert writer.isOpened()
+    try:
+        for source_index in range(80):
+            value = 0 if source_index < 40 else 255
+            writer.write(np.full((48, 64, 3), value, dtype=np.uint8))
+    finally:
+        writer.release()
+
+    # These source-frame samples model VFR presentation times where the hard
+    # cut at source frame 40 is presented at 8 seconds, while SceneDetect's
+    # nominal 10-fps timecode reports 4 seconds.
+    frame_indices = list(range(0, 80, 10))
+    timestamps = [float(index) * 0.2 for index in frame_indices]
+
+    assert detect_scenes(
+        fixture,
+        timestamps,
+        frame_indices=frame_indices,
+    ) == [(0, 3), (4, 7)]
 
 
 def test_real_vfr_fixture_uses_production_opencv_timing_and_exact_replay(

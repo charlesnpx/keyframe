@@ -263,9 +263,14 @@ class TemporalStage:
         )
 
         timestamps = sampling.samples.timestamps
+        frame_indices = sampling.samples.frame_indices
         dhashes = features.dhashes
         n_clusters = min(ctx.config.pass1_clusters, len(timestamps) // 2)
-        scenes = detect_scenes(str(video_path), timestamps)
+        scenes = detect_scenes(
+            str(video_path),
+            timestamps,
+            frame_indices=frame_indices,
+        )
         scenes, scene_coalescence = coalesce_tiny_scenes(
             scenes, timestamps, dhashes, return_trace=True
         )

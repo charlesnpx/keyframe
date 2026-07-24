@@ -597,6 +597,8 @@ def cache_candidate_frames(
         "source": timing_source,
         "decoder_origin_seconds": None,
         "decoder_error": None,
+        "assignment_schedule_verified": None,
+        "replayed_sample_count": 0,
         "candidate_comparisons": [],
     }
     if not wanted:
@@ -607,16 +609,37 @@ def cache_candidate_frames(
     if min(wanted) < 0 or max(wanted) >= sample_count:
         raise FrameCacheError("candidate index is outside the first-pass sample table")
 
-    source_to_sample: dict[int, int] = {}
-    for sample_idx in wanted:
-        source_idx = int(frame_indices[sample_idx])
+    recorded_source_indices: list[int] = []
+    previous_source_idx: int | None = None
+    for source_value in frame_indices:
+        source_idx = int(source_value)
         if source_idx < 0:
             raise FrameCacheError("first-pass source frame index is negative")
-        if source_idx in source_to_sample:
+        if (
+            previous_source_idx is not None
+            and source_idx <= previous_source_idx
+        ):
             raise FrameCacheError(
-                "multiple first-pass samples refer to the same source frame index"
+                "first-pass source frame indices must be strictly increasing"
             )
+        recorded_source_indices.append(source_idx)
+        previous_source_idx = source_idx
+
+    source_to_sample: dict[int, int] = {}
+    for sample_idx in wanted:
+        source_idx = recorded_source_indices[sample_idx]
         source_to_sample[source_idx] = sample_idx
+
+    last_required_source_idx = max(source_to_sample)
+    expected_schedule = [
+        (
+            source_idx,
+            float(consumed_targets[sample_idx]),
+            float(next_targets[sample_idx]),
+        )
+        for sample_idx, source_idx in enumerate(recorded_source_indices)
+        if source_idx <= last_required_source_idx
+    ]
 
     sizes = {index: frame_sizes[index] for index in wanted}
     expected = {index: pixel_digests[index] for index in wanted}
@@ -633,6 +656,8 @@ def cache_candidate_frames(
         decoder_timing = DecoderTimestampNormalizer()
         decoder_disabled = False
         decoder_error: str | None = None
+        replay_sampler = TargetTimeSampler(interval_seconds)
+        replayed_schedule: list[tuple[int, float, float]] = []
         comparisons: list[dict[str, Any]] = []
         while remaining:
             ok, frame = cap.read()
@@ -652,6 +677,18 @@ def cache_candidate_frames(
                 except DecoderTimingUnavailable as exc:
                     decoder_disabled = True
                     decoder_error = str(exc)
+                if normalized_decoder_seconds is not None:
+                    replay_decision = replay_sampler.consider(
+                        normalized_decoder_seconds
+                    )
+                    if replay_decision is not None:
+                        replayed_schedule.append(
+                            (
+                                frame_idx,
+                                float(replay_decision.consumed_target),
+                                float(replay_decision.next_target),
+                            )
+                        )
 
             sample_idx = source_to_sample.get(frame_idx)
             if sample_idx is not None and sample_idx in remaining:
@@ -690,14 +727,6 @@ def cache_candidate_frames(
                         >= float(next_targets[sample_idx])
                     )
                 )
-                if (
-                    timing_source == "decoder_presentation_time"
-                    and assignment_changed
-                ):
-                    raise FrameCacheError(
-                        "second-pass decoder timestamp crossed a recorded "
-                        f"sampling boundary for sample {sample_idx}"
-                    )
                 comparisons.append(
                     {
                         "sample_idx": sample_idx,
@@ -715,9 +744,7 @@ def cache_candidate_frames(
                         ),
                         "next_target_seconds": float(next_targets[sample_idx]),
                         "assignment_changed": assignment_changed,
-                        "comparison_enforced": (
-                            timing_source == "decoder_presentation_time"
-                        ),
+                        "comparison_enforced": False,
                     }
                 )
                 remaining.remove(sample_idx)
@@ -734,11 +761,69 @@ def cache_candidate_frames(
                 "video ended before exact candidate source frames could be cached: "
                 f"{missing}"
             )
-        if not decoder_disabled:
+        decoder_usable = not decoder_disabled
+        if decoder_usable:
             try:
                 decoder_timing.finalize()
             except DecoderTimingUnavailable as exc:
                 decoder_error = str(exc)
+                decoder_usable = False
+
+        enforce_assignment_schedule = (
+            timing_source == "decoder_presentation_time"
+            and decoder_usable
+        )
+        for comparison in comparisons:
+            comparison["comparison_enforced"] = enforce_assignment_schedule
+
+        if enforce_assignment_schedule:
+            mismatch_position = None
+            for position in range(
+                max(len(expected_schedule), len(replayed_schedule))
+            ):
+                expected_row = (
+                    expected_schedule[position]
+                    if position < len(expected_schedule)
+                    else None
+                )
+                replayed_row = (
+                    replayed_schedule[position]
+                    if position < len(replayed_schedule)
+                    else None
+                )
+                if expected_row is None or replayed_row is None:
+                    mismatch_position = position
+                    break
+                source_matches = expected_row[0] == replayed_row[0]
+                consumed_matches = (
+                    abs(expected_row[1] - replayed_row[1])
+                    <= PRESENTATION_TIME_EPSILON_SECONDS
+                )
+                next_matches = (
+                    abs(expected_row[2] - replayed_row[2])
+                    <= PRESENTATION_TIME_EPSILON_SECONDS
+                )
+                if not (source_matches and consumed_matches and next_matches):
+                    mismatch_position = position
+                    break
+            if mismatch_position is not None:
+                expected_row = (
+                    expected_schedule[mismatch_position]
+                    if mismatch_position < len(expected_schedule)
+                    else None
+                )
+                replayed_row = (
+                    replayed_schedule[mismatch_position]
+                    if mismatch_position < len(replayed_schedule)
+                    else None
+                )
+                raise FrameCacheError(
+                    "second-pass decoder timing crossed a recorded sampling "
+                    "boundary and changed the sampling target assignment at "
+                    f"replay position {mismatch_position}: "
+                    f"expected {expected_row}, got {replayed_row}"
+                )
+
         comparisons.sort(key=lambda row: int(row["sample_idx"]))
         return CandidateCacheResult(
             provider=cache.provider(expected),
@@ -746,6 +831,12 @@ def cache_candidate_frames(
                 "source": timing_source,
                 "decoder_origin_seconds": decoder_timing.origin_seconds,
                 "decoder_error": decoder_error,
+                "assignment_schedule_verified": (
+                    True if enforce_assignment_schedule else None
+                ),
+                "replayed_sample_count": (
+                    len(replayed_schedule) if decoder_usable else 0
+                ),
                 "candidate_comparisons": comparisons,
             },
         )
