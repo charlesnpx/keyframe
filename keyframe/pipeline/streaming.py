@@ -354,16 +354,19 @@ def stream_video_features(
                 f"{classification} probe evidence does not permit nominal fallback: "
                 f"{exc}"
             ) from exc
-        print(
-            "  Decoder presentation timing unavailable; restarting confirmed "
-            f"CFR sampling at {confirmed_rate:.6f} fps"
-        )
-        return decode_once(
-            timing_source="nominal_source_index_cfr",
-            nominal_rate=confirmed_rate,
-            fallback_reason=str(exc),
-            announce=False,
-        )
+        fallback_rate = confirmed_rate
+        fallback_reason = str(exc)
+
+    print(
+        "  Decoder presentation timing unavailable; restarting confirmed "
+        f"CFR sampling at {fallback_rate:.6f} fps"
+    )
+    return decode_once(
+        timing_source="nominal_source_index_cfr",
+        nominal_rate=fallback_rate,
+        fallback_reason=fallback_reason,
+        announce=False,
+    )
 
 
 def _ppm_header(width: int, height: int) -> bytes:
@@ -717,13 +720,21 @@ def cache_candidate_frames(
                     if normalized_decoder_seconds is None
                     else normalized_decoder_seconds - first_timestamp
                 )
-                assignment_changed = (
+                assignment_timestamp = (
                     None
                     if normalized_decoder_seconds is None
                     else (
                         normalized_decoder_seconds
+                        + PRESENTATION_TIME_EPSILON_SECONDS
+                    )
+                )
+                assignment_changed = (
+                    None
+                    if assignment_timestamp is None
+                    else (
+                        assignment_timestamp
                         < float(consumed_targets[sample_idx])
-                        or normalized_decoder_seconds
+                        or assignment_timestamp
                         >= float(next_targets[sample_idx])
                     )
                 )

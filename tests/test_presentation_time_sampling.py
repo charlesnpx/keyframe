@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import weakref
 from pathlib import Path
 
 import cv2
@@ -410,11 +411,20 @@ def test_confirmed_cfr_restarts_with_nominal_timing_and_discards_partial_results
         1,
     )
     embed_calls = 0
+    failed_pass_embeddings = []
 
     def distinguish_decode_passes(images):
         nonlocal embed_calls
         embed_calls += 1
-        return np.full((len(images), 2), embed_calls, dtype=np.float32)
+        assert all(reference() is None for reference in failed_pass_embeddings)
+        embeddings = np.full(
+            (len(images), 2),
+            embed_calls,
+            dtype=np.float32,
+        )
+        if embed_calls == 1:
+            failed_pass_embeddings.append(weakref.ref(embeddings))
+        return embeddings
 
     streamed = stream_video_features(
         "recording.mp4",
@@ -429,6 +439,30 @@ def test_confirmed_cfr_restarts_with_nominal_timing_and_discards_partial_results
     assert streamed.clip_embeddings[:, 0].tolist() == [2.0, 3.0, 4.0]
     assert streamed.sampling_timing["source"] == "nominal_source_index_cfr"
     assert "all-zero" in streamed.sampling_timing["fallback_reason"]
+
+
+def test_candidate_cache_uses_sampling_epsilon_for_assignment_diagnostics(
+    tmp_path,
+    monkeypatch,
+):
+    timestamps = [0.0, 499.9995, 1000.0]
+    streamed, cache, run_cache = _cache_streamed(
+        tmp_path,
+        monkeypatch,
+        first_timestamps=timestamps,
+        second_timestamps=timestamps,
+        candidate_indices=(1,),
+    )
+
+    result = run_cache()
+    try:
+        comparison = result.timing_metadata["candidate_comparisons"][0]
+        assert streamed.frame_indices == [0, 1, 2]
+        assert comparison["decoder_delta_seconds"] == pytest.approx(0.0)
+        assert result.timing_metadata["assignment_schedule_verified"] is True
+        assert comparison["assignment_changed"] is False
+    finally:
+        cache.cleanup()
 
 
 @pytest.mark.parametrize(
