@@ -1363,6 +1363,26 @@ def _represented_structured_diversity_buckets(
     }
 
 
+def _structured_label_ids(
+    candidate: CandidateRecord,
+) -> set[str]:
+    return {
+        signature
+        for signature in candidate.evidence.field_signature
+        if signature.startswith("label:")
+    }
+
+
+def _represented_structured_label_ids(
+    candidates: Sequence[CandidateRecord],
+) -> set[str]:
+    represented: set[str] = set()
+    for candidate in candidates:
+        if candidate.selection.rescue_reason == "structured_delta":
+            represented.update(_structured_label_ids(candidate))
+    return represented
+
+
 def _represented_ordinary_scenes(
     candidates: Sequence[CandidateRecord],
 ) -> set[int]:
@@ -1449,6 +1469,14 @@ def _additive_priority_components(
     represented_structured_buckets = (
         represented_structured_buckets or set()
     )
+    structured_labels = (
+        _structured_label_ids(rescue)
+        if structured_delta
+        else set()
+    )
+    represented_structured_labels = (
+        _represented_structured_label_ids(candidates)
+    )
     lane = _promotion_lane(reason)
     represented_ordinary_scenes = (
         represented_ordinary_scenes or set()
@@ -1493,6 +1521,15 @@ def _additive_priority_components(
         "structured_diversity_novel": bool(
             diversity_bucket is not None
             and diversity_bucket not in represented_structured_buckets
+        ),
+        # Independent form labels are separate material states; repeated OCR
+        # variants of an already represented field remain round-robin bounded.
+        "structured_independent_label_set": bool(
+            structured_labels
+            and represented_structured_labels
+            and structured_labels.isdisjoint(
+                represented_structured_labels
+            )
         ),
         "promotion_lane": lane,
         "promotion_lane_round": int(lane_counts.get(lane, 0)),
@@ -1549,6 +1586,7 @@ def _additive_priority_key(
         promotion_lane_counts,
     )
     return (
+        float(components["structured_independent_label_set"]),
         -float(components["promotion_lane_round"]),
         float(components["priority_tier"]),
         float(components["structured_diversity_novel"]),

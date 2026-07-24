@@ -1335,7 +1335,7 @@ def test_structured_promotion_distinguishes_windows_within_a_long_dwell():
     assert len(promoted_idxs & {1, 2}) == 1
 
 
-def test_promotion_round_robin_gives_each_lane_an_opportunity_before_repeat():
+def test_promotion_round_robin_resumes_for_repeated_structured_label():
     candidates = [
         {
             **_cand(0, 0.0, scene=0, window=0),
@@ -1397,6 +1397,59 @@ def test_promotion_round_robin_gives_each_lane_an_opportunity_before_repeat():
         (3, 20, "evidence_marker"),
         (4, 2, "structured_delta"),
     ]
+
+
+def test_structured_form_changes_across_scenes_exhaust_small_budget_first():
+    candidates = [
+        {
+            **_cand(0, 0.0, scene=0),
+            "dwell_id": 0,
+            "field_signature": field_section_signatures(
+                "Status: Draft"
+            ),
+        },
+        {
+            **_cand(10, 10.0, scene=1),
+            "dwell_id": 1,
+            "field_signature": field_section_signatures(
+                "Control ID: 12345"
+            ),
+        },
+    ]
+    shortlist = [
+        {
+            **_cand(1, 1.0, scene=0, cluster=2, proxy=0.9),
+            "dwell_id": 0,
+            "field_signature": field_section_signatures(
+                "Status: Approved"
+            ),
+        },
+        {
+            **_cand(11, 11.0, scene=1, cluster=3, proxy=0.8),
+            "dwell_id": 1,
+            "field_signature": field_section_signatures(
+                "Control ID: 67890"
+            ),
+        },
+        {
+            **_cand(20, 20.0, scene=2, cluster=4, proxy=0.01),
+            "dwell_id": 2,
+            "proposal_lane": "transition",
+        },
+    ]
+
+    promoted = promote_rescue_candidates(
+        candidates,
+        shortlist,
+        list(range(21)),
+        rescue_budget=2,
+    )
+
+    assert {
+        row["sample_idx"]
+        for row in promoted
+        if row.get("rescue_origin")
+    } == {1, 11}
 
 
 def test_structured_lane_wins_first_round_over_transition_and_ordinary():
