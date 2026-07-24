@@ -900,11 +900,6 @@ def build_rescue_shortlist(
         for key in window_keys
     }
 
-    scene_window_counts: dict[Any, int] = defaultdict(int)
-    for scene_id, _window_id in by_time_window:
-        if scene_id is not None:
-            scene_window_counts[scene_id] += 1
-
     ordered_scene_ids = sorted(
         by_scene,
         key=lambda scene_id: (
@@ -912,13 +907,64 @@ def build_rescue_shortlist(
             int(scene_id),
         ),
     )
+
+    def scene_transition_order(
+        scene_id: Any,
+    ) -> list[dict[str, Any]]:
+        by_boundary: dict[
+            tuple[int, float],
+            list[dict[str, Any]],
+        ] = defaultdict(list)
+        for key in window_keys:
+            if key[0] != scene_id:
+                continue
+            for row in transition_queues.get(key, ()):
+                boundary_key = (
+                    int(row["transition_boundary_sample_idx"]),
+                    float(row["transition_boundary_timestamp"]),
+                )
+                by_boundary[boundary_key].append(dict(row))
+
+        ordered_boundaries = sorted(
+            by_boundary,
+            key=lambda boundary: (
+                boundary[1],
+                boundary[0],
+            ),
+        )
+        for rows in by_boundary.values():
+            rows.sort(
+                key=lambda row: (
+                    0 if row["transition_side"] == "pre" else 1,
+                    float(row["timestamp"]),
+                    int(row["frame_idx"]),
+                    int(row["sample_idx"]),
+                )
+            )
+
+        ordered: list[dict[str, Any]] = []
+        side_round = 0
+        while any(
+            side_round < len(by_boundary[boundary])
+            for boundary in ordered_boundaries
+        ):
+            for boundary in ordered_boundaries:
+                rows = by_boundary[boundary]
+                if side_round < len(rows):
+                    ordered.append(rows[side_round])
+            side_round += 1
+        return ordered
+
+    scene_transition_queues = {
+        scene_id: scene_transition_order(scene_id)
+        for scene_id in ordered_scene_ids
+    }
     scene_queues: dict[Any, list[dict[str, Any]]] = {
         scene_id: [
             {**dict(row), "proposal_lane": "scene_coverage"}
             for row in by_scene[scene_id]
         ]
         for scene_id in ordered_scene_ids
-        if scene_window_counts.get(scene_id, 0) > 1
     }
 
     legacy_lane = build_legacy_proxy_lane()
@@ -1058,10 +1104,22 @@ def build_rescue_shortlist(
         )
 
     # The remaining reserved scene portion receives one deterministic
-    # opportunity per eligible multi-window scene.
-    for scene_id, queue in scene_queues.items():
+    # opportunity per eligible scene. Prefer an unallocated first side from
+    # each distinct transition boundary before second sides and generic
+    # farthest-point scene coverage.
+    for scene_id in ordered_scene_ids:
         if len(final_rows) >= reserved_proposal_capacity:
             break
+        scene_transition_queue = scene_transition_queues[scene_id]
+        if scene_transition_queue and take_from_queue(
+            "transition",
+            ("reserved_scene", scene_id),
+            scene_transition_queue,
+            allocation_phase="reserved_scene_coverage",
+        ):
+            continue
+
+        queue = scene_queues[scene_id]
         selected_scene_timestamps = [
             float(row["timestamp"])
             for row in final_rows
@@ -2024,6 +2082,159 @@ def _preflight_rejection_detail(
     }
 
 
+AdditivePromotionCandidate = tuple[
+    tuple[float, ...],
+    CandidateRecord,
+    CandidateRecord | None,
+    str,
+]
+
+
+def _additive_candidate_for_state(
+    rescue: CandidateRecord,
+    promoted: Sequence[CandidateRecord],
+    used_idxs: set[int],
+    dwell_ids: Sequence[int],
+    *,
+    clip_embeddings: Any | None,
+    represented_structured_buckets: set[
+        StructuredDiversityBucket
+    ],
+    represented_ordinary_scenes: set[int],
+    promotion_lane_counts: PromotionLaneCounts,
+) -> AdditivePromotionCandidate | None:
+    """Evaluate one additive candidate against the current mutable selection."""
+    rescue, structured_comparator = _with_structured_comparison(
+        rescue,
+        promoted,
+    )
+    rescue_idx = int(rescue.sample_idx)
+    if rescue_idx in used_idxs:
+        return None
+    structured_delta = bool(
+        rescue.selection.structured_delta_categories
+    )
+    transition_proposal = (
+        not structured_delta
+        and rescue.selection.proposal_lane == "transition"
+    )
+    rescue_tokens = _record_tokens(rescue, rescue=True)
+    if not structured_delta and not transition_proposal:
+        for candidate in promoted:
+            if not _temporally_local(rescue, candidate):
+                continue
+            candidate_tokens = _record_tokens(
+                candidate,
+                rescue=True,
+            )
+            if _marker_redundant(
+                rescue_tokens,
+                candidate_tokens,
+            ):
+                return None
+            if _clip_token_redundant(
+                rescue_tokens,
+                candidate_tokens,
+                clip_embeddings,
+                rescue_idx,
+                int(candidate.sample_idx),
+            ):
+                return None
+
+    primary = structured_comparator if structured_delta else None
+    if primary is None:
+        primary = _primary_for_rescue(
+            rescue,
+            promoted,
+            same_cluster=False,
+        ) or (promoted[0] if promoted else None)
+    if structured_delta:
+        reason = "structured_delta"
+    elif transition_proposal:
+        reason = "transition"
+    elif primary:
+        reason = _rescue_reason(
+            rescue,
+            primary,
+            dwell_ids,
+            promoted,
+        )
+        if reason is None:
+            return None
+        if (
+            reason == "evidence_marker"
+            and _has_marker_signature(rescue_tokens)
+            and has_local_equivalent_coverage(
+                rescue,
+                promoted,
+                dwell_ids,
+            )
+        ):
+            return None
+    else:
+        reason = (
+            "content_reference"
+            if _content_reference_tokens(rescue_tokens)
+            else "evidence_marker"
+        )
+    return (
+        _additive_priority_key(
+            rescue,
+            primary,
+            reason,
+            promoted,
+            represented_structured_buckets,
+            represented_ordinary_scenes,
+            promotion_lane_counts,
+        ),
+        rescue,
+        primary,
+        reason,
+    )
+
+
+def _next_additive_candidate(
+    promoted: Sequence[CandidateRecord],
+    rescue_shortlist: Sequence[CandidateRecord],
+    used_idxs: set[int],
+    dwell_ids: Sequence[int],
+    *,
+    clip_embeddings: Any | None,
+) -> AdditivePromotionCandidate | None:
+    """Return the exact next dynamic additive promotion, if one exists."""
+    represented_structured_buckets = (
+        _represented_structured_diversity_buckets(promoted)
+    )
+    represented_ordinary_scenes = _represented_ordinary_scenes(
+        promoted
+    )
+    promotion_lane_counts = _promotion_lane_counts(promoted)
+    additive_candidates = [
+        candidate
+        for rescue in rescue_shortlist
+        if (
+            candidate := _additive_candidate_for_state(
+                rescue,
+                promoted,
+                used_idxs,
+                dwell_ids,
+                clip_embeddings=clip_embeddings,
+                represented_structured_buckets=(
+                    represented_structured_buckets
+                ),
+                represented_ordinary_scenes=(
+                    represented_ordinary_scenes
+                ),
+                promotion_lane_counts=promotion_lane_counts,
+            )
+        )
+        is not None
+    ]
+    if not additive_candidates:
+        return None
+    return max(additive_candidates, key=lambda item: item[0])
+
+
 def rescue_promotion_preflight_report(
     base_candidates: tuple[CandidateRecord, ...],
     rescue_shortlist: tuple[CandidateRecord, ...],
@@ -2037,73 +2248,126 @@ def rescue_promotion_preflight_report(
     rescue_shortlist = _records(rescue_shortlist)
     current_promoted = _records(current_promoted)
     base_idxs = {int(candidate.sample_idx) for candidate in base_candidates}
-    current_by_idx = {int(candidate.sample_idx): candidate for candidate in current_promoted}
+    current_by_idx = {
+        int(candidate.sample_idx): candidate
+        for candidate in current_promoted
+    }
     base_candidate_count = len(base_candidates)
     current_post_rescue_count = len(current_promoted)
     max_post_rescue_count = base_candidate_count + int(rescue_budget)
-    additive_output_headroom = max(0, max_post_rescue_count - current_post_rescue_count)
-    current_rescue_count = sum(1 for candidate in current_promoted if candidate.selection.rescue_origin)
+    additive_output_headroom = max(
+        0,
+        max_post_rescue_count - current_post_rescue_count,
+    )
+    current_rescue_count = sum(
+        1
+        for candidate in current_promoted
+        if candidate.selection.rescue_origin
+    )
 
     rows: list[dict[str, Any]] = []
-    eligible_pending: list[
-        tuple[
-            CandidateRecord,
-            CandidateRecord | None,
-            str,
-            dict[str, Any],
-            dict[str, Any],
-        ]
-    ] = []
-    represented_structured_buckets = (
-        _represented_structured_diversity_buckets(current_promoted)
-    )
-    represented_ordinary_scenes = _represented_ordinary_scenes(
-        current_promoted
-    )
-    promotion_lane_counts = _promotion_lane_counts(current_promoted)
+    row_by_idx: dict[int, dict[str, Any]] = {}
+    pending_by_idx: dict[int, CandidateRecord] = {}
+
+    def update_comparison_fields(
+        row: dict[str, Any],
+        rescue: CandidateRecord,
+        detail: Mapping[str, Any],
+    ) -> None:
+        competing = detail.get("competing_candidate")
+        competing_tokens = (
+            _record_tokens(competing, rescue=True)
+            if competing is not None
+            else set()
+        )
+        rescue_tokens = _record_tokens(rescue, rescue=True)
+        row.update({
+            "rejection_branch": detail.get("rejection_branch"),
+            "rejection_reason": detail.get("rejection_reason"),
+            "nearest_competing_candidate_sample_idx": (
+                int(competing.sample_idx)
+                if competing is not None
+                else None
+            ),
+            "nearest_competing_candidate_timestamp": (
+                float(competing.timestamp)
+                if competing is not None
+                else None
+            ),
+            "token_jaccard": (
+                float(_jaccard(rescue_tokens, competing_tokens))
+                if competing is not None
+                else None
+            ),
+            "marker_equivalent": (
+                bool(
+                    _marker_equivalent(
+                        rescue_tokens,
+                        competing_tokens,
+                    )
+                )
+                if competing is not None
+                else False
+            ),
+            "local_equivalent_coverage": bool(
+                detail.get("local_equivalent_coverage", False)
+            ),
+            "structured_delta_categories": list(
+                rescue.selection.structured_delta_categories
+            ),
+            "structured_comparator_sample_idx": (
+                rescue.selection.structured_comparator_sample_idx
+            ),
+            "structured_comparator_timestamp": (
+                rescue.selection.structured_comparator_timestamp
+            ),
+            "structured_changed_signature_count": (
+                rescue.selection.structured_changed_signature_count
+            ),
+        })
 
     for rescue in rescue_shortlist:
-        rescue, _structured_comparator = _with_structured_comparison(
-            rescue,
-            current_promoted,
-        )
         rescue_idx = int(rescue.sample_idx)
         current = current_by_idx.get(rescue_idx)
-        if rescue_idx in base_idxs or (current is not None and not current.selection.rescue_origin):
+        if rescue_idx in base_idxs or (
+            current is not None
+            and not current.selection.rescue_origin
+        ):
             status = "already_selected"
             outcome = "already_selected"
-        elif current is not None and current.selection.rescue_origin:
+        elif (
+            current is not None
+            and current.selection.rescue_origin
+        ):
             status = "already_promoted"
             outcome = "already_promoted"
         else:
             status = "unpromoted"
-            outcome = None
+            outcome = "eligible_pending"
+            pending_by_idx[rescue_idx] = rescue
 
-        competing = _nearest_competing_candidate(rescue, current_promoted)
-        local_equivalent_coverage = has_local_equivalent_coverage(rescue, current_promoted, dwell_ids)
+        compared_rescue, comparator = _with_structured_comparison(
+            rescue,
+            current_promoted,
+        )
+        competing = comparator or _nearest_competing_candidate(
+            compared_rescue,
+            current_promoted,
+        )
         detail: dict[str, Any] = {
             "eligible": False,
             "reason": None,
             "rejection_branch": None,
             "rejection_reason": None,
             "competing_candidate": competing,
-            "local_equivalent_coverage": local_equivalent_coverage,
+            "local_equivalent_coverage": (
+                has_local_equivalent_coverage(
+                    compared_rescue,
+                    current_promoted,
+                    dwell_ids,
+                )
+            ),
         }
-        if status == "unpromoted":
-            detail = _preflight_rejection_detail(
-                rescue,
-                current_promoted,
-                dwell_ids,
-                clip_embeddings=clip_embeddings,
-            )
-            if detail["eligible"]:
-                outcome = "eligible_pending"
-            else:
-                outcome = "predicate_rejected"
-
-        competing = detail.get("competing_candidate") or competing
-        competing_tokens = _record_tokens(competing, rescue=True) if competing is not None else set()
-        rescue_tokens = _record_tokens(rescue, rescue=True)
         row = {
             "sample_idx": rescue_idx,
             "timestamp": float(rescue.timestamp),
@@ -2121,78 +2385,68 @@ def rescue_promotion_preflight_report(
             "above_additive_headroom_cut": None,
             "outcome": outcome,
             "binding_budget": "none",
-            "rejection_branch": detail.get("rejection_branch"),
-            "rejection_reason": detail.get("rejection_reason"),
-            "nearest_competing_candidate_sample_idx": (
-                int(competing.sample_idx) if competing is not None else None
-            ),
-            "nearest_competing_candidate_timestamp": (
-                float(competing.timestamp) if competing is not None else None
-            ),
-            "token_jaccard": float(_jaccard(rescue_tokens, competing_tokens)) if competing is not None else None,
-            "marker_equivalent": (
-                bool(_marker_equivalent(rescue_tokens, competing_tokens)) if competing is not None else False
-            ),
-            "local_equivalent_coverage": bool(detail.get("local_equivalent_coverage", False)),
-            "structured_delta_categories": list(
-                rescue.selection.structured_delta_categories
-            ),
-            "structured_comparator_sample_idx": (
-                rescue.selection.structured_comparator_sample_idx
-            ),
-            "structured_comparator_timestamp": (
-                rescue.selection.structured_comparator_timestamp
-            ),
-            "structured_changed_signature_count": (
-                rescue.selection.structured_changed_signature_count
-            ),
         }
-        if row["phase_a_eligible"]:
-            reason = str(detail.get("reason") or "")
-            primary = detail.get("competing_candidate")
-            priority_components = _additive_priority_components(
-                rescue,
-                primary,
-                reason,
-                current_promoted,
-                represented_structured_buckets,
-                represented_ordinary_scenes,
-                promotion_lane_counts,
-            )
-            row.update(priority_components)
-            eligible_pending.append((
-                rescue,
-                primary,
-                reason,
-                row,
-                detail,
-            ))
+        update_comparison_fields(
+            row,
+            compared_rescue,
+            detail,
+        )
         rows.append(row)
+        row_by_idx[rescue_idx] = row
 
     predicted_ordered_eligible: list[dict[str, Any]] = []
-    rank = 0
-    while eligible_pending:
-        best_index = max(
-            range(len(eligible_pending)),
-            key=lambda index: _additive_priority_key(
-                eligible_pending[index][0],
-                eligible_pending[index][1],
-                eligible_pending[index][2],
-                current_promoted,
-                represented_structured_buckets,
-                represented_ordinary_scenes,
-                promotion_lane_counts,
+    simulated_promoted = list(current_promoted)
+    simulated_used_idxs = {
+        int(candidate.sample_idx)
+        for candidate in simulated_promoted
+    }
+    next_cluster = (
+        max(
+            (
+                int(candidate.visual.clip_cluster)
+                for candidate in simulated_promoted
+                if candidate.visual.clip_cluster is not None
             ),
+            default=-1,
         )
-        rescue, primary, reason, row, detail = eligible_pending.pop(
-            best_index
+        + 1
+    )
+    rank = 0
+    while True:
+        next_candidate = _next_additive_candidate(
+            simulated_promoted,
+            rescue_shortlist,
+            simulated_used_idxs,
+            dwell_ids,
+            clip_embeddings=clip_embeddings,
+        )
+        if next_candidate is None:
+            break
+        (
+            _priority_key,
+            rescue,
+            primary,
+            reason,
+        ) = next_candidate
+        rescue_idx = int(rescue.sample_idx)
+        row = row_by_idx[rescue_idx]
+        represented_structured_buckets = (
+            _represented_structured_diversity_buckets(
+                simulated_promoted
+            )
+        )
+        represented_ordinary_scenes = (
+            _represented_ordinary_scenes(simulated_promoted)
+        )
+        promotion_lane_counts = _promotion_lane_counts(
+            simulated_promoted
         )
         row.update(
             _additive_priority_components(
                 rescue,
                 primary,
                 reason,
-                current_promoted,
+                simulated_promoted,
                 represented_structured_buckets,
                 represented_ordinary_scenes,
                 promotion_lane_counts,
@@ -2200,26 +2454,65 @@ def rescue_promotion_preflight_report(
         )
         rank += 1
         above_headroom = rank <= additive_output_headroom
+        row["phase_a_eligible"] = True
         row["phase_a_rank"] = rank
         row["above_additive_headroom_cut"] = above_headroom
         row["outcome"] = "eligible_above_headroom" if above_headroom else "eligible_below_headroom"
         row["binding_budget"] = "additive_output_headroom"
+        detail = {
+            "eligible": True,
+            "reason": reason,
+            "rejection_branch": None,
+            "rejection_reason": None,
+            "competing_candidate": primary,
+            "local_equivalent_coverage": (
+                has_local_equivalent_coverage(
+                    rescue,
+                    simulated_promoted,
+                    dwell_ids,
+                )
+            ),
+        }
+        update_comparison_fields(row, rescue, detail)
         predicted_ordered_eligible.append({
             "sample_idx": int(row["sample_idx"]),
             "timestamp": float(row["timestamp"]),
             "phase_a_rank": rank,
             "above_additive_headroom_cut": above_headroom,
-            "reason": detail.get("reason"),
+            "reason": reason,
         })
-        if reason == "structured_delta":
-            diversity_bucket = _structured_diversity_bucket(rescue)
-            if diversity_bucket is not None:
-                represented_structured_buckets.add(diversity_bucket)
-        if _promotion_lane(reason) == "ordinary":
-            scene_id = rescue.temporal.scene_id
-            if scene_id is not None:
-                represented_ordinary_scenes.add(int(scene_id))
-        promotion_lane_counts[_promotion_lane(reason)] += 1
+        promoted_row = _as_promoted_rescue(
+            rescue,
+            primary,
+            origin="additive_rescue",
+            reason=reason,
+            priority=rank,
+            next_cluster=next_cluster,
+        )
+        if primary is None:
+            next_cluster += 1
+        simulated_promoted.append(promoted_row)
+        simulated_used_idxs.add(rescue_idx)
+        pending_by_idx.pop(rescue_idx, None)
+
+    for rescue_idx, original_rescue in pending_by_idx.items():
+        rescue, _comparator = _with_structured_comparison(
+            original_rescue,
+            simulated_promoted,
+        )
+        detail = _preflight_rejection_detail(
+            rescue,
+            simulated_promoted,
+            dwell_ids,
+            clip_embeddings=clip_embeddings,
+        )
+        row = row_by_idx[rescue_idx]
+        row["phase_a_eligible"] = False
+        row["phase_a_rank"] = None
+        row["above_additive_headroom_cut"] = None
+        row["outcome"] = "predicate_rejected"
+        row["binding_budget"] = "none"
+        update_comparison_fields(row, rescue, detail)
 
     return {
         "rescue_budget": int(rescue_budget),
@@ -2301,126 +2594,17 @@ def promote_rescue_candidates(
                 return True
         return False
 
-    def additive_candidate(
-        rescue: CandidateRecord,
-        represented_structured_buckets: set[
-            StructuredDiversityBucket
-        ],
-        represented_ordinary_scenes: set[int],
-        promotion_lane_counts: PromotionLaneCounts,
-    ) -> tuple[
-        tuple[float, ...],
-        CandidateRecord,
-        CandidateRecord | None,
-        str,
-    ] | None:
-        rescue, structured_comparator = _with_structured_comparison(
-            rescue,
-            promoted,
-        )
-        rescue_idx = int(rescue.sample_idx)
-        if rescue_idx in used_idxs:
-            return None
-        structured_delta = bool(
-            rescue.selection.structured_delta_categories
-        )
-        transition_proposal = (
-            not structured_delta
-            and rescue.selection.proposal_lane == "transition"
-        )
-        rescue_tokens = _record_tokens(rescue, rescue=True)
-        redundant = False
-        if not structured_delta and not transition_proposal:
-            for candidate in promoted:
-                temporally_local = _temporally_local(rescue, candidate)
-                candidate_tokens = _record_tokens(candidate, rescue=True)
-                if temporally_local and _marker_redundant(
-                    rescue_tokens,
-                    candidate_tokens,
-                ):
-                    redundant = True
-                    break
-                if temporally_local and _clip_token_redundant(
-                    rescue_tokens,
-                    candidate_tokens,
-                    clip_embeddings,
-                    rescue_idx,
-                    int(candidate.sample_idx),
-                ):
-                    redundant = True
-                    break
-        if redundant:
-            return None
-
-        primary = (
-            structured_comparator
-            if structured_delta
-            else None
-        )
-        if primary is None:
-            primary = _primary_for_rescue(
-                rescue,
-                promoted,
-                same_cluster=False,
-            ) or (promoted[0] if promoted else None)
-        if structured_delta:
-            reason = "structured_delta"
-        elif transition_proposal:
-            reason = "transition"
-        elif primary:
-            reason = _rescue_reason(rescue, primary, dwell_ids, promoted)
-            if reason is None:
-                return None
-            if (
-                reason == "evidence_marker"
-                and _has_marker_signature(rescue_tokens)
-                and has_local_equivalent_coverage(rescue, promoted, dwell_ids)
-            ):
-                return None
-        else:
-            reason = "content_reference" if _content_reference_tokens(rescue_tokens) else "evidence_marker"
-        return (
-            _additive_priority_key(
-                rescue,
-                primary if primary else None,
-                reason,
-                promoted,
-                represented_structured_buckets,
-                represented_ordinary_scenes,
-                promotion_lane_counts,
-            ),
-            rescue,
-            primary if primary else None,
-            reason,
-        )
-
     while consumed < rescue_budget:
-        represented_structured_buckets = (
-            _represented_structured_diversity_buckets(promoted)
+        next_candidate = _next_additive_candidate(
+            promoted,
+            rescue_shortlist,
+            used_idxs,
+            dwell_ids,
+            clip_embeddings=clip_embeddings,
         )
-        represented_ordinary_scenes = _represented_ordinary_scenes(
-            promoted
-        )
-        promotion_lane_counts = _promotion_lane_counts(promoted)
-        additive_candidates = [
-            candidate
-            for rescue in rescue_shortlist
-            if (
-                candidate := additive_candidate(
-                    rescue,
-                    represented_structured_buckets,
-                    represented_ordinary_scenes,
-                    promotion_lane_counts,
-                )
-            )
-            is not None
-        ]
-        if not additive_candidates:
+        if next_candidate is None:
             break
-        _priority_key, rescue, primary, reason = max(
-            additive_candidates,
-            key=lambda item: item[0],
-        )
+        _priority_key, rescue, primary, reason = next_candidate
         rescue_idx = int(rescue.sample_idx)
         priority += 1
         row = _as_promoted_rescue(

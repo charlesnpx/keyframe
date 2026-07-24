@@ -39,6 +39,7 @@ from keyframe.visual import (
     build_compact_frame_metric_table,
     build_frame_metric_table,
     content_crop,
+    content_endpoint_descriptor,
     laplacian_sharpness,
 )
 
@@ -174,6 +175,7 @@ def stream_video_features(
         source_sharpness: list[float] = []
         metric_rows: list[dict[str, float]] = []
         content_prev_delta: list[float] = []
+        content_endpoint_descriptors: list[np.ndarray] = []
         embeddings: list[np.ndarray] = []
         batch: list[Image.Image] = []
         batch_bytes = 0
@@ -257,6 +259,9 @@ def stream_video_features(
                     if previous_content is not None
                     else 0.0
                 )
+                content_endpoint_descriptors.append(
+                    content_endpoint_descriptor(image)
+                )
                 previous_content = content
                 batch.append(image)
                 batch_bytes += current_bytes
@@ -278,12 +283,18 @@ def stream_video_features(
         content_next_delta = [0.0] * len(content_prev_delta)
         if len(content_prev_delta) > 1:
             content_next_delta[:-1] = content_prev_delta[1:]
+        endpoint_descriptor_stack = (
+            np.stack(content_endpoint_descriptors, axis=0)
+            if content_endpoint_descriptors
+            else np.empty((0, 18, 32), dtype=np.float32)
+        )
         metrics = build_compact_frame_metric_table(
             metric_rows,
             timestamps=timestamps,
             frame_indices=frame_indices,
             content_prev_delta=content_prev_delta,
             content_next_delta=content_next_delta,
+            content_endpoint_descriptors=endpoint_descriptor_stack,
         )
         print(f"  Sampled {len(timestamps)} frames at {interval_seconds}s intervals")
         probe_metadata = (

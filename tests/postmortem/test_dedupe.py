@@ -653,6 +653,31 @@ def test_structured_signatures_reject_prose_clock_path_and_browser_chrome_labels
     assert field_section_signatures(noisy) == ()
 
 
+def test_structured_signatures_reject_uri_and_bare_clock_labels():
+    noisy = (
+        "https://example.com/forms/123\n"
+        "12:00\n"
+        "12:00 PM"
+    )
+
+    assert field_section_signatures(noisy) == ()
+
+
+def test_equivalent_status_spellings_share_canonical_signatures():
+    pairs = [
+        ("Status: Approve", "Status: Approved"),
+        ("Status: Complete", "Status: Completed"),
+        ("Status Approve", "Status Approved"),
+        ("Status Complete", "Status Completed"),
+    ]
+
+    for left_text, right_text in pairs:
+        left = field_section_signatures(left_text)
+        right = field_section_signatures(right_text)
+        assert left == right
+        assert structured_delta_categories(left, right) == ()
+
+
 def test_structured_signatures_ignore_one_character_value_ocr_edits():
     left = field_section_signatures("Facility: Bruce Al")
     right = field_section_signatures("Facility: Bruce A")

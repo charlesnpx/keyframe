@@ -30,8 +30,21 @@ SECTION_LINE_RE = re.compile(
 EXPLICIT_LABEL_RE = re.compile(
     r"^\s*(?P<label>[^:=]{1,120}?)\s*(?P<delimiter>[:=])\s*(?P<value>.*?)\s*$"
 )
+URI_SCHEME_RE = re.compile(
+    r"^\s*[a-z][a-z0-9+.-]*://",
+    re.IGNORECASE,
+)
+CLOCK_LINE_RE = re.compile(
+    r"^\s*(?:[01]?\d|2[0-3]):[0-5]\d"
+    r"(?:\s*[ap]\.?m\.?)?\s*$",
+    re.IGNORECASE,
+)
 
 STATUS_WORDS = {"approved", "approve", "complete", "completed", "draft", "pending", "rejected", "submitted"}
+CANONICAL_STATUS_WORDS = {
+    "approve": "approved",
+    "complete": "completed",
+}
 VALUE_WORDS = {"false", "na", "n/a", "no", "none", "true", "yes"} | STATUS_WORDS
 PROSE_LABEL_HEADS = {"given", "note", "then", "when"}
 BROWSER_CHROME_LABEL_TOKENS = {"bookmarks", "favourites", "favorites"}
@@ -74,6 +87,8 @@ def _looks_like_value_token(token: str) -> bool:
 
 def _explicit_label(raw_line: str) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
     rendered = str(raw_line or "")
+    if URI_SCHEME_RE.match(rendered) or CLOCK_LINE_RE.fullmatch(rendered):
+        return None
     match = EXPLICIT_LABEL_RE.fullmatch(rendered)
     if match is None:
         return None
@@ -97,6 +112,18 @@ def _explicit_label(raw_line: str) -> tuple[tuple[str, ...], tuple[str, ...]] | 
         return None
     value_tokens = normalize_ocr_tokens(match.group("value"))
     return label_tokens, value_tokens
+
+
+def _canonicalize_status_values(
+    label_tokens: tuple[str, ...],
+    value_tokens: tuple[str, ...],
+) -> tuple[str, ...]:
+    if "status" not in set(label_tokens):
+        return value_tokens
+    return tuple(
+        CANONICAL_STATUS_WORDS.get(token, token)
+        for token in value_tokens
+    )
 
 
 def _value_only_line(raw_line: str) -> tuple[str, ...]:
@@ -158,7 +185,10 @@ def _add_contextual_line_categories(
     token_set = set(tokens)
     if "status" in token_set:
         for status in sorted(token_set & STATUS_WORDS):
-            signatures.add(f"status:{status}")
+            signatures.add(
+                "status:"
+                f"{CANONICAL_STATUS_WORDS.get(status, status)}"
+            )
     if "date" in token_set:
         for token in tokens:
             if DATE_VALUE_RE.fullmatch(token):
@@ -187,6 +217,10 @@ def field_section_signatures(text: str, tokens: Iterable[str] = ()) -> tuple[str
             and line_index + 1 < len(lines)
         ):
             value_tokens = _value_only_line(lines[line_index + 1])
+        value_tokens = _canonicalize_status_values(
+            label_tokens,
+            value_tokens,
+        )
 
         value_signature = _material_value_signature(value_tokens)
         state = "populated" if value_signature is not None else "blank"

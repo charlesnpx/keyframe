@@ -20,7 +20,11 @@ from keyframe.scoring import (
     proxy_content_scores,
     rescue_promotion_preflight_report,
 )
-from keyframe.visual import FrameMetricTable, build_frame_metric_table
+from keyframe.visual import (
+    FrameMetricTable,
+    build_compact_frame_metric_table,
+    build_frame_metric_table,
+)
 
 
 def _project(records):
@@ -792,6 +796,86 @@ def test_scene_coverage_maximizes_distance_from_reserved_window_coverage(
     assert scene_coverage["timestamp"] == 0.0
 
 
+def test_single_window_scene_receives_distinct_reserved_scene_coverage():
+    sample_count = 8
+    metrics = _metric_table([0.1] * sample_count)
+
+    _shortlist, *_rest, metadata = build_rescue_shortlist_with_metadata(
+        [Image.new("RGB", (8, 8), "white") for _ in range(sample_count)],
+        [float(i) for i in range(sample_count)],
+        list(range(sample_count)),
+        [_cand(7, 7.0)],
+        pass1_clusters=3,
+        sample_scenes={i: 0 for i in range(sample_count)},
+        frame_metrics=metrics,
+    )
+
+    temporal = next(
+        row
+        for row in metadata["proposal_decisions"]
+        if row["decision"] == "quota_allocated"
+        and row["allocation_phase"]
+        == "reserved_first_temporal_coverage"
+    )
+    scene = next(
+        row
+        for row in metadata["proposal_decisions"]
+        if row["decision"] == "quota_allocated"
+        and row["allocation_phase"] == "reserved_scene_coverage"
+    )
+    assert scene["sample_idx"] != temporal["sample_idx"]
+
+
+def test_scene_reservation_prefers_next_distinct_transition_boundary():
+    sample_count = 12
+    previous_deltas = [0.0] * sample_count
+    previous_deltas[3] = 20.0
+    previous_deltas[8] = 20.0
+    metrics = _metric_table(
+        [0.1] * sample_count,
+        prev_deltas=previous_deltas,
+        textline_scores=[0.0] * sample_count,
+    )
+    changed_hash = (1 << 16) - 1
+    dhashes = [
+        *([0] * 3),
+        *([changed_hash] * 5),
+        *([0] * 4),
+    ]
+
+    _shortlist, *_rest, metadata = build_rescue_shortlist_with_metadata(
+        [
+            Image.new("RGB", (8, 8), "white")
+            for _ in range(sample_count)
+        ],
+        [float(i) for i in range(sample_count)],
+        list(range(sample_count)),
+        [_cand(0, 0.0)],
+        pass1_clusters=3,
+        sample_scenes={i: 0 for i in range(sample_count)},
+        frame_metrics=metrics,
+        dhashes=dhashes,
+    )
+
+    temporal = next(
+        row
+        for row in metadata["proposal_decisions"]
+        if row["decision"] == "quota_allocated"
+        and row["allocation_phase"]
+        == "reserved_first_temporal_coverage"
+    )
+    scene = next(
+        row
+        for row in metadata["proposal_decisions"]
+        if row["decision"] == "quota_allocated"
+        and row["allocation_phase"] == "reserved_scene_coverage"
+    )
+
+    assert scene["sample_idx"] != temporal["sample_idx"]
+    assert scene["proposal_lane"] == "transition"
+    assert scene["sample_idx"] == 7
+
+
 def test_transition_side_rejects_exact_selected_local_coverage():
     frames = [Image.new("RGB", (8, 8), "white") for _ in range(7)]
     metrics = _metric_table(
@@ -894,6 +978,65 @@ def test_transition_side_unavailable_endpoint_delta_is_json_safe():
     assert rejection["coverage_reason"] == "local_selected_dhash"
     assert rejection["content_endpoint_delta"] is None
     json.dumps(metadata, allow_nan=False)
+
+
+def test_compact_metrics_preserve_endpoint_content_coverage():
+    sample_count = 6
+    descriptors = np.full(
+        (sample_count, 2, 2),
+        100.0,
+        dtype=np.float32,
+    )
+    descriptors[2] = 102.0
+    rows = [
+        {
+            "textline_score": 0.0,
+            "edge_score": 0.1,
+            "entropy": 0.1,
+            "dark_ratio": 0.0,
+            "bright_ratio": 0.0,
+        }
+        for _ in range(sample_count)
+    ]
+    metrics = build_compact_frame_metric_table(
+        rows,
+        timestamps=[float(i) for i in range(sample_count)],
+        frame_indices=list(range(sample_count)),
+        content_prev_delta=[0.0, 2.0, 2.0, 20.0, 0.0, 0.0],
+        content_next_delta=[2.0, 2.0, 20.0, 0.0, 0.0, 0.0],
+        content_endpoint_descriptors=descriptors,
+    )
+
+    _shortlist, *_rest, metadata = build_rescue_shortlist_with_metadata(
+        None,
+        [float(i) for i in range(sample_count)],
+        list(range(sample_count)),
+        [_cand(0, 0.0)],
+        pass1_clusters=3,
+        sample_scenes={i: 0 for i in range(sample_count)},
+        frame_metrics=metrics,
+        frame_count=sample_count,
+        dhashes=[
+            0,
+            0,
+            (1 << 16) - 1,
+            (1 << 16) - 1,
+            (1 << 16) - 1,
+            (1 << 16) - 1,
+        ],
+    )
+
+    rejection = next(
+        row
+        for row in metadata["proposal_decisions"]
+        if row["decision"] == "transition_side_rejected"
+        and row["boundary_sample_idx"] == 3
+        and row["transition_side"] == "pre"
+    )
+    assert rejection["coverage_reason"] == (
+        "local_selected_content_delta"
+    )
+    assert rejection["content_endpoint_delta"] == pytest.approx(2.0)
 
 
 def test_transition_side_applies_relative_sharpness_floor_before_distance():
@@ -2308,6 +2451,90 @@ def test_preflight_uses_same_additive_priority_as_promotion():
     assert rows[10]["phase_a_rank"] == 2
     assert rows[10]["outcome"] == "eligible_below_headroom"
     assert rows[20]["reason_priority"] > rows[10]["reason_priority"]
+
+
+def test_preflight_replays_dynamic_promotion_order():
+    def with_fields(candidate, text):
+        return {
+            **candidate,
+            "field_signature": list(
+                field_section_signatures(text)
+            ),
+        }
+
+    base = [
+        with_fields(
+            _cand(0, 0.0, scene=0, tokens=["status", "draft"]),
+            "Status: Draft",
+        )
+    ]
+    shortlist = [
+        with_fields(
+            _cand(
+                1,
+                1.0,
+                scene=0,
+                tokens=["status", "approved"],
+                proxy=0.9,
+            ),
+            "Status: Approved",
+        ),
+        with_fields(
+            _cand(
+                2,
+                2.0,
+                scene=0,
+                tokens=["status", "rejected"],
+                proxy=0.8,
+            ),
+            "Status: Rejected",
+        ),
+        {
+            **_cand(10, 10.0, scene=1, tokens=["transition"]),
+            "proposal_lane": "transition",
+        },
+        _cand(
+            20,
+            20.0,
+            scene=2,
+            tokens=[f"dense{i}" for i in range(20)],
+        ),
+    ]
+    dwell_ids = [0] * 21
+
+    actual = _promote_rescue_candidates(
+        base,
+        shortlist,
+        dwell_ids,
+        rescue_budget=4,
+    )
+    actual_order = [
+        record.sample_idx
+        for record in sorted(
+            (
+                record
+                for record in actual
+                if record.selection.rescue_origin
+            ),
+            key=lambda record: int(
+                record.selection.rescue_priority or 0
+            ),
+        )
+    ]
+    report = _preflight(
+        base,
+        shortlist,
+        base,
+        dwell_ids,
+        4,
+    )
+    predicted_order = [
+        row["sample_idx"]
+        for row in report["predicted_ordered_eligible"]
+    ]
+
+    assert actual_order == [1, 10, 20, 2]
+    assert predicted_order == actual_order
 
 
 def test_promotion_preflight_classifies_eligible_candidate_above_headroom():
