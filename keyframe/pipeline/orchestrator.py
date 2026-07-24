@@ -190,6 +190,7 @@ class StreamingAnalysisStage:
                 video_path,
                 ctx.config.sample_interval,
                 embed_images=lambda batch: clip.embed_images(batch, batch_size=len(batch)),
+                video_timing=ctx.config.video_timing,
             )
         finally:
             clip.cleanup()
@@ -202,6 +203,9 @@ class StreamingAnalysisStage:
             samples=SampleTable(
                 timestamps=streamed.timestamps,
                 frame_indices=streamed.frame_indices,
+                consumed_targets=streamed.consumed_targets,
+                next_targets=streamed.next_targets,
+                timing_metadata=streamed.sampling_timing,
             ),
         )
         features = FeatureOutput(
@@ -259,9 +263,14 @@ class TemporalStage:
         )
 
         timestamps = sampling.samples.timestamps
+        frame_indices = sampling.samples.frame_indices
         dhashes = features.dhashes
         n_clusters = min(ctx.config.pass1_clusters, len(timestamps) // 2)
-        scenes = detect_scenes(str(video_path), timestamps)
+        scenes = detect_scenes(
+            str(video_path),
+            timestamps,
+            frame_indices=frame_indices,
+        )
         scenes, scene_coalescence = coalesce_tiny_scenes(
             scenes, timestamps, dhashes, return_trace=True
         )
@@ -706,6 +715,7 @@ class OutputStage:
         frames = sampling.frame_store.frames
         caption_log_path = save_results(final, frames, output_dir)
         manifest_metadata = {
+            "sampling_timing": sampling.samples.timing_metadata,
             "scene_coalescence": temporal.scene_coalescence,
             "output_cap": {
                 "max_output_frames": ctx.config.max_output_frames,
@@ -807,13 +817,22 @@ def extract_keyframes(
             cache_root=cfg.frame_cache_dir,
             max_bytes=int(cfg.max_frame_cache_mb) * 1024 * 1024,
         )
-        sampling.frame_store.frames = cache_candidate_frames(
+        cache_result = cache_candidate_frames(
             video_path,
             cfg.sample_interval,
             candidate_indices=candidate_union,
+            frame_indices=sampling.samples.frame_indices,
+            timestamps=sampling.samples.timestamps,
+            consumed_targets=sampling.samples.consumed_targets,
+            next_targets=sampling.samples.next_targets,
             frame_sizes=features.frame_sizes,
             pixel_digests=features.pixel_digests,
+            sampling_timing=sampling.samples.timing_metadata,
             cache=frame_cache,
+        )
+        sampling.frame_store.frames = cache_result.provider
+        sampling.samples.timing_metadata["second_pass"] = (
+            cache_result.timing_metadata
         )
 
         RescueEvidenceStage(preloader).run(proposal, sampling, ctx)

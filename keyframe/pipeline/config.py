@@ -4,9 +4,12 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from keyframe.pipeline.qa_targets import load_targets, normalize_targets
+
+if TYPE_CHECKING:
+    from keyframe.media_preflight import VideoTimingMetadata
 
 
 def _finite_float(
@@ -53,6 +56,7 @@ class KeyframeExtractionConfig:
     verbose_trace: bool = False
     debug_qa_targets_path: Path | None = None
     debug_qa_targets: tuple[Mapping[str, Any], ...] | None = None
+    video_timing: VideoTimingMetadata | None = None
 
     def __post_init__(self) -> None:
         sample_interval = _finite_float(

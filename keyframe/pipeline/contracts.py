@@ -25,6 +25,9 @@ class FrameStore:
 class SampleTable:
     timestamps: list[float]
     frame_indices: list[int]
+    consumed_targets: list[float] = field(default_factory=list)
+    next_targets: list[float] = field(default_factory=list)
+    timing_metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def sample_count(self) -> int:

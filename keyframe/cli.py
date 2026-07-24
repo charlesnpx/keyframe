@@ -289,6 +289,7 @@ def _frame_config(
     *,
     device: str | None = None,
     include_paths: bool = True,
+    video_timing=None,
 ):
     from keyframe.pipeline import KeyframeExtractionConfig
 
@@ -315,6 +316,7 @@ def _frame_config(
         debug_qa_targets_path=(
             Path(qa_targets_arg) if qa_targets_arg else None
         ),
+        video_timing=video_timing,
     )
 
 
@@ -362,7 +364,11 @@ def _preflight_extract(args) -> ExtractionPreflight:
                 frame_device = resolve_frame_device(transcript_preflight)
             else:
                 frame_device = resolve_frame_execution_device(frame_runtime)
-            frame_config = _frame_config(args, device=frame_device)
+            frame_config = _frame_config(
+                args,
+                device=frame_device,
+                video_timing=media.selected_video_timing,
+            )
             cache_root = (
                 frame_config.frame_cache_dir
                 if frame_config.frame_cache_dir is not None

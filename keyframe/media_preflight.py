@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
+import math
 import stat
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
-
 
 FFPROBE_TIMEOUT_SECONDS = 15.0
 _UNKNOWN_CODECS = {"", "unknown", "none", "n/a"}
@@ -20,6 +21,164 @@ class MediaPreflightError(ValueError):
 
 
 @dataclass(frozen=True)
+class VideoTimingMetadata:
+    classification: str
+    reason: str
+    avg_frame_rate: str | None
+    r_frame_rate: str | None
+    time_base: str | None
+    stream_start_seconds: float | None
+    duration_seconds: float | None
+    duration_source: str | None
+    duration_ts: int | None
+    nb_frames: int | None
+    nominal_frame_rate: float | None
+    expected_duration_seconds: float | None
+    duration_delta_seconds: float | None
+    duration_tolerance_seconds: float | None
+
+    @property
+    def confirmed_cfr_rate(self) -> float | None:
+        if self.classification != "cfr":
+            return None
+        return self.nominal_frame_rate
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "classification": self.classification,
+            "reason": self.reason,
+            "avg_frame_rate": self.avg_frame_rate,
+            "r_frame_rate": self.r_frame_rate,
+            "time_base": self.time_base,
+            "stream_start_seconds": self.stream_start_seconds,
+            "duration_seconds": self.duration_seconds,
+            "duration_source": self.duration_source,
+            "duration_ts": self.duration_ts,
+            "nb_frames": self.nb_frames,
+            "nominal_frame_rate": self.nominal_frame_rate,
+            "expected_duration_seconds": self.expected_duration_seconds,
+            "duration_delta_seconds": self.duration_delta_seconds,
+            "duration_tolerance_seconds": self.duration_tolerance_seconds,
+        }
+
+
+def _positive_fraction(value: Any) -> Fraction | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if not isinstance(value, (str, int)):
+        return None
+    try:
+        parsed = Fraction(value)
+    except (ValueError, ZeroDivisionError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _fraction_text(value: Fraction | None) -> str | None:
+    if value is None:
+        return None
+    return f"{value.numerator}/{value.denominator}"
+
+
+def _finite_number(value: Any, *, positive: bool = False) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if not isinstance(value, (str, int, float)):
+        return None
+    try:
+        parsed = float(value)
+    except (OverflowError, ValueError):
+        return None
+    if not math.isfinite(parsed):
+        return None
+    if positive and parsed <= 0:
+        return None
+    return parsed
+
+
+def _integer_text(value: Any, *, positive: bool = False) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = int(value)
+        except ValueError:
+            return None
+    else:
+        return None
+    if positive and parsed <= 0:
+        return None
+    return parsed
+
+
+def classify_video_timing(stream: Mapping[str, Any]) -> VideoTimingMetadata:
+    """Classify one ffprobe video stream using conservative timing evidence."""
+
+    avg_rate = _positive_fraction(stream.get("avg_frame_rate"))
+    real_rate = _positive_fraction(stream.get("r_frame_rate"))
+    time_base = _positive_fraction(stream.get("time_base"))
+    start_time = _finite_number(stream.get("start_time"))
+    stream_duration = _finite_number(stream.get("duration"), positive=True)
+    duration_ts = _integer_text(stream.get("duration_ts"), positive=True)
+    nb_frames = _integer_text(stream.get("nb_frames"), positive=True)
+
+    duration_seconds = stream_duration
+    duration_source = "stream_duration" if stream_duration is not None else None
+    if duration_seconds is None and duration_ts is not None and time_base is not None:
+        derived_duration = float(duration_ts * time_base)
+        if math.isfinite(derived_duration) and derived_duration > 0:
+            duration_seconds = derived_duration
+            duration_source = "duration_ts"
+
+    nominal_rate = float(avg_rate) if avg_rate is not None else None
+    expected_duration = None
+    duration_delta = None
+    duration_tolerance = None
+
+    if avg_rate is None or real_rate is None:
+        classification = "unknown"
+        reason = "missing or invalid average/real frame-rate evidence"
+    elif avg_rate != real_rate:
+        classification = "vfr"
+        reason = "average and real frame rates differ after rational reduction"
+    elif duration_seconds is None or nb_frames is None:
+        classification = "unknown"
+        reason = "equal rates lack duration/frame-count consistency evidence"
+    else:
+        expected_duration = float(Fraction(nb_frames, 1) / avg_rate)
+        duration_delta = abs(duration_seconds - expected_duration)
+        duration_tolerance = max(
+            float(Fraction(1, 1) / avg_rate),
+            0.001 * duration_seconds,
+        )
+        if duration_delta <= duration_tolerance:
+            classification = "cfr"
+            reason = "equal reduced rates and consistent duration/frame count"
+        else:
+            classification = "unknown"
+            reason = "equal rates have inconsistent duration/frame-count evidence"
+
+    return VideoTimingMetadata(
+        classification=classification,
+        reason=reason,
+        avg_frame_rate=_fraction_text(avg_rate),
+        r_frame_rate=_fraction_text(real_rate),
+        time_base=_fraction_text(time_base),
+        stream_start_seconds=start_time,
+        duration_seconds=duration_seconds,
+        duration_source=duration_source,
+        duration_ts=duration_ts,
+        nb_frames=nb_frames,
+        nominal_frame_rate=nominal_rate,
+        expected_duration_seconds=expected_duration,
+        duration_delta_seconds=duration_delta,
+        duration_tolerance_seconds=duration_tolerance,
+    )
+
+
+@dataclass(frozen=True)
 class MediaStream:
     codec_type: str
     codec_name: str | None
@@ -27,6 +186,7 @@ class MediaStream:
     height: int | None = None
     channels: int | None = None
     attached_picture: bool = False
+    video_timing: VideoTimingMetadata | None = None
 
     @property
     def is_usable_video(self) -> bool:
@@ -61,6 +221,18 @@ class MediaProbeResult:
     @property
     def has_usable_audio(self) -> bool:
         return any(stream.is_usable_audio for stream in self.streams)
+
+    @property
+    def selected_video_stream(self) -> MediaStream | None:
+        return next(
+            (stream for stream in self.streams if stream.is_usable_video),
+            None,
+        )
+
+    @property
+    def selected_video_timing(self) -> VideoTimingMetadata | None:
+        selected = self.selected_video_stream
+        return selected.video_timing if selected is not None else None
 
 
 @dataclass(frozen=True)
@@ -189,6 +361,11 @@ def parse_ffprobe_payload(payload: Any) -> MediaProbeResult:
                     _attached_picture(raw_stream, stream_index=index)
                     if normalized_type == "video"
                     else False
+                ),
+                video_timing=(
+                    classify_video_timing(raw_stream)
+                    if normalized_type == "video"
+                    else None
                 ),
             )
         )

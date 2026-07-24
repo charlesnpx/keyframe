@@ -178,6 +178,16 @@ class SnapshotterRegistry:
                     "sample_idx": index,
                     "frame_idx": _safe_int(frame_idx),
                     "timestamp": _safe_float(timestamp),
+                    "consumed_target": (
+                        _safe_float(value.consumed_targets[index])
+                        if index < len(value.consumed_targets)
+                        else None
+                    ),
+                    "next_target": (
+                        _safe_float(value.next_targets[index])
+                        if index < len(value.next_targets)
+                        else None
+                    ),
                     "origin": "sampled_frame",
                     "merged_timestamps": [],
                     "merged_from_sample_idxs": [],
@@ -191,6 +201,11 @@ class SnapshotterRegistry:
                 "timestamp_max": max(timestamps) if timestamps else None,
                 "timestamps": timestamps,
                 "frame_indices": [_safe_int(v) for v in value.frame_indices],
+                "consumed_targets": [
+                    _safe_float(v) for v in value.consumed_targets
+                ],
+                "next_targets": [_safe_float(v) for v in value.next_targets],
+                "timing_metadata": _jsonish(value.timing_metadata),
                 "samples": samples,
             }
         if isinstance(value, FeatureOutput):

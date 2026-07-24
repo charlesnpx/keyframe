@@ -76,15 +76,40 @@ def sample_frames(video_path, interval_seconds=0.5):
 
 # ── Scene detection ──────────────────────────────────────────────────────
 
-def detect_scenes(video_path, timestamps, threshold=27.0):
+def detect_scenes(
+    video_path,
+    timestamps,
+    frame_indices=None,
+    threshold=27.0,
+):
     """Run pySceneDetect ContentDetector and return scene boundaries as
-    (start_idx, end_idx) tuples indexed into the timestamps/frames arrays."""
+    (start_idx, end_idx) tuples indexed into the sampled-frame arrays.
+
+    SceneDetect timecodes retain decoded source-frame numbers but convert
+    seconds through the container's nominal frame rate.  That conversion is
+    not presentation time for VFR media, so production sampling supplies the
+    recorded source-frame indices and maps scene boundaries by index.
+    """
     from scenedetect import open_video, SceneManager
     from scenedetect.detectors import ContentDetector
     import bisect
 
+    if not timestamps:
+        return []
+
+    source_frame_indices = None
+    if frame_indices is not None:
+        source_frame_indices = [int(value) for value in frame_indices]
+        if len(source_frame_indices) != len(timestamps):
+            raise ValueError("scene timestamps and source frame indices are misaligned")
+        if any(
+            source_frame_indices[index] <= source_frame_indices[index - 1]
+            for index in range(1, len(source_frame_indices))
+        ):
+            raise ValueError("scene source frame indices must be strictly increasing")
+
     print(f"\n── Scene detection (ContentDetector, threshold={threshold}) ──")
-    video = open_video(video_path)
+    video = open_video(str(video_path))
     sm = SceneManager()
     sm.add_detector(ContentDetector(threshold=threshold))
     sm.detect_scenes(video)
@@ -96,13 +121,31 @@ def detect_scenes(video_path, timestamps, threshold=27.0):
 
     scenes = []
     for start_tc, end_tc in scene_list:
-        start_sec = start_tc.get_seconds()
-        end_sec = end_tc.get_seconds()
-        s_idx = bisect.bisect_left(timestamps, start_sec)
-        e_idx = bisect.bisect_right(timestamps, end_sec) - 1
+        if source_frame_indices is not None:
+            start_frame = int(start_tc.get_frames())
+            end_frame = int(end_tc.get_frames())
+            s_idx = bisect.bisect_left(source_frame_indices, start_frame)
+            # SceneDetect end timecodes are exclusive.  A sample exactly at
+            # the end frame belongs to the following scene.
+            e_idx = bisect.bisect_left(source_frame_indices, end_frame) - 1
+            if (
+                s_idx >= len(source_frame_indices)
+                or e_idx < 0
+                or e_idx < s_idx
+            ):
+                continue
+        else:
+            start_sec = start_tc.get_seconds()
+            end_sec = end_tc.get_seconds()
+            s_idx = bisect.bisect_left(timestamps, start_sec)
+            e_idx = bisect.bisect_right(timestamps, end_sec) - 1
         s_idx = max(0, min(s_idx, len(timestamps) - 1))
         e_idx = max(s_idx, min(e_idx, len(timestamps) - 1))
         scenes.append((s_idx, e_idx))
+
+    if not scenes:
+        print("  No sampled scene cuts detected — treating entire video as one scene")
+        return [(0, len(timestamps) - 1)]
 
     print(f"  Detected {len(scenes)} scenes:")
     for i, (s, e) in enumerate(scenes):
