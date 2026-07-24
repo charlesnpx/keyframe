@@ -12,6 +12,7 @@ Dependencies:
 
 import cv2
 import gc
+import hashlib
 import numpy as np
 import os
 import re
@@ -41,6 +42,109 @@ from keyframe.merge import build_ocr_token_sets
 from keyframe.scoring import score_candidate_for_rep
 from keyframe.pipeline.contracts import CandidateRecord, candidate_records, candidate_to_caption_log_row
 from keyframe.visual import laplacian_sharpness
+
+
+CLIP_MODEL_NAME = "ViT-B-32"
+CLIP_PRETRAINED = "laion2b_s34b_b79k"
+FLORENCE_MODEL_ID = "florence-community/Florence-2-base"
+APPLE_VISION_MODEL_ID = "com.apple.Vision.VNRecognizeTextRequest"
+PADDLE_OCR_MODEL_ID = "PaddleOCR/default-English-pipeline"
+
+_DIRECT_WEIGHT_PATH_ATTRIBUTES = (
+    "checkpoint_file",
+    "checkpoint_path",
+    "model_file",
+    "model_path",
+    "pretrained_path",
+    "weight_file",
+    "weights_file",
+    "weights_path",
+)
+_MODEL_ID_ATTRIBUTES = ("name_or_path", "_name_or_path", "model_id")
+_REVISION_ATTRIBUTES = ("_commit_hash", "commit_hash", "revision")
+
+
+def _hash_file(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _direct_loader_objects(*objects):
+    observed = []
+    for value in objects:
+        if value is None:
+            continue
+        observed.append(value)
+        config = getattr(value, "config", None)
+        if config is not None:
+            observed.append(config)
+    return tuple(observed)
+
+
+def _direct_string_attribute(objects, names):
+    for value in objects:
+        for name in names:
+            candidate = getattr(value, name, None)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+    return None
+
+
+def _direct_weight_files(objects):
+    records = []
+    seen = set()
+    for value in objects:
+        for attribute in _DIRECT_WEIGHT_PATH_ATTRIBUTES:
+            candidate = getattr(value, attribute, None)
+            candidates = candidate if isinstance(candidate, (list, tuple)) else (candidate,)
+            for raw_path in candidates:
+                if not isinstance(raw_path, (str, os.PathLike)):
+                    continue
+                path = Path(raw_path).expanduser()
+                try:
+                    if not path.is_file():
+                        continue
+                    identity = path.resolve()
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                    records.append(
+                        {
+                            "loader_attribute": attribute,
+                            "filename": path.name,
+                            "size_bytes": path.stat().st_size,
+                            "sha256": _hash_file(path),
+                        }
+                    )
+                except OSError:
+                    continue
+    return sorted(
+        records,
+        key=lambda record: (
+            record["loader_attribute"],
+            record["filename"],
+            record["sha256"],
+        ),
+    )
+
+
+def _observed_model_provenance(role, fallback_model_id, *loader_results):
+    objects = _direct_loader_objects(*loader_results)
+    return {
+        "role": role,
+        "model_id": (
+            _direct_string_attribute(objects, _MODEL_ID_ATTRIBUTES)
+            or fallback_model_id
+        ),
+        "repository_revision": _direct_string_attribute(
+            objects,
+            _REVISION_ATTRIBUTES,
+        ),
+        "stable_weight_files": _direct_weight_files(objects),
+    }
 
 
 # ── Video sampling ──────────────────────────────────────────────────────────
@@ -163,7 +267,11 @@ def detect_scenes(
 
 # ── Parallel model preloading ─────────────────────────────────────────────
 
-def _load_clip(device, model_name="ViT-B-32", pretrained="laion2b_s34b_b79k"):
+def _load_clip(
+    device,
+    model_name=CLIP_MODEL_NAME,
+    pretrained=CLIP_PRETRAINED,
+):
     """Load CLIP model (called in background thread)."""
     model, _, preprocess = open_clip.create_model_and_transforms(
         model_name, pretrained=pretrained, device=device
@@ -187,10 +295,10 @@ def _florence_dtype(device):
 
 def _load_florence(device):
     """Load Florence-2 model + processor (called in background thread)."""
-    model_name = "florence-community/Florence-2-base"
-    processor = AutoProcessor.from_pretrained(model_name)
+    processor = AutoProcessor.from_pretrained(FLORENCE_MODEL_ID)
     model = Florence2ForConditionalGeneration.from_pretrained(
-        model_name, dtype=_florence_dtype(device),
+        FLORENCE_MODEL_ID,
+        dtype=_florence_dtype(device),
     ).to(device)
     model.eval()
     return model, processor
@@ -229,16 +337,29 @@ class ModelPreloader:
     def __init__(self, device="mps", need_florence=True, need_ocr=True):
         self._device = device
         self._need_florence = need_florence
-        self._need_ocr = need_ocr and not _is_macos()
+        self._use_apple_vision = need_ocr and _is_macos()
+        self._need_ocr = need_ocr and not self._use_apple_vision
 
         self._clip = None
         self._florence = None
         self._ocr = None
+        self._model_provenance = {}
 
     def get_clip(self):
         if self._clip is None:
             print("  Loading CLIP...")
-            self._clip = _load_clip(self._device)
+            self._clip = _load_clip(
+                self._device,
+                model_name=CLIP_MODEL_NAME,
+                pretrained=CLIP_PRETRAINED,
+            )
+            self._model_provenance["visual-embedding"] = (
+                _observed_model_provenance(
+                    "visual-embedding",
+                    f"open_clip/{CLIP_MODEL_NAME}/{CLIP_PRETRAINED}",
+                    self._clip[0],
+                )
+            )
         return self._clip
 
     def get_florence(self):
@@ -247,15 +368,39 @@ class ModelPreloader:
         if self._florence is None:
             print("  Loading Florence-2...")
             self._florence = _load_florence(self._device)
+            self._model_provenance["captioning"] = _observed_model_provenance(
+                "captioning",
+                FLORENCE_MODEL_ID,
+                *self._florence,
+            )
         return self._florence
 
     def get_ocr_engine(self):
+        if self._use_apple_vision:
+            self._model_provenance["ocr"] = _observed_model_provenance(
+                "ocr",
+                APPLE_VISION_MODEL_ID,
+            )
+            return None
         if not self._need_ocr:
             return None
         if self._ocr is None:
             print("  Loading PaddleOCR...")
             self._ocr = _load_ocr_engine()
+            self._model_provenance["ocr"] = _observed_model_provenance(
+                "ocr",
+                PADDLE_OCR_MODEL_ID,
+                self._ocr,
+            )
         return self._ocr
+
+    def model_provenance(self):
+        role_order = ("visual-embedding", "captioning", "ocr")
+        return [
+            dict(self._model_provenance[role])
+            for role in role_order
+            if role in self._model_provenance
+        ]
 
     def release_clip(self):
         if self._clip is not None:

@@ -19,6 +19,32 @@ def test_snapshot_trace_does_not_store_mutable_references():
     assert saved["timestamp"] == 10.0
 
 
+def test_snapshot_trace_preserves_loader_observed_model_provenance():
+    sink = SnapshotTraceSink()
+    models = [
+        {
+            "role": "captioning",
+            "model_id": "organization/model",
+            "repository_revision": "abc123",
+            "stable_weight_files": [],
+        }
+    ]
+
+    sink.exit("models.provenance", {"models": models})
+    models[0]["model_id"] = "mutated"
+
+    assert sink.records[0]["payload"] == {
+        "models": [
+            {
+                "role": "captioning",
+                "model_id": "organization/model",
+                "repository_revision": "abc123",
+                "stable_weight_files": [],
+            }
+        ]
+    }
+
+
 def test_candidate_snapshot_is_json_safe_and_reports_duplicates_and_violations():
     sink = SnapshotTraceSink()
     batch = CandidateBatch(
