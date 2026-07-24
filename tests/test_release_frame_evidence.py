@@ -376,6 +376,7 @@ def test_git_identity_comes_from_loaded_package_tree_not_cwd(
             "environment_root": "/environment",
             "base_prefix": "/base",
             "keyframe_module_path": str(package / "__init__.py"),
+            "packages": {"keyframe": "0.6.3"},
         },
         source_tree=repository,
         working_directory=unrelated_cwd,
@@ -388,6 +389,47 @@ def test_git_identity_comes_from_loaded_package_tree_not_cwd(
     }
     assert locations["working_directory"] == str(unrelated_cwd.resolve())
     assert calls[0][0] == package.resolve()
+
+
+def test_git_identity_rejects_runtime_package_version_mismatch(
+    monkeypatch,
+    tmp_path,
+):
+    repository = tmp_path / "source-tree"
+    package = repository / "keyframe"
+    package.mkdir(parents=True)
+    (repository / "pyproject.toml").write_text(
+        '[project]\nname = "keyframe"\nversion = "0.6.3"\n',
+        encoding="utf-8",
+    )
+
+    def fake_git(_candidate, *arguments):
+        if arguments == ("rev-parse", "--show-toplevel"):
+            return str(repository)
+        if arguments == (
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+        ):
+            return ""
+        if arguments == ("rev-parse", "HEAD"):
+            return "a" * 40
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr(release_evidence, "_git", fake_git)
+
+    with pytest.raises(
+        release_evidence.ReleaseEvidenceError,
+        match="runtime keyframe package version must match source_identity",
+    ):
+        release_evidence._source_identity_from_probe(
+            {
+                "keyframe_package_root": str(package),
+                "packages": {"keyframe": "0.1.22"},
+            },
+            source_tree=repository,
+            working_directory=repository,
+        )
 
 
 def test_dirty_git_source_cannot_produce_release_evidence(

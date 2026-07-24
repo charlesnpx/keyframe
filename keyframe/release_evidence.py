@@ -1491,6 +1491,11 @@ def _source_identity_from_probe(
         ) from exc
     if not isinstance(version, str) or not version:
         raise ReleaseEvidenceError("source package version must be nonempty")
+    packages = probe.get("packages")
+    if not isinstance(packages, dict) or packages.get("keyframe") != version:
+        raise ReleaseEvidenceError(
+            "runtime keyframe package version must match source_identity"
+        )
     source_identity = {
         "kind": "git",
         "commit_sha": commit,
