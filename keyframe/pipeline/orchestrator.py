@@ -946,6 +946,10 @@ def extract_keyframes(
         )
 
         if isinstance(trace, SnapshotTraceSink):
+            trace.exit(
+                "models.provenance",
+                {"models": preloader.model_provenance()},
+            )
             if cfg.verbose_trace:
                 pipeline_trace_path = output_dir / "pipeline_trace.json"
                 trace.write(pipeline_trace_path)

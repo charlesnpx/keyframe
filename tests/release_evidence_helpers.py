@@ -123,6 +123,40 @@ def write_frame_evidence_bundle(
         "records": [
             {
                 "event": "exit",
+                "stage": "models.provenance",
+                "payload": {
+                    "models": [
+                        {
+                            "role": "visual-embedding",
+                            "model_id": (
+                                "open_clip/ViT-B-32/laion2b_s34b_b79k"
+                            ),
+                            "repository_revision": "clip-test-revision",
+                            "stable_weight_files": [],
+                        },
+                        {
+                            "role": "captioning",
+                            "model_id": (
+                                "florence-community/Florence-2-base"
+                            ),
+                            "repository_revision": "florence-test-revision",
+                            "stable_weight_files": [],
+                        },
+                        {
+                            "role": "ocr",
+                            "model_id": (
+                                "com.apple.Vision.VNRecognizeTextRequest"
+                                if system == "Darwin"
+                                else "PaddleOCR/default-English-pipeline"
+                            ),
+                            "repository_revision": None,
+                            "stable_weight_files": [],
+                        },
+                    ]
+                },
+            },
+            {
+                "event": "exit",
                 "stage": "proposal.rescue_shortlist",
                 "payload": {
                     "candidates": [
@@ -244,7 +278,7 @@ def write_frame_evidence_bundle(
         "platform": release_evidence._platform_record(probe),
         "packages": packages,
         "ocr_backend": release_evidence._ocr_record(probe),
-        "model_provenance": release_evidence._model_provenance(probe),
+        "model_provenance": release_evidence._model_provenance(trace),
         "package_locations": locations,
         "qualification": release_evidence._trace_qualification(trace),
         "validation": {"passed": True, "failures": []},

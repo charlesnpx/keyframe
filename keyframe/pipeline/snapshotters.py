@@ -183,6 +183,8 @@ def snapshot_candidate_batch(stage: str, batch: CandidateBatch | list[dict[str, 
 
 class SnapshotterRegistry:
     def snapshot(self, stage: str, value: Any) -> dict[str, Any]:
+        if stage == "models.provenance":
+            return _jsonish(value)
         if isinstance(value, CandidateBatch):
             return snapshot_candidate_batch(stage, value)
         if isinstance(value, ProposalOutput):

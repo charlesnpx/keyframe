@@ -218,6 +218,7 @@ def test_replay_recomputes_and_ignores_stored_pass_fields(tmp_path):
         "png",
         "png-aggregate",
         "trace",
+        "model-provenance",
         "source-artifact",
     ],
 )
@@ -268,6 +269,9 @@ def test_replay_rejects_tampered_bundle_artifacts(tmp_path, artifact_name):
         payload = json.loads(path.read_text(encoding="utf-8"))
         payload["records"] = []
         path.write_text(json.dumps(payload), encoding="utf-8")
+    elif artifact_name == "model-provenance":
+        report["model_provenance"][0]["model_id"] = "invented/model"
+        _rewrite_report(bundle, report)
     elif artifact_name == "source-artifact":
         path = release_evidence.resolve_bundle_file(
             bundle,
@@ -281,6 +285,26 @@ def test_replay_rejects_tampered_bundle_artifacts(tmp_path, artifact_name):
 
     assert not replay.passed
     assert replay.failures
+
+
+def test_png_validation_rejects_a_truncated_image(tmp_path):
+    bundle = tmp_path / "bundle"
+    report = write_frame_evidence_bundle(
+        bundle,
+        system="Darwin",
+        machine="arm64",
+    )
+    path = release_evidence.resolve_bundle_file(
+        bundle,
+        report["artifacts"]["pngs"][0]["path"],
+    )
+    path.write_bytes(path.read_bytes()[:33])
+
+    with pytest.raises(
+        release_evidence.ReleaseEvidenceError,
+        match="not a valid PNG",
+    ):
+        release_evidence._png_dimensions(path)
 
 
 def test_replay_rejects_path_traversal(tmp_path):
@@ -579,6 +603,7 @@ def test_default_artifact_route_is_isolated_and_sanitized(
     assert captured["kwargs"]["cwd"] == working
     assert "PYTHONPATH" not in captured["kwargs"]["env"]
     assert captured["kwargs"]["env"]["PYTHONSAFEPATH"] == "1"
+    assert "--frames-only" not in captured["command"]
 
 
 def test_runtime_probe_preserves_virtual_environment_launcher_symlink(

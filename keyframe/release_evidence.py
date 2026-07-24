@@ -22,6 +22,8 @@ from fractions import Fraction
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Sequence
 
+from PIL import Image
+
 
 FIXTURE_IDENTIFIER = "keyframe.release-frame-fixture"
 FIXTURE_SCHEMA_VERSION = 1
@@ -652,24 +654,22 @@ def qa_targets_from_fixture(metadata: Mapping[str, Any]) -> dict[str, Any]:
 
 def _png_dimensions(path: Path) -> tuple[int, int]:
     try:
-        with path.open("rb") as handle:
-            signature = handle.read(8)
-            length = int.from_bytes(handle.read(4), "big")
-            chunk_type = handle.read(4)
-            dimensions = handle.read(8)
-    except OSError as exc:
-        raise ReleaseEvidenceError(f"could not read PNG artifact {path}: {exc}") from exc
-    if (
-        signature != b"\x89PNG\r\n\x1a\n"
-        or chunk_type != b"IHDR"
-        or length != 13
-        or len(dimensions) != 8
-    ):
+        with Image.open(path) as image:
+            if image.format != "PNG":
+                raise ReleaseEvidenceError(
+                    f"frame artifact is not a valid PNG: {path}"
+                )
+            dimensions = tuple(int(value) for value in image.size)
+            image.verify()
+    except ReleaseEvidenceError:
+        raise
+    except (OSError, SyntaxError, ValueError) as exc:
+        raise ReleaseEvidenceError(
+            f"frame artifact is not a valid PNG: {path}: {exc}"
+        ) from exc
+    if len(dimensions) != 2 or any(value <= 0 for value in dimensions):
         raise ReleaseEvidenceError(f"frame artifact is not a valid PNG: {path}")
-    return (
-        int.from_bytes(dimensions[:4], "big"),
-        int.from_bytes(dimensions[4:], "big"),
-    )
+    return dimensions
 
 
 def _artifact_file_record(path: Path, bundle: Path) -> dict[str, Any]:
@@ -1518,34 +1518,117 @@ def _source_identity_from_probe(
     return source_identity, locations
 
 
-def _model_provenance(probe: Mapping[str, Any]) -> list[dict[str, Any]]:
-    system = str(probe.get("system"))
-    machine = str(probe.get("machine", "")).lower()
-    ocr_id = (
-        "com.apple.Vision.VNRecognizeTextRequest"
-        if (system, machine) == ("Darwin", "arm64")
-        else "PaddleOCR/default-English-pipeline"
-    )
-    return [
-        {
-            "role": "visual-embedding",
-            "model_id": "open_clip/ViT-B-32/laion2b_s34b_b79k",
-            "repository_revision": None,
-            "stable_weight_files": [],
-        },
-        {
-            "role": "captioning",
-            "model_id": "florence-community/Florence-2-base",
-            "repository_revision": None,
-            "stable_weight_files": [],
-        },
-        {
-            "role": "ocr",
-            "model_id": ocr_id,
-            "repository_revision": None,
-            "stable_weight_files": [],
-        },
+def _model_provenance(
+    pipeline_trace: Mapping[str, Any] | None,
+) -> list[dict[str, Any]]:
+    if pipeline_trace is None:
+        raise ReleaseEvidenceError(
+            "pipeline trace must contain loader-observed model provenance"
+        )
+    records = pipeline_trace.get("records")
+    if not isinstance(records, list):
+        raise ReleaseEvidenceError("pipeline trace records must be a list")
+    matches = [
+        record
+        for record in records
+        if isinstance(record, dict)
+        and record.get("event") == "exit"
+        and record.get("stage") == "models.provenance"
     ]
+    if len(matches) != 1:
+        raise ReleaseEvidenceError(
+            "pipeline trace must contain exactly one models.provenance record"
+        )
+    payload = _mapping(matches[0].get("payload"), "models.provenance payload")
+    models = payload.get("models")
+    if not isinstance(models, list):
+        raise ReleaseEvidenceError("models.provenance models must be a list")
+
+    expected_roles = ("visual-embedding", "captioning", "ocr")
+    normalized: dict[str, dict[str, Any]] = {}
+    for index, raw_model in enumerate(models):
+        model = _mapping(raw_model, f"model provenance {index}")
+        role = model.get("role")
+        if role not in expected_roles or role in normalized:
+            raise ReleaseEvidenceError(
+                f"model provenance {index} has an invalid or duplicate role"
+            )
+        model_id = model.get("model_id")
+        if not isinstance(model_id, str) or not model_id.strip():
+            raise ReleaseEvidenceError(
+                f"model provenance {index} model_id must be nonempty"
+            )
+        revision = model.get("repository_revision")
+        if revision is not None and (
+            not isinstance(revision, str) or not revision.strip()
+        ):
+            raise ReleaseEvidenceError(
+                f"model provenance {index} repository_revision "
+                "must be null or nonempty"
+            )
+        raw_weights = model.get("stable_weight_files")
+        if not isinstance(raw_weights, list):
+            raise ReleaseEvidenceError(
+                f"model provenance {index} stable_weight_files must be a list"
+            )
+        weights = []
+        for weight_index, raw_weight in enumerate(raw_weights):
+            weight = _mapping(
+                raw_weight,
+                f"model provenance {index} stable weight {weight_index}",
+            )
+            attribute = weight.get("loader_attribute")
+            filename = weight.get("filename")
+            size = weight.get("size_bytes")
+            sha256 = weight.get("sha256")
+            if not isinstance(attribute, str) or not attribute:
+                raise ReleaseEvidenceError(
+                    f"model provenance {index} stable weight {weight_index} "
+                    "loader_attribute must be nonempty"
+                )
+            if (
+                not isinstance(filename, str)
+                or PurePosixPath(filename).name != filename
+            ):
+                raise ReleaseEvidenceError(
+                    f"model provenance {index} stable weight {weight_index} "
+                    "filename must be a basename"
+                )
+            _true_integer(
+                size,
+                (
+                    f"model provenance {index} stable weight {weight_index} "
+                    "size_bytes"
+                ),
+                minimum=1,
+            )
+            if not isinstance(sha256, str) or not SHA256_RE.fullmatch(sha256):
+                raise ReleaseEvidenceError(
+                    f"model provenance {index} stable weight {weight_index} "
+                    "sha256 must be lowercase SHA-256"
+                )
+            weights.append(
+                {
+                    "loader_attribute": attribute,
+                    "filename": filename,
+                    "size_bytes": size,
+                    "sha256": sha256,
+                }
+            )
+        normalized[str(role)] = {
+            "role": role,
+            "model_id": model_id.strip(),
+            "repository_revision": (
+                revision.strip() if isinstance(revision, str) else None
+            ),
+            "stable_weight_files": weights,
+        }
+    missing = [role for role in expected_roles if role not in normalized]
+    if missing:
+        raise ReleaseEvidenceError(
+            "models.provenance is missing required roles: " + ", ".join(missing)
+        )
+    return [normalized[role] for role in expected_roles]
 
 
 def _platform_record(probe: Mapping[str, Any]) -> dict[str, Any]:
@@ -1622,7 +1705,6 @@ def _run_default_cli(
             str(fixture),
             "--output",
             str(output_dir),
-            "--frames-only",
             "--sample-interval",
             str(DEFAULT_CONFIGURATION["sample_interval_seconds"]),
             "--pass1-clusters",
@@ -1757,6 +1839,21 @@ def run_fresh(
         redundancy,
         failures,
     ) = _collect_artifact_evidence(bundle, contract)
+    pipeline_trace = _mapping(
+        _load_json(
+            _resolve_bundle_file(
+                bundle,
+                next(
+                    trace["path"]
+                    for trace in artifacts["traces"]
+                    if trace["name"] == "pipeline_trace"
+                ),
+                "pipeline trace",
+            ),
+            "pipeline trace",
+        ),
+        "pipeline trace",
+    )
     report = {
         "identifier": EVIDENCE_IDENTIFIER,
         "schema_version": EVIDENCE_SCHEMA_VERSION,
@@ -1770,25 +1867,9 @@ def run_fresh(
         "platform": _platform_record(probe),
         "packages": dict(_mapping(probe.get("packages"), "runtime packages")),
         "ocr_backend": _ocr_record(probe),
-        "model_provenance": _model_provenance(probe),
+        "model_provenance": _model_provenance(pipeline_trace),
         "package_locations": locations,
-        "qualification": _trace_qualification(
-            _mapping(
-                _load_json(
-                    _resolve_bundle_file(
-                        bundle,
-                        next(
-                            trace["path"]
-                            for trace in artifacts["traces"]
-                            if trace["name"] == "pipeline_trace"
-                        ),
-                        "pipeline trace",
-                    ),
-                    "pipeline trace",
-                ),
-                "pipeline trace",
-            )
-        ),
+        "qualification": _trace_qualification(pipeline_trace),
         "validation": {"passed": not failures, "failures": failures},
     }
     evidence_path = bundle / "evidence.json"
@@ -2055,6 +2136,7 @@ def replay_bundle(bundle: str | Path) -> ReplayResult:
                     "pipeline trace",
                 )
         recomputed_qualification = _trace_qualification(pipeline_trace)
+        recomputed_model_provenance = _model_provenance(pipeline_trace)
 
         _compare_recorded(
             "fixture evidence",
@@ -2095,25 +2177,14 @@ def replay_bundle(bundle: str | Path) -> ReplayResult:
             recomputed_qualification,
             failures,
         )
+        _compare_recorded(
+            "model provenance",
+            report.get("model_provenance"),
+            recomputed_model_provenance,
+            failures,
+        )
         _validate_source_identity(report, root, failures)
         _validate_platform_and_locations(report, failures)
-        model_provenance = report.get("model_provenance")
-        if not isinstance(model_provenance, list) or not model_provenance:
-            failures.append("model_provenance must name observed models")
-        else:
-            for index, raw_model in enumerate(model_provenance):
-                if not isinstance(raw_model, dict):
-                    failures.append(f"model_provenance {index} must be an object")
-                    continue
-                if not isinstance(raw_model.get("model_id"), str):
-                    failures.append(
-                        f"model_provenance {index} model_id must be nonempty"
-                    )
-                weights = raw_model.get("stable_weight_files")
-                if not isinstance(weights, list):
-                    failures.append(
-                        f"model_provenance {index} stable_weight_files must be a list"
-                    )
         recomputed = {
             "fixture": recomputed_fixture,
             "artifacts": recomputed_artifacts,
@@ -2122,6 +2193,7 @@ def replay_bundle(bundle: str | Path) -> ReplayResult:
             "budgets": recomputed_budgets,
             "redundancy": recomputed_redundancy,
             "qualification": recomputed_qualification,
+            "model_provenance": recomputed_model_provenance,
         }
     except ReleaseEvidenceError as exc:
         return ReplayResult(

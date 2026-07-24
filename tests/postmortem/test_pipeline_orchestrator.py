@@ -4,6 +4,43 @@ from types import SimpleNamespace
 from tests.preflight_helpers import patch_cli_media, transcript_preflight_stub
 
 
+def test_model_provenance_uses_direct_loader_metadata(tmp_path):
+    from keyframe.frames import _observed_model_provenance
+
+    weight = tmp_path / "model.safetensors"
+    weight.write_bytes(b"stable model weights")
+    loaded = SimpleNamespace(
+        config=SimpleNamespace(
+            name_or_path="organization/observed-model",
+            _commit_hash="abc123",
+        ),
+        checkpoint_file=weight,
+    )
+
+    provenance = _observed_model_provenance(
+        "captioning",
+        "fallback/model",
+        loaded,
+    )
+
+    assert provenance == {
+        "role": "captioning",
+        "model_id": "organization/observed-model",
+        "repository_revision": "abc123",
+        "stable_weight_files": [
+            {
+                "loader_attribute": "checkpoint_file",
+                "filename": "model.safetensors",
+                "size_bytes": 20,
+                "sha256": (
+                    "72881e60b2f41b03362680924bd2d7d0"
+                    "755bea0baf0f55f48dd4d286898afbb7"
+                ),
+            }
+        ],
+    }
+
+
 def _fake_result(output_dir):
     from keyframe.pipeline import KeyframeExtractionResult
 
