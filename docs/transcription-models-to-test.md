@@ -52,13 +52,11 @@ The adopted medium model is `mlx-community/whisper-medium-mlx` at revision `7fc0
 
 MLX-Whisper supports Python 3.8 or newer, WhisperX supports Python 3.10 through 3.13, and the benchmark ran on Keyframe's Python 3.12.13 runtime. The shared environment uses WhisperX's stricter compatible matrix: `torch~=2.8.0`, `torchaudio~=2.8.0`, `torchvision~=0.23.0`, `whisperx==3.8.6`, `huggingface-hub>=0.34,<1`, and `transformers>=4.50,<5`.
 
-The Keyframe 0.6.3 release contract supports Python 3.11 through 3.13. Its
-clean-install matrix builds wheel and sdist artifacts on macOS ARM64 and Linux
-x86-64 for all three versions. MLX and MLX-Whisper use Darwin ARM64/macOS 14+
-environment markers; Linux x86-64 installs the gated PaddlePaddle and
-PaddleOCR defaults. Linux import validation runs offline in an isolated child,
-imports `keyframe.frames` and `PaddleOCR` without constructing OCR, and rejects
-network attempts or recognizable checkpoint creation.
+Keyframe 0.6.2 supports Python 3.11 through 3.13. Its clean-install
+matrix covers macOS ARM64 and Linux x86-64 on all three versions. MLX and
+MLX-Whisper use Darwin ARM64/macOS 14+ environment markers; the Linux jobs
+assert that neither distribution is installed. Import validation does not load
+models or touch a Hugging Face cache.
 
 ### Adopted runtime behavior
 
@@ -213,44 +211,14 @@ Run every backend against the same source recording and retain:
 
 A backend passes only if it has no systematic opening loss, repeated passages, long-form drift, or material timestamp regression. The CPU transcript is a comparison baseline rather than ground truth, so material disagreements must be reviewed against the audio.
 
-The schema-7 release benchmark is parameterized and keeps user-specific paths
-out of the repository. Build one artifact once; do not rebuild it between
-platform runs:
+The release benchmark is parameterized and keeps user-specific paths out of the
+repository:
 
 ```bash
-python3.12 -m pip wheel --no-deps --wheel-dir /tmp/keyframe-0.6.3-artifact .
-```
-
-Install that exact wheel or sdist in a clean Linux x86-64 environment and run
-the public frame fixture first:
-
-```bash
-python3.12 scripts/release_frame_evidence.py fresh \
-  --fixture tests/fixtures/release-frame-fixture/release-frame-fixture.mp4 \
-  --metadata tests/fixtures/release-frame-fixture/metadata.json \
-  --artifact /tmp/keyframe-0.6.3-artifact/keyframe-0.6.3-py3-none-any.whl \
-  --runtime-python /tmp/keyframe-linux-release/bin/python \
-  --repository-root "$PWD" \
-  --output /tmp/keyframe-linux-frame-evidence
-```
-
-The artifact must have been installed directly into the named virtual
-environment. The runner verifies its PEP 610 archive filename and SHA-256,
-executes `python -I -m keyframe.cli` from outside the checkout, removes
-repository Python path injection, and rejects loaded package or distribution
-roots outside that environment.
-
-On Darwin ARM64, install the same artifact hash in a clean environment and run
-the aggregate:
-
-```bash
-python3.12 scripts/benchmark_transcription.py \
+python scripts/benchmark_transcription.py \
   --input /path/to/meeting.mp4 \
   --baseline tests/fixtures/transcription-benchmark-baseline.json \
-  --output /tmp/keyframe-release-benchmark \
-  --linux-frame-bundle /tmp/keyframe-linux-frame-evidence \
-  --frame-runtime-python /tmp/keyframe-darwin-release/bin/python \
-  --release-artifact /tmp/keyframe-0.6.3-artifact/keyframe-0.6.3-py3-none-any.whl
+  --output /tmp/keyframe-release-benchmark
 ```
 
 It runs the CPU Whisper/CPU diarization reference serially and uses automatic
@@ -270,38 +238,5 @@ historical 613.67-second candidate, at least 15% faster than the same-run serial
 reference, at most 6.60 GiB for the conservative process-tree RSS high-water
 bound, at most 5.96 GiB MLX allocator peak, no more than 335 seconds for MPS
 diarization, and at most five seconds between the interval-derived prediction
-and wall clock. Schema 7 also requires passing Darwin ARM64 and Linux x86-64
-frame evidence with the same source-identity kind/value and package version.
-Artifact mode therefore requires the same wheel/sdist SHA-256 on both
-platforms. Schema 6, a missing platform, any target or budget failure, a
-tampered standalone report or relative artifact tree, and mixed commits,
-artifact hashes, or versions fail the aggregate.
-
-Each standalone report uses identifier `keyframe.frame-fixture-evidence` and
-schema 1. It records the fixture and metadata hashes, manifest and captions,
-every selected PNG and a canonical PNG aggregate, optional trace hashes,
-configuration, target results, budgets, redundancy, platform/packages/OCR,
-observed model identifiers and exposed revisions, package roots, and exact
-source identity. The aggregate embeds both completed standalone reports and
-then records each report file's SHA-256; a standalone report never tries to
-contain its own hash.
-
-Existing aggregate reports can be revalidated without loading models:
-
-```bash
-python3.12 scripts/benchmark_transcription.py \
-  --input /path/to/meeting.mp4 \
-  --baseline tests/fixtures/transcription-benchmark-baseline.json \
-  --replay-report /tmp/keyframe-release-benchmark/report.json \
-  --report /tmp/keyframe-release-benchmark/replayed-report.json
-```
-
-Standalone replay is also available through
-`scripts/release_frame_evidence.py replay --bundle <dir>`. Both paths reject
-traversal and symlinks, rehash and reparse the declared bundle, ignore stored
-pass/status fields, and recompute conclusions. Cross-platform OCR uses
-normalized required token subsets plus the fixture's small explicit aliases,
-not exact captions, full OCR equality, or line-layout equality. Model IDs,
-loader-exposed revisions, and directly exposed stable weight hashes are
-provenance observations; the validator does not crawl framework/model caches
-or promise immutable upstream availability.
+and wall clock. Existing reports can be revalidated with `--replay-report`;
+replay binds the report hash and duration to the explicitly supplied recording.

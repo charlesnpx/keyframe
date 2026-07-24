@@ -19,7 +19,6 @@ from keyframe.validation import (
     normalize_transcript_words,
 )
 from scripts import benchmark_transcription as benchmark
-from tests.release_evidence_helpers import write_cross_platform_frame_evidence
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -161,9 +160,6 @@ def _passing_report(input_path: Path) -> dict:
             "equivalent": True,
             "reason": "partitions are equivalent",
         },
-        "frame_evidence": write_cross_platform_frame_evidence(
-            input_path.parent
-        ),
     }
 
 
@@ -184,114 +180,6 @@ def test_release_contracts_compare_cpu_reference_to_mps_candidate():
     assert benchmark.CANDIDATE_CONTRACT["frame_schedule_reason"] == (
         benchmark.APPLE_ACCELERATOR_SERIAL_REASON
     )
-
-
-@pytest.mark.parametrize(
-    "mutation, expected",
-    [
-        (
-            lambda frame: frame.pop("linux_x86_64"),
-            "frame evidence is missing linux_x86_64",
-        ),
-        (
-            lambda frame: frame["darwin_arm64"]["evidence"]["targets"][0].update(
-                {"passed": False}
-            ),
-            "darwin_arm64 has a failed frame target",
-        ),
-        (
-            lambda frame: frame["linux_x86_64"]["evidence"]["budgets"].update(
-                {"passed": False}
-            ),
-            "linux_x86_64 has a failed frame budget",
-        ),
-        (
-            lambda frame: frame["linux_x86_64"]["evidence"][
-                "redundancy"
-            ].update({"passed": False}),
-            "linux_x86_64 has a failed redundancy budget",
-        ),
-        (
-            lambda frame: frame["darwin_arm64"]["evidence"]["platform"].update(
-                {"machine": "x86_64"}
-            ),
-            "darwin_arm64 evidence machine must be 'arm64'",
-        ),
-        (
-            lambda frame: frame["linux_x86_64"]["evidence"][
-                "source_identity"
-            ].update({"commit_sha": "b" * 40}),
-            "Darwin and Linux frame evidence must use the same source_identity",
-        ),
-        (
-            lambda frame: frame["linux_x86_64"]["evidence"]["packages"].update(
-                {"keyframe": "0.6.2"}
-            ),
-            "linux_x86_64 package version must match source_identity",
-        ),
-    ],
-)
-def test_schema_7_aggregate_rejects_frame_gate_failures(
-    tmp_path,
-    mutation,
-    expected,
-):
-    input_path = tmp_path / "recording.mp4"
-    input_path.write_bytes(b"benchmark recording")
-    report = _passing_report(input_path)
-    mutation(report["frame_evidence"])
-
-    failures = benchmark.evaluate_report(
-        report,
-        _baseline(),
-        critical_path_tolerance_seconds=5.0,
-    )
-
-    assert expected in failures
-
-
-def test_schema_7_aggregate_replays_embedded_artifact_trees(tmp_path):
-    input_path = tmp_path / "recording.mp4"
-    input_path.write_bytes(b"benchmark recording")
-    report = _passing_report(input_path)
-    png_record = report["frame_evidence"]["linux_x86_64"]["evidence"][
-        "artifacts"
-    ]["pngs"][0]
-    png_path = (
-        tmp_path
-        / "frame-evidence"
-        / "linux-x86_64"
-        / png_record["path"]
-    )
-    png_path.write_bytes(png_path.read_bytes() + b"tamper")
-
-    failures = benchmark.evaluate_report(
-        report,
-        _baseline(),
-        critical_path_tolerance_seconds=5.0,
-        report_root=tmp_path,
-    )
-
-    assert any(
-        failure.startswith("linux_x86_64 replay:")
-        for failure in failures
-    )
-
-
-def test_schema_7_aggregate_hashes_completed_standalone_reports(tmp_path):
-    input_path = tmp_path / "recording.mp4"
-    input_path.write_bytes(b"benchmark recording")
-    report = _passing_report(input_path)
-    report["frame_evidence"]["darwin_arm64"]["report_sha256"] = "0" * 64
-
-    failures = benchmark.evaluate_report(
-        report,
-        _baseline(),
-        critical_path_tolerance_seconds=5.0,
-        report_root=tmp_path,
-    )
-
-    assert "darwin_arm64 standalone report hash does not match" in failures
 
 
 def _set_process_tree_peak(report: dict, gibibytes: float) -> None:
@@ -1427,9 +1315,6 @@ def test_candidate_case_uses_and_verifies_automatic_apple_scheduling(
     tmp_path,
 ):
     parsed_argv = []
-    frame_config = object()
-    frame_generation = object()
-    frame_calls = []
 
     def parse_args(argv):
         parsed_argv.extend(argv)
@@ -1516,35 +1401,13 @@ def test_candidate_case_uses_and_verifies_automatic_apple_scheduling(
 
     monkeypatch.setattr(benchmark.cli, "_parse_extract_args", parse_args)
     monkeypatch.setattr(benchmark.cli, "_transcript_config", lambda _args: object())
-    monkeypatch.setattr(
-        benchmark.cli,
-        "_frame_config",
-        lambda args, *, device: (
-            frame_calls.append(("config", args, device)) or frame_config
-        ),
-    )
-    monkeypatch.setattr(
-        benchmark.cli,
-        "_run_frame_generation",
-        lambda video, output, config, supervisor: (
-            frame_calls.append(
-                ("run", video, output, config, supervisor)
-            )
-            or frame_generation
-        ),
-    )
     monkeypatch.setattr(benchmark, "preflight_transcript_run", lambda _config: preflight)
     monkeypatch.setattr(benchmark, "resolve_frame_device", lambda _preflight: "mps")
     monkeypatch.setattr(benchmark, "StageSupervisor", FakeSupervisor)
-
-    def run_pipeline(*_args, **kwargs):
-        assert kwargs["frame_runner"]() is frame_generation
-        return pipeline_result
-
     monkeypatch.setattr(
         benchmark,
         "run_supervised_full_pipeline",
-        run_pipeline,
+        lambda *_args, **_kwargs: pipeline_result,
     )
     monkeypatch.setattr(
         benchmark,
@@ -1591,14 +1454,6 @@ def test_candidate_case_uses_and_verifies_automatic_apple_scheduling(
     assert result["pipeline_evidence"]["frames"]["launch_wave"] == (
         "post-transcription"
     )
-    assert frame_calls[0][0] == "config"
-    assert frame_calls[0][2] == "mps"
-    run_call = frame_calls[1]
-    assert run_call[0] == "run"
-    assert run_call[1] == tmp_path / "input.mp4"
-    assert run_call[2] == tmp_path / "output"
-    assert run_call[3] is frame_config
-    assert isinstance(run_call[4], FakeSupervisor)
 
 
 def test_candidate_case_rejects_an_overlapping_apple_result(monkeypatch, tmp_path):

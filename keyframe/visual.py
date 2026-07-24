@@ -11,9 +11,6 @@ import numpy as np
 from PIL import Image, ImageStat
 
 
-CONTENT_ENDPOINT_DESCRIPTOR_SIZE = (32, 18)
-
-
 def laplacian_sharpness(pil_img: Image.Image) -> float:
     """Score frame sharpness via a small Laplacian variance implementation."""
     gray = np.asarray(pil_img.convert("L"), dtype=np.float32)
@@ -261,9 +258,9 @@ class FrameMetricTable:
             return 0.0
         if abs(left - right) == 1:
             return float(self.content_next_delta[min(left, right)])
-        # Streaming analysis retains a fixed-size content descriptor for each
-        # sample rather than an N×90×160 image stack.  This keeps non-adjacent
-        # endpoint comparisons available without retaining source images.
+        # Streaming analysis intentionally retains scalar metrics rather than
+        # an N×90×160 image stack.  The caller can lazily read the two bounded
+        # candidate images from its disk cache for non-adjacent comparisons.
         if self.content_gray_stack.shape[0] != self.sample_count:
             return None
         return float(np.mean(np.abs(self.content_gray_stack[left] - self.content_gray_stack[right])))
@@ -288,7 +285,6 @@ def build_compact_frame_metric_table(
     frame_indices: Sequence[int],
     content_prev_delta: Sequence[float],
     content_next_delta: Sequence[float],
-    content_endpoint_descriptors: np.ndarray | None = None,
 ) -> FrameMetricTable:
     """Build the normal metric-table scalars without retaining image stacks.
 
@@ -325,28 +321,6 @@ def build_compact_frame_metric_table(
     prev = np.asarray(content_prev_delta, dtype=np.float32)
     next_delta = np.asarray(content_next_delta, dtype=np.float32)
     empty_stack = np.empty((0, 0, 0), dtype=np.float32)
-    if content_endpoint_descriptors is None:
-        endpoint_stack = empty_stack
-    else:
-        endpoint_stack = np.asarray(
-            content_endpoint_descriptors,
-            dtype=np.float32,
-        )
-        if (
-            endpoint_stack.ndim != 3
-            or endpoint_stack.shape[0] != sample_count
-            or endpoint_stack.shape[1] <= 0
-            or endpoint_stack.shape[2] <= 0
-        ):
-            raise ValueError(
-                "content endpoint descriptors must have shape "
-                "(sample_count, height, width)"
-            )
-        if not np.isfinite(endpoint_stack).all():
-            raise ValueError(
-                "content endpoint descriptors must contain finite values"
-            )
-        endpoint_stack = np.ascontiguousarray(endpoint_stack)
     return FrameMetricTable(
         sample_idx=np.arange(sample_count, dtype=np.int64),
         frame_idx=np.asarray(list(frame_indices), dtype=np.int64),
@@ -372,7 +346,7 @@ def build_compact_frame_metric_table(
         visual_unique_buckets=values("visual_unique_buckets"),
         sharpness=values("sharpness"),
         full_gray_stack=empty_stack,
-        content_gray_stack=endpoint_stack,
+        content_gray_stack=empty_stack,
     )
 
 
@@ -519,19 +493,6 @@ def content_crop(image: Image.Image, margin_x: float = 0.12, margin_y: float = 0
     right = max(left + 1, int(width * (1.0 - margin_x)))
     bottom = max(top + 1, int(height * (1.0 - margin_y)))
     return image.crop((left, top, right, bottom))
-
-
-def content_endpoint_descriptor(image: Image.Image) -> np.ndarray:
-    """Return the fixed-size grayscale descriptor used for endpoint deltas."""
-    return np.asarray(
-        content_crop(image)
-        .convert("L")
-        .resize(
-            CONTENT_ENDPOINT_DESCRIPTOR_SIZE,
-            Image.Resampling.BILINEAR,
-        ),
-        dtype=np.float32,
-    )
 
 
 def mean_abs_content_delta(

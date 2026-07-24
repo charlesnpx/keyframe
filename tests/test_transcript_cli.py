@@ -1,6 +1,5 @@
 import errno
 import json
-import uuid
 from types import SimpleNamespace
 
 import pytest
@@ -29,7 +28,7 @@ from keyframe.transcript_cli import (
     print_stage_progress,
     run_supervised_transcript,
 )
-from tests.preflight_helpers import patch_cli_media
+
 
 SUPPORTED_MAC = transcript.RuntimePlatform("Darwin", "arm64", 14, 23)
 LINUX = transcript.RuntimePlatform("Linux", "x86_64", None, 6)
@@ -85,10 +84,8 @@ def test_final_output_write_failure_preserves_the_previous_generation(
     output_paths = (output / "transcript.txt", output / "transcript.json")
     output_paths[0].write_text("previous text", encoding="utf-8")
     output_paths[1].write_text("previous json", encoding="utf-8")
-    staging_root = (
-        output / ".keyframe-work" / "runs" / str(uuid.uuid4())
-    )
-    staging_root.mkdir(parents=True)
+    staging_root = output / "keyframe-run-test"
+    staging_root.mkdir()
 
     def disk_full(*_args, **_kwargs):
         raise OSError(errno.ENOSPC, "injected final-output disk exhaustion")
@@ -104,10 +101,7 @@ def test_final_output_write_failure_preserves_the_previous_generation(
 
     assert output_paths[0].read_text(encoding="utf-8") == "previous text"
     assert output_paths[1].read_text(encoding="utf-8") == "previous json"
-    assert all(
-        path.name.startswith("final-transcript-")
-        for path in staging_root.iterdir()
-    )
+    assert not list(staging_root.iterdir())
 
 
 def test_final_output_promotion_failure_rolls_back_every_representation(
@@ -119,10 +113,8 @@ def test_final_output_promotion_failure_rolls_back_every_representation(
     output_paths = (output / "transcript.txt", output / "transcript.json")
     output_paths[0].write_text("previous text", encoding="utf-8")
     output_paths[1].write_text("previous json", encoding="utf-8")
-    staging_root = (
-        output / ".keyframe-work" / "runs" / str(uuid.uuid4())
-    )
-    staging_root.mkdir(parents=True)
+    staging_root = output / "keyframe-run-test"
+    staging_root.mkdir()
     real_replace = transcript_cli_module._replace_final_output
     calls = 0
 
@@ -149,10 +141,7 @@ def test_final_output_promotion_failure_rolls_back_every_representation(
     assert calls == 6
     assert output_paths[0].read_text(encoding="utf-8") == "previous text"
     assert output_paths[1].read_text(encoding="utf-8") == "previous json"
-    assert all(
-        path.name.startswith("final-transcript-")
-        for path in staging_root.iterdir()
-    )
+    assert not list(staging_root.iterdir())
 
 
 def test_preflight_selects_mlx_and_mps_diarization_on_supported_mac_without_cuda_probe():
@@ -447,14 +436,6 @@ class _FakeSupervisor:
 
     def __enter__(self):
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        staging_root = (
-            self.output_dir
-            / ".keyframe-work"
-            / "runs"
-            / str(uuid.uuid4())
-        )
-        staging_root.mkdir(parents=True)
-        self.staging = SimpleNamespace(root=staging_root)
         self.events.append("enter")
         return self
 
@@ -1014,7 +995,6 @@ def test_cmd_extract_preflight_failure_happens_before_output_creation(
         "current_runtime_platform",
         lambda: LINUX,
     )
-    patch_cli_media(monkeypatch, video=False, audio=True)
     args = SimpleNamespace(
         video=str(video),
         output=str(output),
@@ -1062,7 +1042,6 @@ def test_cmd_extract_reports_explicit_output_creation_failure(
     capsys,
 ):
     video = _video(tmp_path)
-    patch_cli_media(monkeypatch, video=False, audio=True)
     monkeypatch.setattr(cli, "_preflight_transcript", lambda _args: object())
     monkeypatch.setattr(
         cli,
@@ -1095,7 +1074,6 @@ def test_cmd_extract_presents_transcription_failure_and_preserves_prior_final(
     capsys,
 ):
     video = _video(tmp_path)
-    patch_cli_media(monkeypatch, video=False, audio=True)
     output = tmp_path / "out"
     output.mkdir()
     final = output / "transcript.json"

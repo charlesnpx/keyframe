@@ -1,14 +1,11 @@
 import json
 import os
 import stat
-import uuid
 from pathlib import Path
 
 import pytest
 
 from keyframe import artifacts, transcript
-from keyframe.managed_workspace import parse_canonical_uuid4
-from keyframe.output_session import OutputRunSession
 
 
 def test_raw_transcript_checkpoint_round_trips_full_precision_and_unicode(tmp_path):
@@ -339,27 +336,20 @@ def test_final_writer_formats_remain_byte_compatible(tmp_path):
     ).encode()
 
 
-def test_public_and_run_scoped_checkpoint_paths_use_managed_uuid_layout(tmp_path):
+def test_public_and_run_scoped_checkpoint_paths_are_non_hidden_siblings(tmp_path):
     public = artifacts.transcript_checkpoint_paths(tmp_path)
-    entry_id = uuid.uuid4()
-    with OutputRunSession(tmp_path, run_id=entry_id) as session:
-        assert session.workspace is not None
-        staged = artifacts.run_staging_paths(session.workspace, entry_id)
+    staged = artifacts.run_staging_paths(tmp_path, "run_20260720-001")
 
-        assert public.transcript_raw == tmp_path / "transcript.raw.json"
-        assert public.diarization == tmp_path / "diarization.json"
-        assert staged.root == (
-            tmp_path / ".keyframe-work" / "runs" / str(entry_id)
-        )
-        assert staged.transcript_raw == staged.root / "transcript.raw.json"
-        assert staged.diarization == staged.root / "diarization.json"
-        assert staged.frame_backup == (
-            tmp_path / ".keyframe-work" / "recovery" / str(entry_id) / "frames"
-        )
-        assert staged.root.exists()
+    assert public.transcript_raw == tmp_path / "transcript.raw.json"
+    assert public.diarization == tmp_path / "diarization.json"
+    assert staged.root == tmp_path / "keyframe-run-run_20260720-001"
+    assert staged.transcript_raw == staged.root / "transcript.raw.json"
+    assert staged.diarization == staged.root / "diarization.json"
+    assert all(not part.startswith(".") for part in staged.root.relative_to(tmp_path).parts)
+    assert not staged.root.exists()
 
 
 @pytest.mark.parametrize("run_id", ["", ".hidden", "../escape", "with/slash", "white space"])
 def test_run_staging_paths_reject_unsafe_run_ids(tmp_path, run_id):
     with pytest.raises(ValueError):
-        parse_canonical_uuid4(run_id)
+        artifacts.run_staging_paths(tmp_path, run_id)

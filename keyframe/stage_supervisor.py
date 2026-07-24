@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import math
 import multiprocessing as mp
+import math
 import os
 import queue
 import signal
 import threading
 import time
+import uuid
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, replace
@@ -23,16 +24,17 @@ from keyframe.artifacts import (
     TranscriptCheckpointPaths,
     atomic_promote_file,
     reject_path_aliases,
+    run_staging_paths,
     transcript_checkpoint_paths,
 )
-from keyframe.managed_workspace import ManagedWorkspace
 from keyframe.output_session import (
+    LOCK_FILENAME,
+    RUN_DIRECTORY_PREFIX,
     OutputDirectoryLock,
+    OutputDirectoryLockedError,
     OutputSessionError,
-    workspace_entry_id,
-)
-from keyframe.output_session import (
-    OutputDirectoryLockedError as OutputDirectoryLockedError,
+    cleanup_stale_run_directories,
+    remove_keyframe_owned_directory,
 )
 from keyframe.process_memory import process_tree_high_water_rss_bytes
 from keyframe.stage_scheduler import configure_worker_thread_budget
@@ -775,11 +777,9 @@ class StageSupervisor:
         self.progress_callback = progress_callback
         self.progress_capacity = max(1, int(progress_capacity))
         self.cancellation_grace_seconds = max(0.0, float(cancellation_grace_seconds))
-        self.entry_id = workspace_entry_id(run_id)
-        self.run_id = str(self.entry_id)
+        self.run_id = run_id or uuid.uuid4().hex
         self.context = mp.get_context("spawn")
         self.lock: OutputDirectoryLock | None = None
-        self.workspace: ManagedWorkspace | None = None
         self.staging: RunStagingPaths | None = None
         self.public: TranscriptCheckpointPaths | None = None
         self._handles: list[StageHandle] = []
@@ -789,15 +789,16 @@ class StageSupervisor:
     def __enter__(self) -> StageSupervisor:
         if self._entered:
             raise RuntimeError("stage supervisor cannot be entered twice")
-        run_created = False
+        staging_root_was_absent = False
         try:
             self.output_dir.mkdir(parents=True, exist_ok=True)
             self.output_dir = self.output_dir.resolve()
             self.lock = OutputDirectoryLock(self.output_dir)
             self.lock.acquire()
-            self.workspace = ManagedWorkspace.open(self.output_dir, self.lock)
-            self.staging = self.workspace.create_run(self.entry_id)
-            run_created = True
+            self._cleanup_stale_runs()
+            self.staging = run_staging_paths(self.output_dir, self.run_id)
+            staging_root_was_absent = not os.path.lexists(self.staging.root)
+            self.staging.root.mkdir()
             self.public = transcript_checkpoint_paths(self.output_dir)
             self._install_sigterm_handler()
             self._entered = True
@@ -808,12 +809,17 @@ class StageSupervisor:
                     self._restore_sigterm_handler()
                 except BaseException as cleanup_exc:
                     exc.add_note(f"failed to restore SIGTERM handler: {cleanup_exc}")
-                if run_created and self.workspace is not None:
+                if (
+                    staging_root_was_absent
+                    and self.staging is not None
+                    and self.staging.root.is_dir()
+                    and not self.staging.root.is_symlink()
+                ):
                     try:
-                        self.workspace.delete_entry("run", self.entry_id)
+                        remove_keyframe_owned_directory(self.staging.root)
                     except BaseException as cleanup_exc:
                         exc.add_note(
-                            f"failed to remove managed run entry: {cleanup_exc}"
+                            f"failed to remove run staging directory: {cleanup_exc}"
                         )
             finally:
                 if self.lock is not None:
@@ -839,6 +845,9 @@ class StageSupervisor:
     @staticmethod
     def _handle_sigterm(signum: int, _frame: Any) -> None:
         raise SupervisorSignal(signum)
+
+    def _cleanup_stale_runs(self) -> None:
+        cleanup_stale_run_directories(self.output_dir)
 
     def _require_entered(self) -> tuple[RunStagingPaths, TranscriptCheckpointPaths]:
         if not self._entered or self.staging is None or self.public is None:
@@ -1078,11 +1087,11 @@ class StageSupervisor:
                     handle.cancel(self.cancellation_grace_seconds)
                 except BaseException as exc:
                     remember_error(exc, f"failed to cancel {handle.stage} worker")
-            if self.workspace is not None:
+            if self.staging is not None and self.staging.root.exists():
                 try:
-                    self.workspace.delete_entry("run", self.entry_id)
+                    remove_keyframe_owned_directory(self.staging.root)
                 except BaseException as exc:
-                    remember_error(exc, "failed to remove managed run entry")
+                    remember_error(exc, "failed to remove run staging directory")
         finally:
             try:
                 self._restore_sigterm_handler()

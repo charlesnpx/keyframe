@@ -14,7 +14,6 @@ import pytest
 
 from keyframe import stage_supervisor as supervisor_module
 from keyframe import transcript
-from keyframe.output_session import OutputSessionError
 from keyframe.stage_supervisor import (
     DiarizationWorkerRequest,
     OutputDirectoryLock,
@@ -24,6 +23,7 @@ from keyframe.stage_supervisor import (
     StageProgress,
     StageProtocolError,
     StageSupervisor,
+    StageSupervisorError,
     StageTerminal,
     StageWorkerError,
     SupervisorSignal,
@@ -520,7 +520,7 @@ def test_committed_raw_transcript_survives_later_diarization_failure(tmp_path):
     assert not (output / "keyframe-run-partial").exists()
 
 
-def test_legacy_run_prefixes_are_preserved_and_symlinks_are_not_followed(tmp_path):
+def test_stale_run_cleanup_is_scoped_and_does_not_follow_symlinks(tmp_path):
     output = tmp_path / "output"
     output.mkdir()
     stale = output / "keyframe-run-stale"
@@ -534,7 +534,7 @@ def test_legacy_run_prefixes_are_preserved_and_symlinks_are_not_followed(tmp_pat
     run_symlink.symlink_to(external, target_is_directory=True)
 
     with StageSupervisor(output, run_id="current") as supervisor:
-        assert stale.exists()
+        assert not stale.exists()
         assert unrelated.exists()
         assert run_symlink.is_symlink()
         assert external.exists()
@@ -546,7 +546,7 @@ def test_legacy_run_prefixes_are_preserved_and_symlinks_are_not_followed(tmp_pat
 
 
 @pytest.mark.parametrize("frame_artifact", ["file", "directory-symlink"])
-def test_transcript_session_fails_closed_on_invalid_public_frame_path(
+def test_transcript_session_ignores_unrelated_frame_path_without_recovery_backup(
     tmp_path,
     frame_artifact,
 ):
@@ -561,9 +561,15 @@ def test_transcript_session_fails_closed_on_invalid_public_frame_path(
         (external / "sentinel.txt").write_text("user-owned", encoding="utf-8")
         frames.symlink_to(external, target_is_directory=True)
 
-    with pytest.raises(OutputSessionError, match="public frame generation"):
-        with StageSupervisor(output, run_id="transcript-only"):
-            pytest.fail("invalid public frames must block managed mutation")
+    with StageSupervisor(output, run_id="transcript-only") as supervisor:
+        assert supervisor.staging is not None
+        if frame_artifact == "file":
+            assert frames.read_text(encoding="utf-8") == "user-owned"
+        else:
+            assert frames.is_symlink()
+            assert (frames / "sentinel.txt").read_text(encoding="utf-8") == (
+                "user-owned"
+            )
 
     if frame_artifact == "file":
         assert frames.read_text(encoding="utf-8") == "user-owned"
@@ -572,16 +578,15 @@ def test_transcript_session_fails_closed_on_invalid_public_frame_path(
         assert external.exists()
 
 
-def test_legacy_run_collision_is_preserved_and_cannot_alias_managed_run(tmp_path):
+def test_failed_entry_preserves_collision_and_releases_output_lock(tmp_path):
     output = tmp_path / "output"
     output.mkdir()
     collision = output / "keyframe-run-collision"
     collision.write_text("not a run directory", encoding="utf-8")
 
-    with StageSupervisor(output, run_id="collision") as supervisor:
-        assert supervisor.staging is not None
-        assert supervisor.staging.root.parent.parent.name == ".keyframe-work"
-        assert collision.read_text(encoding="utf-8") == "not a run directory"
+    with pytest.raises(StageSupervisorError, match="failed to initialize"):
+        with StageSupervisor(output, run_id="collision"):
+            pytest.fail("a run directory must not replace an existing file")
 
     assert collision.read_text(encoding="utf-8") == "not a run directory"
     with StageSupervisor(output, run_id="after-collision") as supervisor:
