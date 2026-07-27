@@ -59,12 +59,15 @@ def _mlx_requirements() -> dict[str, str]:
     }
 
 
-def _default_requirements() -> dict[str, str]:
+def _requirements_by_name() -> dict[str, list[str]]:
     try:
         requirements = importlib_metadata.requires("keyframe") or []
     except importlib_metadata.PackageNotFoundError as exc:
         raise InstallValidationError("the keyframe distribution is not installed") from exc
-    return {_requirement_name(requirement): requirement for requirement in requirements}
+    grouped: dict[str, list[str]] = {}
+    for requirement in requirements:
+        grouped.setdefault(_requirement_name(requirement), []).append(requirement)
+    return grouped
 
 
 def _is_supported_mlx_runtime() -> bool:
@@ -106,7 +109,7 @@ def validate_install(expected_platform: str = "auto") -> dict[str, Any]:
             f"expected keyframe {EXPECTED_KEYFRAME_VERSION}, found {keyframe_version!r}"
         )
 
-    default_requirements = _default_requirements()
+    requirements_by_name = _requirements_by_name()
     mlx_requirements = _mlx_requirements()
     if set(mlx_requirements) != set(EXPECTED_MLX_VERSIONS):
         raise InstallValidationError(
@@ -150,14 +153,24 @@ def validate_install(expected_platform: str = "auto") -> dict[str, Any]:
                 f"unsupported platform installed MLX distributions: {unexpected}"
             )
 
-    missing_paddle = EXPECTED_LINUX_X86_64_PADDLE - set(default_requirements)
+    missing_paddle = EXPECTED_LINUX_X86_64_PADDLE - set(requirements_by_name)
     if missing_paddle:
         raise InstallValidationError(
             f"installed keyframe metadata is missing Paddle dependencies: {sorted(missing_paddle)}"
         )
     for name in EXPECTED_LINUX_X86_64_PADDLE:
-        marker = default_requirements[name].partition(";")[2].lower()
-        if "sys_platform" not in marker or "platform_machine" not in marker:
+        markers = [
+            requirement.partition(";")[2].lower()
+            for requirement in requirements_by_name[name]
+        ]
+        has_linux_x86_64_marker = any(
+            "sys_platform" in marker
+            and "linux" in marker
+            and "platform_machine" in marker
+            and "x86_64" in marker
+            for marker in markers
+        )
+        if not has_linux_x86_64_marker:
             raise InstallValidationError(
                 f"installed {name} requirement is missing the Linux x86_64 platform gate"
             )
