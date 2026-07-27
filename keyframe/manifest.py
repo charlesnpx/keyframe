@@ -44,6 +44,10 @@ def write_manifest(
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     rows = []
+    sampling_timing = (metadata or {}).get("sampling_timing", {})
+    sampling_timing_source = (
+        sampling_timing.get("source") if isinstance(sampling_timing, dict) else None
+    )
     for item in selected:
         if isinstance(item, CandidateRecord):
             item = candidate_to_manifest_row(
@@ -55,13 +59,24 @@ def write_manifest(
         rows.append({
             "filename": Path(item.get("path", "")).name,
             "timestamp": timestamp,
+            "source_frame_index": item.get("frame_idx"),
             "caption": item.get("caption", ""),
+            "ocr_text": item.get("ocr_text", ""),
             "ocr_cache_source": item.get("ocr_cache_source"),
             "ocr_tokens": tokens,
+            "cleaned_ocr_tokens": tokens,
             "transcript_window": transcript_window(transcript_segments, timestamp),
             "dhash": item.get("dhash_hex") or (f"{int(item['dhash']):016x}" if "dhash" in item else None),
             "merged_from_sample_idxs": item.get("merged_from_sample_idxs", [item.get("sample_idx")]),
             "merged_timestamps": item.get("merged_timestamps", [timestamp]),
+            "coverage_window_ids": item.get("coverage_window_ids", []),
+            "selection_role": item.get("selection_role") or (
+                "rescue" if item.get("rescue_origin") else item.get("proposal_lane")
+            ),
+            "selection_reason": item.get("selection_reason")
+            or item.get("rescue_reason")
+            or item.get("retention_reason"),
+            "sampling_timing_source": sampling_timing_source,
             "screen_type": screen_type(tokens, item.get("caption", "")),
             "cluster_role": item.get("cluster_role"),
             "retention_reason": item.get("retention_reason", "none"),

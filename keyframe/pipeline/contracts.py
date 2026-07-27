@@ -45,6 +45,7 @@ class FeatureOutput:
     source_sharpness: list[float] = field(default_factory=list)
     pixel_digests: list[str] = field(default_factory=list)
     frame_sizes: list[tuple[int, int]] = field(default_factory=list)
+    sampling_timing: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -102,6 +103,7 @@ class CandidateTemporalMetadata:
     dwell_id: int | None = None
     temporal_window_id: int | None = None
     temporal_window_seconds: float | None = None
+    coverage_window_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -130,6 +132,8 @@ class CandidateSelectionMetadata:
     content_area_previous_delta: float | None = None
     content_area_next_delta: float | None = None
     proposal_lane: str | None = None
+    selection_role: str | None = None
+    selection_reason: str | None = None
     end_of_dwell_bonus: float | None = None
     rescue_origin: str | None = None
     rescue_reason: str | None = None

@@ -520,7 +520,7 @@ def test_committed_raw_transcript_survives_later_diarization_failure(tmp_path):
     assert not (output / "keyframe-run-partial").exists()
 
 
-def test_stale_run_cleanup_is_scoped_and_does_not_follow_symlinks(tmp_path):
+def test_stale_run_directories_are_ignored_and_not_followed(tmp_path):
     output = tmp_path / "output"
     output.mkdir()
     stale = output / "keyframe-run-stale"
@@ -534,7 +534,7 @@ def test_stale_run_cleanup_is_scoped_and_does_not_follow_symlinks(tmp_path):
     run_symlink.symlink_to(external, target_is_directory=True)
 
     with StageSupervisor(output, run_id="current") as supervisor:
-        assert not stale.exists()
+        assert stale.exists()
         assert unrelated.exists()
         assert run_symlink.is_symlink()
         assert external.exists()

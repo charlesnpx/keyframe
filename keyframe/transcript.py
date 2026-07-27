@@ -242,6 +242,10 @@ class MLXInferenceError(MLXBackendError):
     """MLX inference failed or returned a malformed result."""
 
 
+class MLXTranscriptValidationError(MLXInferenceError):
+    """MLX returned structurally valid JSON that fails transcript validation."""
+
+
 @dataclass(frozen=True)
 class MLXRuntime:
     snapshot_download: Callable[..., str]
@@ -314,6 +318,7 @@ class CheckpointValidationError(ValueError):
 
 RAW_TRANSCRIPT_FIELDS = frozenset({"start", "end", "text"})
 DIARIZATION_FIELDS = frozenset({"start", "end", "speaker"})
+_TRANSCRIPT_WORD_RE = re.compile(r"[^\W_]+(?:['’][^\W_]+)*", re.UNICODE)
 
 
 def format_time(seconds):
@@ -444,6 +449,81 @@ def _finite_seconds(value: Any) -> float | None:
     return seconds
 
 
+def normalized_transcript_words(
+    segments: Iterable[Mapping[str, Any] | TranscriptSegment],
+) -> tuple[str, ...]:
+    words: list[str] = []
+    for segment in transcript_segments(segments):
+        words.extend(
+            match.group(0).replace("’", "'").casefold()
+            for match in _TRANSCRIPT_WORD_RE.finditer(segment.text)
+        )
+    return tuple(words)
+
+
+def has_catastrophic_repetition(
+    segments: Iterable[Mapping[str, Any] | TranscriptSegment],
+    *,
+    ngram_size: int = 5,
+    minimum_words: int = 80,
+    duplicate_ratio: float = 0.45,
+    minimum_repeats: int = 8,
+) -> bool:
+    words = normalized_transcript_words(segments)
+    if len(words) < minimum_words:
+        return False
+    if ngram_size < 1:
+        raise ValueError("ngram_size must be positive")
+    counts: dict[tuple[str, ...], int] = {}
+    total = max(0, len(words) - ngram_size + 1)
+    for index in range(total):
+        ngram = words[index:index + ngram_size]
+        counts[ngram] = counts.get(ngram, 0) + 1
+    if not counts:
+        return False
+    repeated = sum(count - 1 for count in counts.values() if count > 1)
+    most_common = max(counts.values())
+    return most_common >= minimum_repeats and repeated / total >= duplicate_ratio
+
+
+def validate_transcript_segments(
+    segments: Iterable[Mapping[str, Any] | TranscriptSegment],
+    *,
+    detect_repetition: bool = True,
+) -> tuple[TranscriptSegment, ...]:
+    normalized = tuple(transcript_segments(segments))
+    previous_end = 0.0
+    for index, segment in enumerate(normalized):
+        start = _strict_checkpoint_seconds(
+            segment.start,
+            row_index=index,
+            field="start",
+        )
+        end = _strict_checkpoint_seconds(
+            segment.end,
+            row_index=index,
+            field="end",
+        )
+        if end <= start:
+            raise CheckpointValidationError(
+                f"raw transcript row {index} must have positive duration"
+            )
+        if index > 0 and start < previous_end:
+            raise CheckpointValidationError(
+                f"raw transcript row {index} overlaps the previous row"
+            )
+        if not segment.text.strip():
+            raise CheckpointValidationError(
+                f"raw transcript row {index} field 'text' must be nonempty"
+            )
+        previous_end = end
+    if detect_repetition and has_catastrophic_repetition(normalized):
+        raise CheckpointValidationError(
+            "raw transcript appears to contain a catastrophic repetition loop"
+        )
+    return normalized
+
+
 def _strict_checkpoint_seconds(
     value: Any,
     *,
@@ -495,16 +575,21 @@ def _raw_transcript_checkpoint_row(
 
     start = _strict_checkpoint_seconds(values.get("start"), row_index=row_index, field="start")
     end = _strict_checkpoint_seconds(values.get("end"), row_index=row_index, field="end")
-    if end < start:
+    if end <= start:
         raise CheckpointValidationError(
-            f"raw transcript row {row_index} ends before it starts"
+            f"raw transcript row {row_index} must have positive duration"
         )
     text = values.get("text")
     if not isinstance(text, str):
         raise CheckpointValidationError(
             f"raw transcript row {row_index} field 'text' must be a string"
         )
-    return {"start": start, "end": end, "text": text.strip()}
+    cleaned = text.strip()
+    if not cleaned:
+        raise CheckpointValidationError(
+            f"raw transcript row {row_index} field 'text' must be nonempty"
+        )
+    return {"start": start, "end": end, "text": cleaned}
 
 
 def _diarization_checkpoint_row(
@@ -585,6 +670,7 @@ def write_raw_transcript_checkpoint(
         _raw_transcript_checkpoint_row(segment, index)
         for index, segment in enumerate(segments)
     ]
+    validate_transcript_segments(payload)
     return atomic_write_json(path, payload, allow_nan=False)
 
 
@@ -602,7 +688,7 @@ def read_raw_transcript_checkpoint(
         _raw_transcript_checkpoint_row(row, index)
         for index, row in enumerate(rows)
     ]
-    return tuple(TranscriptSegment(**row) for row in normalized)
+    return validate_transcript_segments(normalized)
 
 
 def write_diarization_checkpoint(
@@ -1122,23 +1208,35 @@ def _normalize_mlx_result(
         raise TypeError("MLX transcription result has no segment sequence")
 
     normalized = []
+    previous_end = 0.0
     for index, raw_segment in enumerate(raw_segments):
         if not isinstance(raw_segment, Mapping):
             raise TypeError(f"MLX segment {index} is not a mapping")
         start = _finite_seconds(raw_segment.get("start"))
         end = _finite_seconds(raw_segment.get("end"))
-        if start is None or end is None or start < 0 or end < start:
+        if start is None or end is None or start < 0 or end <= start:
             raise ValueError(f"MLX segment {index} has invalid timestamps")
+        if index > 0 and start < previous_end:
+            raise ValueError(f"MLX segment {index} overlaps the previous segment")
+        text = str(raw_segment.get("text", "")).strip()
+        if not text:
+            raise ValueError(f"MLX segment {index} has empty text")
         normalized.append(
             TranscriptSegment(
                 start=start,
                 end=end,
-                text=str(raw_segment.get("text", "")),
+                text=text,
             )
         )
+        previous_end = end
+
+    try:
+        segments = validate_transcript_segments(normalized)
+    except CheckpointValidationError as exc:
+        raise MLXTranscriptValidationError("MLX transcript failed validation") from exc
 
     language = result.get("language")
-    return tuple(normalized), str(language) if language else "unknown"
+    return segments, str(language) if language else "unknown"
 
 
 def _extract_with_mlx(
@@ -1189,6 +1287,8 @@ def _extract_with_mlx(
         metadata["mlx_peak_memory_bytes"] = peak_memory_bytes
         return TranscriptionResult(segments, language, metadata)
     except TranscriptionCancelled:
+        raise
+    except MLXTranscriptValidationError:
         raise
     except Exception as exc:
         raise MLXInferenceError(
@@ -1357,7 +1457,7 @@ def extract_transcript(
         model_name,
         transcription_backend,
     )
-    segments, language = result.segments, result.language
+    segments, language = validate_transcript_segments(result.segments), result.language
 
     if speaker_detection and segments:
         hf_token = (os.environ.get("HF_TOKEN") or "").strip()

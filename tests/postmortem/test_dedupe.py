@@ -63,7 +63,7 @@ def test_half_second_ocr_neighbors_collapse():
     assert survivors[0]["merged_from_sample_idxs"] == [10, 11]
 
 
-def test_distinct_near_time_ocr_survives():
+def test_one_frame_near_time_ocr_difference_is_unprotected():
     candidates = [
         {"sample_idx": 1, "timestamp": 1.0},
         {"sample_idx": 2, "timestamp": 1.5},
@@ -72,10 +72,11 @@ def test_distinct_near_time_ocr_survives():
 
     survivors = near_time_dedupe(candidates, tokens)
 
-    assert [c["sample_idx"] for c in survivors] == [1, 2]
+    assert [c["sample_idx"] for c in survivors] == [1]
+    assert survivors[0]["merged_from_sample_idxs"] == [1, 2]
 
 
-def test_near_time_dedupe_keeps_different_page_markers():
+def test_near_time_dedupe_collapses_unprotected_page_marker_burst():
     shared = {"brucepower", "component", "test", "document", "review", "unit", "owner", "date", "form"}
     candidates = [
         {"sample_idx": 1, "timestamp": 10.0, "candidate_score": 1.0},
@@ -84,14 +85,28 @@ def test_near_time_dedupe_keeps_different_page_markers():
 
     survivors = near_time_dedupe(candidates, [shared | {"page1"}, shared | {"page2"}])
 
-    assert [c["sample_idx"] for c in survivors] == [1, 2]
+    assert [c["sample_idx"] for c in survivors] == [2]
+    assert survivors[0]["merged_from_sample_idxs"] == [1, 2]
 
 
-def test_near_time_dedupe_keeps_different_status_tokens():
+def test_near_time_dedupe_collapses_unprotected_status_burst():
     shared = {"approval", "request", "amount", "manager", "review", "owner", "date", "form", "unit"}
     candidates = [
         {"sample_idx": 1, "timestamp": 10.0, "candidate_score": 1.0},
         {"sample_idx": 2, "timestamp": 10.5, "candidate_score": 2.0},
+    ]
+
+    survivors = near_time_dedupe(candidates, [shared | {"draft"}, shared | {"approved"}])
+
+    assert [c["sample_idx"] for c in survivors] == [2]
+    assert survivors[0]["merged_from_sample_idxs"] == [1, 2]
+
+
+def test_near_time_dedupe_keeps_previously_protected_structured_states():
+    shared = {"approval", "request", "amount", "manager", "review", "owner", "date", "form", "unit"}
+    candidates = [
+        {"sample_idx": 1, "timestamp": 10.0, "candidate_score": 1.0, "retention_reason": "differing_evidence"},
+        {"sample_idx": 2, "timestamp": 10.5, "candidate_score": 2.0, "retention_reason": "differing_evidence"},
     ]
 
     survivors = near_time_dedupe(candidates, [shared | {"draft"}, shared | {"approved"}])

@@ -13,10 +13,14 @@ from importlib import metadata as importlib_metadata
 from typing import Any
 
 
-EXPECTED_KEYFRAME_VERSION = "0.6.2"
+EXPECTED_KEYFRAME_VERSION = "0.6.3"
 EXPECTED_MLX_VERSIONS = {
     "mlx": "0.32.0",
     "mlx-whisper": "0.4.3",
+}
+EXPECTED_LINUX_X86_64_PADDLE = {
+    "paddlepaddle",
+    "paddleocr",
 }
 IMPORT_SMOKE_MODULES = (
     "keyframe",
@@ -53,6 +57,14 @@ def _mlx_requirements() -> dict[str, str]:
         for requirement in requirements
         if _requirement_name(requirement) in EXPECTED_MLX_VERSIONS
     }
+
+
+def _default_requirements() -> dict[str, str]:
+    try:
+        requirements = importlib_metadata.requires("keyframe") or []
+    except importlib_metadata.PackageNotFoundError as exc:
+        raise InstallValidationError("the keyframe distribution is not installed") from exc
+    return {_requirement_name(requirement): requirement for requirement in requirements}
 
 
 def _is_supported_mlx_runtime() -> bool:
@@ -94,6 +106,7 @@ def validate_install(expected_platform: str = "auto") -> dict[str, Any]:
             f"expected keyframe {EXPECTED_KEYFRAME_VERSION}, found {keyframe_version!r}"
         )
 
+    default_requirements = _default_requirements()
     mlx_requirements = _mlx_requirements()
     if set(mlx_requirements) != set(EXPECTED_MLX_VERSIONS):
         raise InstallValidationError(
@@ -137,6 +150,18 @@ def validate_install(expected_platform: str = "auto") -> dict[str, Any]:
                 f"unsupported platform installed MLX distributions: {unexpected}"
             )
 
+    missing_paddle = EXPECTED_LINUX_X86_64_PADDLE - set(default_requirements)
+    if missing_paddle:
+        raise InstallValidationError(
+            f"installed keyframe metadata is missing Paddle dependencies: {sorted(missing_paddle)}"
+        )
+    for name in EXPECTED_LINUX_X86_64_PADDLE:
+        marker = default_requirements[name].partition(";")[2].lower()
+        if "sys_platform" not in marker or "platform_machine" not in marker:
+            raise InstallValidationError(
+                f"installed {name} requirement is missing the Linux x86_64 platform gate"
+            )
+
     for module_name in IMPORT_SMOKE_MODULES:
         importlib.import_module(module_name)
 
@@ -149,6 +174,7 @@ def validate_install(expected_platform: str = "auto") -> dict[str, Any]:
         "keyframe": keyframe_version,
         "supports_mlx": supports_mlx,
         "installed_mlx": installed_mlx,
+        "linux_x86_64_paddle_requirements": sorted(EXPECTED_LINUX_X86_64_PADDLE),
         "imports": list(IMPORT_SMOKE_MODULES),
         "model_acquisition_attempted": False,
     }

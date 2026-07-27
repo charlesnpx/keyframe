@@ -104,13 +104,41 @@ def test_checkpoint_writers_reject_non_finite_timestamps_without_publishing(
         {"start": 0.0, "end": 1.0, "text": "ok", "speaker": "SPEAKER_00"},
         {"start": True, "end": 1.0, "text": "bad bool"},
         {"start": -1.0, "end": 1.0, "text": "negative"},
+        {"start": 1.0, "end": 1.0, "text": "zero duration"},
         {"start": 2.0, "end": 1.0, "text": "backwards"},
+        {"start": 0.0, "end": 1.0, "text": "  "},
         {"start": 0.0, "end": 1.0, "text": 42},
     ],
 )
 def test_raw_checkpoint_rejects_malformed_rows(tmp_path, row):
     with pytest.raises(transcript.CheckpointValidationError):
         transcript.write_raw_transcript_checkpoint([row], tmp_path / "raw.json")
+
+
+def test_raw_checkpoint_rejects_overlapping_rows(tmp_path):
+    with pytest.raises(transcript.CheckpointValidationError, match="overlaps"):
+        transcript.write_raw_transcript_checkpoint(
+            [
+                {"start": 0.0, "end": 2.0, "text": "first"},
+                {"start": 1.5, "end": 3.0, "text": "second"},
+            ],
+            tmp_path / "raw.json",
+        )
+
+
+def test_catastrophic_repetition_detection_is_structural():
+    segments = [
+        transcript.TranscriptSegment(
+            float(index),
+            float(index + 1),
+            "alpha beta gamma delta epsilon",
+        )
+        for index in range(30)
+    ]
+
+    assert transcript.has_catastrophic_repetition(segments)
+    with pytest.raises(transcript.CheckpointValidationError, match="repetition"):
+        transcript.validate_transcript_segments(segments)
 
 
 @pytest.mark.parametrize(

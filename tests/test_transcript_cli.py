@@ -40,6 +40,24 @@ def _video(tmp_path):
     return video
 
 
+def _stub_cli_media_preflight(monkeypatch):
+    from keyframe import media_preflight
+
+    monkeypatch.setattr(
+        media_preflight,
+        "probe_media",
+        lambda _path: media_preflight.MediaProbeResult(
+            (
+                media_preflight.MediaStream(
+                    codec_type="audio",
+                    codec_name="aac",
+                    channels=1,
+                ),
+            )
+        ),
+    )
+
+
 def _config(**overrides):
     values = {
         "model_name": "medium",
@@ -1042,6 +1060,7 @@ def test_cmd_extract_reports_explicit_output_creation_failure(
     capsys,
 ):
     video = _video(tmp_path)
+    _stub_cli_media_preflight(monkeypatch)
     monkeypatch.setattr(cli, "_preflight_transcript", lambda _args: object())
     monkeypatch.setattr(
         cli,
@@ -1059,6 +1078,12 @@ def test_cmd_extract_reports_explicit_output_creation_failure(
         diarization_device="auto",
         stage_concurrency="auto",
         no_speaker_detection=True,
+        sample_interval=0.75,
+        pass1_clusters=9,
+        similarity_threshold=0.85,
+        max_output_frames=None,
+        verbose_trace=False,
+        debug_qa_targets=None,
     )
 
     with pytest.raises(SystemExit) as raised:
@@ -1085,6 +1110,7 @@ def test_cmd_extract_presents_transcription_failure_and_preserves_prior_final(
         error_type="RuntimeError",
     )
     monkeypatch.setattr(cli, "_preflight_transcript", lambda _args: object())
+    _stub_cli_media_preflight(monkeypatch)
     monkeypatch.setattr(
         cli,
         "_run_transcript",
@@ -1101,6 +1127,12 @@ def test_cmd_extract_presents_transcription_failure_and_preserves_prior_final(
         diarization_device="auto",
         stage_concurrency="auto",
         no_speaker_detection=True,
+        sample_interval=0.75,
+        pass1_clusters=9,
+        similarity_threshold=0.85,
+        max_output_frames=None,
+        verbose_trace=False,
+        debug_qa_targets=None,
     )
 
     with pytest.raises(SystemExit) as raised:

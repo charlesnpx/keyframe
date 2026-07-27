@@ -7,6 +7,8 @@ import pytest
 from PIL import Image
 
 from keyframe import cli
+from keyframe import frame_preflight
+from keyframe import media_preflight
 from keyframe.frame_generation import (
     FrameGenerationPromotionError,
     FrameGenerationSession,
@@ -110,6 +112,40 @@ def _frames_only_args(video, output):
         whisper_model="medium",
         transcript_format="txt",
         no_speaker_detection=False,
+    )
+
+
+def _stub_cli_preflight(monkeypatch, *, audio: bool = False):
+    streams = [
+        media_preflight.MediaStream(
+            codec_type="video",
+            codec_name="h264",
+            width=16,
+            height=16,
+        )
+    ]
+    if audio:
+        streams.append(
+            media_preflight.MediaStream(
+                codec_type="audio",
+                codec_name="aac",
+                channels=1,
+            )
+        )
+    monkeypatch.setattr(
+        media_preflight,
+        "probe_media",
+        lambda _path: media_preflight.MediaProbeResult(tuple(streams)),
+    )
+    monkeypatch.setattr(
+        frame_preflight,
+        "preflight_frame_runtime",
+        lambda: frame_preflight.FrameRuntimePlatform("Darwin", "arm64"),
+    )
+    monkeypatch.setattr(
+        frame_preflight,
+        "resolve_frame_execution_device",
+        lambda _runtime: "cpu",
     )
 
 
@@ -272,6 +308,7 @@ def test_cli_frame_write_failure_discards_stage_and_preserves_public_generation(
         raise OSError("injected manifest failure")
 
     monkeypatch.setattr(cli, "_run_frame_generation", fail_generation)
+    _stub_cli_preflight(monkeypatch)
 
     with pytest.raises(OSError, match="injected"):
         cli.cmd_extract(_frames_only_args(video, output))
@@ -355,11 +392,11 @@ def test_unrecoverable_rollback_keeps_external_backup_for_next_locked_run(
 
     assert backup.exists()
     with FrameGenerationSession(output, run_id="recovery"):
-        assert _tree_snapshot(output / "frames") == previous
-        assert not backup.exists()
+        assert backup.exists()
+        assert not (output / "frames").exists()
 
 
-def test_locked_session_cleans_abandoned_staging_and_obsolete_backup(tmp_path):
+def test_locked_session_ignores_abandoned_staging_and_obsolete_backup(tmp_path):
     output = tmp_path / "out"
     output.mkdir()
     public = output / "frames"
@@ -375,8 +412,8 @@ def test_locked_session_cleans_abandoned_staging_and_obsolete_backup(tmp_path):
     unrelated.mkdir()
 
     with FrameGenerationSession(output, run_id="current") as session:
-        assert not stale.exists()
-        assert not obsolete_backup.exists()
+        assert stale.exists()
+        assert obsolete_backup.exists()
         assert unrelated.exists()
         assert session.staging is not None
         assert session.staging.root.exists()
@@ -403,6 +440,7 @@ def test_full_cli_defers_publication_until_transcript_manifest_enrichment(
     monkeypatch,
     capsys,
 ):
+    import keyframe.full_pipeline as full_pipeline
     import keyframe.pipeline as pipeline
 
     video = tmp_path / "input.mp4"
@@ -446,7 +484,9 @@ def test_full_cli_defers_publication_until_transcript_manifest_enrichment(
 
     monkeypatch.setattr(pipeline, "extract_keyframes", fake_extract)
     monkeypatch.setattr(cli, "_preflight_transcript", lambda _args: object())
+    monkeypatch.setattr(full_pipeline, "resolve_frame_device", lambda _preflight: "cpu")
     monkeypatch.setattr(cli, "_run_full_pipeline", fake_full_pipeline)
+    _stub_cli_preflight(monkeypatch, audio=True)
     args = _frames_only_args(video, output)
     args.frames_only = False
 

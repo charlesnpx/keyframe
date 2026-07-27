@@ -365,13 +365,27 @@ def merge_candidate_lineage(
         roles.add(str(winner.visual.cluster_role))
     if loser.visual.cluster_role:
         roles.add(str(loser.visual.cluster_role))
+    if winner.selection.selection_role:
+        roles.add(str(winner.selection.selection_role))
+    if loser.selection.selection_role:
+        roles.add(str(loser.selection.selection_role))
+    coverage_window_ids = tuple(
+        sorted(
+            {
+                *(int(value) for value in winner.temporal.coverage_window_ids),
+                *(int(value) for value in loser.temporal.coverage_window_ids),
+            }
+        )
+    )
 
     selection_updates: dict[str, Any] = {"retention_reason": retention_reason}
     if not winner.selection.rescue_origin and loser.selection.rescue_origin:
         selection_updates["rescue_origin"] = loser.selection.rescue_origin
         selection_updates["rescue_reason"] = loser.selection.rescue_reason
 
-    return winner.with_selection(**selection_updates).with_lineage(
+    return winner.with_temporal(
+        coverage_window_ids=coverage_window_ids,
+    ).with_selection(**selection_updates).with_lineage(
         merged_from_sample_idxs=merged_from_sample_idxs,
         merged_timestamps=merged_timestamps,
         retention_reasons_seen=tuple(sorted(reason for reason in reasons_seen if reason)),
@@ -586,6 +600,11 @@ def filter_low_information_candidates(
     )
 
     for row in rows:
+        if row.temporal.coverage_window_ids:
+            survivors.append(
+                row.with_selection(low_information_filter_reason="coverage")
+            )
+            continue
         tokens = _tokens(row)
         has_evidence = _has_evidence_markers(tokens)
         has_protective_caption = _has_protective_caption(row)
@@ -699,6 +718,13 @@ def _same_scene_or_dwell(left: CandidateRecord, right: CandidateRecord) -> bool:
     )
 
 
+def _same_dwell(left: CandidateRecord, right: CandidateRecord) -> bool:
+    return (
+        left.temporal.dwell_id is not None
+        and left.temporal.dwell_id == right.temporal.dwell_id
+    )
+
+
 def _signature_delta(left: CandidateRecord, right: CandidateRecord) -> bool:
     return has_signature_delta(
         left.evidence.ocr_line_signature,
@@ -712,6 +738,52 @@ def _lower_value_duplicate(left: CandidateRecord, right: CandidateRecord) -> tup
     if _candidate_information_score(left) >= _candidate_information_score(right):
         return left, right
     return right, left
+
+
+def _content_delta(
+    left: CandidateRecord,
+    right: CandidateRecord,
+    frames: Sequence[Any] | Mapping[int, Any] | None,
+    frame_metrics: FrameMetricTable | None,
+) -> float | None:
+    if frame_metrics is not None:
+        return frame_metrics.content_delta_between(left.sample_idx, right.sample_idx)
+    if frames is None:
+        return None
+    left_image = _frame_for_candidate(left, frames)
+    right_image = _frame_for_candidate(right, frames)
+    if left_image is None or right_image is None:
+        return None
+    try:
+        return mean_abs_content_delta(left_image, right_image)
+    finally:
+        if getattr(frames, "is_disk_backed", False):
+            left_image.close()
+            right_image.close()
+
+
+def _strong_visual_duplicate(
+    left: CandidateRecord,
+    right: CandidateRecord,
+    *,
+    dhashes: Mapping[int, int] | Sequence[int] | None = None,
+    frames: Sequence[Any] | Mapping[int, Any] | None = None,
+    frame_metrics: FrameMetricTable | None = None,
+    max_hamming: int = 1,
+    max_mean_abs_delta: float = 2.5,
+) -> tuple[bool, float | None]:
+    if not _same_dwell(left, right):
+        return False, None
+    left_hash = _hash_for(left, dhashes)
+    right_hash = _hash_for(right, dhashes)
+    if left_hash is None or right_hash is None:
+        return False, None
+    if hamming(left_hash, right_hash) > max_hamming:
+        return False, None
+    delta = _content_delta(left, right, frames, frame_metrics)
+    if delta is None:
+        return False, None
+    return delta <= max_mean_abs_delta, delta
 
 
 def content_area_duplicate_veto(
@@ -738,26 +810,25 @@ def content_area_duplicate_veto(
             survivors.append(row)
             continue
 
-        delta = frame_metrics.content_delta_between(previous.sample_idx, row.sample_idx) if frame_metrics is not None else None
+        strong_duplicate, strong_delta = _strong_visual_duplicate(
+            previous,
+            row,
+            frames=frames,
+            frame_metrics=frame_metrics,
+        )
+        delta = strong_delta
         if delta is None:
-            left_image = _frame_for_candidate(previous, frames)
-            right_image = _frame_for_candidate(row, frames)
-            if left_image is None or right_image is None:
-                survivors.append(row)
-                continue
-            try:
-                delta = mean_abs_content_delta(left_image, right_image)
-            finally:
-                if getattr(frames, "is_disk_backed", False):
-                    left_image.close()
-                    right_image.close()
+            delta = _content_delta(previous, row, frames, frame_metrics)
+        if delta is None:
+            survivors.append(row)
+            continue
         if delta > max_mean_abs_delta:
             survivors.append(row)
             continue
 
         left_tokens = _tokens(previous)
         right_tokens = _tokens(row)
-        if left_tokens or right_tokens:
+        if not strong_duplicate and (left_tokens or right_tokens):
             overlap = _jaccard(left_tokens, right_tokens)
             if overlap < ocr_jaccard_threshold:
                 survivors.append(row)
@@ -797,6 +868,7 @@ def near_time_dedupe(
     max_dt_seconds: float = 2.0,
     ocr_jaccard_threshold: float = 0.9,
     dhash_hamming_threshold: int = 6,
+    frame_metrics: FrameMetricTable | None = None,
 ) -> tuple[CandidateRecord, ...]:
     """Collapse near-time duplicate candidates with identical OCR or weak/no-OCR dHash matches."""
     rows: list[CandidateRecord] = []
@@ -816,6 +888,24 @@ def near_time_dedupe(
             survivor = survivors[i]
             dt = abs(float(row.timestamp) - float(survivor.timestamp))
             if dt > max_dt_seconds:
+                break
+
+            strong_duplicate, _delta = _strong_visual_duplicate(
+                survivor,
+                row,
+                dhashes=dhashes,
+                frame_metrics=frame_metrics,
+            )
+            if strong_duplicate:
+                duplicate_idx = i
+                break
+
+            if (
+                dt < max_dt_seconds
+                and not is_protected_candidate(row)
+                and not is_protected_candidate(survivor)
+            ):
+                duplicate_idx = i
                 break
 
             survivor_tokens = _tokens(survivor)

@@ -391,6 +391,39 @@ def test_import_failure_is_typed_and_auto_fallback_eligible(monkeypatch, tmp_pat
     assert transcript.is_auto_fallback_eligible(raised.value)
 
 
+def test_mlx_catastrophic_repetition_is_typed_and_fallback_eligible(
+    monkeypatch,
+    tmp_path,
+):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    runtime = transcript.MLXRuntime(
+        snapshot_download=lambda **_kwargs: str(model_dir),
+        load_model=lambda *_args: None,
+        transcribe=lambda *_args, **_kwargs: {
+            "segments": [
+                {
+                    "start": float(index),
+                    "end": float(index + 1),
+                    "text": "alpha beta gamma delta epsilon",
+                }
+                for index in range(30)
+            ],
+            "language": "en",
+        },
+        float16="float16",
+        local_entry_not_found_error=FakeLocalEntryNotFoundError,
+        reset_peak_memory=lambda: None,
+        get_peak_memory=lambda: 0,
+    )
+    monkeypatch.setattr(transcript, "_load_mlx_runtime", lambda: runtime)
+
+    with pytest.raises(transcript.MLXTranscriptValidationError) as raised:
+        transcript._extract_with_mlx(tmp_path / "recording.mp4", "tiny", SUPPORTED_MAC)
+
+    assert transcript.is_auto_fallback_eligible(raised.value)
+
+
 def test_cancellation_and_output_failures_are_not_auto_fallback_eligible(
     monkeypatch,
     tmp_path,
