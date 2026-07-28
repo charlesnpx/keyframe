@@ -19,12 +19,16 @@ import torch
 from collections import Counter
 from PIL import Image
 from pathlib import Path
-from transformers import Florence2ForConditionalGeneration, AutoProcessor
-import open_clip
 from sklearn.cluster import AgglomerativeClustering
 import argparse
 import sys
 import json
+
+from keyframe.import_safety import defer_optional_pyav_import
+
+with defer_optional_pyav_import():
+    import open_clip
+    from transformers import AutoProcessor, Florence2ForConditionalGeneration
 
 from keyframe.dedupe import (
     clean_ocr_token_sets,

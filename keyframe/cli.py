@@ -337,6 +337,7 @@ def cmd_extract(args):
         )
 
         try:
+            print("Frame runtime: loading dependencies...", flush=True)
             runtime = preflight_frame_runtime()
             if transcript_preflight is not None:
                 from keyframe.full_pipeline import resolve_frame_device
