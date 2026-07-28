@@ -43,6 +43,7 @@ TRANSCRIPTION_BACKENDS = ("auto", "mlx", "whisper")
 DIARIZATION_DEVICES = ("auto", "cpu", "mps", "cuda")
 MLX_MINIMUM_MACOS_MAJOR = 14
 MLX_MINIMUM_DARWIN_MAJOR = 23
+MLX_TIMESTAMP_JITTER_SECONDS = 1e-9
 DIARIZATION_SOURCE_IGNORED_FIELDS = frozenset({"label", "segment"})
 SPEAKER_DETECTION_SETUP_WARNING = """Warning: no HF_TOKEN found; falling back to transcript without speaker detection.
 To enable speaker detection, accept the pyannote model terms at:
@@ -1217,7 +1218,10 @@ def _normalize_mlx_result(
         if start is None or end is None or start < 0 or end <= start:
             raise ValueError(f"MLX segment {index} has invalid timestamps")
         if index > 0 and start < previous_end:
-            raise ValueError(f"MLX segment {index} overlaps the previous segment")
+            overlap = previous_end - start
+            if overlap > MLX_TIMESTAMP_JITTER_SECONDS or end <= previous_end:
+                raise ValueError(f"MLX segment {index} overlaps the previous segment")
+            start = previous_end
         text = str(raw_segment.get("text", "")).strip()
         if not text:
             raise ValueError(f"MLX segment {index} has empty text")

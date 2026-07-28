@@ -215,6 +215,51 @@ def test_mlx_adapter_resolves_cached_pinned_snapshot_and_preserves_precision(
     assert output.index("Loading MLX model") < output.index("Transcribing with MLX")
 
 
+def test_mlx_normalizer_clamps_floating_point_boundary_jitter():
+    time_precision = 2 * 160 / 16_000
+    previous_end = 35 * time_precision
+    next_start = 70 * 160 / 16_000
+    assert previous_end > next_start
+
+    segments, language = transcript._normalize_mlx_result(
+        {
+            "language": "en",
+            "segments": [
+                {"start": 0.0, "end": previous_end, "text": "first"},
+                {"start": next_start, "end": 2.0, "text": "second"},
+            ],
+        }
+    )
+
+    assert language == "en"
+    assert segments == (
+        transcript.TranscriptSegment(0.0, previous_end, "first"),
+        transcript.TranscriptSegment(previous_end, 2.0, "second"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("first_end", "second_end"),
+    [
+        (1.00000001, 2.0),
+        (1.0000000005, 1.00000000025),
+    ],
+)
+def test_mlx_normalizer_rejects_material_or_nonpositive_clamped_overlap(
+    first_end,
+    second_end,
+):
+    with pytest.raises(ValueError, match="overlaps the previous segment"):
+        transcript._normalize_mlx_result(
+            {
+                "segments": [
+                    {"start": 0.0, "end": first_end, "text": "first"},
+                    {"start": 1.0, "end": second_end, "text": "second"},
+                ],
+            }
+        )
+
+
 def test_mlx_cache_miss_permits_one_online_resolution(monkeypatch, tmp_path, capsys):
     calls = []
     model_dir = tmp_path / "model"
