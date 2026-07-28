@@ -43,7 +43,6 @@ TRANSCRIPTION_BACKENDS = ("auto", "mlx", "whisper")
 DIARIZATION_DEVICES = ("auto", "cpu", "mps", "cuda")
 MLX_MINIMUM_MACOS_MAJOR = 14
 MLX_MINIMUM_DARWIN_MAJOR = 23
-MLX_TIMESTAMP_JITTER_SECONDS = 1e-9
 DIARIZATION_SOURCE_IGNORED_FIELDS = frozenset({"label", "segment"})
 SPEAKER_DETECTION_SETUP_WARNING = """Warning: no HF_TOKEN found; falling back to transcript without speaker detection.
 To enable speaker detection, accept the pyannote model terms at:
@@ -523,6 +522,54 @@ def validate_transcript_segments(
             "raw transcript appears to contain a catastrophic repetition loop"
         )
     return normalized
+
+
+def _normalize_inference_segments(
+    raw_segments: Sequence[Any],
+    *,
+    backend: str,
+) -> tuple[TranscriptSegment, ...]:
+    normalized: list[TranscriptSegment] = []
+    previous_end = 0.0
+    for index, raw_segment in enumerate(raw_segments):
+        if isinstance(raw_segment, TranscriptSegment):
+            start_value = raw_segment.start
+            end_value = raw_segment.end
+            text_value = raw_segment.text
+            speaker = raw_segment.speaker
+        elif isinstance(raw_segment, Mapping):
+            start_value = raw_segment.get("start")
+            end_value = raw_segment.get("end")
+            text_value = raw_segment.get("text", "")
+            speaker = raw_segment.get("speaker")
+        else:
+            raise TypeError(f"{backend} segment {index} is not a mapping")
+
+        start = _finite_seconds(start_value)
+        end = _finite_seconds(end_value)
+        if start is None or end is None or start < 0 or end <= start:
+            raise ValueError(f"{backend} segment {index} has invalid timestamps")
+        if index > 0 and start < previous_end:
+            if end <= previous_end:
+                raise ValueError(
+                    f"{backend} segment {index} does not advance past the "
+                    "previous segment"
+                )
+            start = previous_end
+        text = str(text_value).strip()
+        if not text:
+            raise ValueError(f"{backend} segment {index} has empty text")
+        normalized.append(
+            TranscriptSegment(
+                start=start,
+                end=end,
+                text=text,
+                speaker=speaker,
+            )
+        )
+        previous_end = end
+
+    return validate_transcript_segments(normalized)
 
 
 def _strict_checkpoint_seconds(
@@ -1208,34 +1255,8 @@ def _normalize_mlx_result(
     if not isinstance(raw_segments, Sequence) or isinstance(raw_segments, (str, bytes)):
         raise TypeError("MLX transcription result has no segment sequence")
 
-    normalized = []
-    previous_end = 0.0
-    for index, raw_segment in enumerate(raw_segments):
-        if not isinstance(raw_segment, Mapping):
-            raise TypeError(f"MLX segment {index} is not a mapping")
-        start = _finite_seconds(raw_segment.get("start"))
-        end = _finite_seconds(raw_segment.get("end"))
-        if start is None or end is None or start < 0 or end <= start:
-            raise ValueError(f"MLX segment {index} has invalid timestamps")
-        if index > 0 and start < previous_end:
-            overlap = previous_end - start
-            if overlap > MLX_TIMESTAMP_JITTER_SECONDS or end <= previous_end:
-                raise ValueError(f"MLX segment {index} overlaps the previous segment")
-            start = previous_end
-        text = str(raw_segment.get("text", "")).strip()
-        if not text:
-            raise ValueError(f"MLX segment {index} has empty text")
-        normalized.append(
-            TranscriptSegment(
-                start=start,
-                end=end,
-                text=text,
-            )
-        )
-        previous_end = end
-
     try:
-        segments = validate_transcript_segments(normalized)
+        segments = _normalize_inference_segments(raw_segments, backend="MLX")
     except CheckpointValidationError as exc:
         raise MLXTranscriptValidationError("MLX transcript failed validation") from exc
 
@@ -1320,8 +1341,14 @@ def _extract_with_whisper(video: Path, model_name: str) -> TranscriptionResult:
         word_timestamps=False,
     )
 
+    if not isinstance(result, Mapping):
+        raise TypeError("Whisper transcription result is not a mapping")
+    raw_segments = result.get("segments")
+    if not isinstance(raw_segments, Sequence) or isinstance(raw_segments, (str, bytes)):
+        raise TypeError("Whisper transcription result has no segment sequence")
+
     return TranscriptionResult(
-        transcript_segments(result["segments"]),
+        _normalize_inference_segments(raw_segments, backend="Whisper"),
         result.get("language", "unknown"),
         {},
     )

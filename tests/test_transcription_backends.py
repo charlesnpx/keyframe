@@ -1,6 +1,8 @@
 import json
+import sys
 import tomllib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from packaging.markers import default_environment
@@ -215,7 +217,7 @@ def test_mlx_adapter_resolves_cached_pinned_snapshot_and_preserves_precision(
     assert output.index("Loading MLX model") < output.index("Transcribing with MLX")
 
 
-def test_mlx_normalizer_clamps_floating_point_boundary_jitter():
+def test_mlx_normalizer_clamps_overlapping_boundary_to_previous_end():
     time_precision = 2 * 160 / 16_000
     previous_end = 35 * time_precision
     next_start = 70 * 160 / 16_000
@@ -238,26 +240,62 @@ def test_mlx_normalizer_clamps_floating_point_boundary_jitter():
     )
 
 
-@pytest.mark.parametrize(
-    ("first_end", "second_end"),
-    [
-        (1.00000001, 2.0),
-        (1.0000000005, 1.00000000025),
-    ],
-)
-def test_mlx_normalizer_rejects_material_or_nonpositive_clamped_overlap(
-    first_end,
-    second_end,
-):
-    with pytest.raises(ValueError, match="overlaps the previous segment"):
+def test_mlx_normalizer_clamps_material_overlap_when_timeline_advances():
+    segments, _language = transcript._normalize_mlx_result(
+        {
+            "segments": [
+                {"start": 0.0, "end": 2.0, "text": "first"},
+                {"start": 1.5, "end": 3.0, "text": "second"},
+            ],
+        }
+    )
+
+    assert segments == (
+        transcript.TranscriptSegment(0.0, 2.0, "first"),
+        transcript.TranscriptSegment(2.0, 3.0, "second"),
+    )
+
+
+def test_mlx_normalizer_rejects_nonadvancing_overlap():
+    with pytest.raises(ValueError, match="does not advance"):
         transcript._normalize_mlx_result(
             {
                 "segments": [
-                    {"start": 0.0, "end": first_end, "text": "first"},
-                    {"start": 1.0, "end": second_end, "text": "second"},
+                    {"start": 0.0, "end": 2.0, "text": "first"},
+                    {"start": 1.0, "end": 1.5, "text": "second"},
                 ],
             }
         )
+
+
+def test_cpu_whisper_normalizer_clamps_overlap_before_checkpointing(
+    monkeypatch,
+    tmp_path,
+):
+    model = SimpleNamespace(
+        transcribe=lambda *_args, **_kwargs: {
+            "language": "en",
+            "segments": [
+                {"start": 0.0, "end": 2.0, "text": "first"},
+                {"start": 1.5, "end": 3.0, "text": "second"},
+            ],
+        }
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "whisper",
+        SimpleNamespace(load_model=lambda _name: model),
+    )
+
+    result = transcript._extract_with_whisper(tmp_path / "recording.mp4", "tiny")
+
+    assert result.segments == (
+        transcript.TranscriptSegment(0.0, 2.0, "first"),
+        transcript.TranscriptSegment(2.0, 3.0, "second"),
+    )
+    checkpoint = tmp_path / "transcript.raw.json"
+    transcript.write_raw_transcript_checkpoint(result.segments, checkpoint)
+    assert transcript.read_raw_transcript_checkpoint(checkpoint) == result.segments
 
 
 def test_mlx_cache_miss_permits_one_online_resolution(monkeypatch, tmp_path, capsys):
