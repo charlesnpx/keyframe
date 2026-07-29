@@ -202,6 +202,10 @@ class FrameMetricTable:
     sharpness: np.ndarray
     full_gray_stack: np.ndarray = field(repr=False)
     content_gray_stack: np.ndarray = field(repr=False)
+    content_signature_stack: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 0, 0), dtype=np.uint8),
+        repr=False,
+    )
 
     @property
     def sample_count(self) -> int:
@@ -258,11 +262,14 @@ class FrameMetricTable:
             return 0.0
         if abs(left - right) == 1:
             return float(self.content_next_delta[min(left, right)])
-        # Streaming analysis intentionally retains scalar metrics rather than
-        # an N×90×160 image stack.  The caller can lazily read the two bounded
-        # candidate images from its disk cache for non-adjacent comparisons.
+        # Streaming analysis keeps a reduced central signature rather than an
+        # N×90×160 float stack for non-adjacent comparisons.
         if self.content_gray_stack.shape[0] != self.sample_count:
-            return None
+            if self.content_signature_stack.shape[0] != self.sample_count:
+                return None
+            left_sig = self.content_signature_stack[left].astype(np.float32)
+            right_sig = self.content_signature_stack[right].astype(np.float32)
+            return float(np.mean(np.abs(left_sig - right_sig)))
         return float(np.mean(np.abs(self.content_gray_stack[left] - self.content_gray_stack[right])))
 
     def summary(self) -> dict[str, Any]:
@@ -272,6 +279,7 @@ class FrameMetricTable:
             "sample_count": self.sample_count,
             "proxy_row_count": self.sample_count,
             "content_gray_shape": list(self.content_gray_stack.shape),
+            "content_signature_shape": list(self.content_signature_stack.shape),
             "full_gray_shape": list(self.full_gray_stack.shape),
             "proxy_content_score_max": proxy_max,
             "content_area_delta_score_max": delta_max,
@@ -285,6 +293,7 @@ def build_compact_frame_metric_table(
     frame_indices: Sequence[int],
     content_prev_delta: Sequence[float],
     content_next_delta: Sequence[float],
+    content_signature_stack: np.ndarray | None = None,
 ) -> FrameMetricTable:
     """Build the normal metric-table scalars without retaining image stacks.
 
@@ -321,6 +330,12 @@ def build_compact_frame_metric_table(
     prev = np.asarray(content_prev_delta, dtype=np.float32)
     next_delta = np.asarray(content_next_delta, dtype=np.float32)
     empty_stack = np.empty((0, 0, 0), dtype=np.float32)
+    if content_signature_stack is None:
+        signature_stack = np.empty((0, 0, 0), dtype=np.uint8)
+    else:
+        signature_stack = np.asarray(content_signature_stack, dtype=np.uint8)
+        if signature_stack.shape[0] != sample_count:
+            raise ValueError("content_signature_stack must match the sample count")
     return FrameMetricTable(
         sample_idx=np.arange(sample_count, dtype=np.int64),
         frame_idx=np.asarray(list(frame_indices), dtype=np.int64),
@@ -347,6 +362,7 @@ def build_compact_frame_metric_table(
         sharpness=values("sharpness"),
         full_gray_stack=empty_stack,
         content_gray_stack=empty_stack,
+        content_signature_stack=signature_stack,
     )
 
 
@@ -507,6 +523,52 @@ def mean_abs_content_delta(
     arr_a = np.asarray(a, dtype=np.float32)
     arr_b = np.asarray(b, dtype=np.float32)
     return float(np.mean(np.abs(arr_a - arr_b)))
+
+
+def dhash_hamming_distance(dhash_a: int, dhash_b: int) -> int:
+    return (int(dhash_a) ^ int(dhash_b)).bit_count()
+
+
+def strong_visual_equivalence(
+    *,
+    dhash_a: int | None,
+    dhash_b: int | None,
+    central_delta: float | None,
+    max_hamming: int = 1,
+    max_central_delta: float = 2.5,
+) -> bool:
+    if dhash_a is None or dhash_b is None or central_delta is None:
+        return False
+    return (
+        dhash_hamming_distance(int(dhash_a), int(dhash_b)) <= int(max_hamming)
+        and float(central_delta) <= float(max_central_delta)
+    )
+
+
+def material_visual_difference(
+    *,
+    central_delta: float | None = None,
+    dhash_distance: int | None = None,
+    clip_distance: float | None = None,
+    central_delta_threshold: float = 2.5,
+    dhash_distance_threshold: int = 6,
+    clip_distance_threshold: float = 0.08,
+) -> bool:
+    return (
+        (central_delta is not None and float(central_delta) > float(central_delta_threshold))
+        or (
+            dhash_distance is not None
+            and int(dhash_distance) >= int(dhash_distance_threshold)
+        )
+        or (
+            clip_distance is not None
+            and float(clip_distance) > float(clip_distance_threshold)
+        )
+    )
+
+
+def timestamp_interval_duration_seconds(start_seconds: float, end_seconds: float) -> float:
+    return max(0.0, float(end_seconds) - float(start_seconds))
 
 
 def frame_for_index(frames: Sequence[Any] | dict[int, Any], sample_idx: int) -> Any | None:

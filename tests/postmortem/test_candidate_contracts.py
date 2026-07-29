@@ -63,6 +63,17 @@ def test_candidate_projection_is_json_safe():
     assert candidate_to_trace_row(candidate)["ocr_tokens"] == ["alpha"]
 
 
+def test_durable_group_identity_stays_internal_to_candidate_processing():
+    candidate = CandidateRecord(sample_idx=2, frame_idx=20, timestamp=4.0).with_temporal(
+        durable_state_group_id=3,
+    )
+
+    row = candidate_to_trace_row(candidate)
+
+    assert candidate.temporal.durable_state_group_id == 3
+    assert "durable_state_group_id" not in row
+
+
 def test_algorithm_outputs_are_candidate_record_tuples():
     from keyframe.dedupe import near_time_dedupe
     from keyframe.merge import union_find_merge

@@ -404,3 +404,95 @@ def test_duration_coverage_pool_selects_settled_global_windows():
         "coverage",
         "coverage",
     ]
+
+
+def test_survival_output_cap_orders_coverage_durable_structured_then_remaining():
+    import numpy as np
+    from PIL import Image
+    from keyframe.pipeline.config import KeyframeExtractionConfig
+    from keyframe.pipeline.context import make_context
+    from keyframe.pipeline.contracts import CandidateRecord, FeatureOutput, FrameStore, SampleTable, SamplingOutput
+    from keyframe.pipeline.orchestrator import SurvivalStage
+    from keyframe.pipeline.trace import NoOpTraceSink
+
+    candidates = (
+        CandidateRecord(sample_idx=0, frame_idx=0, timestamp=0.0)
+        .with_evidence(ocr_tokens=("coverage", "window", "zero"))
+        .with_selection(candidate_score=0.0, selection_role="coverage"),
+        CandidateRecord(sample_idx=1, frame_idx=1, timestamp=10.0)
+        .with_temporal(durable_state_group_id=1)
+        .with_evidence(ocr_tokens=("durable", "workflow", "state"))
+        .with_selection(candidate_score=1.0, selection_role="durable_state"),
+        CandidateRecord(sample_idx=2, frame_idx=2, timestamp=20.0)
+        .with_evidence(
+            ocr_tokens=("structured", "status", "approved"),
+            field_signature=("field-state:status:approved",),
+        )
+        .with_selection(candidate_score=2.0, retention_reason="differing_evidence"),
+        CandidateRecord(sample_idx=3, frame_idx=3, timestamp=30.0)
+        .with_evidence(ocr_tokens=("semantic", "high", "score"))
+        .with_selection(candidate_score=100.0, selection_role="semantic"),
+    )
+    sampling = SamplingOutput(
+        frame_store=FrameStore([Image.new("RGB", (16, 16), "white") for _ in candidates]),
+        samples=SampleTable(
+            timestamps=[candidate.timestamp for candidate in candidates],
+            frame_indices=[candidate.frame_idx for candidate in candidates],
+        ),
+    )
+    features = FeatureOutput(
+        dhashes=[0, 0xFF, 0xFF00, 0xFF0000],
+        clip_embeddings=np.eye(4, dtype=np.float32),
+    )
+    ctx = make_context(KeyframeExtractionConfig(max_output_frames=3), NoOpTraceSink())
+
+    final = SurvivalStage().run(candidates, sampling, features, ctx)
+
+    assert [candidate.sample_idx for candidate in final] == [0, 1, 2]
+
+
+def test_survival_output_cap_balances_durable_states_across_windows():
+    import numpy as np
+    from PIL import Image
+    from keyframe.pipeline.config import KeyframeExtractionConfig
+    from keyframe.pipeline.context import make_context
+    from keyframe.pipeline.contracts import CandidateRecord, FeatureOutput, FrameStore, SampleTable, SamplingOutput
+    from keyframe.pipeline.orchestrator import SurvivalStage
+    from keyframe.pipeline.trace import NoOpTraceSink
+
+    candidates = (
+        CandidateRecord(sample_idx=0, frame_idx=0, timestamp=0.0)
+        .with_evidence(ocr_tokens=("coverage", "window", "state"))
+        .with_selection(selection_role="coverage"),
+        CandidateRecord(sample_idx=1, frame_idx=1, timestamp=10.0)
+        .with_temporal(temporal_window_id=0, durable_state_group_id=1)
+        .with_evidence(ocr_tokens=("durable", "first", "state"))
+        .with_selection(selection_role="durable_state", candidate_score=10.0),
+        CandidateRecord(sample_idx=2, frame_idx=2, timestamp=20.0)
+        .with_temporal(temporal_window_id=0, durable_state_group_id=2)
+        .with_evidence(ocr_tokens=("durable", "second", "state"))
+        .with_selection(selection_role="durable_state", candidate_score=9.0),
+        CandidateRecord(sample_idx=3, frame_idx=3, timestamp=30.0)
+        .with_temporal(temporal_window_id=1, durable_state_group_id=3)
+        .with_evidence(ocr_tokens=("durable", "later", "state"))
+        .with_selection(selection_role="durable_state", candidate_score=1.0),
+        CandidateRecord(sample_idx=4, frame_idx=4, timestamp=40.0)
+        .with_evidence(ocr_tokens=("semantic", "ordinary", "state"))
+        .with_selection(selection_role="semantic", candidate_score=100.0),
+    )
+    sampling = SamplingOutput(
+        frame_store=FrameStore([Image.new("RGB", (16, 16), "white") for _ in candidates]),
+        samples=SampleTable(
+            timestamps=[candidate.timestamp for candidate in candidates],
+            frame_indices=[candidate.frame_idx for candidate in candidates],
+        ),
+    )
+    features = FeatureOutput(
+        dhashes=[0, 0xFF, 0xFF00, 0xFF0000, 0xFF000000],
+        clip_embeddings=np.eye(5, dtype=np.float32),
+    )
+    ctx = make_context(KeyframeExtractionConfig(max_output_frames=3), NoOpTraceSink())
+
+    final = SurvivalStage().run(candidates, sampling, features, ctx)
+
+    assert [candidate.sample_idx for candidate in final] == [0, 1, 3]

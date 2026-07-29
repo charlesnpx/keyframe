@@ -3,11 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 import gc
-import math
 import sys
 import time
-
-import numpy as np
 
 from keyframe.pipeline.config import KeyframeExtractionConfig, KeyframeExtractionResult
 from keyframe.pipeline.context import make_context, RunContext
@@ -24,6 +21,12 @@ from keyframe.pipeline.contracts import (
     as_candidate_record,
     candidate_records,
     candidate_to_manifest_row,
+)
+from keyframe.pipeline.primary_selection import (
+    _coverage_candidate_pool,
+    _coverage_window_bounds,
+    _distributed_window_subset,
+    select_primary_candidates,
 )
 from keyframe.pipeline.qa_targets import write_debug_qa_trace
 from keyframe.pipeline.trace import NoOpTraceSink, SnapshotTraceSink, TraceSink
@@ -74,243 +77,37 @@ def _media_duration_seconds(timestamps: list[float], ctx: RunContext) -> float:
     return float(max(timestamps)) + _sample_step_seconds(timestamps)
 
 
-def _coverage_window_bounds(
-    duration_seconds: float,
-    interval_seconds: float,
-) -> list[tuple[int, float, float]]:
-    if duration_seconds <= 0:
-        return []
-    count = max(1, int(math.ceil(duration_seconds / interval_seconds)))
-    windows = []
-    for window_id in range(count):
-        start = window_id * interval_seconds
-        end = duration_seconds if window_id == count - 1 else (window_id + 1) * interval_seconds
-        if end > start:
-            windows.append((window_id, float(start), float(end)))
-    return windows
-
-
-def _distributed_window_subset(
+def _balanced_durable_cap_order(
     candidates: list[CandidateRecord],
-    capacity: int,
+    score_key,
 ) -> list[CandidateRecord]:
-    if capacity <= 0:
-        return []
-    if len(candidates) <= capacity:
-        return candidates
-    if capacity == 1:
-        return [candidates[len(candidates) // 2]]
-    last = len(candidates) - 1
-    selected_positions = {
-        round(index * last / (capacity - 1))
-        for index in range(capacity)
-    }
-    return [candidate for index, candidate in enumerate(candidates) if index in selected_positions]
+    remaining = list(candidates)
+    ordered: list[CandidateRecord] = []
+    selected_by_window: dict[int, int] = {}
 
+    def window_id(candidate: CandidateRecord) -> int:
+        if candidate.temporal.temporal_window_id is not None:
+            return int(candidate.temporal.temporal_window_id)
+        if candidate.temporal.coverage_window_ids:
+            return int(candidate.temporal.coverage_window_ids[0])
+        return -1
 
-def _coverage_candidate_pool(
-    *,
-    timestamps: list[float],
-    frame_indices: list[int],
-    dhashes: list[int],
-    clip_embeddings: Any,
-    frame_metrics,
-    coverage_interval_seconds: float,
-    minimum_settled_dwell_seconds: float,
-    duration_seconds: float,
-) -> list[CandidateRecord]:
-    from keyframe.scoring import assign_dwell_ids
-
-    if not timestamps:
-        return []
-    dwell_ids = assign_dwell_ids(dhashes)
-    step_seconds = _sample_step_seconds(timestamps)
-    dwell_ranges: dict[int, dict[str, Any]] = {}
-    for sample_idx, dwell_id in enumerate(dwell_ids):
-        row = dwell_ranges.setdefault(
-            int(dwell_id),
-            {"start_idx": sample_idx, "end_idx": sample_idx},
+    while remaining:
+        minimum_count = min(
+            selected_by_window.get(window_id(candidate), 0)
+            for candidate in remaining
         )
-        row["end_idx"] = sample_idx
-    for row in dwell_ranges.values():
-        start_idx = int(row["start_idx"])
-        end_idx = int(row["end_idx"])
-        row["start"] = float(timestamps[start_idx])
-        row["end"] = min(
-            duration_seconds,
-            float(timestamps[end_idx]) + step_seconds,
-        )
-        row["duration"] = max(0.0, float(row["end"]) - float(row["start"]))
-
-    candidates: list[CandidateRecord] = []
-    for window_id, window_start, window_end in _coverage_window_bounds(
-        duration_seconds,
-        coverage_interval_seconds,
-    ):
-        ranked_dwells = []
-        for dwell_id, row in dwell_ranges.items():
-            overlap_start = max(window_start, float(row["start"]))
-            overlap_end = min(window_end, float(row["end"]))
-            overlap = max(0.0, overlap_end - overlap_start)
-            if overlap < minimum_settled_dwell_seconds:
-                continue
-            ranked_dwells.append(
-                (
-                    overlap,
-                    float(row["duration"]),
-                    -float(row["start"]),
-                    int(dwell_id),
-                    overlap_start,
-                    overlap_end,
-                    row,
-                )
-            )
-        if not ranked_dwells:
-            continue
-        ranked_dwells.sort(reverse=True)
-        _overlap, _duration, _neg_start, dwell_id, overlap_start, overlap_end, row = ranked_dwells[0]
-        start_idx = int(row["start_idx"])
-        end_idx = int(row["end_idx"])
-        overlap_indices = [
-            idx
-            for idx in range(start_idx, end_idx + 1)
-            if float(timestamps[idx]) >= overlap_start
-            and (
-                float(timestamps[idx]) < overlap_end
-                or (window_end == duration_seconds and float(timestamps[idx]) <= overlap_end)
-            )
+        eligible = [
+            candidate
+            for candidate in remaining
+            if selected_by_window.get(window_id(candidate), 0) == minimum_count
         ]
-        if not overlap_indices:
-            midpoint = (overlap_start + overlap_end) / 2.0
-            overlap_indices = [
-                min(
-                    range(start_idx, end_idx + 1),
-                    key=lambda idx: abs(float(timestamps[idx]) - midpoint),
-                )
-            ]
-        emb = np.asarray(clip_embeddings[overlap_indices], dtype=np.float32)
-        centroid = emb.mean(axis=0)
-        norm = float(np.linalg.norm(centroid))
-        if norm > 0:
-            centroid = centroid / norm
-        midpoint = (overlap_start + overlap_end) / 2.0
-
-        def rank(idx: int) -> tuple[float, float, float, int]:
-            vector = np.asarray(clip_embeddings[idx], dtype=np.float32)
-            distance = float(1.0 - np.dot(vector, centroid))
-            sharpness = (
-                float(frame_metrics.sharpness_for(idx))
-                if frame_metrics is not None
-                else 0.0
-            )
-            return (
-                distance,
-                abs(float(timestamps[idx]) - midpoint),
-                -sharpness,
-                idx,
-            )
-
-        sample_idx = min(overlap_indices, key=rank)
-        sharpness = (
-            float(frame_metrics.sharpness_for(sample_idx))
-            if frame_metrics is not None
-            else None
-        )
-        candidates.append(
-            CandidateRecord(
-                sample_idx=sample_idx,
-                frame_idx=int(frame_indices[sample_idx]),
-                timestamp=float(timestamps[sample_idx]),
-            )
-            .with_visual(
-                cluster_role="coverage",
-                sharpness=sharpness,
-                dhash=int(dhashes[sample_idx]),
-                dhash_hex=f"{int(dhashes[sample_idx]):016x}",
-            )
-            .with_temporal(
-                dwell_id=int(dwell_id),
-                temporal_window_id=int(window_id),
-                temporal_window_seconds=float(coverage_interval_seconds),
-                coverage_window_ids=(int(window_id),),
-            )
-            .with_selection(
-                proposal_lane="coverage",
-                selection_role="coverage",
-                selection_reason="duration_window",
-                candidate_score=sharpness,
-            )
-            .with_lineage(lineage_roles=("coverage",))
-        )
-    return candidates
-
-
-def _with_coverage_lineage(
-    candidate: CandidateRecord,
-    coverage: CandidateRecord,
-) -> CandidateRecord:
-    window_ids = tuple(
-        sorted(
-            {
-                *(int(value) for value in candidate.temporal.coverage_window_ids),
-                *(int(value) for value in coverage.temporal.coverage_window_ids),
-            }
-        )
-    )
-    roles = set(candidate.lineage.lineage_roles)
-    roles.add("coverage")
-    if candidate.selection.selection_role:
-        roles.add(str(candidate.selection.selection_role))
-    return candidate.with_temporal(
-        coverage_window_ids=window_ids,
-        temporal_window_id=(
-            candidate.temporal.temporal_window_id
-            if candidate.temporal.temporal_window_id is not None
-            else coverage.temporal.temporal_window_id
-        ),
-        temporal_window_seconds=(
-            candidate.temporal.temporal_window_seconds
-            if candidate.temporal.temporal_window_seconds is not None
-            else coverage.temporal.temporal_window_seconds
-        ),
-        dwell_id=(
-            candidate.temporal.dwell_id
-            if candidate.temporal.dwell_id is not None
-            else coverage.temporal.dwell_id
-        ),
-    ).with_lineage(lineage_roles=tuple(sorted(roles)))
-
-
-def _combine_primary_lanes(
-    semantic_candidates: tuple[CandidateRecord, ...],
-    coverage_pool: list[CandidateRecord],
-    *,
-    max_primary_candidates: int,
-) -> tuple[CandidateRecord, ...]:
-    selected: dict[int, CandidateRecord] = {}
-    for candidate in semantic_candidates:
-        roles = set(candidate.lineage.lineage_roles)
-        roles.add("semantic")
-        selected[int(candidate.sample_idx)] = candidate.with_selection(
-            selection_role=candidate.selection.selection_role or "semantic",
-            selection_reason=candidate.selection.selection_reason or "semantic_cluster",
-            proposal_lane=candidate.selection.proposal_lane or "semantic",
-        ).with_lineage(lineage_roles=tuple(sorted(roles)))
-
-    coverage_capacity = max(0, int(max_primary_candidates) - len(selected))
-    added_coverage = 0
-    for coverage in coverage_pool:
-        existing = selected.get(int(coverage.sample_idx))
-        if existing is not None:
-            selected[int(coverage.sample_idx)] = _with_coverage_lineage(existing, coverage)
-            continue
-        if added_coverage >= coverage_capacity:
-            continue
-        selected[int(coverage.sample_idx)] = coverage
-        added_coverage += 1
-        if len(selected) >= max_primary_candidates:
-            break
-    return tuple(sorted(selected.values(), key=lambda c: (float(c.timestamp), int(c.sample_idx))))
+        chosen = max(eligible, key=score_key)
+        remaining.remove(chosen)
+        ordered.append(chosen)
+        chosen_window = window_id(chosen)
+        selected_by_window[chosen_window] = selected_by_window.get(chosen_window, 0) + 1
+    return ordered
 
 
 def _select_pass1_candidates(
@@ -626,16 +423,23 @@ class ProposalStage:
             coverage_interval_seconds=ctx.config.coverage_interval_seconds,
             minimum_settled_dwell_seconds=ctx.config.minimum_settled_dwell_seconds,
             duration_seconds=duration_seconds,
+            sample_scenes=sample_scenes,
         )
-        coverage_pool = _distributed_window_subset(
-            coverage_pool,
-            max(0, ctx.config.max_primary_candidates - len({int(c.sample_idx) for c in candidates})),
-        )
-        candidates = _combine_primary_lanes(
-            candidates,
-            coverage_pool,
+        primary_selection = select_primary_candidates(
+            semantic_candidates=candidates,
+            coverage_pool=coverage_pool,
+            timestamps=timestamps,
+            frame_indices=frame_indices,
+            dhashes=features.dhashes,
+            clip_embeddings=features.clip_embeddings,
+            frame_metrics=frame_metrics,
+            sample_scenes=sample_scenes,
+            coverage_interval_seconds=ctx.config.coverage_interval_seconds,
+            minimum_settled_dwell_seconds=ctx.config.minimum_settled_dwell_seconds,
+            duration_seconds=duration_seconds,
             max_primary_candidates=ctx.config.max_primary_candidates,
         )
+        candidates = primary_selection.candidates
         coverage_window_count = len(
             _coverage_window_bounds(
                 duration_seconds,
@@ -655,8 +459,17 @@ class ProposalStage:
             "coverage_window_count": coverage_window_count,
             "represented_coverage_window_ids": represented_coverage_windows,
             "primary_candidate_capacity": ctx.config.max_primary_candidates,
+            **primary_selection.metadata,
         }
         ctx.trace.exit("temporal.sample_context", temporal)
+        ctx.trace.exit(
+            "proposal.durable_state_fill",
+            _candidate_batch(
+                "proposal.durable_state_fill",
+                primary_selection.durable_state_fill,
+                primary_selection.metadata,
+            ),
+        )
 
         pass1_primary = [c for c in candidates if c.visual.cluster_role != "alt"]
         cluster_alt = [c for c in candidates if c.visual.cluster_role == "alt"]
@@ -908,12 +721,19 @@ class SurvivalStage:
             [set(c.evidence.ocr_tokens) for c in candidates],
             dhashes,
             frame_metrics=frame_metrics,
+            clip_embeddings=features.clip_embeddings,
         )
         print(f"  Near-time dedupe: {len(candidates)} -> {len(deduped)} candidates")
         ctx.trace.exit("survival.after_near_dedupe", _candidate_batch("survival.after_near_dedupe", deduped))
 
         deduped_token_sets = [set(c.evidence.ocr_tokens) for c in deduped]
-        globally_deduped = global_candidate_dedupe(deduped, deduped_token_sets, dhashes)
+        globally_deduped = global_candidate_dedupe(
+            deduped,
+            deduped_token_sets,
+            dhashes,
+            frame_metrics=frame_metrics,
+            clip_embeddings=features.clip_embeddings,
+        )
         print(f"  Global conservative dedupe: {len(deduped)} -> {len(globally_deduped)} candidates")
         ctx.trace.exit("survival.after_global_dedupe", _candidate_batch("survival.after_global_dedupe", globally_deduped))
 
@@ -921,14 +741,33 @@ class SurvivalStage:
         print(f"  Low-information filter: {len(globally_deduped)} -> {len(filtered)} candidates")
         ctx.trace.exit("survival.after_low_info_filter", _candidate_batch("survival.after_low_info_filter", filtered))
 
-        adjacent_deduped = adjacent_same_screen_dedupe(filtered)
+        adjacent_deduped = adjacent_same_screen_dedupe(
+            filtered,
+            dhashes=dhashes,
+            frame_metrics=frame_metrics,
+            clip_embeddings=features.clip_embeddings,
+        )
         print(f"  Adjacent same-screen dedupe: {len(filtered)} -> {len(adjacent_deduped)} candidates")
         ctx.trace.exit("survival.after_adjacent_dedupe", _candidate_batch("survival.after_adjacent_dedupe", adjacent_deduped))
 
         deduped_token_sets = [set(c.evidence.ocr_tokens) for c in adjacent_deduped]
         deduped_has_ocr = [len(tokens) >= 3 for tokens in deduped_token_sets]
-        final = union_find_merge(adjacent_deduped, deduped_token_sets, deduped_has_ocr, frames)
-        post_veto, dropped_duplicates = content_area_duplicate_veto(final, frames, frame_metrics=frame_metrics)
+        final = union_find_merge(
+            adjacent_deduped,
+            deduped_token_sets,
+            deduped_has_ocr,
+            frames,
+            dhashes=dhashes,
+            frame_metrics=frame_metrics,
+            clip_embeddings=features.clip_embeddings,
+        )
+        post_veto, dropped_duplicates = content_area_duplicate_veto(
+            final,
+            frames,
+            frame_metrics=frame_metrics,
+            dhashes=dhashes,
+            clip_embeddings=features.clip_embeddings,
+        )
         print(f"  Content-area duplicate veto: {len(final)} -> {len(post_veto)} candidates")
         ctx.trace.exit(
             "survival.after_content_area_veto",
@@ -944,7 +783,12 @@ class SurvivalStage:
         cap_drops: list[dict[str, Any]] = []
         max_output_frames = ctx.config.max_output_frames
         if max_output_frames is not None and max_output_frames >= 0 and len(post_veto) > max_output_frames:
-            coverage = [cand for cand in post_veto if cand.temporal.coverage_window_ids]
+            coverage = [
+                cand
+                for cand in post_veto
+                if cand.selection.selection_role == "coverage"
+                or "coverage" in cand.lineage.lineage_roles
+            ]
             if len(coverage) > max_output_frames:
                 ranked_coverage = _distributed_window_subset(
                     coverage,
@@ -952,19 +796,36 @@ class SurvivalStage:
                 )
                 ranked = ranked_coverage
             else:
-                protected = [
+                coverage_idxs = {int(cand.sample_idx) for cand in coverage}
+                durable = [
                     cand
                     for cand in post_veto
-                    if cand not in coverage
+                    if int(cand.sample_idx) not in coverage_idxs
                     and (
-                        cand.selection.rescue_origin
-                        or cand.selection.retention_reason not in {None, "none"}
+                        cand.temporal.durable_state_group_id is not None
+                        or cand.selection.selection_role == "durable_state"
+                        or "durable_state" in cand.lineage.lineage_roles
                     )
                 ]
+                durable_idxs = {int(cand.sample_idx) for cand in durable}
+                structured = [
+                    cand
+                    for cand in post_veto
+                    if int(cand.sample_idx) not in coverage_idxs
+                    and int(cand.sample_idx) not in durable_idxs
+                    and (
+                        cand.selection.rescue_reason == "structured_delta"
+                        or cand.selection.retention_reason not in {None, "none"}
+                        or bool(cand.evidence.field_signature)
+                    )
+                ]
+                structured_idxs = {int(cand.sample_idx) for cand in structured}
                 remaining = [
                     cand
                     for cand in post_veto
-                    if cand not in coverage and cand not in protected
+                    if int(cand.sample_idx) not in coverage_idxs
+                    and int(cand.sample_idx) not in durable_idxs
+                    and int(cand.sample_idx) not in structured_idxs
                 ]
 
                 def score_key(cand: CandidateRecord) -> tuple[int, float, float, int]:
@@ -982,7 +843,8 @@ class SurvivalStage:
 
                 ranked = [
                     *coverage,
-                    *sorted(protected, key=score_key, reverse=True),
+                    *_balanced_durable_cap_order(durable, score_key),
+                    *sorted(structured, key=score_key, reverse=True),
                     *sorted(remaining, key=score_key, reverse=True),
                 ]
             kept_idxs = {int(cand.sample_idx) for cand in ranked[:max_output_frames]}

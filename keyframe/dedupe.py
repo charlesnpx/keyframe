@@ -6,11 +6,18 @@ from collections.abc import Mapping, Sequence
 import re
 from typing import Any
 
+import numpy as np
 from PIL import Image
 
 from keyframe.evidence import has_signature_delta
 from keyframe.pipeline.contracts import CandidateRecord, candidate_records
-from keyframe.visual import FrameMetricTable, frame_for_index, mean_abs_content_delta, visual_information_score
+from keyframe.visual import (
+    FrameMetricTable,
+    frame_for_index,
+    material_visual_difference,
+    mean_abs_content_delta,
+    visual_information_score,
+)
 
 
 def compute_dhash(image: Image.Image, hash_size: int = 8) -> int:
@@ -383,8 +390,16 @@ def merge_candidate_lineage(
         selection_updates["rescue_origin"] = loser.selection.rescue_origin
         selection_updates["rescue_reason"] = loser.selection.rescue_reason
 
+    temporal_updates: dict[str, Any] = {
+        "coverage_window_ids": coverage_window_ids,
+    }
+    winner_group_id = winner.temporal.durable_state_group_id
+    loser_group_id = loser.temporal.durable_state_group_id
+    if winner_group_id is None and loser_group_id is not None:
+        temporal_updates["durable_state_group_id"] = int(loser_group_id)
+
     return winner.with_temporal(
-        coverage_window_ids=coverage_window_ids,
+        **temporal_updates,
     ).with_selection(**selection_updates).with_lineage(
         merged_from_sample_idxs=merged_from_sample_idxs,
         merged_timestamps=merged_timestamps,
@@ -477,13 +492,110 @@ def _ocr_merge_threshold(
     return default_threshold
 
 
+def _same_durable_state_group(
+    candidate_a: CandidateRecord,
+    candidate_b: CandidateRecord,
+) -> bool:
+    group_a = candidate_a.temporal.durable_state_group_id
+    group_b = candidate_b.temporal.durable_state_group_id
+    return group_a is not None and group_a == group_b
+
+
+def _different_durable_state_groups(
+    candidate_a: CandidateRecord,
+    candidate_b: CandidateRecord,
+) -> bool:
+    group_a = candidate_a.temporal.durable_state_group_id
+    group_b = candidate_b.temporal.durable_state_group_id
+    return group_a is not None and group_b is not None and group_a != group_b
+
+
+def _clip_distance_for_candidates(
+    candidate_a: CandidateRecord,
+    candidate_b: CandidateRecord,
+    clip_embeddings: Any | None,
+) -> float | None:
+    if clip_embeddings is None:
+        return None
+    try:
+        left = np.asarray(clip_embeddings[int(candidate_a.sample_idx)], dtype=np.float32)
+        right = np.asarray(clip_embeddings[int(candidate_b.sample_idx)], dtype=np.float32)
+    except Exception:
+        return None
+    if left.ndim != 1 or right.ndim != 1 or left.size == 0 or left.shape != right.shape:
+        return None
+    left_norm = float(np.linalg.norm(left))
+    right_norm = float(np.linalg.norm(right))
+    if left_norm <= 0 or right_norm <= 0:
+        return None
+    return float(1.0 - np.dot(left / left_norm, right / right_norm))
+
+
+def _durable_state_merge_veto(
+    candidate_a: CandidateRecord,
+    candidate_b: CandidateRecord,
+    tokens_a: set[str],
+    tokens_b: set[str],
+    *,
+    dhashes: Mapping[int, int] | Sequence[int] | None = None,
+    frame_metrics: FrameMetricTable | None = None,
+    clip_embeddings: Any | None = None,
+) -> bool:
+    if not _different_durable_state_groups(candidate_a, candidate_b):
+        return False
+
+    hash_a = _hash_for(candidate_a, dhashes)
+    hash_b = _hash_for(candidate_b, dhashes)
+    dhash_distance = (
+        hamming(hash_a, hash_b)
+        if hash_a is not None and hash_b is not None
+        else None
+    )
+    central_delta = (
+        frame_metrics.content_delta_between(candidate_a.sample_idx, candidate_b.sample_idx)
+        if frame_metrics is not None
+        else None
+    )
+    if material_visual_difference(
+        central_delta=central_delta,
+        dhash_distance=dhash_distance,
+        clip_distance=_clip_distance_for_candidates(
+            candidate_a,
+            candidate_b,
+            clip_embeddings,
+        ),
+    ):
+        return True
+
+    if (not tokens_a and len(tokens_b) >= 5) or (not tokens_b and len(tokens_a) >= 5):
+        return True
+    symmetric_difference = tokens_a ^ tokens_b
+    return len(symmetric_difference) >= 3 and _jaccard(tokens_a, tokens_b) < 0.75
+
+
 def _ocr_policy_allows_merge(
     candidate_a: CandidateRecord,
     candidate_b: CandidateRecord,
     tokens_a: set[str],
     tokens_b: set[str],
     default_threshold: float,
+    *,
+    dhashes: Mapping[int, int] | Sequence[int] | None = None,
+    frame_metrics: FrameMetricTable | None = None,
+    clip_embeddings: Any | None = None,
 ) -> tuple[bool, str]:
+    if _same_durable_state_group(candidate_a, candidate_b):
+        return True, "durable_state_recurrence"
+    if _durable_state_merge_veto(
+        candidate_a,
+        candidate_b,
+        tokens_a,
+        tokens_b,
+        dhashes=dhashes,
+        frame_metrics=frame_metrics,
+        clip_embeddings=clip_embeddings,
+    ):
+        return False, "different_durable_states"
     if has_differing_evidence(tokens_a, tokens_b):
         return False, "differing_evidence"
     if _density_asymmetry_veto(tokens_a, tokens_b):
@@ -671,6 +783,10 @@ def adjacent_same_screen_dedupe(
     candidates: Sequence[Mapping[str, Any] | CandidateRecord],
     max_dt_seconds: float = 90.0,
     ocr_jaccard_threshold: float = 0.82,
+    *,
+    dhashes: Mapping[int, int] | Sequence[int] | None = None,
+    frame_metrics: FrameMetricTable | None = None,
+    clip_embeddings: Any | None = None,
 ) -> tuple[CandidateRecord, ...]:
     """Collapse neighboring candidates with nearly identical cleaned OCR."""
     rows = tuple(c.with_evidence(ocr_tokens=tuple(sorted(_tokens(c)))) for c in _records(candidates))
@@ -692,7 +808,14 @@ def adjacent_same_screen_dedupe(
             and bool(row_tokens)
             and bool(previous_tokens)
             and _ocr_policy_allows_merge(
-                row, previous, row_tokens, previous_tokens, ocr_jaccard_threshold
+                row,
+                previous,
+                row_tokens,
+                previous_tokens,
+                ocr_jaccard_threshold,
+                dhashes=dhashes,
+                frame_metrics=frame_metrics,
+                clip_embeddings=clip_embeddings,
             )[0]
         )
 
@@ -793,6 +916,8 @@ def content_area_duplicate_veto(
     max_mean_abs_delta: float = 2.5,
     ocr_jaccard_threshold: float = 0.90,
     frame_metrics: FrameMetricTable | None = None,
+    dhashes: Mapping[int, int] | Sequence[int] | None = None,
+    clip_embeddings: Any | None = None,
 ) -> tuple[tuple[CandidateRecord, ...], list[dict[str, Any]]]:
     """Drop late neighboring visual duplicates when content evidence is unchanged."""
     rows = list(sorted(_records(candidates), key=lambda c: (float(c.timestamp), int(c.sample_idx))))
@@ -806,7 +931,22 @@ def content_area_duplicate_veto(
             survivors.append(row)
             continue
         previous = survivors[-1]
-        if not _same_scene_or_dwell(previous, row):
+        same_durable_group = _same_durable_state_group(previous, row)
+        if not _same_scene_or_dwell(previous, row) and not same_durable_group:
+            survivors.append(row)
+            continue
+
+        left_tokens = _tokens(previous)
+        right_tokens = _tokens(row)
+        if _durable_state_merge_veto(
+            previous,
+            row,
+            left_tokens,
+            right_tokens,
+            dhashes=dhashes,
+            frame_metrics=frame_metrics,
+            clip_embeddings=clip_embeddings,
+        ):
             survivors.append(row)
             continue
 
@@ -826,9 +966,7 @@ def content_area_duplicate_veto(
             survivors.append(row)
             continue
 
-        left_tokens = _tokens(previous)
-        right_tokens = _tokens(row)
-        if not strong_duplicate and (left_tokens or right_tokens):
+        if not strong_duplicate and not same_durable_group and (left_tokens or right_tokens):
             overlap = _jaccard(left_tokens, right_tokens)
             if overlap < ocr_jaccard_threshold:
                 survivors.append(row)
@@ -836,7 +974,13 @@ def content_area_duplicate_veto(
         else:
             overlap = 1.0
 
-        if _has_form_state_delta(left_tokens, right_tokens) or _signature_delta(previous, row):
+        if (
+            not same_durable_group
+            and (
+                _has_form_state_delta(left_tokens, right_tokens)
+                or _signature_delta(previous, row)
+            )
+        ):
             survivors.append(row)
             continue
 
@@ -869,6 +1013,7 @@ def near_time_dedupe(
     ocr_jaccard_threshold: float = 0.9,
     dhash_hamming_threshold: int = 6,
     frame_metrics: FrameMetricTable | None = None,
+    clip_embeddings: Any | None = None,
 ) -> tuple[CandidateRecord, ...]:
     """Collapse near-time duplicate candidates with identical OCR or weak/no-OCR dHash matches."""
     rows: list[CandidateRecord] = []
@@ -896,6 +1041,20 @@ def near_time_dedupe(
                 dhashes=dhashes,
                 frame_metrics=frame_metrics,
             )
+            survivor_tokens = _tokens(survivor)
+            if _same_durable_state_group(survivor, row):
+                duplicate_idx = i
+                break
+            if _durable_state_merge_veto(
+                survivor,
+                row,
+                survivor_tokens,
+                row_tokens,
+                dhashes=dhashes,
+                frame_metrics=frame_metrics,
+                clip_embeddings=clip_embeddings,
+            ):
+                continue
             if strong_duplicate:
                 duplicate_idx = i
                 break
@@ -908,10 +1067,16 @@ def near_time_dedupe(
                 duplicate_idx = i
                 break
 
-            survivor_tokens = _tokens(survivor)
             if row_tokens and survivor_tokens:
                 ok, _reason = _ocr_policy_allows_merge(
-                    row, survivor, row_tokens, survivor_tokens, ocr_jaccard_threshold
+                    row,
+                    survivor,
+                    row_tokens,
+                    survivor_tokens,
+                    ocr_jaccard_threshold,
+                    dhashes=dhashes,
+                    frame_metrics=frame_metrics,
+                    clip_embeddings=clip_embeddings,
                 )
                 if ok:
                     duplicate_idx = i
@@ -943,6 +1108,9 @@ def global_candidate_dedupe(
     dhashes: Mapping[int, int] | Sequence[int] | None = None,
     ocr_jaccard_threshold: float = 0.85,
     dhash_hamming_threshold: int = 2,
+    *,
+    frame_metrics: FrameMetricTable | None = None,
+    clip_embeddings: Any | None = None,
 ) -> tuple[CandidateRecord, ...]:
     """Conservatively collapse duplicate candidates across the whole video."""
     rows = [
@@ -960,9 +1128,29 @@ def global_candidate_dedupe(
 
         for i, survivor in enumerate(survivors):
             survivor_tokens = _tokens(survivor)
+            if _same_durable_state_group(row, survivor):
+                duplicate_idx = i
+                break
+            if _durable_state_merge_veto(
+                row,
+                survivor,
+                row_tokens,
+                survivor_tokens,
+                dhashes=dhashes,
+                frame_metrics=frame_metrics,
+                clip_embeddings=clip_embeddings,
+            ):
+                continue
             if row_tokens and survivor_tokens:
                 ok, _reason = _ocr_policy_allows_merge(
-                    row, survivor, row_tokens, survivor_tokens, ocr_jaccard_threshold
+                    row,
+                    survivor,
+                    row_tokens,
+                    survivor_tokens,
+                    ocr_jaccard_threshold,
+                    dhashes=dhashes,
+                    frame_metrics=frame_metrics,
+                    clip_embeddings=clip_embeddings,
                 )
                 if ok:
                     duplicate_idx = i
