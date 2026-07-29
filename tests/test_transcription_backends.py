@@ -1,6 +1,8 @@
 import json
+import sys
 import tomllib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from packaging.markers import default_environment
@@ -215,6 +217,87 @@ def test_mlx_adapter_resolves_cached_pinned_snapshot_and_preserves_precision(
     assert output.index("Loading MLX model") < output.index("Transcribing with MLX")
 
 
+def test_mlx_normalizer_clamps_overlapping_boundary_to_previous_end():
+    time_precision = 2 * 160 / 16_000
+    previous_end = 35 * time_precision
+    next_start = 70 * 160 / 16_000
+    assert previous_end > next_start
+
+    segments, language = transcript._normalize_mlx_result(
+        {
+            "language": "en",
+            "segments": [
+                {"start": 0.0, "end": previous_end, "text": "first"},
+                {"start": next_start, "end": 2.0, "text": "second"},
+            ],
+        }
+    )
+
+    assert language == "en"
+    assert segments == (
+        transcript.TranscriptSegment(0.0, previous_end, "first"),
+        transcript.TranscriptSegment(previous_end, 2.0, "second"),
+    )
+
+
+def test_mlx_normalizer_clamps_material_overlap_when_timeline_advances():
+    segments, _language = transcript._normalize_mlx_result(
+        {
+            "segments": [
+                {"start": 0.0, "end": 2.0, "text": "first"},
+                {"start": 1.5, "end": 3.0, "text": "second"},
+            ],
+        }
+    )
+
+    assert segments == (
+        transcript.TranscriptSegment(0.0, 2.0, "first"),
+        transcript.TranscriptSegment(2.0, 3.0, "second"),
+    )
+
+
+def test_mlx_normalizer_rejects_nonadvancing_overlap():
+    with pytest.raises(ValueError, match="does not advance"):
+        transcript._normalize_mlx_result(
+            {
+                "segments": [
+                    {"start": 0.0, "end": 2.0, "text": "first"},
+                    {"start": 1.0, "end": 1.5, "text": "second"},
+                ],
+            }
+        )
+
+
+def test_cpu_whisper_normalizer_clamps_overlap_before_checkpointing(
+    monkeypatch,
+    tmp_path,
+):
+    model = SimpleNamespace(
+        transcribe=lambda *_args, **_kwargs: {
+            "language": "en",
+            "segments": [
+                {"start": 0.0, "end": 2.0, "text": "first"},
+                {"start": 1.5, "end": 3.0, "text": "second"},
+            ],
+        }
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "whisper",
+        SimpleNamespace(load_model=lambda _name: model),
+    )
+
+    result = transcript._extract_with_whisper(tmp_path / "recording.mp4", "tiny")
+
+    assert result.segments == (
+        transcript.TranscriptSegment(0.0, 2.0, "first"),
+        transcript.TranscriptSegment(2.0, 3.0, "second"),
+    )
+    checkpoint = tmp_path / "transcript.raw.json"
+    transcript.write_raw_transcript_checkpoint(result.segments, checkpoint)
+    assert transcript.read_raw_transcript_checkpoint(checkpoint) == result.segments
+
+
 def test_mlx_cache_miss_permits_one_online_resolution(monkeypatch, tmp_path, capsys):
     calls = []
     model_dir = tmp_path / "model"
@@ -388,6 +471,39 @@ def test_import_failure_is_typed_and_auto_fallback_eligible(monkeypatch, tmp_pat
         transcript._extract_with_mlx(tmp_path / "recording.mp4", "tiny", SUPPORTED_MAC)
 
     assert raised.value is error
+    assert transcript.is_auto_fallback_eligible(raised.value)
+
+
+def test_mlx_catastrophic_repetition_is_typed_and_fallback_eligible(
+    monkeypatch,
+    tmp_path,
+):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    runtime = transcript.MLXRuntime(
+        snapshot_download=lambda **_kwargs: str(model_dir),
+        load_model=lambda *_args: None,
+        transcribe=lambda *_args, **_kwargs: {
+            "segments": [
+                {
+                    "start": float(index),
+                    "end": float(index + 1),
+                    "text": "alpha beta gamma delta epsilon",
+                }
+                for index in range(30)
+            ],
+            "language": "en",
+        },
+        float16="float16",
+        local_entry_not_found_error=FakeLocalEntryNotFoundError,
+        reset_peak_memory=lambda: None,
+        get_peak_memory=lambda: 0,
+    )
+    monkeypatch.setattr(transcript, "_load_mlx_runtime", lambda: runtime)
+
+    with pytest.raises(transcript.MLXTranscriptValidationError) as raised:
+        transcript._extract_with_mlx(tmp_path / "recording.mp4", "tiny", SUPPORTED_MAC)
+
     assert transcript.is_auto_fallback_eligible(raised.value)
 
 

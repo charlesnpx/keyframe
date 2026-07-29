@@ -29,6 +29,39 @@ LINUX = transcript.RuntimePlatform("Linux", "x86_64", None, 6)
 AMPLE_MEMORY = 64 * GIB
 
 
+def _stub_cli_media_preflight(monkeypatch, *, audio: bool = True, video: bool = True):
+    from keyframe import frame_preflight, media_preflight
+
+    streams = []
+    if video:
+        streams.append(
+            media_preflight.MediaStream(
+                codec_type="video",
+                codec_name="h264",
+                width=16,
+                height=16,
+            )
+        )
+    if audio:
+        streams.append(
+            media_preflight.MediaStream(
+                codec_type="audio",
+                codec_name="aac",
+                channels=1,
+            )
+        )
+    monkeypatch.setattr(
+        media_preflight,
+        "probe_media",
+        lambda _path: media_preflight.MediaProbeResult(tuple(streams)),
+    )
+    monkeypatch.setattr(
+        frame_preflight,
+        "preflight_frame_runtime",
+        lambda: frame_preflight.FrameRuntimePlatform("Darwin", "arm64"),
+    )
+
+
 def _preflight(
     *,
     runtime=MAC,
@@ -1511,7 +1544,8 @@ def test_full_cli_reports_partial_frame_output_with_nonzero_status(
     prior_frames = output / "frames"
     prior_frames.mkdir(parents=True)
     (prior_frames / "previous.txt").write_text("previous", encoding="utf-8")
-    monkeypatch.setattr(cli, "_preflight_transcript", lambda _args: object())
+    _stub_cli_media_preflight(monkeypatch, audio=True, video=True)
+    monkeypatch.setattr(cli, "_preflight_transcript", lambda _args: _preflight())
 
     def fail_full_pipeline(*_args):
         raise FullPipelineFrameError("partial output: injected frame failure")
@@ -1525,6 +1559,12 @@ def test_full_cli_reports_partial_frame_output_with_nonzero_status(
         whisper_model="medium",
         transcript_format="json",
         no_speaker_detection=False,
+        sample_interval=0.75,
+        pass1_clusters=9,
+        similarity_threshold=0.85,
+        max_output_frames=None,
+        verbose_trace=False,
+        debug_qa_targets=None,
     )
 
     with pytest.raises(SystemExit) as raised:

@@ -129,37 +129,14 @@ def remove_keyframe_owned_directory(path: str | Path) -> None:
 
 
 def cleanup_stale_run_directories(output_dir: Path) -> None:
-    public_frames = output_dir / "frames"
-    backups = sorted(
-        candidate
-        for candidate in output_dir.iterdir()
-        if candidate.name.startswith(FRAME_BACKUP_PREFIX)
-        and candidate.is_dir()
-        and not candidate.is_symlink()
-    )
-    if backups:
-        if os.path.lexists(public_frames):
-            if public_frames.is_symlink() or not public_frames.is_dir():
-                raise OutputSessionError(
-                    f"public frame path is not a recoverable directory: {public_frames}"
-                )
-            for backup in backups:
-                remove_keyframe_owned_directory(backup)
-        elif len(backups) == 1:
-            os.replace(backups[0], public_frames)
-        else:
-            raise OutputSessionError(
-                "multiple frame-generation recovery backups exist while the public "
-                f"frames directory is missing: {[str(path) for path in backups]}"
-            )
+    """Ignore abandoned run directories from earlier interrupted processes.
 
-    for candidate in output_dir.iterdir():
-        if (
-            candidate.name.startswith(RUN_DIRECTORY_PREFIX)
-            and candidate.is_dir()
-            and not candidate.is_symlink()
-        ):
-            remove_keyframe_owned_directory(candidate)
+    The active session only owns the run path it just created and keeps in
+    memory. Abrupt termination can leave manual cleanup work, but later runs
+    must not infer recovery state from stale directories.
+    """
+
+    return None
 
 
 class OutputRunSession:

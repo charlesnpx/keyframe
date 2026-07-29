@@ -9,6 +9,24 @@ import pytest
 from keyframe import transcript
 
 
+def _stub_cli_media_preflight(monkeypatch):
+    from keyframe import media_preflight
+
+    monkeypatch.setattr(
+        media_preflight,
+        "probe_media",
+        lambda _path: media_preflight.MediaProbeResult(
+            (
+                media_preflight.MediaStream(
+                    codec_type="audio",
+                    codec_name="aac",
+                    channels=1,
+                ),
+            )
+        ),
+    )
+
+
 def _video(tmp_path):
     video = tmp_path / "recording.mp4"
     video.write_bytes(b"not real media")
@@ -829,6 +847,7 @@ def test_companion_json_uses_same_speaker_semantics(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cli, "_preflight_transcript", lambda _args: object())
     monkeypatch.setattr(cli, "_run_transcript", fake_run_transcript)
+    _stub_cli_media_preflight(monkeypatch)
 
     cli.cmd_extract(
         SimpleNamespace(

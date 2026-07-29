@@ -13,6 +13,7 @@ Usage:
 import argparse
 import hashlib
 import json
+import math
 import os
 import shutil
 import sys
@@ -225,6 +226,7 @@ def _frame_config(args, *, device: str | None = None):
             if getattr(args, "debug_qa_targets", None)
             else None
         ),
+        video_timing=getattr(args, "_video_timing", None),
     )
 
 
@@ -241,6 +243,7 @@ def _run_frame_generation(
 
     if session.staging is None:
         raise RuntimeError("frame generation session did not initialize staging paths")
+    frame_device = frame_device or getattr(args, "_frame_device", None)
     result = extract_keyframes(
         video,
         session.staging.frames,
@@ -293,13 +296,30 @@ def _print_frame_result(result) -> None:
 
 
 def cmd_extract(args):
-    video = Path(args.video)
-    if not video.exists():
-        print(f"Error: file not found: {args.video}", file=sys.stderr)
-        sys.exit(1)
+    from keyframe.media_preflight import (
+        MediaPreflightError,
+        probe_media,
+        resolve_extraction_mode,
+        resolve_readable_media_file,
+    )
 
-    do_frames = not args.transcript_only
-    do_transcript = not args.frames_only
+    try:
+        video = resolve_readable_media_file(args.video)
+        media = probe_media(video)
+        mode = resolve_extraction_mode(
+            media,
+            frames_only=bool(args.frames_only),
+            transcript_only=bool(args.transcript_only),
+        )
+    except MediaPreflightError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
+
+    do_frames = mode.do_frames
+    do_transcript = mode.do_transcript
+    if mode.notice:
+        print(f"Note: {mode.notice}")
+    setattr(args, "_video_timing", media.selected_video_timing)
     transcript_preflight = None
     if do_transcript:
         from keyframe.transcript import TranscriptionError
@@ -307,6 +327,33 @@ def cmd_extract(args):
         try:
             transcript_preflight = _preflight_transcript(args)
         except (ValueError, TranscriptionError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            raise SystemExit(2) from None
+    if do_frames:
+        from keyframe.frame_preflight import (
+            FramePreflightError,
+            preflight_frame_runtime,
+            resolve_frame_execution_device,
+        )
+
+        try:
+            print("Frame runtime: loading dependencies...", flush=True)
+            runtime = preflight_frame_runtime()
+            if transcript_preflight is not None:
+                from keyframe.full_pipeline import resolve_frame_device
+
+                frame_device = resolve_frame_device(transcript_preflight)
+            else:
+                frame_device = resolve_frame_execution_device(runtime)
+            setattr(args, "_frame_device", frame_device)
+            _frame_config(args, device=frame_device)
+        except (FramePreflightError, ValueError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            raise SystemExit(2) from None
+    else:
+        try:
+            _frame_config(args)
+        except ValueError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             raise SystemExit(2) from None
 
@@ -413,6 +460,33 @@ def _parse_extract_args(argv):
     return _build_extract_parser().parse_args(argv)
 
 
+def _positive_float_arg(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a finite positive number") from exc
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a finite positive number")
+    return parsed
+
+
+def _positive_int_arg(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def _probability_arg(value: str) -> float:
+    parsed = _positive_float_arg(value)
+    if parsed > 1:
+        raise argparse.ArgumentTypeError("must be between 0 and 1")
+    return parsed
+
+
 def main():
     # Check for `install-skills` subcommand first
     if len(sys.argv) > 1 and sys.argv[1] == "install-skills":
@@ -453,19 +527,19 @@ def _add_extract_args(parser):
     mode.add_argument("--transcript-only", action="store_true",
                       help="Only extract transcript, skip key frames")
 
-    parser.add_argument("--sample-interval", "-i", type=float, default=0.5,
+    parser.add_argument("--sample-interval", "-i", type=_positive_float_arg, default=0.5,
                         help="Sample one frame every N seconds (default: 0.5)")
-    parser.add_argument("--pass1-clusters", "-c", type=int, default=15,
+    parser.add_argument("--pass1-clusters", "-c", type=_positive_int_arg, default=15,
                         help="Number of CLIP clusters in pass 1 (1-64, default: 15)")
-    parser.add_argument("--max-clustering-memory-mb", type=int, default=2048,
+    parser.add_argument("--max-clustering-memory-mb", type=_positive_int_arg, default=2048,
                         help="Maximum memory admitted for an isolated clustering worker (default: 2048)")
-    parser.add_argument("--max-frame-cache-mb", type=int, default=8192,
+    parser.add_argument("--max-frame-cache-mb", type=_positive_int_arg, default=8192,
                         help="Maximum lossless candidate cache size in MiB (default: 8192)")
     parser.add_argument("--frame-cache-dir", default=None,
                         help="Directory for temporary candidate frames (default: the OS temp directory)")
-    parser.add_argument("--similarity-threshold", "-t", type=float, default=0.85,
+    parser.add_argument("--similarity-threshold", "-t", type=_probability_arg, default=0.85,
                         help="Deprecated no-op; deterministic merge vetoes are used")
-    parser.add_argument("--max-output-frames", type=int, default=None,
+    parser.add_argument("--max-output-frames", type=_positive_int_arg, default=None,
                         help="Optional final frame cap applied after scoring and dedupe")
     parser.add_argument("--verbose-trace", action="store_true",
                         help="Write structured pipeline trace snapshots for debugging")

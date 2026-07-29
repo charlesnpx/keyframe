@@ -25,6 +25,15 @@ import cv2
 import numpy as np
 from PIL import Image
 
+from keyframe.media_preflight import VideoTimingMetadata
+from keyframe.pipeline.sampling import (
+    DecoderTimestampNormalizer,
+    DecoderTimingRegression,
+    DecoderTimingUnavailable,
+    FrameTimingError,
+    PRESENTATION_TIME_EPSILON_SECONDS,
+    TargetTimeSampler,
+)
 from keyframe.visual import (
     FrameMetricTable,
     build_compact_frame_metric_table,
@@ -62,12 +71,15 @@ class ClusteringWorkerError(RuntimeError):
 class StreamedFeatures:
     timestamps: list[float]
     frame_indices: list[int]
+    consumed_targets: list[float]
+    next_targets: list[float]
     dhashes: list[int]
     pixel_digests: list[str]
     frame_sizes: list[tuple[int, int]]
     source_sharpness: list[float]
     clip_embeddings: np.ndarray
     frame_metrics: FrameMetricTable
+    sampling_timing: dict[str, Any]
 
 
 def _rgb_digest(image: Image.Image) -> str:
@@ -110,6 +122,7 @@ def stream_video_features(
     interval_seconds: float,
     *,
     embed_images: Callable[[Sequence[Image.Image]], np.ndarray],
+    video_timing: VideoTimingMetadata | None = None,
 ) -> StreamedFeatures:
     """Decode sampled frames once, retaining compact metadata only.
 
@@ -119,34 +132,57 @@ def stream_video_features(
     """
     from keyframe.dedupe import compute_dhash
 
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"could not open video: {video_path}")
-    try:
+    interval_seconds = float(interval_seconds)
+
+    def decode_once(
+        *,
+        timing_source: str,
+        nominal_rate: float | None = None,
+        fallback_reason: str | None = None,
+        announce: bool,
+    ) -> StreamedFeatures:
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            raise RuntimeError(f"could not open video: {video_path}")
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         fps = float(cap.get(cv2.CAP_PROP_FPS))
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        if fps <= 0:
-            raise RuntimeError("video reports an invalid frame rate")
-        _frame_bytes(width, height)
-        duration = total_frames / fps if total_frames > 0 else 0.0
-        print(f"Video: {video_path}")
-        print(f"  {width}x{height}, {fps:.1f} fps, {total_frames} frames, {duration:.1f}s")
+        if width > 0 and height > 0:
+            _frame_bytes(width, height)
+        duration = (
+            float(video_timing.duration_seconds)
+            if video_timing is not None and video_timing.duration_seconds is not None
+            else total_frames / fps
+            if total_frames > 0 and fps > 0
+            else 0.0
+        )
+        if announce:
+            fps_text = f"{fps:.3f}" if fps > 0 else "unknown"
+            print(f"Video: {video_path}")
+            print(
+                f"  {width}x{height}, {fps_text} fps, "
+                f"{total_frames} frames, {duration:.1f}s"
+            )
 
-        interval_frames = max(1, int(float(interval_seconds) * fps))
         timestamps: list[float] = []
         frame_indices: list[int] = []
+        consumed_targets: list[float] = []
+        next_targets: list[float] = []
         dhashes: list[int] = []
         pixel_digests: list[str] = []
         frame_sizes: list[tuple[int, int]] = []
         source_sharpness: list[float] = []
         metric_rows: list[dict[str, float]] = []
         content_prev_delta: list[float] = []
+        content_signatures: list[np.ndarray] = []
         embeddings: list[np.ndarray] = []
         batch: list[Image.Image] = []
         batch_bytes = 0
         previous_content: np.ndarray | None = None
+        target_sampler = TargetTimeSampler(interval_seconds)
+        decoder_timing = DecoderTimestampNormalizer()
+        decoder_diagnostic_error: str | None = None
 
         def flush_batch() -> None:
             nonlocal batch, batch_bytes
@@ -162,48 +198,78 @@ def stream_video_features(
             batch_bytes = 0
 
         frame_idx = 0
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            if frame_idx % interval_frames != 0:
+        try:
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                raw_decoder_seconds = float(cap.get(cv2.CAP_PROP_POS_MSEC)) / 1000.0
+                if timing_source == "decoder_presentation_time":
+                    timestamp = decoder_timing.observe(raw_decoder_seconds)
+                    if timestamp is None:
+                        frame_idx += 1
+                        continue
+                else:
+                    if nominal_rate is None or nominal_rate <= 0:
+                        raise FrameTimingError(
+                            "nominal CFR fallback requires a positive probe rate"
+                        )
+                    if decoder_diagnostic_error is None:
+                        try:
+                            decoder_timing.observe(raw_decoder_seconds)
+                        except FrameTimingError as exc:
+                            decoder_diagnostic_error = str(exc)
+                    timestamp = frame_idx / nominal_rate
+
+                decision = target_sampler.consider(timestamp)
+                if decision is None:
+                    frame_idx += 1
+                    continue
+
+                height_now, width_now = frame.shape[:2]
+                current_bytes = _frame_bytes(int(width_now), int(height_now))
+                if batch and batch_bytes + current_bytes > _MAX_CLIP_BATCH_BYTES:
+                    flush_batch()
+
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                image = Image.fromarray(rgb)
+                timestamps.append(float(decision.timestamp))
+                frame_indices.append(int(frame_idx))
+                consumed_targets.append(float(decision.consumed_target))
+                next_targets.append(float(decision.next_target))
+                dhashes.append(int(compute_dhash(image)))
+                pixel_digests.append(_rgb_digest(image))
+                frame_sizes.append((int(width_now), int(height_now)))
+                row = _stream_metric_row(image)
+                metric_rows.append(row)
+                # clip_oversegment historically used source-resolution sharpness,
+                # while a one-cluster scene used the compact FrameMetricTable
+                # score. Retain both scalar forms without retaining the image.
+                source_sharpness.append(float(laplacian_sharpness(image)))
+                content = np.asarray(
+                    content_crop(image).convert("L").resize((160, 90), Image.Resampling.BILINEAR),
+                    dtype=np.float32,
+                )
+                content_prev_delta.append(
+                    float(np.mean(np.abs(previous_content - content))) if previous_content is not None else 0.0
+                )
+                content_signatures.append(
+                    np.clip(np.rint(content[::2, ::2]), 0, 255).astype(np.uint8)
+                )
+                previous_content = content
+                batch.append(image)
+                batch_bytes += current_bytes
+                if batch_bytes >= _MAX_CLIP_BATCH_BYTES:
+                    flush_batch()
                 frame_idx += 1
-                continue
+            if timing_source == "decoder_presentation_time":
+                decoder_timing.finalize()
+            flush_batch()
+        finally:
+            for image in batch:
+                image.close()
+            cap.release()
 
-            height_now, width_now = frame.shape[:2]
-            current_bytes = _frame_bytes(int(width_now), int(height_now))
-            if batch and batch_bytes + current_bytes > _MAX_CLIP_BATCH_BYTES:
-                flush_batch()
-
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            image = Image.fromarray(rgb)
-            timestamp = frame_idx / fps
-            timestamps.append(float(timestamp))
-            frame_indices.append(int(frame_idx))
-            dhashes.append(int(compute_dhash(image)))
-            pixel_digests.append(_rgb_digest(image))
-            frame_sizes.append((int(width_now), int(height_now)))
-            row = _stream_metric_row(image)
-            metric_rows.append(row)
-            # clip_oversegment historically used source-resolution sharpness,
-            # while a one-cluster scene used the compact FrameMetricTable
-            # score. Retain both scalar forms without retaining the image.
-            source_sharpness.append(float(laplacian_sharpness(image)))
-            content = np.asarray(
-                content_crop(image).convert("L").resize((160, 90), Image.Resampling.BILINEAR),
-                dtype=np.float32,
-            )
-            content_prev_delta.append(
-                float(np.mean(np.abs(previous_content - content))) if previous_content is not None else 0.0
-            )
-            previous_content = content
-            batch.append(image)
-            batch_bytes += current_bytes
-            if batch_bytes >= _MAX_CLIP_BATCH_BYTES:
-                flush_batch()
-            frame_idx += 1
-
-        flush_batch()
         if not embeddings:
             clip_embeddings = np.empty((0, 0), dtype=np.float32)
         else:
@@ -217,20 +283,85 @@ def stream_video_features(
             frame_indices=frame_indices,
             content_prev_delta=content_prev_delta,
             content_next_delta=content_next_delta,
+            content_signature_stack=(
+                np.stack(content_signatures, axis=0)
+                if content_signatures
+                else np.empty((0, 0, 0), dtype=np.uint8)
+            ),
         )
         print(f"  Sampled {len(timestamps)} frames at {interval_seconds}s intervals")
+        probe_metadata = (
+            video_timing.to_dict()
+            if video_timing is not None
+            else {
+                "classification": "unknown",
+                "reason": "no ffprobe timing metadata was supplied",
+                "avg_frame_rate": None,
+                "r_frame_rate": None,
+                "time_base": None,
+                "stream_start_seconds": None,
+                "duration_seconds": duration,
+                "duration_source": None,
+                "duration_ts": None,
+                "nb_frames": total_frames if total_frames > 0 else None,
+                "nominal_frame_rate": fps if fps > 0 else None,
+                "expected_duration_seconds": None,
+                "duration_delta_seconds": None,
+                "duration_tolerance_seconds": None,
+            }
+        )
+        sampling_timing = {
+            **probe_metadata,
+            "source": timing_source,
+            "interval_seconds": interval_seconds,
+            "epsilon_seconds": PRESENTATION_TIME_EPSILON_SECONDS,
+            "decoder_origin_seconds": decoder_timing.origin_seconds,
+            "fallback_reason": fallback_reason,
+            "decoder_diagnostic_error": decoder_diagnostic_error,
+            "decoded_frame_count": frame_idx,
+            "sample_count": len(timestamps),
+            "second_pass": None,
+        }
         return StreamedFeatures(
             timestamps=timestamps,
             frame_indices=frame_indices,
+            consumed_targets=consumed_targets,
+            next_targets=next_targets,
             dhashes=dhashes,
             pixel_digests=pixel_digests,
             frame_sizes=frame_sizes,
             source_sharpness=source_sharpness,
             clip_embeddings=clip_embeddings,
             frame_metrics=metrics,
+            sampling_timing=sampling_timing,
         )
-    finally:
-        cap.release()
+
+    try:
+        return decode_once(
+            timing_source="decoder_presentation_time",
+            announce=True,
+        )
+    except (DecoderTimingUnavailable, DecoderTimingRegression) as exc:
+        confirmed_rate = video_timing.confirmed_cfr_rate if video_timing is not None else None
+        if confirmed_rate is None:
+            classification = video_timing.classification if video_timing is not None else "unknown"
+            raise FrameTimingError(
+                "decoder presentation timing is unusable and "
+                f"{classification} probe evidence does not permit nominal fallback: {exc}"
+            ) from exc
+        fallback_rate = confirmed_rate
+        fallback_reason = str(exc)
+
+    print(
+        "  Decoder presentation timing unavailable; restarting confirmed "
+        f"CFR sampling at {fallback_rate:.6f} fps"
+    )
+    return decode_once(
+        timing_source="nominal_source_index_cfr",
+        nominal_rate=fallback_rate,
+        fallback_reason=fallback_reason,
+        announce=False,
+    )
 
 
 def _ppm_header(width: int, height: int) -> bytes:
@@ -366,19 +497,14 @@ class CandidateFrameCache:
             self.cleanup()
             raise
 
-    def write(self, sample_idx: int, image: Image.Image, expected_digest: str) -> None:
+    def write(self, sample_idx: int, image: Image.Image) -> str | None:
         index = int(sample_idx)
         path = self._paths.get(index)
         if path is None:
-            return
+            return None
         image = image.convert("RGB")
         try:
             actual_digest = _rgb_digest(image)
-            if actual_digest != expected_digest:
-                raise FrameCacheError(
-                    f"video changed or decoded inconsistently while caching sample {index}; "
-                    "refusing to mix passes"
-                )
             header = _ppm_header(*image.size)
             payload = image.tobytes()
             expected_size = self._sizes[index]
@@ -389,6 +515,7 @@ class CandidateFrameCache:
                 output.write(payload)
                 output.flush()
                 os.fsync(output.fileno())
+            return actual_digest
         except OSError as exc:
             raise FrameCacheError(f"could not write cached candidate {index}: {exc}") from exc
         finally:
@@ -410,6 +537,7 @@ def cache_candidate_frames(
     interval_seconds: float,
     *,
     candidate_indices: Iterable[int],
+    frame_indices: Sequence[int] | None = None,
     frame_sizes: Sequence[tuple[int, int]],
     pixel_digests: Sequence[str],
     cache: CandidateFrameCache,
@@ -420,14 +548,40 @@ def cache_candidate_frames(
         return CandidateImageProvider({}, {})
     if min(wanted) < 0 or max(wanted) >= len(frame_sizes):
         raise FrameCacheError("candidate index is outside the first-pass sample table")
+    if frame_indices is not None and len(frame_indices) != len(frame_sizes):
+        raise FrameCacheError("first-pass source frame index table is misaligned")
+    if len(pixel_digests) != len(frame_sizes):
+        raise FrameCacheError("first-pass pixel digest table is misaligned")
     sizes = {index: frame_sizes[index] for index in wanted}
-    expected = {index: pixel_digests[index] for index in wanted}
+    cached_digests: dict[int, str] = {}
     cache.reserve(sizes)
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"could not reopen video for candidate cache: {video_path}")
     try:
+        if frame_indices is not None:
+            for sample_idx in sorted(wanted):
+                source_idx = int(frame_indices[sample_idx])
+                if source_idx < 0:
+                    raise FrameCacheError("source frame index is negative")
+                if not cap.set(cv2.CAP_PROP_POS_FRAMES, source_idx):
+                    raise FrameCacheError(
+                        f"could not seek to source frame {source_idx}"
+                    )
+                ok, frame = cap.read()
+                if not ok:
+                    raise FrameCacheError(
+                        f"video ended before source frame {source_idx} could be cached"
+                    )
+                height, width = frame.shape[:2]
+                _frame_bytes(int(width), int(height))
+                image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                digest = cache.write(sample_idx, image)
+                if digest is not None:
+                    cached_digests[sample_idx] = digest
+            return cache.provider(cached_digests)
+
         fps = float(cap.get(cv2.CAP_PROP_FPS))
         if fps <= 0:
             raise RuntimeError("video reports an invalid frame rate")
@@ -444,13 +598,15 @@ def cache_candidate_frames(
                     height, width = frame.shape[:2]
                     _frame_bytes(int(width), int(height))
                     image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                    cache.write(sample_idx, image, expected[sample_idx])
+                    digest = cache.write(sample_idx, image)
+                    if digest is not None:
+                        cached_digests[sample_idx] = digest
                     remaining.remove(sample_idx)
                 sample_idx += 1
             frame_idx += 1
         if remaining:
             raise FrameCacheError(f"video ended before candidate samples could be cached: {sorted(remaining)}")
-        return cache.provider(expected)
+        return cache.provider(cached_digests)
     except Exception:
         cache.cleanup()
         raise

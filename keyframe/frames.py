@@ -19,12 +19,16 @@ import torch
 from collections import Counter
 from PIL import Image
 from pathlib import Path
-from transformers import Florence2ForConditionalGeneration, AutoProcessor
-import open_clip
 from sklearn.cluster import AgglomerativeClustering
 import argparse
 import sys
 import json
+
+from keyframe.import_safety import defer_optional_pyav_import
+
+with defer_optional_pyav_import():
+    import open_clip
+    from transformers import AutoProcessor, Florence2ForConditionalGeneration
 
 from keyframe.dedupe import (
     clean_ocr_token_sets,
@@ -805,14 +809,14 @@ def save_results(selected, frames, output_dir):
     log = [{
         "file": Path(s["path"]).name,
         "timestamp": s["timestamp"],
-        "caption": s["caption"],
-        "caption_cluster": s["caption_cluster"],
-        "merged_from": s["merged_from"],
+        "caption": s.get("caption", ""),
+        "caption_cluster": s.get("caption_cluster"),
+        "merged_from": s.get("merged_from"),
         "merged_captions": s.get("merged_captions", []),
         "merged_timestamps": s.get("merged_timestamps", []),
         "merged_from_sample_idxs": s.get("merged_from_sample_idxs", [s["sample_idx"]]),
-        "clip_cluster": s["clip_cluster"],
-        "clip_cluster_size": s["clip_cluster_size"],
+        "clip_cluster": s.get("clip_cluster"),
+        "clip_cluster_size": s.get("clip_cluster_size"),
         "split_from_generic": s.get("split_from_generic", False),
         "ocr_text": s.get("ocr_text", ""),
         "ocr_cache_source": s.get("ocr_cache_source"),

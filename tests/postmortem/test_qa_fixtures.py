@@ -170,13 +170,12 @@ FIXTURES = {
 EXPECTED_BASELINE = {
     "36381": {
         "misses": {
-            "amot_spacing_midpage_consequence_dependencies_comments",
             "amot_spacing_page_boundary_current_state_description_to_page2",
             "source_form_text_fields_for_spacing_comparison",
             "priority_form_spacing_sections",
         },
         "buckets": {
-            "amot_spacing_midpage_consequence_dependencies_comments": "sampled_but_no_proposal_near_target",
+            "amot_spacing_midpage_consequence_dependencies_comments": "hit_direct",
             "amot_spacing_page_boundary_current_state_description_to_page2": "rescue_ocrd_but_not_promoted",
             "source_form_text_fields_for_spacing_comparison": "rescue_ocrd_but_not_promoted",
             "priority_form_spacing_sections": "sampled_but_no_proposal_near_target",
@@ -186,12 +185,11 @@ EXPECTED_BASELINE = {
         "misses": {
             "regular_amot_pdf_header_body_fields_wrong_location",
             "cover_page_unapproved_signed_by_should_be_blank",
-            "priority_form_header_fields_in_body",
         },
         "buckets": {
             "regular_amot_pdf_header_body_fields_wrong_location": "sampled_but_no_proposal_near_target",
             "cover_page_unapproved_signed_by_should_be_blank": "sampled_but_no_proposal_near_target",
-            "priority_form_header_fields_in_body": "sampled_but_no_proposal_near_target",
+            "priority_form_header_fields_in_body": "hit_direct",
         },
     },
     "36324": {
@@ -205,7 +203,7 @@ EXPECTED_BASELINE = {
     "11111": {
         "misses": set(),
         "buckets": {
-            "active_amot_0264_visible_in_list": "hit_direct",
+            "active_amot_0264_visible_in_list": "hit_lineage_only",
             "amot_0264_search_value_available": "hit_direct",
             "amot_0264_filter_returns_no_templates_found": "hit_direct",
         },

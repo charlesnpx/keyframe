@@ -22,6 +22,12 @@ from keyframe.pipeline.contracts import (
     candidate_records,
     candidate_to_manifest_row,
 )
+from keyframe.pipeline.primary_selection import (
+    _coverage_candidate_pool,
+    _coverage_window_bounds,
+    _distributed_window_subset,
+    select_primary_candidates,
+)
 from keyframe.pipeline.qa_targets import write_debug_qa_trace
 from keyframe.pipeline.trace import NoOpTraceSink, SnapshotTraceSink, TraceSink
 
@@ -47,6 +53,61 @@ def _empty_cache(device: str) -> None:
 
 def _candidate_batch(stage: str, candidates, metadata: dict[str, Any] | None = None) -> CandidateBatch:
     return CandidateBatch(stage=stage, candidates=candidate_records(candidates), metadata=metadata or {})
+
+
+def _sample_step_seconds(timestamps: list[float]) -> float:
+    diffs = [
+        float(b) - float(a)
+        for a, b in zip(timestamps, timestamps[1:])
+        if float(b) > float(a)
+    ]
+    if not diffs:
+        return 0.5
+    diffs.sort()
+    return float(diffs[len(diffs) // 2])
+
+
+def _media_duration_seconds(timestamps: list[float], ctx: RunContext) -> float:
+    timing = getattr(ctx.config, "video_timing", None)
+    duration = getattr(timing, "duration_seconds", None)
+    if isinstance(duration, (int, float)) and duration > 0:
+        return float(duration)
+    if not timestamps:
+        return 0.0
+    return float(max(timestamps)) + _sample_step_seconds(timestamps)
+
+
+def _balanced_durable_cap_order(
+    candidates: list[CandidateRecord],
+    score_key,
+) -> list[CandidateRecord]:
+    remaining = list(candidates)
+    ordered: list[CandidateRecord] = []
+    selected_by_window: dict[int, int] = {}
+
+    def window_id(candidate: CandidateRecord) -> int:
+        if candidate.temporal.temporal_window_id is not None:
+            return int(candidate.temporal.temporal_window_id)
+        if candidate.temporal.coverage_window_ids:
+            return int(candidate.temporal.coverage_window_ids[0])
+        return -1
+
+    while remaining:
+        minimum_count = min(
+            selected_by_window.get(window_id(candidate), 0)
+            for candidate in remaining
+        )
+        eligible = [
+            candidate
+            for candidate in remaining
+            if selected_by_window.get(window_id(candidate), 0) == minimum_count
+        ]
+        chosen = max(eligible, key=score_key)
+        remaining.remove(chosen)
+        ordered.append(chosen)
+        chosen_window = window_id(chosen)
+        selected_by_window[chosen_window] = selected_by_window.get(chosen_window, 0) + 1
+    return ordered
 
 
 def _select_pass1_candidates(
@@ -190,6 +251,7 @@ class StreamingAnalysisStage:
                 video_path,
                 ctx.config.sample_interval,
                 embed_images=lambda batch: clip.embed_images(batch, batch_size=len(batch)),
+                video_timing=ctx.config.video_timing,
             )
         finally:
             clip.cleanup()
@@ -211,6 +273,7 @@ class StreamingAnalysisStage:
             source_sharpness=streamed.source_sharpness,
             pixel_digests=streamed.pixel_digests,
             frame_sizes=streamed.frame_sizes,
+            sampling_timing=streamed.sampling_timing,
         )
         print(f"  Embedded {len(streamed.timestamps)} frames -> {streamed.clip_embeddings.shape}")
         ctx.trace.exit("sampling", sampling)
@@ -254,7 +317,6 @@ class TemporalStage:
         from keyframe.frames import detect_scenes
         from keyframe.scoring import (
             allocate_clusters_by_novelty,
-            candidate_budget_for_scenes,
             coalesce_tiny_scenes,
         )
 
@@ -271,7 +333,7 @@ class TemporalStage:
                 f"{scene_coalescence['original_scene_count']} -> "
                 f"{scene_coalescence['coalesced_scene_count']}"
             )
-        cluster_budget = candidate_budget_for_scenes(n_clusters, len(scenes))
+        cluster_budget = n_clusters
         cluster_allocs = allocate_clusters_by_novelty(scenes, cluster_budget, dhashes, floor=1)
         print(f"  Cluster allocation budget: {sum(cluster_allocs)} candidates")
         out = TemporalOutput(
@@ -351,7 +413,63 @@ class ProposalStage:
             )
             for cand in candidates
         )
+        duration_seconds = _media_duration_seconds(timestamps, ctx)
+        coverage_pool = _coverage_candidate_pool(
+            timestamps=timestamps,
+            frame_indices=frame_indices,
+            dhashes=features.dhashes,
+            clip_embeddings=features.clip_embeddings,
+            frame_metrics=frame_metrics,
+            coverage_interval_seconds=ctx.config.coverage_interval_seconds,
+            minimum_settled_dwell_seconds=ctx.config.minimum_settled_dwell_seconds,
+            duration_seconds=duration_seconds,
+            sample_scenes=sample_scenes,
+        )
+        primary_selection = select_primary_candidates(
+            semantic_candidates=candidates,
+            coverage_pool=coverage_pool,
+            timestamps=timestamps,
+            frame_indices=frame_indices,
+            dhashes=features.dhashes,
+            clip_embeddings=features.clip_embeddings,
+            frame_metrics=frame_metrics,
+            sample_scenes=sample_scenes,
+            coverage_interval_seconds=ctx.config.coverage_interval_seconds,
+            minimum_settled_dwell_seconds=ctx.config.minimum_settled_dwell_seconds,
+            duration_seconds=duration_seconds,
+            max_primary_candidates=ctx.config.max_primary_candidates,
+        )
+        candidates = primary_selection.candidates
+        coverage_window_count = len(
+            _coverage_window_bounds(
+                duration_seconds,
+                ctx.config.coverage_interval_seconds,
+            )
+        )
+        represented_coverage_windows = sorted(
+            {
+                int(window_id)
+                for candidate in candidates
+                for window_id in candidate.temporal.coverage_window_ids
+            }
+        )
+        ctx.metadata["coverage"] = {
+            "coverage_interval_seconds": ctx.config.coverage_interval_seconds,
+            "minimum_settled_dwell_seconds": ctx.config.minimum_settled_dwell_seconds,
+            "coverage_window_count": coverage_window_count,
+            "represented_coverage_window_ids": represented_coverage_windows,
+            "primary_candidate_capacity": ctx.config.max_primary_candidates,
+            **primary_selection.metadata,
+        }
         ctx.trace.exit("temporal.sample_context", temporal)
+        ctx.trace.exit(
+            "proposal.durable_state_fill",
+            _candidate_batch(
+                "proposal.durable_state_fill",
+                primary_selection.durable_state_fill,
+                primary_selection.metadata,
+            ),
+        )
 
         pass1_primary = [c for c in candidates if c.visual.cluster_role != "alt"]
         cluster_alt = [c for c in candidates if c.visual.cluster_role == "alt"]
@@ -598,12 +716,24 @@ class SurvivalStage:
 
         frames = sampling.frame_store.frames
         dhashes = features.dhashes
-        deduped = near_time_dedupe(candidates, [set(c.evidence.ocr_tokens) for c in candidates], dhashes)
+        deduped = near_time_dedupe(
+            candidates,
+            [set(c.evidence.ocr_tokens) for c in candidates],
+            dhashes,
+            frame_metrics=frame_metrics,
+            clip_embeddings=features.clip_embeddings,
+        )
         print(f"  Near-time dedupe: {len(candidates)} -> {len(deduped)} candidates")
         ctx.trace.exit("survival.after_near_dedupe", _candidate_batch("survival.after_near_dedupe", deduped))
 
         deduped_token_sets = [set(c.evidence.ocr_tokens) for c in deduped]
-        globally_deduped = global_candidate_dedupe(deduped, deduped_token_sets, dhashes)
+        globally_deduped = global_candidate_dedupe(
+            deduped,
+            deduped_token_sets,
+            dhashes,
+            frame_metrics=frame_metrics,
+            clip_embeddings=features.clip_embeddings,
+        )
         print(f"  Global conservative dedupe: {len(deduped)} -> {len(globally_deduped)} candidates")
         ctx.trace.exit("survival.after_global_dedupe", _candidate_batch("survival.after_global_dedupe", globally_deduped))
 
@@ -611,14 +741,33 @@ class SurvivalStage:
         print(f"  Low-information filter: {len(globally_deduped)} -> {len(filtered)} candidates")
         ctx.trace.exit("survival.after_low_info_filter", _candidate_batch("survival.after_low_info_filter", filtered))
 
-        adjacent_deduped = adjacent_same_screen_dedupe(filtered)
+        adjacent_deduped = adjacent_same_screen_dedupe(
+            filtered,
+            dhashes=dhashes,
+            frame_metrics=frame_metrics,
+            clip_embeddings=features.clip_embeddings,
+        )
         print(f"  Adjacent same-screen dedupe: {len(filtered)} -> {len(adjacent_deduped)} candidates")
         ctx.trace.exit("survival.after_adjacent_dedupe", _candidate_batch("survival.after_adjacent_dedupe", adjacent_deduped))
 
         deduped_token_sets = [set(c.evidence.ocr_tokens) for c in adjacent_deduped]
         deduped_has_ocr = [len(tokens) >= 3 for tokens in deduped_token_sets]
-        final = union_find_merge(adjacent_deduped, deduped_token_sets, deduped_has_ocr, frames)
-        post_veto, dropped_duplicates = content_area_duplicate_veto(final, frames, frame_metrics=frame_metrics)
+        final = union_find_merge(
+            adjacent_deduped,
+            deduped_token_sets,
+            deduped_has_ocr,
+            frames,
+            dhashes=dhashes,
+            frame_metrics=frame_metrics,
+            clip_embeddings=features.clip_embeddings,
+        )
+        post_veto, dropped_duplicates = content_area_duplicate_veto(
+            final,
+            frames,
+            frame_metrics=frame_metrics,
+            dhashes=dhashes,
+            clip_embeddings=features.clip_embeddings,
+        )
         print(f"  Content-area duplicate veto: {len(final)} -> {len(post_veto)} candidates")
         ctx.trace.exit(
             "survival.after_content_area_veto",
@@ -634,16 +783,70 @@ class SurvivalStage:
         cap_drops: list[dict[str, Any]] = []
         max_output_frames = ctx.config.max_output_frames
         if max_output_frames is not None and max_output_frames >= 0 and len(post_veto) > max_output_frames:
-            ranked = sorted(
-                post_veto,
-                key=lambda cand: (
-                    len(cand.evidence.ocr_tokens),
-                    float(cand.selection.candidate_score or cand.selection.score or cand.visual.sharpness or 0.0),
-                    -float(cand.timestamp),
-                    -int(cand.sample_idx),
-                ),
-                reverse=True,
-            )
+            coverage = [
+                cand
+                for cand in post_veto
+                if cand.selection.selection_role == "coverage"
+                or "coverage" in cand.lineage.lineage_roles
+            ]
+            if len(coverage) > max_output_frames:
+                ranked_coverage = _distributed_window_subset(
+                    coverage,
+                    max_output_frames,
+                )
+                ranked = ranked_coverage
+            else:
+                coverage_idxs = {int(cand.sample_idx) for cand in coverage}
+                durable = [
+                    cand
+                    for cand in post_veto
+                    if int(cand.sample_idx) not in coverage_idxs
+                    and (
+                        cand.temporal.durable_state_group_id is not None
+                        or cand.selection.selection_role == "durable_state"
+                        or "durable_state" in cand.lineage.lineage_roles
+                    )
+                ]
+                durable_idxs = {int(cand.sample_idx) for cand in durable}
+                structured = [
+                    cand
+                    for cand in post_veto
+                    if int(cand.sample_idx) not in coverage_idxs
+                    and int(cand.sample_idx) not in durable_idxs
+                    and (
+                        cand.selection.rescue_reason == "structured_delta"
+                        or cand.selection.retention_reason not in {None, "none"}
+                        or bool(cand.evidence.field_signature)
+                    )
+                ]
+                structured_idxs = {int(cand.sample_idx) for cand in structured}
+                remaining = [
+                    cand
+                    for cand in post_veto
+                    if int(cand.sample_idx) not in coverage_idxs
+                    and int(cand.sample_idx) not in durable_idxs
+                    and int(cand.sample_idx) not in structured_idxs
+                ]
+
+                def score_key(cand: CandidateRecord) -> tuple[int, float, float, int]:
+                    return (
+                        len(cand.evidence.ocr_tokens),
+                        float(
+                            cand.selection.candidate_score
+                            or cand.selection.score
+                            or cand.visual.sharpness
+                            or 0.0
+                        ),
+                        -float(cand.timestamp),
+                        -int(cand.sample_idx),
+                    )
+
+                ranked = [
+                    *coverage,
+                    *_balanced_durable_cap_order(durable, score_key),
+                    *sorted(structured, key=score_key, reverse=True),
+                    *sorted(remaining, key=score_key, reverse=True),
+                ]
             kept_idxs = {int(cand.sample_idx) for cand in ranked[:max_output_frames]}
             capped = tuple(cand for cand in post_veto if int(cand.sample_idx) in kept_idxs)
             cap_drops = [
@@ -690,6 +893,7 @@ class OutputStage:
         self,
         final: tuple[CandidateRecord, ...],
         sampling: SamplingOutput,
+        features: FeatureOutput,
         temporal: TemporalOutput,
         output_dir: Path,
         rescue_budget: int,
@@ -706,6 +910,8 @@ class OutputStage:
         frames = sampling.frame_store.frames
         caption_log_path = save_results(final, frames, output_dir)
         manifest_metadata = {
+            "sampling_timing": features.sampling_timing,
+            "coverage": ctx.metadata.get("coverage", {}),
             "scene_coalescence": temporal.scene_coalescence,
             "output_cap": {
                 "max_output_frames": ctx.config.max_output_frames,
@@ -811,6 +1017,7 @@ def extract_keyframes(
             video_path,
             cfg.sample_interval,
             candidate_indices=candidate_union,
+            frame_indices=sampling.samples.frame_indices,
             frame_sizes=features.frame_sizes,
             pixel_digests=features.pixel_digests,
             cache=frame_cache,
@@ -851,6 +1058,7 @@ def extract_keyframes(
         artifacts = OutputStage().run(
             final,
             sampling,
+            features,
             temporal,
             output_dir,
             proposal.rescue_budget,

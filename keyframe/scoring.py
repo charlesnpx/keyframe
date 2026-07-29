@@ -74,7 +74,7 @@ def allocate_clusters_by_novelty(
     dhashes: Sequence[int] | Mapping[int, int],
     floor: int = 1,
 ) -> list[int]:
-    """Allocate a cluster budget by scene visual novelty while summing exactly."""
+    """Allocate a cluster budget by durable visual-change mass."""
     if not scenes:
         return []
     if total_clusters <= 0:
@@ -88,13 +88,15 @@ def allocate_clusters_by_novelty(
 
     novelty: list[float] = []
     for start, end in scenes:
-        distances = []
+        durable_change_mass = 0
         for idx in range(start, end):
             try:
-                distances.append(hamming(int(dhashes[idx]), int(dhashes[idx + 1])))
+                distance = hamming(int(dhashes[idx]), int(dhashes[idx + 1]))
             except (IndexError, KeyError):
                 continue
-        novelty.append(sum(distances) / len(distances) if distances else 0.0)
+            if distance >= 6:
+                durable_change_mass += min(int(distance), 16)
+        novelty.append(math.log1p(durable_change_mass))
 
     if sum(novelty) <= 0:
         weights = [max(1, end - start + 1) for start, end in scenes]

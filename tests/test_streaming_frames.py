@@ -41,10 +41,12 @@ def test_streaming_pass_keeps_compact_metadata_and_caches_only_candidates(tmp_pa
     streamed = stream_video_features(video, 0.1, embed_images=embed)
 
     assert len(streamed.timestamps) == 5
+    assert streamed.sampling_timing["source"] == "decoder_presentation_time"
     assert streamed.clip_embeddings.shape == (5, 3)
     assert len(streamed.pixel_digests) == 5
     assert streamed.frame_metrics.full_gray_stack.shape == (0, 0, 0)
     assert streamed.frame_metrics.content_gray_stack.shape == (0, 0, 0)
+    assert streamed.frame_metrics.content_signature_stack.shape[0] == 5
     assert sum(batches) == 5
 
     cache = CandidateFrameCache(cache_root=tmp_path, max_bytes=1024 * 1024)
@@ -66,6 +68,32 @@ def test_streaming_pass_keeps_compact_metadata_and_caches_only_candidates(tmp_pa
     cache_path = cache.path
     cache.cleanup()
     assert not cache_path.exists()
+
+
+def test_candidate_cache_uses_recorded_source_frame_indices(tmp_path):
+    video = _video(tmp_path / "recording.mp4", frames=5)
+    streamed = stream_video_features(
+        video,
+        0.1,
+        embed_images=lambda images: np.ones((len(images), 2), dtype=np.float32),
+    )
+    cache = CandidateFrameCache(cache_root=tmp_path, max_bytes=1024 * 1024)
+    provider = cache_candidate_frames(
+        video,
+        0.1,
+        candidate_indices={1},
+        frame_indices=[0, 3],
+        frame_sizes=[streamed.frame_sizes[0], streamed.frame_sizes[3]],
+        pixel_digests=[streamed.pixel_digests[0], streamed.pixel_digests[3]],
+        cache=cache,
+    )
+
+    image = provider[1]
+    try:
+        assert np.asarray(image).mean() == pytest.approx(90, abs=4)
+    finally:
+        image.close()
+        cache.cleanup()
 
 
 def test_candidate_cache_rejects_union_above_configured_byte_limit(tmp_path):
