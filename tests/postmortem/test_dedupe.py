@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from PIL import Image
+import pytest
 
 from keyframe.dedupe import (
     _is_retained_evidence_candidate,
@@ -773,3 +774,81 @@ def test_merge_metadata_preserves_rescue_policy_fields():
     assert winner["rescue_origins_seen"] == ["additive_rescue"]
     assert winner["rescue_priorities_seen"] == [2]
     assert winner["lineage_roles"] == ["primary", "rescue"]
+
+
+def test_near_time_dedupe_preserves_visually_material_durable_groups():
+    candidates = (
+        as_candidate_record({"sample_idx": 0, "timestamp": 10.0})
+        .with_visual(dhash=0)
+        .with_temporal(durable_state_group_id=1),
+        as_candidate_record({"sample_idx": 1, "timestamp": 10.5})
+        .with_visual(dhash=0xFF)
+        .with_temporal(durable_state_group_id=2),
+    )
+
+    survivors = _near_time_dedupe(
+        candidates,
+        [{"shared", "screen"}, {"shared", "screen"}],
+        [0, 0xFF],
+    )
+
+    assert [candidate.sample_idx for candidate in survivors] == [0, 1]
+
+
+@pytest.mark.parametrize(
+    "left_tokens,right_tokens",
+    [
+        ({"shared", "alpha", "beta"}, {"shared", "delta", "epsilon"}),
+        (set(), {"one", "two", "three", "four", "five"}),
+    ],
+)
+def test_near_time_dedupe_preserves_durable_groups_with_material_ocr_difference(
+    left_tokens,
+    right_tokens,
+):
+    candidates = (
+        as_candidate_record({"sample_idx": 0, "timestamp": 10.0})
+        .with_visual(dhash=0)
+        .with_temporal(durable_state_group_id=1),
+        as_candidate_record({"sample_idx": 1, "timestamp": 10.5})
+        .with_visual(dhash=0)
+        .with_temporal(durable_state_group_id=2),
+    )
+
+    survivors = _near_time_dedupe(
+        candidates,
+        [left_tokens, right_tokens],
+        [0, 0],
+    )
+
+    assert [candidate.sample_idx for candidate in survivors] == [0, 1]
+
+
+def test_global_dedupe_collapses_recurrences_from_same_durable_group():
+    candidates = (
+        as_candidate_record({"sample_idx": 0, "timestamp": 10.0, "candidate_score": 1.0})
+        .with_temporal(durable_state_group_id=7),
+        as_candidate_record({"sample_idx": 1, "timestamp": 200.0, "candidate_score": 2.0})
+        .with_temporal(durable_state_group_id=7),
+    )
+
+    survivors = _global_candidate_dedupe(
+        candidates,
+        [{"noisy", "first"}, {"entirely", "different", "ocr"}],
+        [0, 0],
+    )
+
+    assert len(survivors) == 1
+    assert survivors[0].temporal.durable_state_group_id == 7
+    assert survivors[0].lineage.merged_timestamps == (10.0, 200.0)
+
+
+def test_merge_lineage_transfers_durable_group_to_non_durable_winner():
+    winner = as_candidate_record({"sample_idx": 0, "timestamp": 10.0})
+    loser = as_candidate_record({"sample_idx": 1, "timestamp": 11.0}).with_temporal(
+        durable_state_group_id=9,
+    )
+
+    merged = merge_candidate_lineage(winner, loser, stage="test", reason="equivalent")
+
+    assert merged.temporal.durable_state_group_id == 9

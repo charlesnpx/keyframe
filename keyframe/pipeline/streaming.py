@@ -175,6 +175,7 @@ def stream_video_features(
         source_sharpness: list[float] = []
         metric_rows: list[dict[str, float]] = []
         content_prev_delta: list[float] = []
+        content_signatures: list[np.ndarray] = []
         embeddings: list[np.ndarray] = []
         batch: list[Image.Image] = []
         batch_bytes = 0
@@ -252,6 +253,9 @@ def stream_video_features(
                 content_prev_delta.append(
                     float(np.mean(np.abs(previous_content - content))) if previous_content is not None else 0.0
                 )
+                content_signatures.append(
+                    np.clip(np.rint(content[::2, ::2]), 0, 255).astype(np.uint8)
+                )
                 previous_content = content
                 batch.append(image)
                 batch_bytes += current_bytes
@@ -279,6 +283,11 @@ def stream_video_features(
             frame_indices=frame_indices,
             content_prev_delta=content_prev_delta,
             content_next_delta=content_next_delta,
+            content_signature_stack=(
+                np.stack(content_signatures, axis=0)
+                if content_signatures
+                else np.empty((0, 0, 0), dtype=np.uint8)
+            ),
         )
         print(f"  Sampled {len(timestamps)} frames at {interval_seconds}s intervals")
         probe_metadata = (

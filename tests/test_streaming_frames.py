@@ -46,6 +46,7 @@ def test_streaming_pass_keeps_compact_metadata_and_caches_only_candidates(tmp_pa
     assert len(streamed.pixel_digests) == 5
     assert streamed.frame_metrics.full_gray_stack.shape == (0, 0, 0)
     assert streamed.frame_metrics.content_gray_stack.shape == (0, 0, 0)
+    assert streamed.frame_metrics.content_signature_stack.shape[0] == 5
     assert sum(batches) == 5
 
     cache = CandidateFrameCache(cache_root=tmp_path, max_bytes=1024 * 1024)

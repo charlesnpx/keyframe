@@ -104,6 +104,7 @@ class CandidateTemporalMetadata:
     temporal_window_id: int | None = None
     temporal_window_seconds: float | None = None
     coverage_window_ids: tuple[int, ...] = ()
+    durable_state_group_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -166,6 +167,10 @@ _GROUP_FIELDS = {
     **{field_name: ("evidence", field_name) for field_name in CandidateEvidenceMetadata.__dataclass_fields__},
     **{field_name: ("selection", field_name) for field_name in CandidateSelectionMetadata.__dataclass_fields__},
     **{field_name: ("lineage", field_name) for field_name in CandidateLineageMetadata.__dataclass_fields__},
+}
+
+_INTERNAL_PROJECTION_FIELDS = {
+    "durable_state_group_id",
 }
 
 
@@ -296,6 +301,8 @@ def _candidate_projection(candidate: CandidateRecord) -> dict[str, Any]:
     }
     for group in (candidate.visual, candidate.temporal, candidate.evidence, candidate.selection, candidate.lineage):
         for key, value in group.__dict__.items():
+            if key in _INTERNAL_PROJECTION_FIELDS:
+                continue
             if value is not None and value != ():
                 row[key] = _thaw_value(value)
     return row

@@ -8,6 +8,9 @@ from typing import Any
 import numpy as np
 
 from keyframe.dedupe import (
+    _different_durable_state_groups,
+    _durable_state_merge_veto,
+    _same_durable_state_group,
     has_differing_evidence,
     has_evidence_asymmetry,
     has_protective_caption_asymmetry,
@@ -16,6 +19,7 @@ from keyframe.dedupe import (
 )
 from keyframe.scoring import score_candidate_for_rep
 from keyframe.pipeline.contracts import CandidateRecord, candidate_records
+from keyframe.visual import FrameMetricTable
 
 
 def jaccard_similarity(tokens_a: set[str], tokens_b: set[str]) -> float:
@@ -87,7 +91,23 @@ def _should_merge(
     transcript_b: set[str],
     has_ocr_a: bool,
     has_ocr_b: bool,
+    *,
+    dhashes: Mapping[int, int] | Sequence[int] | None = None,
+    frame_metrics: FrameMetricTable | None = None,
+    clip_embeddings: Any | None = None,
 ) -> tuple[bool, str]:
+    if _same_durable_state_group(cand_a, cand_b):
+        return True, "durable-state-recurrence"
+    if _durable_state_merge_veto(
+        cand_a,
+        cand_b,
+        tokens_a,
+        tokens_b,
+        dhashes=dhashes,
+        frame_metrics=frame_metrics,
+        clip_embeddings=clip_embeddings,
+    ):
+        return False, "different-durable-states"
     if has_ocr_a and has_ocr_b:
         jac = jaccard_similarity(tokens_a, tokens_b)
         if has_differing_evidence(tokens_a, tokens_b):
@@ -119,13 +139,29 @@ def _should_merge(
 def _component_evidence_compatible(
     left: Sequence[int],
     right: Sequence[int],
-    candidates: Sequence[Mapping[str, Any]],
+    candidates: Sequence[CandidateRecord],
     ocr_token_sets: Sequence[set[str]],
+    *,
+    dhashes: Mapping[int, int] | Sequence[int] | None = None,
+    frame_metrics: FrameMetricTable | None = None,
+    clip_embeddings: Any | None = None,
 ) -> bool:
     for i in left:
         for j in right:
             tokens_i = set(ocr_token_sets[i])
             tokens_j = set(ocr_token_sets[j])
+            if _same_durable_state_group(candidates[i], candidates[j]):
+                continue
+            if _different_durable_state_groups(candidates[i], candidates[j]) and _durable_state_merge_veto(
+                candidates[i],
+                candidates[j],
+                tokens_i,
+                tokens_j,
+                dhashes=dhashes,
+                frame_metrics=frame_metrics,
+                clip_embeddings=clip_embeddings,
+            ):
+                return False
             if has_differing_evidence(tokens_i, tokens_j):
                 return False
             protected = is_protected_candidate(candidates[i]) or is_protected_candidate(candidates[j])
@@ -142,6 +178,10 @@ def union_find_merge(
     has_ocr: Sequence[bool],
     frames: Sequence[Any] | Mapping[int, Any],
     transcript_token_sets: Sequence[set[str]] | None = None,
+    *,
+    dhashes: Mapping[int, int] | Sequence[int] | None = None,
+    frame_metrics: FrameMetricTable | None = None,
+    clip_embeddings: Any | None = None,
 ) -> tuple[Any, ...]:
     """Merge candidate pairs with explicit vetoes and union-find components."""
     print("\n── Merging via deterministic union-find veto graph ──")
@@ -157,11 +197,22 @@ def union_find_merge(
                 set(ocr_token_sets[i]), set(ocr_token_sets[j]),
                 set(transcript_token_sets[i]), set(transcript_token_sets[j]),
                 bool(has_ocr[i]), bool(has_ocr[j]),
+                dhashes=dhashes,
+                frame_metrics=frame_metrics,
+                clip_embeddings=clip_embeddings,
             )
             if ok:
                 comp_i = [idx for idx in range(n) if uf.find(idx) == uf.find(i)]
                 comp_j = [idx for idx in range(n) if uf.find(idx) == uf.find(j)]
-                if not _component_evidence_compatible(comp_i, comp_j, candidates, ocr_token_sets):
+                if not _component_evidence_compatible(
+                    comp_i,
+                    comp_j,
+                    candidates,
+                    ocr_token_sets,
+                    dhashes=dhashes,
+                    frame_metrics=frame_metrics,
+                    clip_embeddings=clip_embeddings,
+                ):
                     continue
                 print(f"    {candidates[i].timestamp:5.1f}s ↔ {candidates[j].timestamp:5.1f}s (will merge)")
                 uf.union(i, j)
