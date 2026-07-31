@@ -13,7 +13,7 @@ from importlib import metadata as importlib_metadata
 from typing import Any
 
 
-EXPECTED_KEYFRAME_VERSION = "0.6.3"
+EXPECTED_KEYFRAME_VERSION = "0.6.4"
 EXPECTED_MLX_VERSIONS = {
     "mlx": "0.32.0",
     "mlx-whisper": "0.4.3",

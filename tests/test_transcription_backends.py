@@ -256,6 +256,81 @@ def test_mlx_normalizer_clamps_material_overlap_when_timeline_advances():
     )
 
 
+def test_mlx_normalizer_discards_exact_trailing_placeholder_and_checkpoints(
+    tmp_path,
+):
+    raw_segments = [
+        {
+            "start": float(index * 4),
+            "end": float((index + 1) * 4),
+            "text": f"segment {index}",
+        }
+        for index in range(44)
+    ]
+    raw_segments.extend(
+        [
+            {"start": 176.0, "end": 184.3, "text": "final segment"},
+            {"start": 184.3, "end": 184.3, "text": ""},
+        ]
+    )
+
+    segments, language = transcript._normalize_mlx_result(
+        {"language": "en", "segments": raw_segments}
+    )
+
+    assert language == "en"
+    assert len(segments) == 45
+    assert segments[-1] == transcript.TranscriptSegment(
+        176.0,
+        184.3,
+        "final segment",
+    )
+    checkpoint = tmp_path / "transcript.raw.json"
+    transcript.write_raw_transcript_checkpoint(segments, checkpoint)
+    assert transcript.read_raw_transcript_checkpoint(checkpoint) == segments
+
+
+@pytest.mark.parametrize("text", ["", "   "])
+def test_inference_normalizer_discards_empty_positive_duration_rows(text):
+    segments = transcript._normalize_inference_segments(
+        [
+            {"start": 0.0, "end": 1.0, "text": "first"},
+            {"start": 1.0, "end": 2.0, "text": text},
+            {"start": 2.0, "end": 3.0, "text": "second"},
+        ],
+        backend="test",
+    )
+
+    assert segments == (
+        transcript.TranscriptSegment(0.0, 1.0, "first"),
+        transcript.TranscriptSegment(2.0, 3.0, "second"),
+    )
+
+
+def test_inference_normalizer_rejects_nonempty_zero_duration_row():
+    with pytest.raises(ValueError, match="invalid timestamps"):
+        transcript._normalize_inference_segments(
+            [{"start": 184.3, "end": 184.3, "text": "unexpected text"}],
+            backend="test",
+        )
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {"end": 1.0, "text": ""},
+        {"start": 0.0, "text": ""},
+        {"start": float("nan"), "end": 1.0, "text": ""},
+        {"start": 0.0, "end": float("inf"), "text": ""},
+        {"start": -1.0, "end": 1.0, "text": ""},
+        {"start": 2.0, "end": 1.0, "text": ""},
+    ],
+)
+def test_inference_normalizer_rejects_malformed_empty_rows(row):
+    with pytest.raises(ValueError, match="invalid timestamps"):
+        transcript._normalize_inference_segments([row], backend="test")
+
+
 def test_mlx_normalizer_rejects_nonadvancing_overlap():
     with pytest.raises(ValueError, match="does not advance"):
         transcript._normalize_mlx_result(

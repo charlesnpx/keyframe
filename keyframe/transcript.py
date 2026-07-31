@@ -547,7 +547,12 @@ def _normalize_inference_segments(
 
         start = _finite_seconds(start_value)
         end = _finite_seconds(end_value)
-        if start is None or end is None or start < 0 or end <= start:
+        if start is None or end is None or start < 0 or end < 0 or end < start:
+            raise ValueError(f"{backend} segment {index} has invalid timestamps")
+        text = str(text_value).strip()
+        if not text:
+            continue
+        if end == start:
             raise ValueError(f"{backend} segment {index} has invalid timestamps")
         if index > 0 and start < previous_end:
             if end <= previous_end:
@@ -556,9 +561,6 @@ def _normalize_inference_segments(
                     "previous segment"
                 )
             start = previous_end
-        text = str(text_value).strip()
-        if not text:
-            raise ValueError(f"{backend} segment {index} has empty text")
         normalized.append(
             TranscriptSegment(
                 start=start,
