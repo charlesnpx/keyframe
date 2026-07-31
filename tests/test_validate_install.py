@@ -12,7 +12,7 @@ def _stub_clean_install_metadata(monkeypatch, requirements):
     monkeypatch.setattr(
         validate_install,
         "_distribution_version",
-        lambda name: "0.6.3" if name == "keyframe" else None,
+        lambda name: "0.6.4" if name == "keyframe" else None,
     )
     monkeypatch.setattr(validate_install, "_is_supported_mlx_runtime", lambda: False)
     monkeypatch.setattr(validate_install.importlib, "import_module", lambda name: object())
