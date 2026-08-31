@@ -8,6 +8,7 @@ Usage:
     keyframe video.mp4 --frames-only
     keyframe video.mp4 --transcript-only
     keyframe install-skills
+    keyframe setup-paddle
 """
 
 import argparse
@@ -212,6 +213,8 @@ def _frame_config(args, *, device: str | None = None):
         pass1_clusters=args.pass1_clusters,
         similarity_threshold=args.similarity_threshold,
         device=device,
+        ocr_device=getattr(args, "_ocr_device", None),
+        paddle_runtime=getattr(args, "_paddle_runtime", None),
         max_output_frames=getattr(args, "max_output_frames", None),
         max_clustering_memory_mb=getattr(args, "max_clustering_memory_mb", 2048),
         max_frame_cache_mb=getattr(args, "max_frame_cache_mb", 8192),
@@ -260,19 +263,24 @@ def _run_full_pipeline(video: Path, out_dir: Path, args, preflight, supervisor):
     )
 
     frame_device = resolve_frame_device(preflight)
-    return run_supervised_full_pipeline(
-        video,
-        out_dir,
-        preflight,
-        supervisor=supervisor,
-        frame_device=frame_device,
-        frame_runner=lambda: _run_frame_generation(
+    pipeline_kwargs = {
+        "supervisor": supervisor,
+        "frame_device": frame_device,
+        "frame_runner": lambda: _run_frame_generation(
             video,
             out_dir,
             args,
             supervisor,
             frame_device=frame_device,
         ),
+    }
+    if hasattr(args, "_ocr_device"):
+        pipeline_kwargs["ocr_device"] = getattr(args, "_ocr_device")
+    return run_supervised_full_pipeline(
+        video,
+        out_dir,
+        preflight,
+        **pipeline_kwargs,
     )
 
 
@@ -339,6 +347,14 @@ def cmd_extract(args):
         try:
             print("Frame runtime: loading dependencies...", flush=True)
             runtime = preflight_frame_runtime()
+            paddle_runtime = runtime.paddle_runtime
+            ocr_device = (
+                paddle_runtime.ocr_device
+                if paddle_runtime is not None and paddle_runtime.ocr_device is not None
+                else "cpu"
+            )
+            setattr(args, "_paddle_runtime", paddle_runtime)
+            setattr(args, "_ocr_device", ocr_device)
             if transcript_preflight is not None:
                 from keyframe.full_pipeline import resolve_frame_device
 
@@ -446,8 +462,14 @@ def _build_extract_parser() -> argparse.ArgumentParser:
                     "  keyframe video.mp4\n"
                     "  keyframe extract video.mp4\n"
                     "  keyframe video.mp4 -o ./output\n"
+                    "  keyframe setup-paddle\n"
                     "  keyframe install-skills",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {_version()}",
     )
     _add_extract_args(parser)
     return parser
@@ -487,6 +509,60 @@ def _probability_arg(value: str) -> float:
     return parsed
 
 
+def cmd_setup_paddle(args) -> int:
+    """Report or repair the selected Linux Paddle runtime."""
+
+    from keyframe.paddle_runtime import (
+        PaddleRuntimeManager,
+        PaddleRuntimeSelection,
+        PaddleSetupError,
+    )
+
+    json_mode = bool(getattr(args, "json", False))
+    progress = (
+        (lambda message: print(message, file=sys.stderr, flush=True))
+        if json_mode
+        else (lambda message: print(f"Paddle setup: {message}", flush=True))
+    )
+    try:
+        result = PaddleRuntimeManager(progress=progress).ensure(
+            force=bool(getattr(args, "force", False))
+        )
+        exit_code = 0
+    except PaddleSetupError as exc:
+        result = exc.result or PaddleRuntimeSelection(
+            schema_version=1,
+            status="error",
+            distribution=None,
+            version=None,
+            ocr_device=None,
+            cuda_flavor=None,
+            reason=str(exc),
+        )
+        exit_code = 1
+
+    if json_mode:
+        print(json.dumps(result.to_dict(), sort_keys=True))
+    else:
+        distribution = (
+            f"{result.distribution}=={result.version}"
+            if result.distribution and result.version
+            else "none"
+        )
+        print(f"Paddle runtime: {result.status}")
+        print(f"  Distribution: {distribution}")
+        print(f"  OCR device: {result.ocr_device or 'not applicable'}")
+        print(f"  CUDA flavor: {result.cuda_flavor or 'none'}")
+        print(f"  Changed: {'yes' if result.changed else 'no'}")
+        print(f"  Reason: {result.reason}")
+        if exit_code:
+            print(
+                "  Frame extraction is unavailable; transcript-only operation remains usable.",
+                file=sys.stderr,
+            )
+    return exit_code
+
+
 def main():
     # Check for `install-skills` subcommand first
     if len(sys.argv) > 1 and sys.argv[1] == "install-skills":
@@ -499,6 +575,23 @@ def main():
         parser.add_argument("--json", action="store_true", help="Emit mise-en-place delegated-installer JSON on stdout")
         parser.add_argument("--install-root", help="Stage install under this absolute directory as if it were HOME")
         cmd_install_skills(parser.parse_args(sys.argv[2:]))
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1] == "setup-paddle":
+        parser = argparse.ArgumentParser(prog="keyframe setup-paddle")
+        parser.add_argument(
+            "--force",
+            action="store_true",
+            help="Retry GPU detection and setup after a recorded failure",
+        )
+        parser.add_argument(
+            "--json",
+            action="store_true",
+            help="Emit the Paddle runtime selection as JSON",
+        )
+        code = cmd_setup_paddle(parser.parse_args(sys.argv[2:]))
+        if code:
+            raise SystemExit(code)
         return
 
     # Direct extraction and the explicit `extract` alias share one parser.

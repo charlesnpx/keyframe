@@ -42,6 +42,14 @@ Extract key frames and/or a timestamped transcript from a video or audio file.
    - `--pass1-clusters 20` — more candidate frames before merging (default: 15)
    - `--similarity-threshold` — deprecated no-op; do not tune with this flag
 
+   On Linux x86-64, the first frame-capable run automatically downloads and
+   verifies pinned Paddle 3.3.1. A visible NVIDIA GPU needs compute capability
+   7.5+ and CUDA 11.8+; otherwise Keyframe uses verified CPU Paddle. GPU setup
+   failures remain on CPU until `keyframe setup-paddle --force` is run. State is
+   stored at `$XDG_STATE_HOME/keyframe/paddle-runtime.json` (default
+   `~/.local/state/keyframe/paddle-runtime.json`). If both GPU and CPU setup fail,
+   frame extraction is unavailable but `--transcript-only` still works.
+
    The automatic backend uses pinned MLX-Whisper on Apple Silicon running macOS 14 or newer and OpenAI Whisper elsewhere. Supported Macs resolve the exact pinned snapshot from the local cache before permitting a network download; unsupported platforms neither install MLX nor request its weights. Eligible automatic MLX failures retry OpenAI Whisper in a fresh CPU worker. Automatic diarization prefers MPS on Darwin ARM64, CUDA elsewhere when available, and CPU otherwise. Eligible automatic MPS compute failures retry once in a fresh CPU worker; explicit MPS and non-compute failures are strict. MPS workers disable PyTorch's implicit CPU fallback so retries cannot bypass scheduler admission or evidence. Speaker detection is attempted by default when `HF_TOKEN` exists; pyannote then adds segment-level labels to Whisper segments. To enable it, accept the pyannote model terms at `https://huggingface.co/pyannote/speaker-diarization-community-1`, create a Hugging Face token at `https://huggingface.co/settings/tokens`, and export it as `HF_TOKEN`. If `HF_TOKEN` is missing or pyannote access fails, Keyframe warns and keeps the unlabeled Whisper transcript. The two exact known harmless pyannote warnings are condensed; unrelated warnings stay visible, and malformed diarization rows cannot be published.
 
    In automatic concurrency mode, independent stages can overlap after 10%-headroom admission. macOS uses physical-memory pressure evidence with a bounded `vm_stat` fallback and never counts swap. MLX transcription, MPS diarization, and MPS frames share the Apple accelerator and remain serialized. CPU diarization retains the existing overlap behavior, including a fresh admission decision before a fallback can overlap frames.
@@ -93,3 +101,5 @@ Extract key frames and/or a timestamped transcript from a video or audio file.
 - If `keyframe` is not found, tell the user to install it with Python 3.12: `pipx install --python python3.12 git+ssh://git@github.com/charlesnpx/keyframe.git && keyframe install-skills`
 - If models fail to download (SSL errors), suggest: `/Applications/Python\ 3.12/Install\ Certificates.command`
 - If ffmpeg is missing (Whisper needs it), suggest: `brew install ffmpeg`
+- If Linux Paddle setup fails, run `keyframe setup-paddle --force`; use
+  `keyframe setup-paddle --json` when machine-readable diagnostics are useful.

@@ -37,6 +37,11 @@ the staged absolute paths in JSON.
   export HF_TOKEN=hf_...
   ```
 
+Linux frame extraction is supported on x86-64. NVIDIA acceleration requires a
+visible CUDA GPU with compute capability 7.5 or newer and a driver/runtime that
+supports CUDA 11.8 or newer. AMD ROCm, Linux ARM, and Windows Paddle GPU setup
+are not supported.
+
 ### SSL issues
 
 If you hit SSL cert errors when models download for the first time:
@@ -56,6 +61,8 @@ These download automatically on first use and are cached:
 - **Florence-2-base** (~450MB) — frame captioning
 - **Whisper medium** (~1.4GB) — MLX-Whisper on supported Apple Silicon Macs, OpenAI Whisper elsewhere
 - **pyannote speaker diarization** — segment-level speaker labels when `HF_TOKEN` is configured
+- **Paddle 3.3.1 runtime** — one official CPU or NVIDIA wheel selected on the
+  first Linux frame extraction; PaddleOCR itself is installed with Keyframe
 
 MLX dependencies and weights are gated to Apple Silicon running macOS 14 or
 newer. Linux, Windows, Intel Macs, and older macOS releases do not install MLX
@@ -63,6 +70,26 @@ and do not request MLX model weights. On a supported Mac, Keyframe resolves the
 exact pinned MLX revision from the local Hugging Face cache first. It permits a
 network download only when that exact snapshot is genuinely absent, so a warm
 run does not wait on online model resolution.
+
+On Linux x86-64, the first frame-capable run probes `nvidia-smi` and Torch in
+bounded child processes, respects `CUDA_VISIBLE_DEVICES`, and selects the
+highest compatible official Paddle wheel (`cu130`, `cu129`, `cu126`, or
+`cu118`). The wheel is downloaded before an existing Paddle distribution is
+removed, then verified with a real tensor allocation. If GPU setup fails,
+Keyframe restores and verifies `paddlepaddle==3.3.1` on CPU and records the
+failure so ordinary runs do not repeatedly retry it. Retry manually with:
+
+```bash
+keyframe setup-paddle --force
+keyframe setup-paddle --json
+```
+
+Selection state is written atomically to
+`$XDG_STATE_HOME/keyframe/paddle-runtime.json`, or
+`~/.local/state/keyframe/paddle-runtime.json` when `XDG_STATE_HOME` is unset.
+If neither wheel can be installed (for example, a fresh offline install), frame
+extraction stops with the repair command while transcript-only runs remain
+available. macOS continues to use Apple Vision and performs no Paddle setup.
 
 ## Usage
 
@@ -139,6 +166,7 @@ $keyframe ~/Downloads/meeting-recording.mp4
 |---------|-------------|
 | `keyframe <file>` | Extract frames + transcript |
 | `keyframe extract <file>` | Same as above (explicit subcommand) |
+| `keyframe setup-paddle [--force] [--json]` | Report, install, or repair the Linux Paddle runtime |
 | `keyframe install-skills` | Install Claude Code and Codex skills |
 
 ## Flags
@@ -167,7 +195,7 @@ $keyframe ~/Downloads/meeting-recording.mp4
 
 1. **Pass 1 (streaming CLIP + dHash):** Sample frames at 0.5s intervals, compute compact dHash/metric metadata and CLIP vectors in bounded batches, allocate more clusters to visually novel scenes, and pick scored representatives. Source-resolution frames are released immediately.
 
-2. **Pass 2 (candidate cache + Florence-2 + OCR):** Re-decode only the finite candidate union into a private, lossless cache under the OS temporary directory (or `--frame-cache-dir`), verify it against the first-pass SHA-256 metadata, then caption and OCR in bounded batches before deterministic dedupe.
+2. **Pass 2 (candidate cache + Florence-2 + OCR):** Re-decode only the finite candidate union into a private, lossless cache under the OS temporary directory (or `--frame-cache-dir`), verify it against the first-pass SHA-256 metadata, then caption and OCR in bounded batches before deterministic dedupe. Linux passes the selected `gpu:N` or `cpu` device explicitly to PaddleOCR. If GPU initialization or its first prediction fails and the same operation succeeds on CPU, that frame is retried once and the run continues on CPU.
 
 Scrolling a data table (visually different but semantically identical) gets collapsed, while a dropdown opening (visually similar but semantically distinct) gets preserved.
 
@@ -210,6 +238,9 @@ serially. A full run makes a fresh scheduling decision after transcription and
 again before any CPU diarization fallback. CPU diarization can overlap
 MPS/CUDA frames when current pressure admits it; if MPS fails while independent
 CPU frame work is already running, the CPU retry starts after those frames.
+Linux frame scheduling accounts for the Paddle OCR device separately from the
+Torch CLIP/Florence device, so GPU OCR remains mutually exclusive with another
+stage using that CUDA device even when Torch frame models run on CPU.
 `parallel` may override
 CPU-count and memory admission with a warning, but never shared-accelerator
 exclusion.

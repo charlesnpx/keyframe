@@ -1,5 +1,6 @@
 import json
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 
@@ -84,3 +85,27 @@ def test_linux_x86_64_frame_preflight_requires_paddleocr():
             FrameRuntimePlatform("Linux", "x86_64"),
             importer=importer,
         )
+
+
+def test_linux_frame_preflight_sets_up_paddle_before_importing_dependencies():
+    events = []
+    selection = SimpleNamespace(ocr_device="gpu:0")
+
+    def setup(**_kwargs):
+        events.append("setup")
+        return selection
+
+    def importer(name):
+        events.append(name)
+        if name == "paddleocr":
+            return SimpleNamespace(PaddleOCR=lambda **_kwargs: object())
+        return object()
+
+    runtime = preflight_frame_runtime(
+        FrameRuntimePlatform("Linux", "x86_64"),
+        importer=importer,
+        paddle_setup=setup,
+    )
+
+    assert events == ["setup", "keyframe.frames", "paddleocr"]
+    assert runtime.paddle_runtime is selection

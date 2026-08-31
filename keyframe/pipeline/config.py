@@ -47,6 +47,8 @@ class KeyframeExtractionConfig:
     coverage_interval_seconds: float = 90.0
     minimum_settled_dwell_seconds: float = 2.0
     device: str | None = None
+    ocr_device: str | None = None
+    paddle_runtime: Any | None = None
     max_clustering_memory_mb: int = 2048
     max_frame_cache_mb: int = 8192
     frame_cache_dir: Path | None = None
@@ -114,3 +116,5 @@ class KeyframeExtractionResult:
     final_frame_count: int
     pipeline_trace_path: Path | None = None
     debug_qa_trace_path: Path | None = None
+    frame_device: str = "cpu"
+    ocr_device: str = "cpu"

@@ -77,6 +77,7 @@ class StageDemand:
     stage: str
     device: str
     memory_bytes: int
+    additional_accelerators: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.stage.strip():
@@ -85,6 +86,9 @@ class StageDemand:
             raise ValueError("device must not be empty")
         if self.memory_bytes <= 0:
             raise ValueError("memory_bytes must be positive")
+        for accelerator in self.additional_accelerators:
+            if not re.fullmatch(r"(?:apple|cuda):\d+", accelerator):
+                raise ValueError(f"invalid additional accelerator {accelerator!r}")
 
     @property
     def accelerator(self) -> str | None:
@@ -98,6 +102,15 @@ class StageDemand:
         if device.startswith("cuda:"):
             return device
         return None
+
+    @property
+    def owned_accelerators(self) -> frozenset[str]:
+        accelerator = self.accelerator
+        return frozenset(
+            (*self.additional_accelerators,)
+            if accelerator is None
+            else (accelerator, *self.additional_accelerators)
+        )
 
     @property
     def is_cpu(self) -> bool:
@@ -193,7 +206,7 @@ def diarization_demand(device: str) -> StageDemand:
     return StageDemand("diarization", effective_device, DIARIZATION_MEMORY_GIB * GIB)
 
 
-def frame_demand(device: str) -> StageDemand:
+def frame_demand(device: str, *, ocr_device: str = "cpu") -> StageDemand:
     effective_device = device.strip().lower()
     if (
         effective_device != "cpu"
@@ -203,7 +216,27 @@ def frame_demand(device: str) -> StageDemand:
         and not effective_device.startswith("cuda:")
     ):
         raise ValueError("frame device must be cpu, mps, or cuda")
-    return StageDemand("frames", effective_device, FRAME_MEMORY_GIB * GIB)
+    effective_ocr_device = ocr_device.strip().lower()
+    if effective_ocr_device == "cpu":
+        ocr_accelerators: tuple[str, ...] = ()
+    elif re.fullmatch(r"gpu:\d+", effective_ocr_device):
+        ocr_accelerators = (
+            f"cuda:{int(effective_ocr_device.split(':', 1)[1])}",
+        )
+    else:
+        raise ValueError("Paddle OCR device must be cpu or gpu:N")
+    primary = StageDemand("frames", effective_device, FRAME_MEMORY_GIB * GIB)
+    additional = tuple(
+        accelerator
+        for accelerator in ocr_accelerators
+        if accelerator not in primary.owned_accelerators
+    )
+    return StageDemand(
+        "frames",
+        effective_device,
+        FRAME_MEMORY_GIB * GIB,
+        additional,
+    )
 
 
 def _linux_available_memory() -> int | None:
@@ -393,10 +426,9 @@ def required_memory_with_headroom(stages: Iterable[StageDemand]) -> int:
 def _shared_accelerator(stages: Sequence[StageDemand]) -> str | None:
     owners: set[str] = set()
     for stage in stages:
-        accelerator = stage.accelerator
-        if accelerator is not None and accelerator in owners:
-            return accelerator
-        if accelerator is not None:
+        for accelerator in sorted(stage.owned_accelerators):
+            if accelerator in owners:
+                return accelerator
             owners.add(accelerator)
     return None
 

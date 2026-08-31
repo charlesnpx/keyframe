@@ -59,3 +59,26 @@ def test_real_cuda_diarization_smoke():
     rows = transcript._detect_speakers(video, hf_token, device="cuda")
 
     assert rows
+
+
+@pytest.mark.hardware
+@pytest.mark.cuda
+def test_real_paddle_cuda_ocr_smoke():
+    if os.environ.get("KEYFRAME_PADDLE_CUDA_SMOKE") != "1":
+        pytest.skip("set KEYFRAME_PADDLE_CUDA_SMOKE=1 to opt into this smoke test")
+
+    import numpy as np
+
+    from keyframe.frames import _load_ocr_engine
+    from keyframe.paddle_runtime import ensure_paddle_runtime
+
+    selection = ensure_paddle_runtime(force=True)
+    if selection.status != "gpu":
+        pytest.fail(f"Paddle CUDA smoke selected {selection.status}: {selection.reason}")
+
+    engine = _load_ocr_engine(selection.ocr_device, selection)
+    image = np.full((64, 256, 3), 255, dtype=np.uint8)
+    result = engine.predict(image)
+
+    assert engine.device.startswith("gpu:")
+    assert isinstance(result, list)

@@ -910,6 +910,7 @@ class OutputStage:
         frames = sampling.frame_store.frames
         caption_log_path = save_results(final, frames, output_dir)
         manifest_metadata = {
+            "runtime": ctx.metadata.get("runtime", {}),
             "sampling_timing": features.sampling_timing,
             "coverage": ctx.metadata.get("coverage", {}),
             "scene_coalescence": temporal.scene_coalescence,
@@ -988,7 +989,13 @@ def extract_keyframes(
             file=sys.stderr,
         )
 
-    preloader = ModelPreloader(device=device, need_florence=True, need_ocr=True)
+    preloader = ModelPreloader(
+        device=device,
+        need_florence=True,
+        need_ocr=True,
+        ocr_device=cfg.ocr_device or "cpu",
+        paddle_runtime=cfg.paddle_runtime,
+    )
     t0 = time.time()
     pipeline_trace_path: Path | None = None
     debug_qa_trace_path: Path | None = None
@@ -1055,6 +1062,17 @@ def extract_keyframes(
         retained = SelectionStage().run(candidates, ctx)
         final = SurvivalStage().run(retained, sampling, features, ctx, frame_metrics=proposal.frame_metrics)
 
+        runtime_metadata = {
+            "frame_device": str(device),
+            "paddle_ocr_device": preloader.ocr_device,
+        }
+        paddle_runtime = preloader.paddle_runtime
+        if paddle_runtime is not None and hasattr(paddle_runtime, "to_dict"):
+            paddle_metadata = paddle_runtime.to_dict()
+            paddle_metadata.pop("changed", None)
+            runtime_metadata["paddle"] = paddle_metadata
+        ctx.metadata["runtime"] = runtime_metadata
+
         artifacts = OutputStage().run(
             final,
             sampling,
@@ -1110,6 +1128,8 @@ def extract_keyframes(
             final_frame_count=len(final),
             pipeline_trace_path=pipeline_trace_path,
             debug_qa_trace_path=debug_qa_trace_path,
+            frame_device=str(device),
+            ocr_device=preloader.ocr_device,
         )
     finally:
         if frame_cache is not None:
