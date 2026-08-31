@@ -13,15 +13,13 @@ from importlib import metadata as importlib_metadata
 from typing import Any
 
 
-EXPECTED_KEYFRAME_VERSION = "0.6.4"
+EXPECTED_KEYFRAME_VERSION = "0.6.5"
 EXPECTED_MLX_VERSIONS = {
     "mlx": "0.32.0",
     "mlx-whisper": "0.4.3",
 }
-EXPECTED_LINUX_X86_64_PADDLE = {
-    "paddlepaddle",
-    "paddleocr",
-}
+EXPECTED_LINUX_X86_64_PADDLE_OCR = "paddleocr"
+PADDLE_ENGINES = ("paddlepaddle", "paddlepaddle-gpu")
 IMPORT_SMOKE_MODULES = (
     "keyframe",
     "keyframe.cli",
@@ -94,7 +92,11 @@ def _validate_expected_platform(expected: str) -> None:
         )
 
 
-def validate_install(expected_platform: str = "auto") -> dict[str, Any]:
+def validate_install(
+    expected_platform: str = "auto",
+    *,
+    setup_paddle: bool = False,
+) -> dict[str, Any]:
     """Return a machine-readable clean-install report or raise on mismatch."""
 
     if not ((3, 11) <= sys.version_info[:2] < (3, 14)):
@@ -153,26 +155,97 @@ def validate_install(expected_platform: str = "auto") -> dict[str, Any]:
                 f"unsupported platform installed MLX distributions: {unexpected}"
             )
 
-    missing_paddle = EXPECTED_LINUX_X86_64_PADDLE - set(requirements_by_name)
-    if missing_paddle:
+    if EXPECTED_LINUX_X86_64_PADDLE_OCR not in requirements_by_name:
         raise InstallValidationError(
-            f"installed keyframe metadata is missing Paddle dependencies: {sorted(missing_paddle)}"
+            "installed keyframe metadata is missing the PaddleOCR dependency"
         )
-    for name in EXPECTED_LINUX_X86_64_PADDLE:
-        markers = [
-            requirement.partition(";")[2].lower()
-            for requirement in requirements_by_name[name]
-        ]
-        has_linux_x86_64_marker = any(
-            "sys_platform" in marker
-            and "linux" in marker
-            and "platform_machine" in marker
-            and "x86_64" in marker
-            for marker in markers
+    paddleocr_markers = [
+        requirement.partition(";")[2].lower()
+        for requirement in requirements_by_name[EXPECTED_LINUX_X86_64_PADDLE_OCR]
+    ]
+    if not any(
+        "sys_platform" in marker
+        and "linux" in marker
+        and "platform_machine" in marker
+        and "x86_64" in marker
+        for marker in paddleocr_markers
+    ):
+        raise InstallValidationError(
+            "installed paddleocr requirement is missing the Linux x86_64 platform gate"
         )
-        if not has_linux_x86_64_marker:
+
+    paddle_engine_requirements = requirements_by_name.get("paddlepaddle", [])
+    if not any(
+        "paddlepaddle==3.3.1" in requirement.replace(" ", "").lower()
+        and "extra" in requirement.partition(";")[2].lower()
+        and "linux" in requirement.partition(";")[2].lower()
+        and "platform_machine" in requirement.partition(";")[2].lower()
+        for requirement in paddle_engine_requirements
+    ):
+        raise InstallValidationError(
+            "the Linux x86-64 paddle extra must pin CPU paddlepaddle==3.3.1"
+        )
+    if any(
+        "linux" in requirement.partition(";")[2].lower()
+        and "extra" not in requirement.partition(";")[2].lower()
+        for requirement in paddle_engine_requirements
+    ):
+        raise InstallValidationError(
+            "Linux metadata must not force-install a Paddle engine before setup"
+        )
+
+    initial_paddle_engines = {
+        name: _distribution_version(name) for name in PADDLE_ENGINES
+    }
+    installed_paddleocr = _distribution_version("paddleocr")
+    paddle_setup = None
+    actual_platform = (platform.system(), platform.machine().lower())
+    if actual_platform == ("Darwin", "arm64"):
+        unexpected_engines = {
+            name: version
+            for name, version in {
+                **initial_paddle_engines,
+                "paddleocr": installed_paddleocr,
+            }.items()
+            if version is not None
+        }
+        if unexpected_engines:
             raise InstallValidationError(
-                f"installed {name} requirement is missing the Linux x86_64 platform gate"
+                f"macOS clean install contains unexpected Paddle engines: {unexpected_engines}"
+            )
+    if setup_paddle and actual_platform == ("Linux", "x86_64"):
+        if installed_paddleocr is None:
+            raise InstallValidationError(
+                "clean Linux install is missing the gated PaddleOCR distribution"
+            )
+        unexpected = {
+            name: version
+            for name, version in initial_paddle_engines.items()
+            if version is not None
+        }
+        if unexpected:
+            raise InstallValidationError(
+                f"clean Linux install already contains a Paddle engine: {unexpected}"
+            )
+        from keyframe.paddle_runtime import PaddleSetupError, ensure_paddle_runtime
+
+        try:
+            selection = ensure_paddle_runtime()
+        except PaddleSetupError as exc:
+            raise InstallValidationError(f"automatic Paddle setup failed: {exc}") from exc
+        paddle_setup = selection.to_dict()
+        installed_after_setup = {
+            name: _distribution_version(name) for name in PADDLE_ENGINES
+        }
+        expected_distribution = selection.distribution
+        if (
+            expected_distribution is None
+            or installed_after_setup.get(expected_distribution) != "3.3.1"
+            or sum(version is not None for version in installed_after_setup.values()) != 1
+        ):
+            raise InstallValidationError(
+                "Paddle setup did not leave exactly one selected 3.3.1 engine: "
+                f"{installed_after_setup}"
             )
 
     for module_name in IMPORT_SMOKE_MODULES:
@@ -187,7 +260,10 @@ def validate_install(expected_platform: str = "auto") -> dict[str, Any]:
         "keyframe": keyframe_version,
         "supports_mlx": supports_mlx,
         "installed_mlx": installed_mlx,
-        "linux_x86_64_paddle_requirements": sorted(EXPECTED_LINUX_X86_64_PADDLE),
+        "linux_x86_64_paddleocr_requirement": EXPECTED_LINUX_X86_64_PADDLE_OCR,
+        "initial_paddle_engines": initial_paddle_engines,
+        "installed_paddleocr": installed_paddleocr,
+        "paddle_setup": paddle_setup,
         "imports": list(IMPORT_SMOKE_MODULES),
         "model_acquisition_attempted": False,
     }
@@ -207,7 +283,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    report = validate_install(args.expect_platform)
+    report = validate_install(args.expect_platform, setup_paddle=True)
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0
 

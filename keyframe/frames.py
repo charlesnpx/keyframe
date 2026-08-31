@@ -151,16 +151,109 @@ def _load_florence(device):
     return model, processor
 
 
-def _load_ocr_engine():
-    """Load PaddleOCR engine for non-macOS (called in background thread)."""
-    os.environ["FLAGS_use_mkldnn"] = "0"
-    os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+class PaddleOCRRuntimeError(RuntimeError):
+    """PaddleOCR failed on both the selected GPU and the CPU fallback."""
+
+
+def _paddle_ocr_constructor(device):
     from paddleocr import PaddleOCR
+
     return PaddleOCR(
         lang='en',
+        device=device,
         use_doc_orientation_classify=False,
         use_doc_unwarping=False,
         use_textline_orientation=False,
+    )
+
+
+class ManagedPaddleOCR:
+    """Own one explicit PaddleOCR device and one first-use GPU fallback."""
+
+    def __init__(self, device="cpu", runtime_selection=None, constructor=None):
+        self.device = str(device or "cpu")
+        self.runtime_selection = runtime_selection
+        self._constructor = constructor or _paddle_ocr_constructor
+        self._prediction_count = 0
+        try:
+            self._engine = self._constructor(self.device)
+        except Exception as gpu_error:
+            if not self.device.startswith("gpu:"):
+                raise
+            try:
+                cpu_engine = self._constructor("cpu")
+            except Exception as cpu_error:
+                error = PaddleOCRRuntimeError(
+                    "PaddleOCR initialization failed on both GPU and CPU: "
+                    f"GPU {type(gpu_error).__name__}: {gpu_error}; "
+                    f"CPU {type(cpu_error).__name__}: {cpu_error}"
+                )
+                raise error from cpu_error
+            self._engine = cpu_engine
+            self._record_cpu_fallback("initialization", gpu_error)
+
+    def _record_cpu_fallback(self, phase, gpu_error):
+        from keyframe.paddle_runtime import record_gpu_runtime_failure
+
+        failed_device = self.device
+        self.device = "cpu"
+        failure = (
+            f"PaddleOCR {phase} failed on {failed_device}: "
+            f"{type(gpu_error).__name__}: {gpu_error}"
+        )
+        recorded = False
+        try:
+            self.runtime_selection = record_gpu_runtime_failure(
+                self.runtime_selection,
+                failure,
+            )
+            recorded = bool(
+                self.runtime_selection is not None
+                and getattr(self.runtime_selection, "status", None) == "cpu"
+            )
+        except Exception as state_error:
+            print(
+                "Warning: CPU OCR fallback succeeded, but the GPU failure state "
+                f"could not be recorded: {type(state_error).__name__}: {state_error}",
+                file=sys.stderr,
+            )
+        retry_note = (
+            " and suppressing automatic GPU retry until "
+            "`keyframe setup-paddle --force`"
+            if recorded
+            else ""
+        )
+        print(f"Warning: {failure}; continuing this run on CPU{retry_note}.", file=sys.stderr)
+
+    def predict(self, image):
+        try:
+            result = self._engine.predict(image)
+        except Exception as gpu_error:
+            if not self.device.startswith("gpu:") or self._prediction_count != 0:
+                raise
+            try:
+                cpu_engine = self._constructor("cpu")
+                result = cpu_engine.predict(image)
+            except Exception as cpu_error:
+                error = PaddleOCRRuntimeError(
+                    "the first PaddleOCR prediction failed on both GPU and CPU: "
+                    f"GPU {type(gpu_error).__name__}: {gpu_error}; "
+                    f"CPU {type(cpu_error).__name__}: {cpu_error}"
+                )
+                raise error from cpu_error
+            self._engine = cpu_engine
+            self._record_cpu_fallback("first prediction", gpu_error)
+        self._prediction_count += 1
+        return result
+
+
+def _load_ocr_engine(ocr_device="cpu", paddle_runtime=None):
+    """Load PaddleOCR engine for non-macOS (called in background thread)."""
+    os.environ["FLAGS_use_mkldnn"] = "0"
+    os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+    return ManagedPaddleOCR(
+        device=ocr_device,
+        runtime_selection=paddle_runtime,
     )
 
 
@@ -181,10 +274,19 @@ class ModelPreloader:
     Florence loads, and Florence before OCR loads.
     """
 
-    def __init__(self, device="mps", need_florence=True, need_ocr=True):
+    def __init__(
+        self,
+        device="mps",
+        need_florence=True,
+        need_ocr=True,
+        ocr_device="cpu",
+        paddle_runtime=None,
+    ):
         self._device = device
         self._need_florence = need_florence
         self._need_ocr = need_ocr and not _is_macos()
+        self._ocr_device = str(ocr_device or "cpu")
+        self._paddle_runtime = paddle_runtime
 
         self._clip = None
         self._florence = None
@@ -208,9 +310,24 @@ class ModelPreloader:
         if not self._need_ocr:
             return None
         if self._ocr is None:
-            print("  Loading PaddleOCR...")
-            self._ocr = _load_ocr_engine()
+            print(f"  Loading PaddleOCR on {self._ocr_device}...")
+            self._ocr = _load_ocr_engine(
+                self._ocr_device,
+                self._paddle_runtime,
+            )
         return self._ocr
+
+    @property
+    def ocr_device(self):
+        if self._ocr is not None:
+            return str(getattr(self._ocr, "device", self._ocr_device))
+        return self._ocr_device
+
+    @property
+    def paddle_runtime(self):
+        if self._ocr is not None:
+            return getattr(self._ocr, "runtime_selection", self._paddle_runtime)
+        return self._paddle_runtime
 
     def release_clip(self):
         if self._clip is not None:
@@ -226,6 +343,12 @@ class ModelPreloader:
 
     def release_ocr_engine(self):
         if self._ocr is not None:
+            self._ocr_device = str(getattr(self._ocr, "device", self._ocr_device))
+            self._paddle_runtime = getattr(
+                self._ocr,
+                "runtime_selection",
+                self._paddle_runtime,
+            )
             self._ocr = None
             gc.collect()
 
@@ -539,7 +662,14 @@ def _is_macos():
     return platform.system() == "Darwin"
 
 
-def ocr_candidates(candidates, frames, preloaded_engine=None):
+def ocr_candidates(
+    candidates,
+    frames,
+    preloaded_engine=None,
+    *,
+    ocr_device="cpu",
+    paddle_runtime=None,
+):
     """Run OCR on each candidate frame. Uses Apple Vision on macOS, PaddleOCR elsewhere."""
     candidates = candidate_records(candidates)
     use_apple = _is_macos()
@@ -549,16 +679,13 @@ def ocr_candidates(candidates, frames, preloaded_engine=None):
     need_ocr = any(cand.evidence.ocr_text is None for cand in candidates)
     paddle_engine = None
     if not use_apple and need_ocr:
-        if preloaded_engine:
+        if preloaded_engine is not None:
             paddle_engine = preloaded_engine
         else:
             os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
-            from paddleocr import PaddleOCR
-            paddle_engine = PaddleOCR(
-                lang='en',
-                use_doc_orientation_classify=False,
-                use_doc_unwarping=False,
-                use_textline_orientation=False,
+            paddle_engine = ManagedPaddleOCR(
+                device=ocr_device,
+                runtime_selection=paddle_runtime,
             )
 
     ocr_texts = []

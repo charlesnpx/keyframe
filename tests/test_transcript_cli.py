@@ -315,6 +315,14 @@ def test_direct_and_explicit_extract_alias_share_exact_parser_contract():
     assert direct.stage_concurrency == "parallel"
 
 
+def test_cli_version_reports_project_version(capsys):
+    with pytest.raises(SystemExit) as raised:
+        cli._parse_extract_args(["--version"])
+
+    assert raised.value.code == 0
+    assert capsys.readouterr().out == "keyframe 0.6.5\n"
+
+
 def test_new_cli_options_default_to_auto():
     args = cli._parse_extract_args(["recording.mp4"])
 

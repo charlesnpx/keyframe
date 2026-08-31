@@ -5,8 +5,9 @@ from __future__ import annotations
 import importlib
 import platform
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from types import ModuleType
+from typing import Any
 
 
 class FramePreflightError(ValueError):
@@ -17,6 +18,7 @@ class FramePreflightError(ValueError):
 class FrameRuntimePlatform:
     system: str
     machine: str
+    paddle_runtime: Any | None = field(default=None, compare=False, repr=False)
 
     @property
     def normalized(self) -> tuple[str, str]:
@@ -42,6 +44,7 @@ def preflight_frame_runtime(
     runtime_platform: FrameRuntimePlatform | None = None,
     *,
     importer: Callable[[str], ModuleType] = importlib.import_module,
+    paddle_setup: Callable[..., Any] | None = None,
 ) -> FrameRuntimePlatform:
     runtime = runtime_platform or current_frame_runtime_platform()
     if not runtime.supports_frames:
@@ -50,6 +53,23 @@ def preflight_frame_runtime(
             f"x86-64 (detected {runtime.system} {runtime.machine}); use "
             "--transcript-only when the input has usable audio"
         )
+    if runtime.requires_paddle and (
+        paddle_setup is not None or importer is importlib.import_module
+    ):
+        from keyframe.paddle_runtime import PaddleSetupError, ensure_paddle_runtime
+
+        try:
+            setup = paddle_setup or ensure_paddle_runtime
+            selection = setup(
+                progress=lambda message: print(f"Paddle setup: {message}", flush=True),
+            )
+        except PaddleSetupError as exc:
+            raise FramePreflightError(
+                f"Linux Paddle runtime setup failed: {exc}. Repair with "
+                "`keyframe setup-paddle --force`; transcript-only operation remains available"
+            ) from exc
+        runtime = replace(runtime, paddle_runtime=selection)
+
     try:
         importer("keyframe.frames")
         if runtime.requires_paddle:

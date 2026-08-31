@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "keyframe"
-version = "0.6.4"
+version = "0.6.5"
 description = "Extract key frames and transcripts from video files using CLIP, Florence-2, and Whisper"
 requires-python = ">=3.11,<3.14"
 license = "MIT"
@@ -27,14 +27,13 @@ dependencies = [
     "tqdm",
     "pyobjc-framework-Vision; sys_platform == 'darwin'",
     "pyobjc-framework-Quartz; sys_platform == 'darwin'",
-    "paddlepaddle; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "paddleocr; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
 [project.optional-dependencies]
 paddle = [
-    "paddlepaddle",
-    "paddleocr",
+    "paddlepaddle==3.3.1; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "paddleocr; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
 [project.scripts]

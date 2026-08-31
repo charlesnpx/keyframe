@@ -175,6 +175,7 @@ class FullPipelineRunResult:
     transcript: TranscriptRunResult
     frames: Any
     frame_device: str
+    ocr_device: str
     initial_schedule: ScheduleDecision
     frame_schedule: ScheduleDecision
     critical_path: str
@@ -382,6 +383,7 @@ def run_supervised_full_pipeline(
     supervisor: Any,
     frame_runner: Callable[[], Any],
     frame_device: str | None = None,
+    ocr_device: str = "cpu",
     scheduler: StageScheduler | None = None,
     fallback_runner: Callable[..., Any] | None = None,
     clock: Callable[[], float] | None = None,
@@ -395,7 +397,7 @@ def run_supervised_full_pipeline(
     fallback_runner = fallback_runner or complete_transcription_with_auto_fallback
     clock = clock or time.monotonic
     frame_device = frame_device or resolve_frame_device(preflight)
-    frame_stage = frame_demand(frame_device)
+    frame_stage = frame_demand(frame_device, ocr_device=ocr_device)
     output_paths = _final_output_paths(output_dir, config.fmt)
     final_paths: Iterable[Path] = output_paths
 
@@ -872,6 +874,7 @@ def run_supervised_full_pipeline(
         transcript=transcript_result,
         frames=public_frames,
         frame_device=frame_device,
+        ocr_device=str(getattr(public_frames, "ocr_device", ocr_device)),
         initial_schedule=initial_schedule,
         frame_schedule=frame_schedule,
         critical_path=critical_path,
