@@ -86,6 +86,15 @@ def _rgb_digest(image: Image.Image) -> str:
     return hashlib.sha256(image.tobytes()).hexdigest()
 
 
+def _format_elapsed(seconds: float) -> str:
+    total = int(seconds)
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{secs:02d}s"
+    return f"{minutes}m{secs:02d}s"
+
+
 def _frame_bytes(width: int, height: int) -> int:
     if width <= 0 or height <= 0:
         raise FramePipelineMemoryError(f"invalid frame dimensions: {width}x{height}")
@@ -183,6 +192,9 @@ def stream_video_features(
         target_sampler = TargetTimeSampler(interval_seconds)
         decoder_timing = DecoderTimestampNormalizer()
         decoder_diagnostic_error: str | None = None
+        progress_started = time.monotonic()
+        progress_last = progress_started
+        progress_interval_seconds = 30.0
 
         def flush_batch() -> None:
             nonlocal batch, batch_bytes
@@ -225,6 +237,21 @@ def stream_video_features(
                 if decision is None:
                     frame_idx += 1
                     continue
+
+                progress_now = time.monotonic()
+                if progress_now - progress_last >= progress_interval_seconds:
+                    progress_last = progress_now
+                    elapsed_text = _format_elapsed(progress_now - progress_started)
+                    if duration > 0:
+                        percent = min(100.0, 100.0 * timestamp / duration)
+                        position = f"{timestamp:.1f}s / {duration:.1f}s ({percent:.0f}%)"
+                    else:
+                        position = f"{timestamp:.1f}s"
+                    print(
+                        f"  Sampling: {position} · {len(timestamps)} samples · "
+                        f"{elapsed_text} elapsed",
+                        flush=True,
+                    )
 
                 height_now, width_now = frame.shape[:2]
                 current_bytes = _frame_bytes(int(width_now), int(height_now))

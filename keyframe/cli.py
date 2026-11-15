@@ -564,6 +564,10 @@ def cmd_setup_paddle(args) -> int:
 
 
 def main():
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(line_buffering=True)
     # Check for `install-skills` subcommand first
     if len(sys.argv) > 1 and sys.argv[1] == "install-skills":
         parser = argparse.ArgumentParser(prog="keyframe install-skills")
