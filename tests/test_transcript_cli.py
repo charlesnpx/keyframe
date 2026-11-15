@@ -320,7 +320,7 @@ def test_cli_version_reports_project_version(capsys):
         cli._parse_extract_args(["--version"])
 
     assert raised.value.code == 0
-    assert capsys.readouterr().out == "keyframe 0.6.5\n"
+    assert capsys.readouterr().out == "keyframe 0.6.6\n"
 
 
 def test_new_cli_options_default_to_auto():
