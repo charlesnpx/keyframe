@@ -91,7 +91,7 @@ def detect_scenes(video_path, timestamps, threshold=27.0):
     video = open_video(video_path)
     sm = SceneManager()
     sm.add_detector(ContentDetector(threshold=threshold))
-    sm.detect_scenes(video)
+    sm.detect_scenes(video, show_progress=True)
     scene_list = sm.get_scene_list()
 
     if not scene_list:
